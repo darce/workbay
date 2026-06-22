@@ -1,0 +1,20 @@
+name: branch-review
+scope: harness
+description: Use when reviewing implementation changes on a feature branch. Triggers
+  on `make review-run` for lane/local working-tree review, branch diff review requests,
+  or pre-merge audit passes.
+mode: execution
+context_budget: 150
+makefile_target: review-run
+mcp_tools:
+- get_latest_slice_review_packet
+- get_review_findings_summary
+- reconcile_review_findings
+- review_findings
+- review_runs
+- record_event
+- integrity_check
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
