@@ -1,0 +1,76 @@
+{
+  "packages": [
+    {
+      "name": "workbay-protocol",
+      "path": "packages/workbay-protocol",
+      "distribution": "workbay-protocol",
+      "artifact_prefix": "workbay_protocol",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay-protocol/CHANGELOG.md"
+    },
+    {
+      "name": "mcp-workbay-handoff",
+      "path": "packages/mcp-workbay-handoff",
+      "distribution": "mcp-workbay-handoff",
+      "artifact_prefix": "mcp_workbay_handoff",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/mcp-workbay-handoff/CHANGELOG.md"
+    },
+    {
+      "name": "mcp-workbay-orchestrator",
+      "path": "packages/mcp-workbay-orchestrator",
+      "distribution": "mcp-workbay-orchestrator",
+      "artifact_prefix": "mcp_workbay_orchestrator",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/mcp-workbay-orchestrator/CHANGELOG.md"
+    },
+    {
+      "name": "workbay-bootstrap",
+      "path": "packages/workbay-bootstrap",
+      "distribution": "workbay-bootstrap",
+      "artifact_prefix": "workbay_bootstrap",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay-bootstrap/CHANGELOG.md"
+    },
+    {
+      "name": "workbay-codex-bridge",
+      "path": "packages/workbay-codex-bridge",
+      "distribution": "workbay-codex-bridge",
+      "artifact_prefix": "workbay_codex_bridge",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay-codex-bridge/CHANGELOG.md"
+    },
+    {
+      "name": "workbay-system",
+      "path": "packages/workbay-system",
+      "distribution": "workbay-system",
+      "artifact_prefix": "workbay_system",
+      "publish": true,
+      "test_command": "python -m pytest -q tests/test_distribution_packaging.py",
+      "changelog": "packages/workbay-system/CHANGELOG.md"
+    },
+    {
+      "name": "workbay-stack",
+      "path": "packages/workbay-stack",
+      "distribution": "workbay-stack",
+      "artifact_prefix": "workbay_stack",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay-stack/CHANGELOG.md"
+    },
+    {
+      "name": "workbay",
+      "path": "packages/workbay",
+      "distribution": "workbay",
+      "artifact_prefix": "workbay",
+      "publish": true,
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay/CHANGELOG.md"
+    }
+  ]
+}

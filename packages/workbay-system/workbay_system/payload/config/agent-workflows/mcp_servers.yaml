@@ -1,0 +1,53 @@
+# packages/workbay-system/config/agent-workflows/mcp_servers.yaml
+#
+# Canonical MCP server registration manifest. Single source for every MCP
+# registration surface: the plugin distribution generator reads it directly,
+# and the bootstrap-side root-surface pins in
+# packages/workbay-bootstrap/src/workbay_bootstrap/install.py are
+# generated from it.
+#
+# `registration` declares, per harness, which surface owns MCP server
+# registration:
+#   root   — the bootstrap-written root surface (.mcp.json /
+#            .vscode/mcp.json / .codex/config.toml) registers the
+#            servers; emitted plugin trees carry skills only.
+#   plugin — the emitted plugin tree registers the servers via
+#            plugin.json `mcpServers` + a sibling .mcp.json (Claude uses
+#            the camelCase `mcpServers` wrapper; live Codex CLI 0.131.0
+#            only accepts the bare server map).
+# Dual registration (the pre-plan-0028 Claude duplicate) is a bug, never
+# a valid configuration.
+#
+# `plugin_version` is the single source for the emitted plugin.json
+# `"version"` field. Bump in lockstep with epic phase rollouts.
+
+version: 2
+plugin_version: "0.3.0"
+registration:
+  claude: root
+  codex: root
+  cursor: root
+  vscode: root
+  grok: root
+mcp_servers:
+  - name: workbay-handoff-mcp
+    command: uvx
+    args:
+      - mcp-workbay-handoff@0.1.0
+      - --workspace-root
+      - .
+      - serve-stdio
+    harnesses: [claude, codex, cursor, grok, vscode]
+  - name: workbay-orchestrator-mcp
+    command: uvx
+    args:
+      # The [bridge] extra pulls workbay-codex-bridge (published on PyPI) so
+      # the `codex-subagent` backend is importable in the uvx-launched runtime;
+      # without it `list_available_backends(probe=true)` reports
+      # declared_not_installed and review-parallel degrades to the in-process
+      # 2-pass fallback.
+      - mcp-workbay-orchestrator[bridge]@0.1.0
+      - --workspace-root
+      - .
+      - serve-stdio
+    harnesses: [claude, codex, cursor, grok, vscode]
