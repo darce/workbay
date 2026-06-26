@@ -1,0 +1,165 @@
+{
+  "$defs": {
+    "PluginAcceptUpstreamProvenance": {
+      "additionalProperties": false,
+      "description": "Recorded ``overrides accept-upstream`` event for one component.",
+      "properties": {
+        "accepted_at": {
+          "minLength": 1,
+          "title": "Accepted At",
+          "type": "string"
+        },
+        "new_upstream_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "New Upstream Digest",
+          "type": "string"
+        },
+        "previous_upstream_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Previous Upstream Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "previous_upstream_digest",
+        "new_upstream_digest",
+        "accepted_at"
+      ],
+      "title": "PluginAcceptUpstreamProvenance",
+      "type": "object"
+    },
+    "PluginOverrideLockEntry": {
+      "additionalProperties": false,
+      "description": "Tracked provenance for one consumer-owned plugin override.",
+      "properties": {
+        "base_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Path"
+        },
+        "component_kind": {
+          "enum": [
+            "skill",
+            "command",
+            "portable_command",
+            "mcp_server",
+            "claude_settings_hooks"
+          ],
+          "title": "Component Kind",
+          "type": "string"
+        },
+        "last_accept_upstream": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginAcceptUpstreamProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "local_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Path"
+        },
+        "mode": {
+          "enum": [
+            "replace",
+            "disable",
+            "add",
+            "patch",
+            "override"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "patch_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Patch Path"
+        },
+        "upstream_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Upstream Digest"
+        }
+      },
+      "required": [
+        "component_kind",
+        "name",
+        "mode"
+      ],
+      "title": "PluginOverrideLockEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Source-controlled lockfile for plugin overrides.",
+  "properties": {
+    "base_remote_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Base Remote Sha",
+      "type": "string"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/PluginOverrideLockEntry"
+      },
+      "title": "Components",
+      "type": "array"
+    },
+    "plugin": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Plugin",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "plugin",
+    "base_remote_sha"
+  ],
+  "title": "PluginOverrideLock",
+  "type": "object"
+}

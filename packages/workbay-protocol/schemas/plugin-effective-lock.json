@@ -1,0 +1,144 @@
+{
+  "$defs": {
+    "PluginEffectiveLockEntry": {
+      "additionalProperties": false,
+      "description": "Generated receipt entry for one component in the effective plugin tree.",
+      "properties": {
+        "component_kind": {
+          "enum": [
+            "skill",
+            "command",
+            "portable_command",
+            "mcp_server",
+            "claude_settings_hooks"
+          ],
+          "title": "Component Kind",
+          "type": "string"
+        },
+        "current_base_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Base Digest"
+        },
+        "effective_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Effective Digest",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "replace",
+            "disable",
+            "add",
+            "patch",
+            "override",
+            "passthrough"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "override_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Override Path"
+        },
+        "recorded_upstream_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recorded Upstream Digest"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "stale",
+                "merge_conflict"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "required": [
+        "component_kind",
+        "name",
+        "mode",
+        "effective_digest"
+      ],
+      "title": "PluginEffectiveLockEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Generated receipt describing the composed effective plugin tree.",
+  "properties": {
+    "base_remote_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Base Remote Sha",
+      "type": "string"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/PluginEffectiveLockEntry"
+      },
+      "title": "Components",
+      "type": "array"
+    },
+    "effective_root": {
+      "minLength": 1,
+      "title": "Effective Root",
+      "type": "string"
+    },
+    "plugin": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Plugin",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "plugin",
+    "base_remote_sha",
+    "effective_root"
+  ],
+  "title": "PluginEffectiveLock",
+  "type": "object"
+}
