@@ -1,0 +1,48 @@
+# Brand-token map — SSOT for the WorkBay project identity (implementation note D1).
+#
+# `make brand-check` (scripts/check_brand.py) fails if a forbidden prior-brand
+# token reappears in tracked production source outside the allowlist — so a future
+# rename is a codemod over this one map, not a manual sweep, and stray legacy
+# tokens are caught in CI. The runtime display/URL constants live in
+# `workbay_protocol.brand`; this file governs the *structural* token set that a
+# constant cannot reach (implementation note §2).
+
+[canonical]
+display = "WorkBay"
+slug = "workbay"
+org = "darce"
+repo = "workbay"
+
+[forbidden]
+# Prior brand names (display + lowercase token) that must not reappear in scanned
+# source. Intentional divergence from implementation note §5, which also listed
+# `agentic-system` / `.agentic`: those are NOT forbidden because the legacy-origin
+# guard in workbay-bootstrap references them by design, so forbidding them would
+# false-positive on live code. All-caps `WORKSTATE` is likewise excluded — it is a
+# constant-name convention (e.g. the export-scrub `WORKSTATE-REF`), not brand
+# usage. So the forbidden set is the live prior brand only.
+tokens = ["workstate", "Workstate"]
+
+[scan]
+# Tracked dirs scanned for forbidden tokens (by directory; the allowlist below
+# filters paths that intentionally carry historical brand names). Untracked /
+# gitignored files (node_modules, build/) are never scanned — git grep only sees
+# tracked files.
+globs = [
+  "packages",
+  "scripts",
+  "apps",
+  ".github",
+  "Makefile",
+  "Makefile.d",
+]
+
+[allowlist]
+# fnmatch globs (matched against each hit's repo-relative path) for paths exempt
+# from the scan — intentional history / coverage (implementation note §5).
+globs = [
+  "*/tests/*",
+  "*/test_*.py",
+  "*/docs/*",
+  "packages/workbay-system/workbay_system/payload/*",
+]
