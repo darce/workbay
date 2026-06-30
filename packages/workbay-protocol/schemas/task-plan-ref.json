@@ -1,0 +1,67 @@
+{
+  "$defs": {
+    "TaskPlanResolution": {
+      "description": "How an absolute task-plan path was resolved at read time.\n\n``absolute``: the configured ``task_plan_path`` was already absolute.\n``worktree``: resolved against ``target_worktree_path``.\n``workspace``: resolved against the configured workspace root because\n               no ``target_worktree_path`` was set.\n``unresolved``: resolution failed (no worktree, no workspace).",
+      "enum": [
+        "absolute",
+        "worktree",
+        "workspace",
+        "unresolved"
+      ],
+      "title": "TaskPlanResolution",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Structured pointer to a task's planning artifact.\n\nReplaces inferring plan paths from the freeform ``focus`` field.\nThe triple (path, abs_path, exists, resolution) is computed by the\nhandoff runtime against ``target_worktree_path`` and surfaced on\nevery active row so the root workspace can discover and open plans\nliving in sibling worktrees without switching the root checkout.",
+  "properties": {
+    "task_plan_abs_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Absolute path resolved against the target worktree.",
+      "title": "Task Plan Abs Path"
+    },
+    "task_plan_exists": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Whether the resolved absolute path is a regular file at read time.",
+      "title": "Task Plan Exists"
+    },
+    "task_plan_path": {
+      "description": "Repo-relative path (or absolute path) to the planning artifact.",
+      "title": "Task Plan Path",
+      "type": "string"
+    },
+    "task_plan_resolution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskPlanResolution"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "How task_plan_abs_path was derived."
+    }
+  },
+  "required": [
+    "task_plan_path"
+  ],
+  "title": "TaskPlanRef",
+  "type": "object"
+}
