@@ -1,0 +1,127 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py",
+        "timeout": 5,
+        "statusMessage": "Guarding worktree drift"
+      },
+      {
+        "matcher": "Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py .github/hooks/guard-main-branch.py",
+        "timeout": 5,
+        "statusMessage": "Guarding main branch edits"
+      },
+      {
+        "matcher": "Bash",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-bash-main-branch.py",
+        "timeout": 5,
+        "statusMessage": "Guarding main branch"
+      },
+      {
+        "matcher": "Edit|Write",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-task-plan-findings.py",
+        "timeout": 5,
+        "statusMessage": "Guarding task plan findings"
+      },
+      {
+        "matcher": "mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-rationale-size.py",
+        "timeout": 5,
+        "statusMessage": "Checking rationale size"
+      },
+      {
+        "matcher": "mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/validate-mcp-dict-params.py",
+        "timeout": 5,
+        "statusMessage": "Validating MCP dict params"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/record-file-touch.py",
+            "timeout": 10,
+            "statusMessage": "Recording file touch"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__workbay-handoff-mcp__review_findings",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/ace-detect.py",
+            "timeout": 5,
+            "statusMessage": "Detecting ACE references"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__workbay-handoff-mcp__get_handoff_state|mcp__workbay-handoff-mcp__load_session|mcp__workbay-handoff-mcp__render_handoff",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/slim-handoff-response.py",
+            "timeout": 5,
+            "statusMessage": "Slimming handoff response"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/filter-test-output.py",
+            "timeout": 5,
+            "statusMessage": "Filtering test output"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/capture-agent-errors.py",
+            "timeout": 15,
+            "statusMessage": "Capturing agent errors"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/advise-worktree-cd.py",
+        "timeout": 5,
+        "statusMessage": "Advising worktree cd"
+      },
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/coherence-self-check.py",
+        "timeout": 10,
+        "statusMessage": "Checking hook-surface coherence"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/advise-worktree-cd.py",
+        "timeout": 5,
+        "statusMessage": "Advising worktree cd"
+      }
+    ]
+  }
+}

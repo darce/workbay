@@ -1,0 +1,18 @@
+name: review-parallel
+scope: harness
+description: Use when a branch review benefits from N independent parallel reviewers.
+  Triggers on `/review-parallel`, explicit `reviewers_count>=2` requests, or review-coverage
+  targets that require more than one pass over the same diff.
+mode: execution
+context_budget: 150
+makefile_target: null
+mcp_tools:
+- review_findings
+- review_runs
+- record_event
+- get_handoff_state
+- integrity_check
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
