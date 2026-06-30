@@ -1,0 +1,60 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "cwd": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Working directory of the Claude Code process at event time.",
+      "title": "Cwd"
+    },
+    "hook_event_name": {
+      "const": "SessionStart",
+      "default": "SessionStart",
+      "title": "Hook Event Name",
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Stable per-session identifier from Claude Code.",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Why the session started (e.g. 'startup', 'resume', 'compact').",
+      "title": "Source"
+    },
+    "transcript_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Filesystem path to the active session transcript, when emitted by the harness.",
+      "title": "Transcript Path"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionStartEvent",
+  "type": "object"
+}
