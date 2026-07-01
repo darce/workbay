@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workbay-bootstrap"
+version = "0.3.4"
+description = "Bootstrap CLI that hoists the shared workbay-system surface into consumer repos."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+authors = [{ name = "darce" }]
+dependencies = [
+	"tomlkit>=0.13",
+	"pyyaml>=6",
+	"workbay-protocol>=0.2.0,<0.3.0",
+	"workbay-system>=0.3.3,<0.4.0",
+	"packaging>=23",
+]
+
+[project.scripts]
+workbay-bootstrap = "workbay_bootstrap.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/workbay-bootstrap"
+Documentation = "https://github.com/darce/workbay/blob/main/docs/CONSUMER.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mcp-workbay-handoff; python_version >= '3.12'"]
+
+[tool.uv.sources]
+mcp-workbay-handoff = { workspace = true }
+workbay-protocol = { workspace = true }
+workbay-system = { workspace = true }
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["workbay_bootstrap"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["workbay_bootstrap", "hatch_build.py", "_scrub_core.py"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
