@@ -1,0 +1,27 @@
+name: handoff-lifecycle
+scope: harness
+description: Use when entering, resuming, switching, or ending a task session. Triggers
+  on `make context`, `load_session`, and task-to-task transitions.
+mode: execution
+context_budget: 100
+makefile_target: null
+mcp_tools:
+- load_session
+- get_handoff_state
+- record_event
+- close_slice
+- validate
+- compaction
+- set_handoff_state
+- render_handoff
+- switch_task
+- list_handoff_rows
+- next_actions
+- export_handoff_state
+- import_handoff_state
+tdd_gate: false
+generator:
+  prompt_body_sections:
+    - Core Process
+  claude_overrides:
+    disable-model-invocation: false
