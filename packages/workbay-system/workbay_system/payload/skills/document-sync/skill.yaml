@@ -1,0 +1,16 @@
+name: document-sync
+description: Update repository documentation to match the current code and workflow
+  surfaces after code changes land.
+mode: execution
+context_budget: 180
+makefile_target: null
+mcp_tools:
+- search_handoff
+- get_handoff_state
+- record_event
+- render_handoff
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false

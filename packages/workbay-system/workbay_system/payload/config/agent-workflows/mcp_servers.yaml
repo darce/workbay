@@ -1,0 +1,33 @@
+# packages/workbay-system/config/agent-workflows/mcp_servers.yaml
+#
+# Canonical MCP server registration manifest. Single source for every MCP
+# registration surface: the plugin distribution generator reads it directly,
+# and the bootstrap-side root-surface pins in
+# packages/workbay-bootstrap/src/workbay_bootstrap/install.py are
+# generated from it.
+#
+# Git-only delivery (internal S2): launch through the stdlib
+# ``mcp_launch.py`` shim, which execs the git-installed / workspace ``.venv``
+# console script — never per-session ``uvx`` PyPI resolution.
+
+version: 2
+plugin_version: "0.3.0"
+registration:
+  claude: root
+  codex: root
+  cursor: root
+  vscode: root
+  grok: root
+mcp_servers:
+  - name: workbay-handoff-mcp
+    command: python3
+    args:
+      - scripts/hooks/mcp_launch.py
+      - workbay-handoff-mcp
+    harnesses: [claude, codex, cursor, grok, vscode]
+  - name: workbay-orchestrator-mcp
+    command: python3
+    args:
+      - scripts/hooks/mcp_launch.py
+      - workbay-orchestrator-mcp
+    harnesses: [claude, codex, cursor, grok, vscode]
