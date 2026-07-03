@@ -1,0 +1,21 @@
+name: offload
+scope: harness
+description: One-command bounded grok Composer-2.5 offload with token governor and
+  review gate. Triggers on `/offload` and operator requests to dispatch a self-contained
+  slice to a junior grok lane.
+mode: execution
+context_budget: 120
+makefile_target: null
+mcp_tools:
+- offload_preflight
+- materialize_offload_lane_manifest
+- manage_worktree_lane
+- dispatch_lane_work
+- manage_worker
+- worker_reports
+- get_lane_activity
+- list_available_backends
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
