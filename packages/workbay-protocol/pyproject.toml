@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workbay-protocol"
+version = "0.2.1"
+description = "Typed cross-repo contracts for the WorkBay system: handoff state, MCP I/O, hook events, skill manifests, bootstrap install manifest."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "pydantic>=2.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/workbay-protocol"
+Documentation = "https://github.com/darce/workbay/blob/main/docs/CONSUMER.md"
+Changelog = "https://github.com/darce/workbay/blob/main/packages/workbay-protocol/CHANGELOG.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+# Scrub-at-build shape: only-include the remapped IMPORT name (not src/<pkg>) so
+# hatchling ships nothing raw and the hook's scrubbed force-include is the sole
+# copy. Avoids shipping the unscrubbed src/ tree alongside it (REVB-01); keeps the
+# wheel-from-sdist rebuild working (the hook resolves the name to the sdist's
+# top-level <pkg> dir when src/<pkg> is absent).
+[tool.hatch.build.targets.wheel]
+only-include = ["workbay_protocol"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["workbay_protocol", "schemas", "hatch_build.py", "_scrub_core.py"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
