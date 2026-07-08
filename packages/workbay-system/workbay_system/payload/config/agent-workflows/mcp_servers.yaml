@@ -1,0 +1,69 @@
+# packages/workbay-system/config/agent-workflows/mcp_servers.yaml
+#
+# Canonical MCP server registration manifest. Single source for every MCP
+# registration surface: the plugin distribution generator reads it directly,
+# and the bootstrap-side root-surface pins in
+# packages/workbay-bootstrap/src/workbay_bootstrap/install.py are
+# generated from it.
+#
+# Git-only delivery (internal S2): launch through the stdlib
+# ``mcp_launch.py`` shim, which execs the git-installed / workspace ``.venv``
+# console script — never per-session ``uvx`` PyPI resolution.
+#
+# cwd-independent launcher (internal S3): the harness may start
+# an MCP server from any cwd inside the repo (a linked worktree, a subdir
+# session), not just the repo root. A bare ``python3 scripts/hooks/mcp_launch.py``
+# resolves that RELATIVE script path against the launch cwd and cannot find it
+# off-root, so the server fails to start. Wrap the launch in ``sh -c`` that
+# resolves the shim against the git repo root at launch time — portable (no
+# machine-absolute path baked into this managed file). ``sh`` is $0 and the
+# server id is the sole trailing positional forwarded via ``"$@"``, so every
+# recognizer reads it as ``args[-1]`` and the shim path stays embedded in
+# ``args[1]``.
+
+version: 2
+plugin_version: "0.3.0"
+registration:
+  claude: root
+  codex: root
+  cursor: root
+  vscode: root
+  grok: root
+mcp_servers:
+  - name: workbay-handoff-mcp
+    command: sh
+    args:
+      - "-c"
+      - 'root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"; exec python3 "$root/scripts/hooks/mcp_launch.py" "$@"'
+      - "sh"
+      - workbay-handoff-mcp
+    harnesses: [claude, codex, cursor, grok, vscode]
+  - name: workbay-orchestrator-mcp
+    command: sh
+    args:
+      - "-c"
+      - 'root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"; exec python3 "$root/scripts/hooks/mcp_launch.py" "$@"'
+      - "sh"
+      - workbay-orchestrator-mcp
+    harnesses: [claude, codex, cursor, grok, vscode]
+
+# Opt-in managed servers. Kept under a DISTINCT top-level key (not `mcp_servers`)
+# so any consumer that predates opt-in support — an older `render()`, or the
+# harness-surface generator that iterates `mcp_servers` — ignores this block
+# entirely and materialises a valid (thinner) surface with these servers
+# EXCLUDED. That is the forward-compatible default (DDIA §4: old code ignores
+# unknown fields; the safe default must be "absent", never "always-on").
+# Materialised only when the operator passes `opt_in_flag`. The concrete binary
+# identity and its launch-time capability probe live ONLY in the shim's SERVERS
+# registry (scripts/hooks/mcp_launch.py) — never here — so no vendor/binary name
+# leaks into the canonical manifest (correctness-checklist §6).
+optional_mcp_servers:
+  - name: codebase-graph-mcp
+    command: sh
+    args:
+      - "-c"
+      - 'root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"; exec python3 "$root/scripts/hooks/mcp_launch.py" "$@"'
+      - "sh"
+      - codebase-graph-mcp
+    harnesses: [claude, codex, cursor, grok, vscode]
+    opt_in_flag: --with-codebase-graph

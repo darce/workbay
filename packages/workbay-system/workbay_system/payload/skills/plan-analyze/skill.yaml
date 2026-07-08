@@ -1,0 +1,15 @@
+name: plan-analyze
+scope: harness
+description: Use for pre-review triage of planning documents. Triggers on `make plan-analyze`
+  and requests to scan a plan for ambiguity, duplication, or missing coverage before
+  formal planning review.
+mode: advisory
+context_budget: 200
+makefile_target: plan-analyze
+mcp_tools:
+- review_findings
+- search_handoff
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
