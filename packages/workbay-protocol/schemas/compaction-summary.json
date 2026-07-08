@@ -1,0 +1,150 @@
+{
+  "$defs": {
+    "DecisionRef": {
+      "additionalProperties": false,
+      "description": "Stable decision pointer captured in a compaction summary.",
+      "properties": {
+        "decision_id": {
+          "description": "Stable decision identifier recorded in handoff.",
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "slug": {
+          "description": "Human-readable decision slug used for quick inspection.",
+          "title": "Slug",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_id",
+        "slug"
+      ],
+      "title": "DecisionRef",
+      "type": "object"
+    },
+    "TurnRange": {
+      "additionalProperties": false,
+      "description": "Inclusive turn range covered by the compaction summary.",
+      "properties": {
+        "end_turn": {
+          "description": "Inclusive 1-indexed last turn covered by the summary.",
+          "minimum": 1,
+          "title": "End Turn",
+          "type": "integer"
+        },
+        "start_turn": {
+          "description": "Inclusive 1-indexed first turn covered by the summary.",
+          "minimum": 1,
+          "title": "Start Turn",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_turn",
+        "end_turn"
+      ],
+      "title": "TurnRange",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Durable structured summary stored for cross-harness compaction.",
+  "properties": {
+    "compaction_id": {
+      "description": "Server-generated stable compaction handle.",
+      "title": "Compaction Id",
+      "type": "string"
+    },
+    "created_at": {
+      "description": "Timestamp when the compaction row was created.",
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "decisions": {
+      "items": {
+        "$ref": "#/$defs/DecisionRef"
+      },
+      "title": "Decisions",
+      "type": "array"
+    },
+    "files_touched": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Files Touched",
+      "type": "array"
+    },
+    "findings_fixed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Findings Fixed",
+      "type": "array"
+    },
+    "findings_opened": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Findings Opened",
+      "type": "array"
+    },
+    "harness": {
+      "description": "Harness that produced the compaction record.",
+      "enum": [
+        "claude-code",
+        "codex",
+        "grok",
+        "vscode",
+        "manual"
+      ],
+      "title": "Harness",
+      "type": "string"
+    },
+    "prose_residual": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Narrative spans that the extractor could not resolve to structured IDs.",
+      "title": "Prose Residual"
+    },
+    "session_id": {
+      "description": "Harness session identifier for the compacted transcript span.",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "task_ref": {
+      "description": "Short task identifier, e.g. 'internal' or 'internal'.",
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Task Ref",
+      "type": "string"
+    },
+    "tests_verified": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Tests Verified",
+      "type": "array"
+    },
+    "turn_range": {
+      "$ref": "#/$defs/TurnRange"
+    }
+  },
+  "required": [
+    "compaction_id",
+    "session_id",
+    "harness",
+    "task_ref",
+    "turn_range",
+    "created_at"
+  ],
+  "title": "StructuredSummary",
+  "type": "object"
+}

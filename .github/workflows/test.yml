@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  public-build-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Validate release manifest
+        run: python scripts/release_manifest.py validate
+
+      - name: Build public distributions
+        run: |
+          mkdir -p dist/all
+          python scripts/release_manifest.py list --release-only --field name > /tmp/workbay-packages.txt
+          while IFS= read -r package; do
+            python -m build --outdir dist/all "packages/${package}"
+          done < /tmp/workbay-packages.txt
+          python -m twine check dist/all/*
+
+      - name: Install built distributions
+        run: |
+          # Install the freshly built wheels by path so the local artifacts
+          # always win; deps still resolve from PyPI. Using
+          # `--find-links dist/all <names>` instead lets pip pick a same-
+          # versioned stale PyPI release (e.g. workbay-protocol 0.2.0 without
+          # TEMPLATES_DIR) over the just-built wheel — a git-only/PyPI skew
+          # that broke the import smoke.
+          python -m pip install dist/all/*.whl
+
+      - name: Import smoke
+        run: |
+          python - <<'PY'
+          import workbay_bootstrap
+          import workbay_codex_bridge
+          import workbay_handoff_mcp
+          import workbay_orchestrator_mcp
+          import workbay_protocol
+
+          print("public import smoke passed")
+          PY

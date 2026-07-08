@@ -1,0 +1,211 @@
+{
+  "$defs": {
+    "OverlayConfigEntry": {
+      "additionalProperties": true,
+      "description": "A consumer-tool config that bootstrap wrote (e.g. .vscode/mcp.json).\n\n``action`` is the string the install flow emits today\n(``created``, ``updated``, ``set``, ``unchanged``). Modeled as a\nfree string rather than a Literal so the contract does not block\nbootstrap from introducing new actions before the protocol bumps.",
+      "properties": {
+        "action": {
+          "description": "What bootstrap did to the config (e.g. 'created', 'updated', 'set', 'unchanged').",
+          "minLength": 1,
+          "title": "Action",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "action"
+      ],
+      "title": "OverlayConfigEntry",
+      "type": "object"
+    },
+    "OverlaySurface": {
+      "additionalProperties": true,
+      "description": "A single overlay surface entry (e.g. skills, commands, hooks).",
+      "properties": {
+        "path": {
+          "description": "Repo-relative surface path (e.g. '.claude/skills/handoff-lifecycle').",
+          "title": "Path",
+          "type": "string"
+        },
+        "source": {
+          "description": "Origin tier: 'shared' (symlinked from workbay-system), 'local' (target-owned), 'overlapping' (target overrides shared), 'generated' (per-agent surface produced by generate_agent_workflows.py during install \u2014 implementation note step 1), 'lifecycle' (implementation note hoisted Make fragment + runner package \u2014 copied, not symlinked, so the consumer can run `make context` without the workbay-system packaging tree).",
+          "enum": [
+            "shared",
+            "local",
+            "overlapping",
+            "generated",
+            "lifecycle"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "source"
+      ],
+      "title": "OverlaySurface",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "description": "Top-level shape of ``.workbay-overlay.json``.\n\nValidated on write by ``workbay-bootstrap.install`` so the file\ncannot drift silently. Consumers (drift detectors, doctor commands)\nparse the same model on read.",
+  "properties": {
+    "configs": {
+      "items": {
+        "$ref": "#/$defs/OverlayConfigEntry"
+      },
+      "title": "Configs",
+      "type": "array"
+    },
+    "mcp_servers": {
+      "description": "Sorted list of managed MCP server names bootstrap last wrote into ``.mcp.json`` / ``.vscode/mcp.json`` / ``.codex/config.toml``. Read by ``sync_mcp_configs(prune_removed_managed=True)`` as the authoritative previously-managed provenance so third-party launchers in those files are preserved across syncs.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Mcp Servers",
+      "type": "array"
+    },
+    "package_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Installed workbay-system distribution version (package source).",
+      "title": "Package Version"
+    },
+    "plugin_overrides_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional explicit plugin override root recorded by bootstrap so later doctor/update/repair runs can reuse a non-default internal override location.",
+      "title": "Plugin Overrides Path"
+    },
+    "remote_ref": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Remote Ref"
+    },
+    "remote_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Resolved 40-char git SHA at install time (git_overlay source).",
+      "title": "Remote Sha"
+    },
+    "remote_url": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Remote Url"
+    },
+    "schema_version": {
+      "description": "Manifest schema version.",
+      "minimum": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_kind": {
+      "default": "git_overlay",
+      "description": "Overlay delivery source: 'git_overlay' (a clone checked out at remote_ref), 'package' (an installed workbay-system distribution), or 'worktree' (the repo's own working tree / HEAD). Defaults to 'git_overlay' so manifests written before internal validate unchanged.",
+      "enum": [
+        "git_overlay",
+        "package",
+        "worktree"
+      ],
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "stack_distribution": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Meta-package anchor distribution recorded by package-source install/update when it is installed (implementation note: 'workbay'). None for legacy/pre-stack installs.",
+      "title": "Stack Distribution"
+    },
+    "stack_members": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Mapping of stack member distribution name -> exact version pinned by the installed anchor's metadata. Doctor compares the live environment against this expectation (stack_drift).",
+      "title": "Stack Members"
+    },
+    "stack_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Installed version of the stack anchor distribution at install/update time (package source only).",
+      "title": "Stack Version"
+    },
+    "surfaces": {
+      "items": {
+        "$ref": "#/$defs/OverlaySurface"
+      },
+      "title": "Surfaces",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "BootstrapManifest",
+  "type": "object"
+}
