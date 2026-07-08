@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workbay-system"
+version = "0.3.8"
+description = "Canonical workbay-system overlay payload (skills, hooks, contracts, generator) shipped as package data for workbay-bootstrap."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+authors = [{ name = "darce" }]
+dependencies = [
+    "pyyaml>=6",
+]
+
+[project.scripts]
+workbay-overlay-tooling = "workbay_system.overlay_tooling.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/workbay-system"
+Documentation = "https://github.com/darce/workbay/blob/main/docs/CONSUMER.md"
+Changelog = "https://github.com/darce/workbay/blob/main/packages/workbay-system/CHANGELOG.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyyaml>=6", "hatchling>=1.27"]
+
+# uv-only dev provisioning: sibling test deps resolve via path-editable sources.
+# ``[project.optional-dependencies] dev`` stays for pip; ``dependency-groups`` is
+# what ``uv sync`` installs by default (also additively with ``--extra dev``).
+# The three shared pins are duplicated in ``[project.optional-dependencies] dev``
+# above (pip path vs uv path) — keep both lists in sync when bumping a pin.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pyyaml>=6",
+    "hatchling>=1.27",
+    "mcp-workbay-handoff[test] ; python_version >= '3.12'",
+]
+
+[tool.uv.sources]
+mcp-workbay-handoff = { workspace = true }
+workbay-protocol = { workspace = true }
+
+# Overlay packaging (0020 S3): the overlay payload is co-located under
+# `workbay_system/payload/` and ships by "ship the package" — `only-include`
+# delivers the importable package (with its payload subtree) and there is no
+# force-include map. Internal-only material (evals, adrs, generated, tests)
+# lives OUTSIDE `workbay_system/`, so it is structurally impossible to sweep
+# into the wheel; `tests/test_payload_colocation.py` (the negative privacy
+# guard + the wheel-vs-source byte-parity test) is the comprehensive guard that
+# no internal file leaks and no needed surface is dropped.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["workbay_system"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+# Source-model rework (0038): the sdist is an allowlist (not a denylist) so
+# internal-only top-level material (task docs, specs, adrs, harness prompts,
+# editor config, dev scripts, agent guides, changelog) can never silently leak
+# into the published source distribution. Ship only what is needed to rebuild
+# the wheel from sdist: the importable package (with its scrubbed payload), the
+# build hook, and its vendored scrub core. pyproject.toml and README.md are
+# always included by hatchling as sdist metadata. The privacy gate scans the
+# *entire* unpacked sdist, so anything added here is also gated.
+[tool.hatch.build.targets.sdist]
+only-include = ["workbay_system", "hatch_build.py", "_scrub_core.py"]
+exclude = ["**/__pycache__", "**/*.pyc", "**/evals/**", "**/evals.mk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: uv-driven environment provisioning checks (need `uv`; isolated, side-effect-free).",
+]
