@@ -1,0 +1,17 @@
+name: security-audit
+description: Run a structured security audit over the monorepo and record actionable
+  findings with credible exploit paths.
+mode: execution
+context_budget: 220
+makefile_target: null
+mcp_tools:
+- review_findings
+- review_runs
+- record_event
+- get_handoff_state
+- render_handoff
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false
