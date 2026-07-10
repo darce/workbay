@@ -1,0 +1,194 @@
+{
+  "$defs": {
+    "AppendArgsOp": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "const": "append_args",
+          "title": "Op",
+          "type": "string"
+        },
+        "value": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Value",
+          "type": "array"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ],
+      "title": "AppendArgsOp",
+      "type": "object"
+    },
+    "DisableServerOp": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "const": "disable_server",
+          "title": "Op",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "title": "DisableServerOp",
+      "type": "object"
+    },
+    "RemoveEnvOp": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "op": {
+          "const": "remove_env",
+          "title": "Op",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "name"
+      ],
+      "title": "RemoveEnvOp",
+      "type": "object"
+    },
+    "ReplaceArgsOp": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "const": "replace_args",
+          "title": "Op",
+          "type": "string"
+        },
+        "value": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Value",
+          "type": "array"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ],
+      "title": "ReplaceArgsOp",
+      "type": "object"
+    },
+    "ReplaceCommandOp": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "const": "replace_command",
+          "title": "Op",
+          "type": "string"
+        },
+        "value": {
+          "minLength": 1,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ],
+      "title": "ReplaceCommandOp",
+      "type": "object"
+    },
+    "UpsertEnvOp": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "op": {
+          "const": "upsert_env",
+          "title": "Op",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "name",
+        "value"
+      ],
+      "title": "UpsertEnvOp",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Typed patch grammar for MCP server mutations in consumer overrides.",
+  "properties": {
+    "ops": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "append_args": "#/$defs/AppendArgsOp",
+            "disable_server": "#/$defs/DisableServerOp",
+            "remove_env": "#/$defs/RemoveEnvOp",
+            "replace_args": "#/$defs/ReplaceArgsOp",
+            "replace_command": "#/$defs/ReplaceCommandOp",
+            "upsert_env": "#/$defs/UpsertEnvOp"
+          },
+          "propertyName": "op"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ReplaceCommandOp"
+          },
+          {
+            "$ref": "#/$defs/ReplaceArgsOp"
+          },
+          {
+            "$ref": "#/$defs/AppendArgsOp"
+          },
+          {
+            "$ref": "#/$defs/UpsertEnvOp"
+          },
+          {
+            "$ref": "#/$defs/RemoveEnvOp"
+          },
+          {
+            "$ref": "#/$defs/DisableServerOp"
+          }
+        ]
+      },
+      "minItems": 1,
+      "title": "Ops",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "target_server": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Target Server",
+      "type": "string"
+    }
+  },
+  "required": [
+    "target_server",
+    "ops"
+  ],
+  "title": "PluginMcpServerPatch",
+  "type": "object"
+}
