@@ -1,0 +1,16 @@
+name: daemon-lifecycle
+description: Start, stop, pause, resume, inspect, or recover orchestrator and worker
+  daemons. Handles lock files, PID checks, and status files.
+mode: execution
+context_budget: 150
+makefile_target: daemon-status
+mcp_tools:
+- manage_orchestrator
+- manage_worker
+- get_lane_activity
+tdd_gate: false
+argument-hint: '[start|stop|pause|resume|inspect] [orchestrator|worker]'
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false
