@@ -1,0 +1,109 @@
+# MCP Tool Routing
+#
+# Declarative rules for which MCP servers an agent should surface at session
+# start. Validated by `scripts/check_skills.py` (mcp_tools reference checks)
+# and applied by any agent harness (Claude Code, Codex, future).
+#
+# This file is the single source of truth — harness-specific entry files
+# (CLAUDE.md, AGENTS.md, etc.) link to it instead of duplicating its rules.
+#
+# Pattern source: borrowed from CodeRabbit's `.coderabbit.yaml` per-glob
+# `path_instructions[]` model.
+
+# ---------------------------------------------------------------------------
+# always: servers loaded eagerly on every session
+# ---------------------------------------------------------------------------
+# These servers are needed in essentially every dev session, so the harness
+# should make their tool schemas available without waiting for a trigger.
+always:
+  - workbay-handoff-mcp  # source of truth for task state, decisions, findings
+
+# ---------------------------------------------------------------------------
+# on_demand: servers loaded only when a trigger fires
+# ---------------------------------------------------------------------------
+# Each server lists triggers (keywords / paths / roles). The agent loads the
+# server's tools (e.g. via Claude Code's `ToolSearch select:mcp__<server>__*`)
+# the moment the active prompt or task scope matches any trigger.
+on_demand:
+  workbay-orchestrator-mcp:
+    description: >-
+      Lane lifecycle, worker dispatch, daemon control, plan cursors,
+      structured-turn execution. Heavy tool surface; only load when actually
+      doing orchestration work.
+    triggers:
+      keywords:
+        - lane
+        - worker
+        - daemon
+        - dispatch
+        - orchestrator
+        - worktree-lane
+        - plan-cursor
+        - manage_worker
+        - worker_start
+        - worker_stop
+        - lane-inbox
+        - lane-brief
+        - structured_turn
+        - run_structured_turn
+        - reconcile_review_findings
+      paths:
+        - "config/lane-orchestration/**"
+        - "docs/workbay/contracts/workbay-orchestrator-mcp.md"
+        - "mk/lane-*.mk"
+        - "mk/orchestrator.mk"
+        - "scripts/worktree-lane/**"
+      roles:
+        - orchestration
+        - lane-worker
+        - worktree-orchestrator
+
+  context7:
+    description: >-
+      Upstream library documentation lookup. Only load when the slice depends
+      on framework / library behavior that cannot be deduced from local code.
+      See `docs/workbay/instructions.md` § "ctx7 entry criteria" for the gate.
+    triggers:
+      keywords:
+        - upstream library
+        - documentation for
+        - "API of "
+        - "how does "
+        - library docs
+        - framework docs
+      criteria_doc: docs/workbay/instructions.md#ctx7-entry-criteria
+
+  computer-use:
+    description: >-
+      Desktop screenshot / native app automation. Almost never needed for
+      coding work. Load only when the prompt explicitly references a desktop
+      app or visual workflow.
+    triggers:
+      keywords:
+        - screenshot
+        - desktop
+        - native app
+        - "click on screen"
+        - "type into screen"
+        - "open application"
+
+# ---------------------------------------------------------------------------
+# exclude: pre-flight exclusions (CodeRabbit pattern 4)
+# ---------------------------------------------------------------------------
+# If the changed-file scope matches an exclusion glob, the named server is
+# guaranteed unnecessary and the agent must NOT load it even if a keyword
+# trigger would otherwise fire. This catches cases like "the user mentioned
+# 'lane' in passing while editing a docs-only PR" — the orchestrator MCP is
+# still not needed.
+exclude:
+  workbay-orchestrator-mcp:
+    paths_only:
+      - "*.md"
+      - "docs/**"
+      - "CHANGELOG*"
+      - "README*"
+      - "LICENSE*"
+  context7:
+    paths_only:
+      - "*.md"
+      - "docs/**"
