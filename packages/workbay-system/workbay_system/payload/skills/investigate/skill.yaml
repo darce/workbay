@@ -1,0 +1,17 @@
+name: investigate
+description: Diagnose the root cause of a defect before fixing it, and preserve the
+  investigation trail in MCP.
+mode: execution
+context_budget: 200
+makefile_target: null
+mcp_tools:
+- review_findings
+- record_event
+- search_handoff
+- get_handoff_state
+- render_handoff
+tdd_gate: true
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false
