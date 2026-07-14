@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+DASHBOARD.md
+# heuristics-canon fetch cache (sync_heuristics_canon.py); sidecar state is tracked.
+.cache/
