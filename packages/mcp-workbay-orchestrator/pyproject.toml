@@ -1,0 +1,176 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-workbay-orchestrator"
+version = "0.2.10"
+description = "MCP server for orchestration, lane management, worker daemons, and turn metrics."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp",
+    "mcp-workbay-handoff>=0.2.8,<0.3.0",
+    "workbay-protocol>=0.2.2,<0.3.0",
+]
+
+[project.scripts]
+mcp-workbay-orchestrator = "workbay_orchestrator_mcp.cli:main"
+workbay-hostgov = "workbay_orchestrator_mcp.orchestration.hostgov_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/mcp-workbay-orchestrator"
+Documentation = "https://github.com/darce/workbay/blob/main/docs/CONSUMER.md"
+Changelog = "https://github.com/darce/workbay/blob/main/packages/mcp-workbay-orchestrator/CHANGELOG.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+# Optional host bridge for the `codex-subagent` backend. It is intentionally NOT
+# a base dependency: the bridge is host-specific, so a default install (and the
+# bootstrap `uv run --no-sync` launcher's presync) stays cheap and bridge-free.
+# Git-only installs must source workbay-codex-bridge from the same workbay tag
+# via `uv tool install --with git+...#subdirectory=packages/workbay-codex-bridge`;
+# do not rely on PyPI for the optional bridge. For local source launches install
+# on demand with `uv sync --extra bridge` (resolved from the sibling source via
+# [tool.uv.sources] below). When the bridge is absent,
+# `list_available_backends(probe=true)` reports the `codex-subagent` backend as
+# `availability_state="declared_not_installed"` rather than silently claiming it
+# is available.
+bridge = [
+    "workbay-codex-bridge>=0.2.0,<0.3.0",
+]
+test = [
+    "hypothesis>=6.0.0",
+    "pytest>=8.0.0",
+]
+dev = [
+    "hypothesis>=6.0.0",
+    "pytest>=8.0.0",
+    "ruff>=0.11.0,<1.0.0",
+    "mypy>=1.13.0,<2.0.0",
+]
+
+[tool.uv.sources]
+workbay-protocol = { workspace = true }
+mcp-workbay-handoff = { workspace = true }
+workbay-codex-bridge = { workspace = true }
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+# Scrub-at-build shape: only-include the remapped IMPORT names (not src/<pkg>) so
+# hatchling ships nothing raw and the hook's scrubbed force-include is the sole
+# copy of both the package and the launcher (REVB-01/REVC-02). Rebuild-safe: the
+# hook falls back to the sdist top-level entries when src/ is absent.
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "workbay_orchestrator_mcp",
+    "workbay_orchestrator_mcp_launcher.py",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "workbay_orchestrator_mcp",
+    "workbay_orchestrator_mcp_launcher.py",
+    "hatch_build.py",
+    "_scrub_core.py",
+]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+    "build",
+    "src/*.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"src/workbay_orchestrator_mcp/api.py" = ["F401"]
+"src/workbay_orchestrator_mcp/orchestration/*.py" = ["E402"]
+"tests/**/*.py" = ["E402", "F401", "F811"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+exclude = ["build/"]
+warn_return_any = true
+warn_unused_configs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+no_implicit_optional = true
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = [
+    "fastmcp",
+    "fastmcp.*",
+    "textual",
+    "textual.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "_env",
+    "backend_registry",
+    "bootstrap_lane",
+    "dashboard_live",
+    "lane_manifest",
+    "orchestrator_guidance",
+    "orchestrator_helpers",
+    "orchestrator_lanes",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "workbay_orchestrator_mcp.api",
+    "workbay_orchestrator_mcp.orchestration.ace_metrics",
+    "workbay_orchestrator_mcp.orchestration.adapters.codex_cli",
+    "workbay_orchestrator_mcp.orchestration.backend_registry",
+    "workbay_orchestrator_mcp.orchestration.bootstrap_lane",
+    "workbay_orchestrator_mcp.orchestration.lane_exec",
+    "workbay_orchestrator_mcp.orchestration.lane_prompt",
+    "workbay_orchestrator_mcp.orchestration.lane_result",
+    "workbay_orchestrator_mcp.orchestration.orchestrator_daemon",
+    "workbay_orchestrator_mcp.orchestration.orchestrator_guidance",
+    "workbay_orchestrator_mcp.orchestration.review_runner",
+    "workbay_orchestrator_mcp.orchestration.worker_daemon",
+]
+ignore_errors = true
+disable_error_code = ["method-assign", "arg-type"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".pytest_cache",
+    "build",
+    "src/*.egg-info",
+]
+
+[tool.hoisted]
+repository = "darce/workbay"
+install_url = "git+https://github.com/darce/workbay.git@mcp-workbay-orchestrator-v{version}#subdirectory=packages/mcp-workbay-orchestrator"
+changelog = "CHANGELOG.md"

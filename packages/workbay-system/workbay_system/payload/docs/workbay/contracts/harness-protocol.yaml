@@ -1,0 +1,675 @@
+version: 1
+
+harness_capabilities:
+  review_parallel:
+    rows:
+      - harness_key: claude-code
+        label: Claude Code (coordinator is an in-process Claude agent)
+        primitive: "`Agent` tool with `subagent_type` + scoped `task_ref` inside the prompt"
+        notes: "In-process. **Must not** invoke the `ClaudeCodeAdapter` (CLI subprocess) from inside an active Claude Code session — that adapter is reserved for external orchestration and inverts the cost premise when used mid-session."
+      - harness_key: codex
+        label: Codex (coordinator is a Codex agent)
+        primitive: "`run_structured_turn` on `workbay-orchestrator-mcp`"
+        notes: "In-repo MCP tool. Each call is a bounded ephemeral turn with the reviewer prompt + scoped `task_ref`."
+      - harness_key: cursor
+        label: Cursor (coordinator is a Cursor agent)
+        primitive: "in-process `Subagent` tool for reviewer fan-out"
+        notes: "In-process. Use Cursor subagents from the active session when available; fallback to the deterministic sequential reviewer path if subagents or the orchestrator MCP are unavailable."
+      - harness_key: vscode
+        label: Copilot / VS Code
+        primitive: "`run_structured_turn` on `workbay-orchestrator-mcp`"
+        notes: "Same MCP tool, reachable over MCP from the Copilot host."
+      - harness_key: grok
+        label: Grok (coordinator is a Grok agent)
+        primitive: "in-process `task` tool for subagent fan-out"
+        notes: "In-process. **Must not** shell out to an external CLI from inside an active Grok session — that inverts the cost premise when used mid-session. Fallback when `task` is unavailable: `run_structured_turn` on `workbay-orchestrator-mcp`."
+      - harness_key: external
+        label: External orchestrator (no interactive harness)
+        primitive: "`backend_registry.get_adapter(<kind>)` + `BackendAdapter.execute(...)`"
+        notes: "CLI/bridge path. Correct cost profile only when no interactive session exists. See [backend_adapter.py](../../../../../../mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/orchestration/backend_adapter.py) and [backend_registry.py](../../../../../../mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/orchestration/backend_registry.py) — exercised by the implementation note cross-vendor equivalence matrix."
+  plugin_activation:
+    rows:
+      - harness_key: claude-code
+        mechanism: settings_json
+        scope: project
+        selector_form: marketplace_qualified
+        selector: workbay-system@workbay-marketplace
+        config_path: .claude/settings.json
+        field: enabledPlugins
+      - harness_key: codex
+        mechanism: project_toml
+        scope: project
+        selector_form: marketplace_qualified
+        selector: workbay-system@workbay-marketplace
+        config_path: .codex/config.toml
+        field: plugins.<selector>.enabled
+      - harness_key: cursor
+        mechanism: materialized_project_surfaces
+        scope: project
+        selector_form: direct_paths
+        selector: .cursor/commands + .cursor/skills
+        config_path: .cursor/
+        # .cursor/commands is materialized but skills-only: it carries a single
+        # .native-skills-only marker, not per-command markdown (workflow
+        # discovery is via .cursor/skills, avoiding duplicate Cursor picker
+        # entries). The path stays listed because the surface is still created.
+        fields:
+          - commands
+          - skills
+          - hooks.json
+          - mcp.json
+      - harness_key: grok
+        mechanism: cli_mediated
+        scope: user_global
+        selector_form: bare_name
+        selector: workbay-system
+        commands:
+          - grok plugin install <plugin_dest> --trust
+          - grok plugin enable workbay-system
+        materialization: copytree
+        adopt_materialization: symlink
+        notes: "S1 (grok 0.2.22): project-scoped .grok/config.toml enabled alone does not activate discovery; CLI install+enable required. Symlinked plugin dirs are discovered. grok plugin install copies to ~/.grok/installed-plugins/."
+
+cold_start:
+  shared_steps:
+    - id: make-context
+      description: "run make context at session start"
+      phrase: "make context"
+      references:
+        - CLAUDE.md
+        - .github/copilot-instructions.md
+    - id: mcp-tool-calls-first
+      description: "use MCP tool calls when available; fall back to the Python API on cold start or context switch"
+      phrase: "MCP tool calls"
+      references:
+        - CLAUDE.md
+        - .github/copilot-instructions.md
+    - id: python-api-fallback-imports
+      description: "use workbay_handoff_mcp package-root imports as the Python fallback surface"
+      phrase: "from workbay_handoff_mcp import"
+      references:
+        - CLAUDE.md
+        - .github/copilot-instructions.md
+
+branch_isolation:
+  protected_branches:
+    - main
+    - master
+  code_roots:
+    - apps/
+    - packages/
+    - scripts/
+    - .github/hooks/
+    - .claude/
+    - mk/
+  protected_extensions:
+    - .py
+    - .ts
+    - .tsx
+    - .js
+    - .jsx
+    - .php
+    - .sql
+    - .sh
+    - .css
+    - .scss
+    - .mk
+  root_protected_files:
+    - Makefile
+  # Legacy combined surface — kept populated during the internal transition
+  # for back-compat with `_bash_isolation_guard.py`,
+  # `_guard_main_branch_inline.py`, and existing test fixtures that
+  # consume `protected_main_surfaces` directly. New consumers should use
+  # `first_edit_protected_surfaces` (planning artifacts) and
+  # `state_dirty_surfaces` (post-merge tripwire) below; this list is
+  # equivalent to `first_edit_protected_surfaces` until those consumers
+  # migrate.
+  protected_main_surfaces:
+    - pattern: "docs/tasks/**/*.md"
+      reason: "Top-level task plans must live on a task branch from the first edit"
+    - pattern: "docs/assessments/**"
+      reason: "Top-level assessments must live on a task branch from the first edit"
+    - pattern: "docs/scopes/**"
+      reason: "Top-level scope notes must live on a task branch from the first edit"
+    - pattern: "docs/epics/**"
+      reason: "Top-level epic planning artifacts must live on a task branch from the first edit"
+    - pattern: "docs/specs/**"
+      reason: "Top-level specs must live on a task branch from the first edit"
+    - pattern: "docs/adrs/**"
+      reason: "Top-level ADRs must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/tasks/**"
+      reason: "Package-local task plans must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/assessments/**"
+      reason: "Package-local assessments must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/specs/**"
+      reason: "Package-local specs must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/epics/**"
+      reason: "Package-local epics must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/adrs/**"
+      reason: "Package-local ADRs must live on a task branch from the first edit"
+  # internal: planning artefacts whose first edit must happen on a task
+  # branch (PreToolUse file-mutation surface). Mirrors
+  # `protected_main_surfaces` during the transition; `_worktree_drift.py`
+  # and other file-mutation isolation helpers will migrate to consume
+  # this key directly.
+  first_edit_protected_surfaces:
+    - pattern: "docs/tasks/**/*.md"
+      reason: "Top-level task plans must live on a task branch from the first edit"
+    - pattern: "docs/assessments/**"
+      reason: "Top-level assessments must live on a task branch from the first edit"
+    - pattern: "docs/scopes/**"
+      reason: "Top-level scope notes must live on a task branch from the first edit"
+    - pattern: "docs/epics/**"
+      reason: "Top-level epic planning artifacts must live on a task branch from the first edit"
+    - pattern: "docs/specs/**"
+      reason: "Top-level specs must live on a task branch from the first edit"
+    - pattern: "docs/adrs/**"
+      reason: "Top-level ADRs must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/tasks/**"
+      reason: "Package-local task plans must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/assessments/**"
+      reason: "Package-local assessments must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/specs/**"
+      reason: "Package-local specs must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/epics/**"
+      reason: "Package-local epics must live on a task branch from the first edit"
+    - pattern: "packages/*/docs/adrs/**"
+      reason: "Package-local ADRs must live on a task branch from the first edit"
+  # internal: actual runtime state files. Drives the post-merge
+  # `check-main-clean` tripwire via `find_dirty_state_files()`. The
+  # helper combines direct filesystem checks with `git status --ignored`
+  # so tracked state surfaces still block even when Git reports a whole
+  # directory; ignored-untracked generated projections remain local
+  # per-checkout state and do not hard-block normal control-plane use.
+  state_dirty_surfaces:
+    - pattern: "CURRENT_TASK.json"
+      reason: "Machine-readable active-task snapshot must not be dirty on main post-merge"
+    - pattern: "DASHBOARD.txt"
+      reason: "Human-readable dashboard render must not be dirty on main post-merge"
+    - pattern: ".task-state/handoff.db"
+      reason: "Handoff database file must not be dirty on main post-merge"
+    - pattern: ".task-state/handoff.db-shm"
+      reason: "Handoff database SQLite shared-memory sidecar must not be dirty on main post-merge"
+    - pattern: ".task-state/handoff.db-wal"
+      reason: "Handoff database SQLite WAL sidecar must not be dirty on main post-merge"
+    - pattern: "docs/tasks/archive/**"
+      reason: "Archived task snapshots must not be dirty on main post-merge"
+    - pattern: "packages/*/docs/tasks/archive/**"
+      reason: "Package-local archived task snapshots must not be dirty on main post-merge"
+  # Repo-local allow-list: projects adopting this harness should rewrite these
+  # patterns to match their own legitimate non-planning main-worktree surfaces.
+  permitted_main_surfaces:
+    - pattern: "CLAUDE.md"
+      reason: "Canonical agent dispatcher stays editable on main"
+    - pattern: ".github/copilot-instructions.md"
+      reason: "VS Code harness mirror of CLAUDE.md"
+    - pattern: "docs/workbay/BOOTSTRAP.md"
+      reason: "Operator-facing cold-start reference"
+    - pattern: "docs/workbay/instructions.md"
+      reason: "Canonical agent instructions surface"
+    - pattern: "docs/workbay/contracts/**"
+      reason: "Harness contracts stay editable on main"
+    - pattern: "docs/workbay/rules/**"
+      reason: "Workflow rules stay editable on main"
+    - pattern: "docs/workbay/maps/**"
+      reason: "Routing and map artifacts stay editable on main"
+    - pattern: "docs/workbay/generated/**"
+      reason: "Generated agentic artifacts can update on main"
+    - pattern: "docs/tasks/archive/**"
+      reason: "Archived task snapshots stay editable on main"
+    - pattern: "DASHBOARD.txt"
+      reason: "Dashboard artifact is regenerated on main"
+    - pattern: "CURRENT_TASK.json"
+      reason: "Current-task snapshot is regenerated on main"
+    - pattern: ".claude/settings.json"
+      reason: "Operator config stays editable on main under MAINT-* tasks"
+    - pattern: ".claude/settings.hooks.json"
+      reason: "Managed hook template stays editable on main under MAINT-* tasks"
+  enforcers:
+    - path: .github/hooks/guard-main-branch.py
+      harness: vscode
+    - path: scripts/hooks/guard-main-branch.sh
+      harness: claude
+
+python_api_fallback:
+  package: workbay_handoff_mcp
+  required_exports:
+    - RuntimeConfig
+    - configure_runtime
+    - get_handoff_state
+    - search_handoff
+    - review_findings
+    - review_runs
+    - record_event
+    - render_handoff
+    - generate_current_task_md
+    - generate_dashboard_md
+    - integrity_check
+    - set_handoff_state
+    - switch_task
+
+bootstrap_overlay:
+  # internal — consumer overlay contract (workbay-bootstrap).
+  # Implementation: packages/workbay-bootstrap/src/workbay_bootstrap/overlay_boundary.py
+  # and config/agent-workflows/portable_commands.json hook adapters.
+  tracked_vs_overlay_boundary:
+    summary: >
+      Overlay-managed paths are gitignored and materialized by workbay-bootstrap
+      install; consumer-owned paths stay tracked and must not be silently
+      absorbed into the managed ignore block. Self-host monorepos additionally
+      track real overlay source under the declared source paths below.
+    overlay_managed_prefixes:
+      - scripts/hooks/
+      - docs/workbay/contracts/
+      - docs/workbay/rules/
+      - Makefile.d/
+      - scripts/workbay/
+      - .github/hooks/
+      - .github/prompts/
+      - .workbay/generated/plugins/workbay-system/
+      - .mcp.json
+      - .vscode/mcp.json
+      - .codex/config.toml
+    tracked_overlay_source_paths:
+      - scripts/hooks
+      - Makefile.d
+      - scripts/workbay
+      - docs/workbay/contracts
+      - docs/workbay/rules
+      - .github/hooks
+      - .github/prompts
+      - .codex/hooks.json
+      - .cursor/hooks.json
+    validation:
+      command: workbay-bootstrap doctor --target <consumer-root>
+      finding_kind: tracked_overlay_boundary
+      cases:
+        - id: tracked_overlay_duplicate
+          description: >
+            Git tracks skills/<slug>/SKILL.md while bootstrap also materialized
+            .cursor/skills/<slug> as an overlay symlink.
+        - id: tracked_source_would_leak_ignore
+          description: >
+            A declared self-host overlay source path would receive a managed
+            gitignore entry (defensive; should not occur when tracked).
+  portable_stop_hook_adapter:
+    summary: >
+      Opt-in Stop-hook adapters declared in portable_commands.json (hook_id
+      compact-session) must remain workspace-relative so doctor/repair can compare
+      managed entries without rewriting absolute consumer paths.
+    hook_id: compact-session
+    json_paths:
+      - $.hooks.Stop
+    canonical_command_forms:
+      claude_code: 'python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/compact-session.py"'
+      codex: "{{consumer_root}}/scripts/hooks/compact-session.py"
+      vscode: "{{consumer_root}}/scripts/hooks/compact-session.py"
+      grok: 'python3 "{{consumer_root}}/scripts/hooks/compact-session.py"'
+    tokens:
+      consumer_root: >
+        Template placeholder substituted at install/apply-hooks time with the
+        resolved consumer repository root (see workbay_bootstrap.install
+        _TEMPLATE_CONSUMER_ROOT).
+      claude_project_dir: >
+        Claude Code runtime env var pointing at the project root; equivalent to
+        consumer_root for hook command resolution when normalized.
+    doctor_repair:
+      normalization: >
+        normalize_hook_command_for_compare collapses {{consumer_root}} and
+        $CLAUDE_PROJECT_DIR-prefixed paths to repo-relative forms before drift
+        detection; hook_adapter_drift is not raised when only the portable
+        spelling differs.
+
+
+compaction:
+  advisory_field: compaction_recommended
+  # threshold_tokens / threshold_chars are the canonical defaults and the
+  # single source of truth for the compaction advisory (the values live in the
+  # threshold_tokens / threshold_chars keys below). threshold_chars is kept at
+  # threshold_tokens x 4 (~4 chars/token) so the char advisory tracks the
+  # token-based Stop-hook auto-fire gate. The char advisory compares raw
+  # characters against threshold_chars; the `chars / 4` divisor is only the
+  # token-savings estimate, not the gate.
+  # Stop-hook row writes fire on `new_tokens >= WORKBAY_HANDOFF_COMPACTION_MIN_NEW_TOKENS`.
+  # When unset, the gate default resolves from this block's `threshold_tokens`
+  # (env > overlay `compaction.thresholds.tokens` > contract > code constant).
+  # Gate semantics (implementation note D5): `=0` skips every turn; `=1` is the documented
+  # "effectively no token gate" idiom; `WORKBAY_HANDOFF_COMPACTION_DISABLED` is
+  # the kill switch for both Stop-hook writes and advisory evaluation.
+  # Multi-task workspaces: when ≥2 in_progress rows share the workspace and
+  # no cwd/worktree disambiguator applies, compaction/reinjection hooks
+  # tiebreak to the most-recent `updated_at` row and emit a stderr note.
+  # Set `WORKBAY_HANDOFF_ACTIVE_TASK=<task_ref>` to pin attribution; the
+  # pin must name an existing live-active row (in_progress, review, or
+  # blocked; hooks fail open with a clear
+  # stderr message when the pin is missing or not live). MCP write paths keep
+  # raising `AmbiguousWorkspaceContextError` unless `task_ref` is explicit.
+  # User-visible notification (implementation note): when a row is written and
+  # `WORKBAY_HANDOFF_COMPACTION_NOTIFY` is on (code default), Claude Code
+  # Stop hooks emit a stdout JSON envelope with `systemMessage`; other
+  # harnesses keep receipt lines on stderr only. Set notify to `0`/`false`
+  # to suppress the stdout envelope while keeping stderr receipts.
+  # Advisory threshold overrides (internal): set
+  # `WORKBAY_HANDOFF_COMPACTION_THRESHOLD_{TOKENS,CHARS}` env vars, or
+  # `.workbay-overlay.json -> compaction.thresholds.{tokens,chars}`.
+  # Precedence per knob: env > overlay > contract.
+  #
+  # Runtime disable (internal): the unified resolver
+  # `resolve_compaction_disabled(env, conn, task_ref)` silences BOTH the
+  # `compute_compaction_advisory` envelope (returns
+  # `disabled=true, disabled_source=<env|db>`, threshold/floor logic
+  # skipped) AND the `compact-session` Stop hook (logs
+  # `compaction skipped: disabled (source=<env|db>)`). Sources, in
+  # precedence order: `WORKBAY_HANDOFF_COMPACTION_DISABLED` env var (legacy
+  # `WORKBAY_COMPACTION_DISABLED` alias; `AGENT_HANDOFF_*` names are not read) → task-scoped row in
+  # `compaction_settings` → workspace-default row → enabled. DB rows are
+  # written via the `compaction(operation="disable"|"enable"|"status")`
+  # MCP op / `mcp-workbay-handoff compaction --operation <op>` CLI /
+  # `make compaction-{disable,enable,status} [TASK=<ref>]` wrappers.
+  # Host-harness compaction (Claude Code's own /compact, Codex's
+  # internal summarization, etc.) is unaffected.
+  threshold_tokens: 75000
+  threshold_chars: 300000
+  unknown_harness: warn_and_skip
+  transcript_discovery:
+    claude-code:
+      env_var: CLAUDE_SESSION_TRANSCRIPT_PATH
+      fallback_glob: ~/.claude/projects/**/transcript*.jsonl
+    codex:
+      env_var: CODEX_SESSION_TRANSCRIPT_PATH
+      fallback_glob: ~/.codex/sessions/**/*.jsonl
+    vscode:
+      env_var: VSCODE_TARGET_SESSION_LOG
+      fallback_glob: ~/Library/Application Support/Code/User/workspaceStorage/**/GitHub.copilot-chat/**/*.json
+    grok:
+      env_var: GROK_SESSION_TRANSCRIPT_PATH
+      fallback_glob: ~/.grok/sessions/**/events.jsonl
+  # Presence-only identity markers (distinct from transcript_discovery paths).
+  # Used by write-attribution harness detection when transcript path env vars
+  # are absent (common for MCP subprocesses). Seed only grounded markers —
+  # omit a harness rather than invent an unverified env var. Compaction still
+  # needs the real transcript path from transcript_discovery; do not conflate.
+  harness_identity_markers:
+    claude-code:
+      markers:
+        - CLAUDE_CODE_SESSION_ID
+
+reinjection:
+  # SessionStart re-injection of handoff.db references (internal /
+  # implementation note). The `scripts/hooks/reinject-context.py` hook — opt-in,
+  # manifest-declared in portable_commands.json `hooks[]`, deliberately NOT
+  # part of the always-on generated `hooks:` families below — emits one
+  # fenced block to SessionStart stdout (the surface Claude Code injects
+  # into model context) so a post-compaction or resumed session recovers
+  # task_ref, status, focus, the latest compaction_id + turn range, open
+  # finding ids, and the next-action hint without knowing to ask. The hook
+  # never blocks the session start; it honors the internal unified compaction
+  # disable resolver, so a disabled compaction surface also silences
+  # re-injection. Successful emissions best-effort persist telemetry (implementation note).
+  #
+  # Tunables (env > contract default, mirroring the compaction-threshold
+  # precedence model above; no overlay knob until a consumer needs one):
+  #   WORKBAY_HANDOFF_ACTIVE_TASK    pin active task_ref when multiple
+  #                                    in_progress rows share the workspace
+  #                                    (shared with Stop-hook compaction)
+  #   WORKBAY_REINJECT_SOURCES       comma list of SessionStart `source`
+  #                                    values that trigger the **generic** block
+  #   WORKBAY_REINJECT_BUDGET_CHARS  total stdout chars budget
+  #   WORKBAY_HANDOFF_COMPACTION_NOTIFY  shared with Stop-hook compaction
+  #                                    (code default on). When on and
+  #                                    `WORKBAY_HANDOFF_HARNESS=claude-code`,
+  #                                    stdout is a JSON envelope with
+  #                                    `additionalContext` (the fenced block)
+  #                                    plus `systemMessage` (user notify).
+  #                                    Other harnesses and notify-off keep the
+  #                                    raw fenced block on stdout.
+  #   WORKBAY_REINJECT_SEMANTIC      master semantic-arm switch (default off).
+  #                                    When truthy, semantic `relevant:` lines
+  #                                    require source=compact + compaction_id;
+  #                                    sticky (task_ref,compaction_id) only for
+  #                                    status=selected with emission evidence.
+  #                                    Resume/startup keep generic-only.
+  #   WORKBAY_REINJECT_SEMANTIC_TOP_K    top-K concept count, default ``8``
+  #   WORKBAY_REINJECT_SEMANTIC_CANDIDATE_POOL  ranked candidate pool, default ``32``
+  #   WORKBAY_REINJECT_SEMANTIC_MIN_SCORE       cosine floor, default ``0.35``
+  #   WORKBAY_REINJECT_SEMANTIC_MAX_SCORE_DROP  score window, default ``0.20``
+  #   WORKBAY_REINJECT_SEMANTIC_MMR_WEIGHT      seeded MMR lambda, default ``0.70``
+  #   WORKBAY_REINJECT_SEMANTIC_MAX_REDUNDANCY  redundancy cap, default ``0.92``
+  #   WORKBAY_REINJECT_SEMANTIC_SNIPPET_CHARS   snippet budget, default ``120``
+  #   WORKBAY_REINJECT_NOTIFY_ALLOWANCE_CHARS   notify reserve, default ``220``
+  #   WORKBAY_REINJECT_SEMANTIC_REFRESH_BUDGET_CHARS pull-path budget, default ``1500``
+  # Telemetry (internal): each successful emission best-effort writes
+  # one `session_reinjections` row (`reinjection_id`, `session_id`, `harness`,
+  # `task_ref`, `compaction_id`, `source`, `emitted_chars`, nullable `arm`
+  # (legacy; write-retired after implementation note S4 — new rows leave arm NULL;
+  # historical treatment/control may exist),
+  # nullable `semantic_detail_json` canonical telemetry when semantic selection runs).
+  # A failed DB write logs to stderr and never blocks stdout injection.
+  # `sources` defaults exclude `startup` so ordinary session starts are not
+  # taxed next to load_session guidance.
+  sources:
+    - compact
+    - resume
+  budget_chars: 1500
+  fields:
+    - task_ref
+    - status
+    - focus
+    - latest_compaction
+    - open_findings
+    - next_action
+    - recover_hints
+
+orchestrator:
+  daemons:
+    enabled: false
+  # internal: host-memory admission gate + elastic dispatch width.
+  # Fail-closed: an ABSENT or malformed block means these enforce defaults
+  # apply (gate ACTIVE); only an explicit `enforcement: off` disables. Values
+  # here are the shipped defaults, listed for operator discoverability.
+  host_memory:
+    enforcement: enforce        # enforce | warn_only | off
+    os_reserve_gib: 3           # RAM kept free for the OS (width formula subtracts it)
+    os_reserve_remote_api_gib: 0.5  # smaller OS reserve for remote-API workers (grok-cli): off-box inference/suite => tiny local footprint, so the full heavy reserve should not gate them
+    rss_per_heavy_gib: 2.5      # expected peak RSS per heavy worker
+    max_width: 4                # hard cap on concurrent heavy slots
+    swap_free_floor_mb: 512     # refuse heavy/suite below this swap-free
+    swap_volume_disk_floor_gib: 8   # refuse when the swap volume's disk is this low
+    slots_full_outcome: defer   # defer | refuse when all derived slots are busy
+    suite_lock_timeout_s: 1800  # suite bulkhead wait; timeout => admission_deferred
+
+hooks:
+  # Per-entry display metadata:
+  #   status_message — harness-neutral progress label. Codex renders it as
+  #     `statusMessage` on every inner command handler; Claude Code and VS Code
+  #     ignore it until their schemas grow an equivalent.
+  #   timeout — seconds budget for the hook command (rendered verbatim into
+  #     per-harness configs).
+  #   codex_command — Codex CLI command (consumer-relative path, no
+  #     $CLAUDE_PROJECT_DIR). codex_matcher overrides the shared matcher when
+  #     Codex only surfaces the double-underscore MCP tool-name form.
+  #   codex_enabled / unsupported_reason — Codex opt-out. An entry may omit
+  #     codex_command ONLY by declaring `codex_enabled: false` plus a
+  #     non-empty `unsupported_reason`; the renderer and check-harness-sync
+  #     reject silent omission, and reject `codex_enabled: false` combined
+  #     with a codex_command.
+  pre_tool_use:
+    - id: worktree-drift
+      matcher: Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file
+      cursor_matcher: ApplyPatch|Edit|Write
+      status_message: Guarding worktree drift
+      timeout: 5
+      claude_command: bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-worktree-drift.sh"
+      vscode_command: python3 .github/hooks/guard-worktree-drift.py
+      codex_command: python3 .github/hooks/guard-worktree-drift.py
+      cursor_command: bash scripts/hooks/guard-worktree-drift.sh
+      grok_command: bash "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-worktree-drift.sh"
+    - id: main-branch
+      matcher: Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file
+      cursor_matcher: ApplyPatch|Edit|Write
+      status_message: Guarding main branch edits
+      timeout: 5
+      claude_command: bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh"
+      vscode_command: python3 .github/hooks/guard-main-branch.py
+      codex_command: python3 .github/hooks/guard-main-branch.py
+      cursor_command: bash scripts/hooks/guard-main-branch.sh
+      grok_command: bash "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-main-branch.sh"
+    - id: bash-main-branch
+      matcher: Bash
+      cursor_matcher: Shell
+      status_message: Guarding main branch
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-bash-main-branch.py"
+      vscode_command: python3 scripts/hooks/guard-bash-main-branch.py
+      codex_command: python3 scripts/hooks/guard-bash-main-branch.py
+      cursor_command: python3 scripts/hooks/guard-bash-main-branch.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-bash-main-branch.py"
+    - id: task-plan-findings
+      matcher: Edit|Write
+      cursor_matcher: ApplyPatch|Edit|Write
+      status_message: Guarding task plan findings
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-task-plan-findings.py"
+      vscode_command: python3 scripts/hooks/guard-task-plan-findings.py
+      codex_command: python3 scripts/hooks/guard-task-plan-findings.py
+      cursor_command: python3 scripts/hooks/guard-task-plan-findings.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-task-plan-findings.py"
+    - id: rationale-size
+      matcher: mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_close_slice|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice
+      claude_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice
+      codex_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice
+      cursor_matcher: "MCP: workbay-handoff-mcp"
+      status_message: Checking rationale size
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-rationale-size.py"
+      vscode_command: python3 scripts/hooks/guard-rationale-size.py
+      codex_command: python3 scripts/hooks/guard-rationale-size.py
+      cursor_command: python3 scripts/hooks/guard-rationale-size.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-rationale-size.py"
+    - id: validate-mcp-dict-params
+      matcher: mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_review_findings|mcp_workbay-handoff-mcp_review_runs|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs
+      claude_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs
+      codex_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs
+      cursor_matcher: "MCP: workbay-handoff-mcp"
+      status_message: Validating MCP dict params
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/validate-mcp-dict-params.py"
+      vscode_command: python3 scripts/hooks/validate-mcp-dict-params.py
+      codex_command: python3 scripts/hooks/validate-mcp-dict-params.py
+      cursor_command: python3 scripts/hooks/validate-mcp-dict-params.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/validate-mcp-dict-params.py"
+    - id: review-finding-resolve
+      matcher: mcp_workbay-handoff-mcp_review_findings|mcp__workbay-handoff-mcp__review_findings
+      claude_matcher: mcp__workbay-handoff-mcp__review_findings
+      codex_matcher: mcp__workbay-handoff-mcp__review_findings
+      cursor_matcher: "MCP: workbay-handoff-mcp"
+      status_message: Redirecting finding closure
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-review-finding-resolve.py"
+      vscode_command: python3 scripts/hooks/guard-review-finding-resolve.py
+      codex_command: python3 scripts/hooks/guard-review-finding-resolve.py
+      cursor_command: python3 scripts/hooks/guard-review-finding-resolve.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-review-finding-resolve.py"
+  post_tool_use:
+    - id: record-file-touch
+      matcher: Edit|Write
+      cursor_matcher: ApplyPatch|Edit|Write
+      status_message: Recording file touch
+      timeout: 10
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/record-file-touch.py"
+      vscode_command: python3 scripts/hooks/record-file-touch.py
+      codex_command: python3 scripts/hooks/record-file-touch.py
+      cursor_command: python3 scripts/hooks/record-file-touch.py
+    - id: ace-detect
+      matcher: mcp_workbay-handoff-mcp_review_findings|mcp__workbay-handoff-mcp__review_findings
+      claude_matcher: mcp__workbay-handoff-mcp__review_findings
+      codex_matcher: mcp__workbay-handoff-mcp__review_findings
+      cursor_matcher: "MCP: workbay-handoff-mcp"
+      status_message: Detecting ACE references
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/ace-detect.py"
+      vscode_command: python3 scripts/hooks/ace-detect.py
+      codex_command: python3 scripts/hooks/ace-detect.py
+      cursor_command: python3 scripts/hooks/ace-detect.py
+    - id: slim-handoff-response
+      matcher: mcp_workbay-handoff-mcp_get_handoff_state|mcp_workbay-handoff-mcp_load_session|mcp_workbay-handoff-mcp_render_handoff|mcp__workbay-handoff-mcp__get_handoff_state|mcp__workbay-handoff-mcp__load_session|mcp__workbay-handoff-mcp__render_handoff
+      claude_matcher: mcp__workbay-handoff-mcp__get_handoff_state|mcp__workbay-handoff-mcp__load_session|mcp__workbay-handoff-mcp__render_handoff
+      codex_matcher: mcp__workbay-handoff-mcp__get_handoff_state|mcp__workbay-handoff-mcp__load_session|mcp__workbay-handoff-mcp__render_handoff
+      cursor_matcher: "MCP: workbay-handoff-mcp"
+      status_message: Slimming handoff response
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/slim-handoff-response.py"
+      vscode_command: python3 scripts/hooks/slim-handoff-response.py
+      codex_command: python3 scripts/hooks/slim-handoff-response.py
+      cursor_command: python3 scripts/hooks/slim-handoff-response.py
+    - id: filter-test-output
+      matcher: Bash
+      cursor_matcher: Shell
+      status_message: Filtering test output
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/filter-test-output.py"
+      vscode_command: python3 scripts/hooks/filter-test-output.py
+      codex_command: python3 scripts/hooks/filter-test-output.py
+      cursor_command: python3 scripts/hooks/filter-test-output.py
+    - id: capture-agent-errors
+      matcher: Bash
+      cursor_matcher: Shell
+      status_message: Capturing agent errors
+      timeout: 15
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/capture-agent-errors.py"
+      vscode_command: python3 scripts/hooks/capture-agent-errors.py
+      codex_command: python3 scripts/hooks/capture-agent-errors.py
+      cursor_command: python3 scripts/hooks/capture-agent-errors.py
+      grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/capture-agent-errors.py"
+  # SessionStart and UserPromptSubmit hooks have no tool-name matcher in the
+  # Claude Code schema; the matcher field is omitted intentionally.
+  session_start:
+  # Fresh-clone self-heal: regenerates gitignored plugin trees + Copilot prompts
+  # before slash commands load. Script body ships once under scripts/hooks/
+  # (shared provenance surface, already fenced) — not under .claude/hooks —
+  # so install materializes it without a harness-specific fence entry [REF-15].
+  #
+  # Claude-only registration by design. The script shells `make plugins-build` /
+  # `make generate-agent-workflows` — monorepo self-host dev targets that do not
+  # exist in a consumer repo (consumers install prebuilt surfaces from the
+  # package). It also only fires on Claude Code SessionStart; VS Code Copilot and
+  # Codex have no equivalent trigger. Declaring vscode_command/cursor_command
+  # would emit the script into cross-harness guard surfaces (terminal-guard.json,
+  # cursor hooks.json) where install hook-coherence would fail consumers that
+  # never materialize SessionStart wiring. Omitting them keeps registration in
+  # `.claude/settings.json` only; the script itself is delivered via the shared
+  # surface for all consumers.
+    - id: ensure-agent-surfaces
+      status_message: Ensuring agent surfaces
+      timeout: 60
+      claude_command: bash "$CLAUDE_PROJECT_DIR/scripts/hooks/ensure-agent-surfaces.sh"
+      vscode_enabled: false
+      cursor_enabled: false
+      codex_enabled: false
+      unsupported_reason: "Claude SessionStart only; Codex (and VS Code/Cursor) have no SessionStart hook surface, and the script runs monorepo-only make targets."
+    - id: advise-worktree-cd
+      status_message: Advising worktree cd
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/advise-worktree-cd.py"
+      vscode_command: python3 scripts/hooks/advise-worktree-cd.py
+      codex_command: python3 scripts/hooks/advise-worktree-cd.py
+      cursor_command: python3 scripts/hooks/advise-worktree-cd.py
+    # internal: surfaces dangling hook references at session start
+    # (warn-only via additionalContext, always exit 0; the fail-open
+    # _run_guard.py wrapper is the runtime net once configs carry the
+    # wrapper prefix).
+    - id: coherence-self-check
+      status_message: Checking hook-surface coherence
+      timeout: 10
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/coherence-self-check.py"
+      vscode_command: python3 scripts/hooks/coherence-self-check.py
+      codex_command: python3 scripts/hooks/coherence-self-check.py
+      cursor_command: python3 scripts/hooks/coherence-self-check.py
+  user_prompt_submit:
+    - id: advise-worktree-cd
+      status_message: Advising worktree cd
+      timeout: 5
+      claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/advise-worktree-cd.py"
+      vscode_command: python3 scripts/hooks/advise-worktree-cd.py
+      codex_command: python3 scripts/hooks/advise-worktree-cd.py
+      cursor_command: python3 scripts/hooks/advise-worktree-cd.py
