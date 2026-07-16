@@ -1,0 +1,41 @@
+#!/bin/sh
+# Git post-checkout hook: warn if protected paths are dirty on main (BR-16/BR-22),
+# and warn if the root worktree is switched away from main.
+#
+# Installed via `make install-git-hooks` which sets core.hooksPath to
+# scripts/hooks/git. The scanner early-exits on non-protected branches.
+#
+# Args: $1=prev_head $2=new_head $3=is_branch_checkout (1 for branch)
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+# Resolve guard scripts relative to this hook's own location, not $REPO_ROOT.
+# The guards live at scripts/hooks/<name>.py — one level up from this hook's
+# scripts/hooks/git/ directory — so $GUARD_DIR is correct in both the monorepo
+# source layout (packages/workbay-system/scripts/hooks/...) and the hoisted
+# consumer layout (<root>/scripts/hooks/...), regardless of where
+# core.hooksPath points or what $REPO_ROOT resolves to. Resolving via $REPO_ROOT
+# silently missed in the nested source layout.
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+GUARD_DIR="$(dirname "$HOOK_DIR")"
+
+python3 "$GUARD_DIR/check_main_clean.py" --trigger post-checkout || true
+
+# Branch-naming warn (internal). Warn-only — operators may
+# rename via `git branch -m` before any commit. The pre-commit /
+# pre-push gates own the hard-block contract.
+python3 "$GUARD_DIR/check_branch_naming.py" --trigger post-checkout || true
+
+# Root-worktree guard: warn loudly if a branch checkout switched the root
+# worktree away from main/master. Git has no pre-checkout hook, so this is
+# the earliest detection point. The PreToolUse guard in _worktree_drift.py
+# will hard-block subsequent edits.
+IS_BRANCH_CHECKOUT="${3:-0}"
+if [ "$IS_BRANCH_CHECKOUT" = "1" ]; then
+    python3 "$GUARD_DIR/check_root_on_main.py" || true
+fi
+
+exit 0
