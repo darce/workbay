@@ -1,0 +1,25 @@
+{
+  "canon_ref": "main",
+  "canon_url": "https://github.com/darce/heuristics-canon",
+  "lexicons": {
+    "accessibility": {
+      "sha": "57d78870c8a2d8cf3b9c8de5134b37a3960b9cfc"
+    },
+    "business-marketing": {
+      "sha": "19ee516e93e9300ee4e0421cb937f54554186cf0"
+    },
+    "design-aesthetics": {
+      "sha": "cecb01c7c3adffd794e63d1b78e5e249e32b6b31"
+    },
+    "engineering": {
+      "sha": "9b588b1aba7f643f46f552bbc2ec22975bbb5b0a"
+    },
+    "security": {
+      "sha": "47fd89d3ce028d396aa47da677f21b0af160a254"
+    },
+    "writing": {
+      "sha": "e9a450148da83eb5f7ae7ead5a4e8d094d467b73"
+    }
+  },
+  "synced_at": "2026-07-12T06:31:29Z"
+}
