@@ -1,0 +1,34 @@
+#!/bin/sh
+# Git post-merge hook: warn-only dirty-protected-path scan on main (internal).
+#
+# Installed via `make install-git-hooks`. Fires after a successful merge/pull.
+# Routine merges with no dirty protected paths exit 0 silently. When the
+# merge leaves protected paths dirty on main, the scanner prints a DOCTOR
+# advisory pointing the operator at `make doctor LIFECYCLE_ARGS=--json` and
+# exits 0 — the publish boundary (pre-push hook + handoff_close_check) is
+# the place that actually hard-blocks. This keeps unrelated worktree
+# operations from interrupting parallel agents while still surfacing
+# ownership-aware remediation guidance.
+#
+# Pre-internal behavior (--block, exit 2 on dirty protected paths) is
+# now scoped to pre-push only; see scripts/hooks/git/pre-push and the
+# internal task plan section for rationale.
+#
+# Args: $1=is_squash (1 if squash merge, else 0)
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+# Resolve guard scripts relative to this hook's own location (one level up from
+# the git/ hook dir), not $REPO_ROOT — works in nested-source / hoisted consumer
+# layouts where the git root is not the shared hook source (implementation note ask G).
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+GUARD_DIR="$(dirname "$HOOK_DIR")"
+
+# Reaper exits 0 on every path by contract (implementation note); ``|| true`` is only a
+# backstop if the process is killed mid-flight — not the failure-handling mechanism.
+python3 "$GUARD_DIR/_post_merge_reap_tasks.py" "$1" || true
+python3 "$GUARD_DIR/check_main_clean.py" --trigger post-merge --mode doctor || true
+exit 0

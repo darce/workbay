@@ -1,0 +1,37 @@
+{
+  "canon_ref": "v2.0.0",
+  "canon_url": "https://github.com/darce/heuristics-canon",
+  "lexicons": {
+    "accessibility": {
+      "sha": "f48a6dfe4a05afbb294a80b3f90cc34f24b74d25463acf747e364572c847d3ed"
+    },
+    "business-marketing": {
+      "sha": "c3b07e75f48f0b07eca8bc8833516b465ca66a50aca75661fda98f1a16f466ab"
+    },
+    "design-aesthetics": {
+      "sha": "0fefec478ab391db51af9574f737d920948c825f7257ec6560a6affb27e729d2"
+    },
+    "engineering": {
+      "sha": "e0d5514ed184e5bafb79a7cae936c182b1094161640000ef4969a7364332d1cd"
+    },
+    "epistemics": {
+      "sha": "e73f011e6df21ce5c64ccad4d969e8248ac9352e93476445d73d306b33d70d03"
+    },
+    "graph-theory": {
+      "sha": "56e20e744099f6e1223ecd3b968d88ce34d193cf1fba8004b19652fdd2982585"
+    },
+    "interaction-ux": {
+      "sha": "70e31d168ddbd6b442b00bd7ca6e6b6078923f7cbbb1f3edc4a34750c0ee034a"
+    },
+    "ml-systems": {
+      "sha": "eb846c1034330dad2176e6970fb22323e194269de909e3f319b730911977e3de"
+    },
+    "security": {
+      "sha": "086a75e4d3787451d8b1e152238b3f25b18e6fff0d9c60c1bd28b94b4ea9229e"
+    },
+    "writing": {
+      "sha": "e547545a2de57fe3ef95f2e514af6c069787c6ce059e9db455e5a48f5a1c6520"
+    }
+  },
+  "synced_at": "2026-07-21T08:53:07Z"
+}

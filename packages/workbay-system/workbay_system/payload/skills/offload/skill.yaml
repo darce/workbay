@@ -1,0 +1,24 @@
+name: offload
+scope: harness
+description: One-command bounded cross-harness offload (grok-remote, grok-cli, or
+  codex-subagent) with explicit --agent/--effort, caller-owned token budget, and a
+  review gate; remote_only installs (--with-remote) natively prefer grok-remote at
+  high effort and flag remote_required instead of falling back. Triggers on `/offload`
+  and operator requests to dispatch a self-contained slice to a junior lane. Fail-fast,
+  no fallback.
+mode: execution
+context_budget: 120
+makefile_target: null
+mcp_tools:
+- offload_preflight
+- materialize_offload_lane_manifest
+- manage_worktree_lane
+- dispatch_lane_work
+- run_offload_pass
+- await_offload_pass
+- list_available_backends
+- turn_metrics
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

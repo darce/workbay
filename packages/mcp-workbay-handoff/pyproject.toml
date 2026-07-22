@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-workbay-handoff"
+version = "0.2.14"
+description = "Portable MCP server for agent handoff state and review tracking."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp",
+    "pydantic>=2.6.0,<3.0.0",
+    "tiktoken>=0.9.0",
+    "workbay-protocol>=0.2.3,<0.3.0",
+]
+
+[project.scripts]
+mcp-workbay-handoff = "workbay_handoff_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/mcp-workbay-handoff"
+Documentation = "https://github.com/darce/workbay/blob/main/docs/CONSUMER.md"
+Changelog = "https://github.com/darce/workbay/blob/main/packages/mcp-workbay-handoff/CHANGELOG.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0", "pytest-timeout>=2.3.0", "jsonschema>=4.0.0", "numpy>=2.0.0,<3.0.0"]
+# Local semantic-reinjection embedding provider. Opt-in: the core server runs
+# without these. The ~147MB gte-base-en-v1.5 ONNX model is NOT a pip dependency
+# — it ships as a separate optional artifact (resolved from a packaged data path
+# when present); this group only pulls the runtime libs.
+embeddings = ["numpy>=2.0.0,<3.0.0", "onnxruntime>=1.20.0", "tokenizers>=0.20.0"]
+dev = [
+    "jsonschema>=4.0.0",
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.3.0",
+    "ruff>=0.11.0,<1.0.0",
+    "mypy>=1.13.0,<2.0.0",
+    "numpy>=2.0.0,<3.0.0",
+]
+
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "workbay_handoff_mcp",
+    "workbay_handoff_mcp_launcher.py",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "workbay_handoff_mcp",
+    "workbay_handoff_mcp_launcher.py",
+    "hatch_build.py",
+    "_scrub_core.py",
+]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["build", "src/*.egg-info"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"src/workbay_handoff_mcp/_shared.py" = ["F401"]
+"src/workbay_handoff_mcp/api.py" = ["F401"]
+"src/workbay_handoff_mcp/cli.py" = ["F401"]
+"tests/**/*.py" = ["E402", "F401", "F811"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+exclude = ["build/"]
+warn_return_any = true
+warn_unused_configs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+no_implicit_optional = true
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["fastmcp", "fastmcp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["workbay_protocol", "workbay_protocol.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional embeddings extra; imported lazily, absent on the core path.
+module = ["onnxruntime", "tokenizers"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
+timeout_method = "thread"
+norecursedirs = [".pytest_cache", "build", "src/*.egg-info"]
+
+[tool.hoisted]
+repository = "darce/workbay"
+install_url = "git+https://github.com/darce/workbay.git@mcp-workbay-handoff-v{version}#subdirectory=packages/mcp-workbay-handoff"
+changelog = "CHANGELOG.md"
