@@ -1,0 +1,21 @@
+#!/bin/sh
+# Git post-rewrite hook: warn if protected paths are dirty on main (BR-16/BR-22).
+#
+# Installed via `make install-git-hooks`. Fires after rebase/amend.
+#
+# Args: $1=trigger (rebase|amend), stdin=rewrite records
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+# Resolve guard scripts relative to this hook's own location (one level up from
+# the git/ hook dir), not $REPO_ROOT — works in nested-source / hoisted consumer
+# layouts where the git root is not the shared hook source (implementation note ask G).
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+GUARD_DIR="$(dirname "$HOOK_DIR")"
+
+cat >/dev/null  # drain stdin so upstream doesn't block on pipe backpressure
+python3 "$GUARD_DIR/check_main_clean.py" --trigger post-rewrite || true
+exit 0

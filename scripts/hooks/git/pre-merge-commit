@@ -1,0 +1,29 @@
+#!/bin/sh
+# Git pre-merge-commit hook: extend the commit-time root-branch backstop to
+# merge commits.
+#
+# git runs pre-commit for ordinary commits but NOT for the merge commit created
+# by `git merge --no-ff`. Without this hook a main-integration *merge* performed
+# on a root worktree that was wrongly switched off main would still land on the
+# feature branch — the exact threat the backstop exists to stop (the repo
+# integrates feature branches via non-ff merge commits). A conflicted merge
+# falls through to `git commit`, which the pre-commit hook already guards.
+#
+# `git merge --no-verify` bypasses this check, mirroring the pre-commit escape
+# hatch. Installed via the bootstrap installer, which sets core.hooksPath to
+# scripts/hooks/git.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+# Fail-OPEN if the script is missing (overlay drift / partial install): a
+# vanished check must never hard-block every merge. Only its own exit 1 blocks.
+if [ -f "$HOOK_DIR/check_root_branch.py" ]; then
+    exec python3 "$HOOK_DIR/check_root_branch.py"
+fi
+
+exit 0

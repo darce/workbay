@@ -1,0 +1,119 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py .github/hooks/guard-main-branch.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "Bash",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-bash-main-branch.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "Edit|Write",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-task-plan-findings.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_close_slice|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-rationale-size.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_review_findings|mcp_workbay-handoff-mcp_review_runs|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/validate-mcp-dict-params.py",
+        "timeout": 5
+      },
+      {
+        "matcher": "mcp_workbay-handoff-mcp_review_findings|mcp__workbay-handoff-mcp__review_findings",
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/guard-review-finding-resolve.py",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/record-file-touch.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp_workbay-handoff-mcp_review_findings|mcp__workbay-handoff-mcp__review_findings",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/ace-detect.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp_workbay-handoff-mcp_get_handoff_state|mcp_workbay-handoff-mcp_load_session|mcp_workbay-handoff-mcp_render_handoff|mcp__workbay-handoff-mcp__get_handoff_state|mcp__workbay-handoff-mcp__load_session|mcp__workbay-handoff-mcp__render_handoff",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/slim-handoff-response.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/filter-test-output.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/capture-agent-errors.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/advise-worktree-cd.py",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/coherence-self-check.py",
+        "timeout": 10
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "python3 scripts/hooks/_run_guard.py scripts/hooks/advise-worktree-cd.py",
+        "timeout": 5
+      }
+    ]
+  }
+}

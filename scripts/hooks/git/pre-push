@@ -1,0 +1,37 @@
+#!/bin/sh
+# Git pre-push hook: BLOCK push when protected paths are dirty on main
+# (BR-16 / BR-22). Prevents accidentally publishing a contaminated main.
+#
+# Installed via `make install-git-hooks`. Scanner exits 2 on dirty state
+# when --block is set; we propagate that exit code to abort the push.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+# Resolve guard scripts relative to this hook's own location (one level up from
+# the git/ hook dir), not $REPO_ROOT — works in nested-source / hoisted consumer
+# layouts where the git root is not the shared hook source (implementation note ask G).
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+GUARD_DIR="$(dirname "$HOOK_DIR")"
+
+cat >/dev/null  # drain push refs; we don't care which refs, only local state
+python3 "$GUARD_DIR/check_main_clean.py" --trigger pre-push --block
+STATUS=$?
+if [ "$STATUS" -ne 0 ]; then
+    echo "" >&2
+    echo "pre-push aborted: main has dirty protected paths (see above)." >&2
+    echo "If you know this is intentional, bypass with: git push --no-verify" >&2
+    exit "$STATUS"
+fi
+
+# internal: branch-naming hard gate at publish time. Distinct
+# override env var (WORKBAY_ALLOW_NONCONFORMING_BRANCH_PUSH) — commit-side
+# leniency does not leak across the publish boundary.
+python3 "$GUARD_DIR/check_branch_naming.py" --trigger pre-push
+STATUS=$?
+if [ "$STATUS" -ne 0 ]; then
+    exit "$STATUS"
+fi
+exit 0

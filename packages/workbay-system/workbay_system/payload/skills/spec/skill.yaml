@@ -1,0 +1,17 @@
+name: spec
+scope: harness
+description: Draft or revise repository specs after a scope, assessment, ADR need,
+  or planning-review finding. Use when Codex needs to create docs/specs artifacts,
+  close spec findings, convert assessment findings into RCL-style requirements,
+  or decide what belongs in spec versus ADR/task-plan.
+mode: advisory
+context_budget: 120
+makefile_target: null
+mcp_tools:
+- record_event
+- review_findings
+- search_handoff
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

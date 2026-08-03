@@ -1,0 +1,20 @@
+name: auto-fix
+scope: harness
+description: Use when iterating on a single failing test inside an active feature-branch
+  task. Triggers on `/auto-fix`, on 'loop until this test passes' asks, or when the
+  operator wants a bounded autonomous debug pass without spending a task-plan's worth
+  of tokens per iteration.
+mode: execution
+context_budget: 120
+makefile_target: null
+mcp_tools:
+- get_handoff_state
+- record_event
+- review_findings
+- close_slice
+- integrity_check
+- set_handoff_state
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
