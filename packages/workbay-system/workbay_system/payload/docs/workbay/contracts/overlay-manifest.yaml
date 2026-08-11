@@ -1,0 +1,150 @@
+version: 1
+# Canonical install ledger written by current workbay-bootstrap. The legacy
+# mapping manifest below is read-only compatibility for pre-migration installs.
+canonical_manifest_file: .workbay-bootstrap.json
+legacy_manifest_file: .workbay-overlay.json
+# Back-compat alias: historically `manifest_file` named the legacy overlay file.
+manifest_file: .workbay-overlay.json
+summary: >-
+  Contract for the consumer-local overlay manifests read by
+  scripts/overlay_resolver.py. The CANONICAL install ledger is
+  `.workbay-bootstrap.json`, written by `workbay-bootstrap install`; the
+  LEGACY `.workbay-overlay.json` mapping manifest remains readable for
+  pre-migration installs and third-party local overlays. The resolver classifies
+  the consumer with `detect_overlay_mode()` and tells validators and bootstrap
+  maintenance commands where shared/local/generated surfaces live, which remote
+  clone backs the shared layer, and what per-surface overlap counts were observed.
+
+manifest_modes:
+  source_tree:
+    description: >-
+      Neither manifest present (this monorepo's source tree, or an uninstalled
+      checkout). The resolver scans the default surface roots directly.
+  canonical:
+    manifest_file: .workbay-bootstrap.json
+    description: >-
+      Current bootstrap install ledger. `surfaces` is a LIST of {path, source}
+      entries keyed by filesystem path (not by resolver kind). `source` is one of
+      shared | local | generated | lifecycle. The resolver maps each requested
+      kind to the ledger path(s) it owns (contracts -> docs/workbay/contracts;
+      hooks -> .github/hooks and scripts/hooks; prompts -> .github/prompts).
+      `skills`/`commands` are NOT ledger surfaces — they live in the generated
+      plugin tree under .workbay/generated/plugins/ — so their absence is not
+      drift. Only `source: shared` entries must resolve as symlinks into
+      .workbay/remote; a missing/replaced shared surface fails closed with a
+      BrokenOverlayError that points at `workbay-bootstrap doctor`/`repair`.
+      `generated`/`lifecycle`/`local` entries are real paths validated by
+      existence. Malformed JSON, missing schema_version/remote_sha, or a non-list
+      `surfaces` raise OverlayResolverError.
+    note: >-
+      A SOURCE repo self-installed via `workbay-bootstrap install` at its own
+      root (a `.workbay-bootstrap.json` recording docs/workbay/contracts and
+      .github/hooks as shared, while those stay real source dirs rather than
+      clone symlinks) is classified canonical and fails closed there. The shipped
+      validators default their repo root to packages/workbay-system (no
+      manifest -> source_tree), so this only surfaces if a caller points a
+      resolver-backed validator at such a self-installed root.
+    canonical_fields:
+      schema_version: integer
+      remote_sha: string
+      surfaces:
+        type: list
+        item_required_keys:
+          - path
+          - source
+  legacy:
+    manifest_file: .workbay-overlay.json
+    description: >-
+      Pre-migration mapping manifest (and user-owned third-party overlays). The
+      legacy schema below applies. When BOTH manifests exist, a stale
+      bootstrap-owned legacy file (list-shaped `surfaces`) is treated as
+      migratable and canonical wins; a user-owned mapping overlay raises an
+      ambiguous-manifest OverlayResolverError so the resolver never silently
+      picks one authority.
+
+# --- Legacy `.workbay-overlay.json` mapping schema (read-compat) ---
+required_fields:
+  schema_version:
+    type: integer
+    description: Monotonic schema version for the manifest payload.
+  remote_clone_path:
+    type: string
+    description: >-
+      Project-relative path to the checked-out shared agentic remote, normally
+      <project-root>/.workbay/remote.
+  remote_sha:
+    type: string
+    description: Full commit SHA of the shared remote clone that the overlay currently pins.
+  surfaces:
+    type: mapping
+    description: Surface metadata keyed by overlay-resolver surface kind.
+    allowed_keys:
+      - skills
+      - hooks
+      - commands
+      - prompts
+      - contracts
+    additional_properties:
+      type: mapping
+      required_keys:
+        - shared_root
+        - local_root
+      optional_keys:
+        - shared_count
+        - local_count
+        - overlap_count
+      field_types:
+        shared_root: string
+        local_root: string
+        shared_count: integer
+        local_count: integer
+        overlap_count: integer
+
+notes:
+  - >-
+    shared_root and local_root are project-relative paths. The overlay resolver joins
+    them against the consumer project root before scanning for entries.
+  - >-
+    The hooks surface is still represented by one shared/local root pair in the manifest.
+    Repository-specific hook subtrees such as scripts/hooks/git are described by the
+    shared checkout layout, not by additional top-level manifest keys.
+  - >-
+    Validators may treat shared_count, local_count, and overlap_count as advisory
+    metadata. They help status and doctor commands report overlay health without
+    changing resolver behavior.
+
+example_manifest:
+  schema_version: 1
+  remote_clone_path: .workbay/remote
+  remote_sha: 0123456789abcdef0123456789abcdef01234567
+  surfaces:
+    skills:
+      shared_root: .workbay/remote/.claude/skills
+      local_root: local/.claude/skills
+      shared_count: 12
+      local_count: 1
+      overlap_count: 1
+    hooks:
+      shared_root: .workbay/remote/.github/hooks
+      local_root: local/.github/hooks
+      shared_count: 4
+      local_count: 0
+      overlap_count: 0
+    commands:
+      shared_root: .workbay/remote/.claude/commands
+      local_root: local/.claude/commands
+      shared_count: 6
+      local_count: 0
+      overlap_count: 0
+    prompts:
+      shared_root: .workbay/remote/.github/prompts
+      local_root: local/.github/prompts
+      shared_count: 5
+      local_count: 0
+      overlap_count: 0
+    contracts:
+      shared_root: .workbay/remote/docs/workbay/contracts
+      local_root: local/docs/workbay/contracts
+      shared_count: 9
+      local_count: 1
+      overlap_count: 1

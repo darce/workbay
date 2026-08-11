@@ -1,0 +1,16 @@
+name: planning-review
+scope: harness
+description: Use when reviewing task plans, epics, ADRs, or other planning documents.
+  Triggers on `make plan-review` and planning review requests.
+mode: execution
+context_budget: 120
+makefile_target: plan-review
+mcp_tools:
+- review_findings
+- review_runs
+- record_event
+- search_handoff
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

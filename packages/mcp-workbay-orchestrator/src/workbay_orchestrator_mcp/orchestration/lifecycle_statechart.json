@@ -1,0 +1,286 @@
+{
+  "id": "orchestrator_lifecycle",
+  "version": "1.0.0",
+  "description": "Hierarchical (Harel) lifecycle statechart: outer task machine with nested lane machine under the in-flight region. Spec-only; not a runtime interpreter.",
+  "allowed_evidence_classes": [
+    "commit_ancestry",
+    "test_exit_code",
+    "findings_count",
+    "machine_terminal_outcome",
+    "machine_observation"
+  ],
+  "outer": {
+    "id": "task_machine",
+    "initial": "scoping",
+    "terminals": ["closed"],
+    "states": [
+      "scoping",
+      "planned",
+      "branch_open",
+      "slice_open",
+      "slice_review",
+      "branch_review",
+      "close_pending",
+      "closed"
+    ],
+    "projection": {
+      "scoping": "in_progress",
+      "planned": "in_progress",
+      "branch_open": "in_progress",
+      "slice_open": "in_progress",
+      "slice_review": "review",
+      "branch_review": "review",
+      "close_pending": "review",
+      "closed": "done"
+    },
+    "nested_region": {
+      "id": "in_flight",
+      "parent_states": ["branch_open", "slice_open", "slice_review"],
+      "child_machine": "lane_machine",
+      "description": "In-flight region spans branch/slice work through slice_review until lanes are terminal; exits toward branch_review require child-terminal evidence."
+    },
+    "transitions": [
+      {
+        "id": "t_scoping_to_planned",
+        "from": "scoping",
+        "to": "planned",
+        "guard": {
+          "predicate_id": "scope_accepted",
+          "evidence_class": "findings_count",
+          "description": "Scope review has no open blocking findings; plan admitted."
+        }
+      },
+      {
+        "id": "t_planned_to_branch_open",
+        "from": "planned",
+        "to": "branch_open",
+        "guard": {
+          "predicate_id": "feature_branch_created",
+          "evidence_class": "machine_observation",
+          "description": "Feature branch ref exists (ref existence / creation observation); not a merge-base ancestry claim."
+        }
+      },
+      {
+        "id": "t_branch_open_to_slice_open",
+        "from": "branch_open",
+        "to": "slice_open",
+        "guard": {
+          "predicate_id": "slice_admitted",
+          "evidence_class": "commit_ancestry",
+          "description": "Next slice admitted; upstream landed_sha is ancestor of integration tip (dispatch-time ancestry)."
+        }
+      },
+      {
+        "id": "t_slice_open_to_slice_review",
+        "from": "slice_open",
+        "to": "slice_review",
+        "guard": {
+          "predicate_id": "slice_work_ready_for_review",
+          "evidence_class": "test_exit_code",
+          "description": "Slice test command suite exited zero; work is ready for slice review."
+        }
+      },
+      {
+        "id": "t_slice_review_exit",
+        "from": "slice_review",
+        "to": ["slice_open", "branch_review"],
+        "guard": {
+          "predicate_id": "slice_gate_verdict",
+          "evidence_class": "findings_count",
+          "description": "Slice gate clean (require_clean_slice): open findings closed; either admit next slice or leave in-flight toward branch review. Leaving to branch_review consumes child-terminal evidence.",
+          "child_evidence_sources": ["merged", "closed"]
+        }
+      },
+      {
+        "id": "t_branch_open_to_branch_review",
+        "from": "branch_open",
+        "to": "branch_review",
+        "guard": {
+          "predicate_id": "all_lanes_terminal",
+          "evidence_class": "machine_terminal_outcome",
+          "description": "Every lane has reached a child terminal (merged or closed); parent may leave in-flight.",
+          "child_evidence_sources": ["merged", "closed"]
+        }
+      },
+      {
+        "id": "t_branch_review_to_close_pending",
+        "from": "branch_review",
+        "to": "close_pending",
+        "guard": {
+          "predicate_id": "close_check_clean",
+          "evidence_class": "findings_count",
+          "description": "make close-check reports readiness: findings closed, integrity clean.",
+          "child_evidence_sources": ["merged"]
+        }
+      },
+      {
+        "id": "t_close_pending_to_closed",
+        "from": "close_pending",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "merge_landed_on_main",
+          "evidence_class": "commit_ancestry",
+          "description": "Merge (or squash) commit on main carries the task change; landed_sha recorded in ledger. Preceded by handoff-close-check merge-readiness gate."
+        }
+      }
+    ]
+  },
+  "child": {
+    "id": "lane_machine",
+    "initial": "planned",
+    "terminals": ["merged", "closed"],
+    "states": [
+      "planned",
+      "active",
+      "blocked",
+      "review",
+      "merged",
+      "closed"
+    ],
+    "transitions": [
+      {
+        "id": "t_lane_planned_to_active",
+        "from": "planned",
+        "to": "active",
+        "guards": [
+          {
+            "predicate_id": "upstream_landed_ancestry",
+            "evidence_class": "commit_ancestry",
+            "description": "satisfied(A→B) := landed_sha(A) is ancestor of base(B); dispatch-time form uses integration tip."
+          },
+          {
+            "predicate_id": "collision_freedom",
+            "evidence_class": "machine_terminal_outcome",
+            "description": "No non-terminal, DAG-incomparable lane shares an owned_paths prefix (conflict-graph covered by depends_on)."
+          }
+        ]
+      },
+      {
+        "id": "t_lane_active_to_blocked",
+        "from": "active",
+        "to": "blocked",
+        "guard": {
+          "predicate_id": "lane_blocked_observation",
+          "evidence_class": "machine_observation",
+          "description": "Worker or preflight observed a blocking condition mid-lifecycle; not a terminal peer/process outcome."
+        }
+      },
+      {
+        "id": "t_lane_blocked_to_active",
+        "from": "blocked",
+        "to": "active",
+        "guard": {
+          "predicate_id": "blocker_cleared",
+          "evidence_class": "findings_count",
+          "description": "Blocking findings resolved; lane may resume."
+        }
+      },
+      {
+        "id": "t_lane_active_to_review",
+        "from": "active",
+        "to": "review",
+        "guard": {
+          "predicate_id": "lane_tests_green",
+          "evidence_class": "test_exit_code",
+          "description": "Lane test_commands exited zero; ready for review."
+        }
+      },
+      {
+        "id": "t_lane_review_to_merged",
+        "from": "review",
+        "to": "merged",
+        "guard": {
+          "predicate_id": "lane_merged_to_task_branch",
+          "evidence_class": "commit_ancestry",
+          "description": "Lane branch merge commit is on the task integration branch (merge_order)."
+        }
+      },
+      {
+        "id": "t_lane_review_to_active",
+        "from": "review",
+        "to": "active",
+        "guard": {
+          "predicate_id": "review_findings_reopen_work",
+          "evidence_class": "findings_count",
+          "description": "Review findings reopen work; lane returns to active."
+        }
+      },
+      {
+        "id": "t_lane_planned_to_closed",
+        "from": "planned",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "lane_vacuous_close",
+          "evidence_class": "machine_terminal_outcome",
+          "description": "Lane closed without work (no_work / no_actionable_work); outgoing edges discharge vacuously."
+        }
+      },
+      {
+        "id": "t_lane_blocked_to_closed",
+        "from": "blocked",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "lane_abandoned",
+          "evidence_class": "machine_terminal_outcome",
+          "description": "Operator or policy closed a blocked lane without merge."
+        }
+      },
+      {
+        "id": "t_lane_active_to_closed",
+        "from": "active",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "lane_cancelled",
+          "evidence_class": "machine_terminal_outcome",
+          "description": "Lane cancelled mid-work; no landed commit."
+        }
+      },
+      {
+        "id": "t_lane_review_to_closed",
+        "from": "review",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "lane_review_rejected_close",
+          "evidence_class": "findings_count",
+          "description": "Review rejects and closes lane without merge."
+        }
+      }
+    ]
+  },
+  "gates": [
+    {
+      "id": "close_check",
+      "surface": "make close-check (close_check.py local merge gate)",
+      "transition_id": "t_branch_review_to_close_pending"
+    },
+    {
+      "id": "merge_gate",
+      "surface": "make handoff-close-check (enforced merge-readiness on final branch HEAD)",
+      "transition_id": "t_close_pending_to_closed"
+    },
+    {
+      "id": "slice_gate",
+      "surface": "require_clean_slice / lanes.py:_evaluate_clean_slice_gate (MCP plan-cursor upsert gate)",
+      "transition_id": "t_slice_review_exit"
+    },
+    {
+      "id": "review_ready",
+      "surface": "make review-ready (review_ready.py pre-review gate)",
+      "transition_id": "t_branch_open_to_branch_review"
+    }
+  ],
+  "gate_exclusions": [
+    {
+      "surface": "scripts/hooks/git/pre-merge-commit (check_root_branch.py)",
+      "reason": "Root-worktree-on-main policy only; does not check findings, ledger readiness, or landed ancestry. Not a lifecycle merge-readiness gate."
+    },
+    {
+      "surface": "pre-push hard blocks (dirty main / branch naming)",
+      "reason": "Repo-policy push blocks; not mapped to a single outer lifecycle transition."
+    },
+    {
+      "surface": "PreToolUse guards (worktree drift, main-branch bash, rationale size, task-plan findings)",
+      "reason": "Session/tool policy surfaces; none implement slice-review exit or clean-slice totality (that is require_clean_slice)."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "_note": "Symbol names, not line numbers. An earlier version of this file hardcoded line numbers read from the repo-root worktree (main) while the document is pinned to the branch base; that one file differs by 18 lines between the two trees, and the mismatch manufactured a false high-severity finding. Resolving by symbol is tree-independent, which is the only form of this check that cannot repeat that error.",
+  "source": "packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/orchestration/backend_registry.py",
+  "symbols": {
+    "_probe_cursor_remote": "def _probe_cursor_remote",
+    "_probe_codex_remote": "def _probe_codex_remote",
+    "_parse_codex_cli_version": "def _parse_codex_cli_version",
+    "_CURSOR_REMOTE_REMEDY": "_CURSOR_REMOTE_REMEDY = (",
+    "cursor_remote_row": "\"cursor-remote\": BackendSpec(",
+    "codex_remote_row": "\"codex-remote\": BackendSpec(",
+    "BACKENDS": "BACKENDS: dict[str, BackendSpec]"
+  },
+  "_citation_rule": "Every backend_registry.py:N cited by the document must land on a line that is not blank and not a bare comment, in the tree the document is pinned to. Anchors are NOT compared against any other tree."
+}
