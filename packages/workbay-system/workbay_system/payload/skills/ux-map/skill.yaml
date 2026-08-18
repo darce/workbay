@@ -1,0 +1,15 @@
+name: ux-map
+scope: harness
+description: Use when inventorying product screens/zones/states/flows as a text-first
+  UX map, critiquing IA against heuristics, or projecting a flow to canvas for spatial
+  review. Triggers on Workbench or SPA task decomposition, .uxmap.json edits, and
+  planning that needs screen/flow structure before UI code.
+mode: advisory
+context_budget: 80
+makefile_target: null
+mcp_tools:
+- record_event
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

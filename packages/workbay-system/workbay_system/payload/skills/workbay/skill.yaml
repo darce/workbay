@@ -1,0 +1,13 @@
+name: workbay
+scope: harness
+description: Use to control WorkBay install surfaces from the harness — today semantic
+  embeddings on/off/status. Triggers on `/workbay` and operator requests to toggle
+  embeddings without hand-editing `.workbay/embedding.env`.
+mode: advisory
+context_budget: 40
+makefile_target: null
+mcp_tools: []
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
