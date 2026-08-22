@@ -1,0 +1,20 @@
+name: review
+description: 'Use when asked to review a branch diff, task plan, PR, epic, or ADR.
+  Triggers on: ''review'', ''audit'', ''flag gaps/bugs'', ''propose improvements''.'
+mode: execution
+context_budget: 250
+makefile_target: review-dispatch
+mcp_tools:
+- review_findings
+- review_runs
+- record_event
+- get_handoff_state
+- render_handoff
+- get_latest_slice_review_packet
+- integrity_check
+- search_handoff
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false
