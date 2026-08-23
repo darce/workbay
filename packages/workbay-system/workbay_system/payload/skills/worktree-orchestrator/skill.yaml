@@ -1,0 +1,17 @@
+name: worktree-orchestrator
+description: Split a task across Git worktrees. Decompose into bounded lanes, create
+  worktrees, render worker briefs, enforce ownership, coordinate merge order.
+mode: execution
+context_budget: 200
+makefile_target: lane-open
+mcp_tools:
+- manage_worktree_lane
+- lane_communication
+- get_lane_activity
+- worker_reports
+- plan_cursor
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false

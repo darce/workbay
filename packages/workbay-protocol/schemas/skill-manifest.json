@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "SkillScope": {
+      "description": "Portability scope of a skill.\n\n``harness``: project-agnostic. Lives in ``workbay-system`` source of\n             truth and is installed/symlinked into target repos by\n             ``workbay-bootstrap``. Must not reference project-specific\n             paths, package names, or domain terminology.\n``project``: project-specific. Stays in the target repo's\n             ``skills/`` (or its generated ``.claude/skills/``\n             mirror) and is never hoisted by bootstrap. May freely\n             reference project-local apps, packages, and\n             conventions.",
+      "enum": [
+        "harness",
+        "project"
+      ],
+      "title": "SkillScope",
+      "type": "string"
+    }
+  },
+  "additionalProperties": true,
+  "description": "Required cross-repo fields on a skill's frontmatter.",
+  "properties": {
+    "description": {
+      "description": "One-line description used for skill matching.",
+      "minLength": 1,
+      "title": "Description",
+      "type": "string"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional preferred model identifier (e.g. 'claude-opus-4-7').",
+      "title": "Model"
+    },
+    "name": {
+      "description": "Unique skill identifier (kebab-case).",
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "scope": {
+      "$ref": "#/$defs/SkillScope",
+      "description": "Portability scope. 'harness' = installed into target repos by bootstrap; 'project' = stays local."
+    },
+    "triggers": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional list of trigger phrases or patterns the skill responds to.",
+      "title": "Triggers"
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "scope"
+  ],
+  "title": "SkillManifest",
+  "type": "object"
+}

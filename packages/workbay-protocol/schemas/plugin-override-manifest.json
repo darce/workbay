@@ -1,0 +1,372 @@
+{
+  "$defs": {
+    "PluginClaudeSettingsHooksOverride": {
+      "additionalProperties": false,
+      "description": "Override contract for compositional Claude settings hooks.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "add",
+            "override"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^/"
+              },
+              {
+                "pattern": "(^|/)\\.\\.(/|$)"
+              },
+              {
+                "pattern": "^\\.?$"
+              },
+              {
+                "pattern": "\\\\"
+              }
+            ]
+          },
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "path"
+      ],
+      "title": "PluginClaudeSettingsHooksOverride",
+      "type": "object"
+    },
+    "PluginDocOverride": {
+      "additionalProperties": false,
+      "description": "Override contract for one rules or guides doc under the override root.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "add",
+            "replace"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^/"
+              },
+              {
+                "pattern": "(^|/)\\.\\.(/|$)"
+              },
+              {
+                "pattern": "^\\.?$"
+              },
+              {
+                "pattern": "\\\\"
+              }
+            ]
+          },
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "path"
+      ],
+      "title": "PluginDocOverride",
+      "type": "object"
+    },
+    "PluginMcpServerOverride": {
+      "additionalProperties": false,
+      "description": "Override contract for one MCP server entry in the plugin manifest.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "patch",
+            "disable",
+            "add"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "patch_path": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "^/"
+                  },
+                  {
+                    "pattern": "(^|/)\\.\\.(/|$)"
+                  },
+                  {
+                    "pattern": "^\\.?$"
+                  },
+                  {
+                    "pattern": "\\\\"
+                  }
+                ]
+              },
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Patch Path"
+        },
+        "requires_trust_ack": {
+          "default": false,
+          "title": "Requires Trust Ack",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "PluginMcpServerOverride",
+      "type": "object"
+    },
+    "PluginOverrideComponents": {
+      "additionalProperties": false,
+      "description": "Declared override components grouped by plugin surface kind.",
+      "properties": {
+        "claude_settings_hooks": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginClaudeSettingsHooksOverride"
+            }
+          },
+          "title": "Claude Settings Hooks",
+          "type": "object"
+        },
+        "guides": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginDocOverride"
+            }
+          },
+          "title": "Guides",
+          "type": "object"
+        },
+        "mcp_servers": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginMcpServerOverride"
+            }
+          },
+          "title": "Mcp Servers",
+          "type": "object"
+        },
+        "portable_commands": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginPortableCommandOverride"
+            }
+          },
+          "title": "Portable Commands",
+          "type": "object"
+        },
+        "rules": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginDocOverride"
+            }
+          },
+          "title": "Rules",
+          "type": "object"
+        },
+        "skills": {
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$": {
+              "$ref": "#/$defs/PluginSkillOverride"
+            }
+          },
+          "title": "Skills",
+          "type": "object"
+        }
+      },
+      "title": "PluginOverrideComponents",
+      "type": "object"
+    },
+    "PluginPortableCommandOverride": {
+      "additionalProperties": false,
+      "description": "Override contract for one portable command manifest entry.",
+      "properties": {
+        "mode": {
+          "const": "add",
+          "title": "Mode",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^/"
+              },
+              {
+                "pattern": "(^|/)\\.\\.(/|$)"
+              },
+              {
+                "pattern": "^\\.?$"
+              },
+              {
+                "pattern": "\\\\"
+              }
+            ]
+          },
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "path"
+      ],
+      "title": "PluginPortableCommandOverride",
+      "type": "object"
+    },
+    "PluginSkillOverride": {
+      "additionalProperties": false,
+      "description": "Override contract for one plugin skill body.",
+      "properties": {
+        "base_path": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "^/"
+                  },
+                  {
+                    "pattern": "(^|/)\\.\\.(/|$)"
+                  },
+                  {
+                    "pattern": "^\\.?$"
+                  },
+                  {
+                    "pattern": "\\\\"
+                  }
+                ]
+              },
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Path"
+        },
+        "mode": {
+          "enum": [
+            "replace",
+            "patch",
+            "disable",
+            "add"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "on_upstream_change": {
+          "anyOf": [
+            {
+              "enum": [
+                "warn",
+                "error",
+                "ignore"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Upstream Change"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "^/"
+                  },
+                  {
+                    "pattern": "(^|/)\\.\\.(/|$)"
+                  },
+                  {
+                    "pattern": "^\\.?$"
+                  },
+                  {
+                    "pattern": "\\\\"
+                  }
+                ]
+              },
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "upstream_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Upstream Digest"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "PluginSkillOverride",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Tracked, repo-owned plugin override manifest.",
+  "properties": {
+    "components": {
+      "$ref": "#/$defs/PluginOverrideComponents"
+    },
+    "plugin": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Plugin",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "plugin"
+  ],
+  "title": "PluginOverrideManifest",
+  "type": "object"
+}
