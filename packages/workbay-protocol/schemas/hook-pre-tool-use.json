@@ -1,0 +1,59 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "cwd": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Working directory of the Claude Code process at event time.",
+      "title": "Cwd"
+    },
+    "hook_event_name": {
+      "const": "PreToolUse",
+      "default": "PreToolUse",
+      "title": "Hook Event Name",
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Stable per-session identifier from Claude Code.",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "tool_input": {
+      "additionalProperties": true,
+      "description": "Arguments the model passed to the tool.",
+      "title": "Tool Input",
+      "type": "object"
+    },
+    "tool_name": {
+      "description": "Tool the model is about to invoke.",
+      "title": "Tool Name",
+      "type": "string"
+    },
+    "transcript_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Filesystem path to the active session transcript, when emitted by the harness.",
+      "title": "Transcript Path"
+    }
+  },
+  "required": [
+    "session_id",
+    "tool_name"
+  ],
+  "title": "PreToolUseEvent",
+  "type": "object"
+}

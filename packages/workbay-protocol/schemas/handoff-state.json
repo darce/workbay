@@ -1,0 +1,184 @@
+{
+  "$defs": {
+    "ActiveTask": {
+      "additionalProperties": true,
+      "description": "Wire shape for a single active handoff row.\n\nCarries identifiers, status, optional target worktree, optional\nstructured task-plan reference, and a revision counter used for\noptimistic concurrency control. ``extra='allow'`` lets older or\nnewer columns (lane metadata, audit fields) round-trip without\nrequiring a coordinated bump of every consumer.",
+      "properties": {
+        "focus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Freeform context for the current iteration. Not a plan-path source \u2014 see task_plan_path.",
+          "title": "Focus"
+        },
+        "objective": {
+          "description": "Human-readable task objective.",
+          "title": "Objective",
+          "type": "string"
+        },
+        "revision": {
+          "default": 0,
+          "description": "Optimistic-concurrency counter.",
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/HandoffStatus",
+          "default": "in_progress"
+        },
+        "target_branch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Branch"
+        },
+        "target_worktree_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Worktree Path"
+        },
+        "task_plan_abs_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Plan Abs Path"
+        },
+        "task_plan_exists": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Plan Exists"
+        },
+        "task_plan_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Plan Path"
+        },
+        "task_plan_resolution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskPlanResolution"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "task_ref": {
+          "description": "Short task identifier, e.g. 'internal' or 'internal'.",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Task Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_ref",
+        "objective"
+      ],
+      "title": "ActiveTask",
+      "type": "object"
+    },
+    "HandoffStatus": {
+      "description": "Lifecycle status of a handoff row.\n\nMirrors the CHECK constraint on ``handoff_state.status`` in\n``mcp-workbay-handoff`` (``shared_schema.py``).",
+      "enum": [
+        "in_progress",
+        "blocked",
+        "review",
+        "done"
+      ],
+      "title": "HandoffStatus",
+      "type": "string"
+    },
+    "TaskPlanResolution": {
+      "description": "How an absolute task-plan path was resolved at read time.\n\n``absolute``: the configured ``task_plan_path`` was already absolute.\n``worktree``: resolved against ``target_worktree_path``.\n``workspace``: resolved against the configured workspace root because\n               no ``target_worktree_path`` was set.\n``unresolved``: resolution failed (no worktree, no workspace).",
+      "enum": [
+        "absolute",
+        "worktree",
+        "workspace",
+        "unresolved"
+      ],
+      "title": "TaskPlanResolution",
+      "type": "string"
+    }
+  },
+  "additionalProperties": true,
+  "description": "Top-level handoff state surface.\n\nA list of active tasks plus a pointer to which one resolves to the\ncurrent workspace context (``active_task_ref``). The single-active\nfallback (``active``) is kept for callers that still expect the\nlegacy single-task envelope; it equals the entry whose ``task_ref``\nmatches ``active_task_ref`` when present.",
+  "properties": {
+    "active": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ActiveTask"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "active_task_ref": {
+      "anyOf": [
+        {
+          "description": "Short task identifier, e.g. 'internal' or 'internal'.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Active Task Ref"
+    },
+    "active_tasks": {
+      "items": {
+        "$ref": "#/$defs/ActiveTask"
+      },
+      "title": "Active Tasks",
+      "type": "array"
+    }
+  },
+  "title": "HandoffState",
+  "type": "object"
+}
