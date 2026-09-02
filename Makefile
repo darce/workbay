@@ -1,0 +1,945 @@
+# WorkBay — distribution automation
+#
+# `make release-public` (scripts/release_public.py) is the authoritative
+# public-release path — git-only mirror; see docs/RELEASING.md. scripts/release.sh
+# remains the plan/status/tag helper; the retired release-pending/all/package
+# targets (the deleted PyPI publish flow) were removed.
+# Authoritative playbook: docs/RELEASING.md.
+#
+# Usage examples:
+#   make preflight                          # checklist only
+#   make release-status                     # show package/tag release state (git-only)
+#   make release-plan FLAGS=--json          # show the canonical machine-readable release plan
+#   make release-public                     # orchestrate the public-release flow (dry-run by default)
+#   make release-public FLAGS=--execute     # push/tag after interactive confirmation
+#   make release-prepare PKG=workbay-protocol BUMP=patch
+#   make release-monorepo TAG=v0.1.3
+#   make dogfood DOGFOOD_SOURCE=package     # install from the built package payload (no PyPI)
+#
+# Variables:
+#   PKG     — package directory under packages/ for release-prepare
+#   TAG     — monorepo tag (vX.Y.Z) for release-monorepo
+#   FLAGS   — extra flags forwarded to scripts/release.sh
+#   DOGFOOD_SOURCE         — git_overlay (default), package, or worktree
+#   DOGFOOD_BOOTSTRAP_SPEC — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_SYSTEM_SPEC    — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_GIT_URL        — public mirror URL composed into the package-mode specs
+#   DOGFOOD_PACKAGE_REF    — tag/branch for package-mode specs (DOGFOOD_REF, else TAG, else main)
+
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+# Judge = directory of the `-f` Makefile. Subject = `-C` / CURDIR.
+# `make -f <judge>/Makefile -C <subject> lane-check` must not resolve includes
+# or parse-time discovery against the subject: a subject cannot supply (or
+# omit) the instrument that measures it.
+JUDGE_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
+
+MANIFEST_HELPER := $(JUDGE_ROOT)/scripts/release_manifest.py
+PACKAGES := $(shell python3 $(MANIFEST_HELPER) list --field name)
+# False-green guard: $(shell ...) swallows the helper's exit status, so a broken
+# manifest helper (path/name skew, import error) silently yields an empty PACKAGES
+# and every per-package loop (test/check/format) runs zero suites and reports green.
+# Refuse to parse with an empty package set so the failure is loud, not silent.
+$(if $(strip $(PACKAGES)),,$(error release_manifest.py produced no packages — manifest helper failed or manifest is empty (false-green guard); run: python3 $(MANIFEST_HELPER) list --field name))
+RELEASE_PACKAGES := $(shell python3 $(MANIFEST_HELPER) list --release-only --field name)
+$(if $(strip $(RELEASE_PACKAGES)),,$(error release_manifest.py produced no release packages — manifest helper failed (false-green guard); run: python3 $(MANIFEST_HELPER) list --release-only --field name))
+# Manifest/disk skew guard: every manifest package must have its dir on disk. The
+# per-package test/check/versions/clean loops all assume `packages/<name>`, so a
+# manifest entry whose dir is gone (rename skew) otherwise slips through silently
+# (e.g. `clean` rm -rf's a nonexistent dir, `versions` skips it).
+$(foreach p,$(PACKAGES),$(if $(wildcard $(JUDGE_ROOT)/packages/$(p)/pyproject.toml),,$(error manifest lists package '$(p)' but $(JUDGE_ROOT)/packages/$(p)/pyproject.toml is missing — manifest/disk skew)))
+RELEASE  := scripts/release.sh
+FLAGS    ?=
+DOGFOOD_SOURCE ?= git_overlay
+# Package-mode uvx specs must resolve from the git mirror, never a bare dist name
+# (bare names hit PyPI and can silently install stale unyanked 0.2.x releases).
+# Shape mirrors workbay_bootstrap.gitonly_closure.git_member_spec:
+#   git+<url>@<ref>#subdirectory=packages/<member>
+# Make treats bare # as a comment, so the fragment is escaped as \#.
+DOGFOOD_GIT_URL ?= https://github.com/darce/workbay.git
+DOGFOOD_PACKAGE_REF ?= $(if $(strip $(DOGFOOD_REF)),$(DOGFOOD_REF),$(if $(strip $(TAG)),$(TAG),main))
+DOGFOOD_BOOTSTRAP_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/workbay-bootstrap
+DOGFOOD_SYSTEM_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/workbay-system
+DOGFOOD_UVX_FLAGS ?= --refresh
+# Extra flags forwarded verbatim to every `workbay-bootstrap install`
+# invocation inside `make dogfood` — the sanctioned opt-in path for the
+# cross-harness Stop adapters declared in portable_commands.json, e.g.
+# `make dogfood DOGFOOD_INSTALL_FLAGS=--install-claude-stop-hook-local`
+# (also: --install-codex-stop-hook, --install-vscode-stop-hook,
+# --install-grok-stop-hook). Never applied to
+# `status` invocations.
+DOGFOOD_INSTALL_FLAGS ?=
+
+# Wire the lifecycle.mk `make format` target (the hoist-safe entry
+# point referenced by the branch-lifecycle skill) to this monorepo's
+# `format-all` walker. Bootstrap consumers without a `format-all`
+# target override this in their own Makefile (or accept the loud no-op
+# default that lifecycle.mk ships).
+LIFECYCLE_FORMATTER := $(MAKE) format-all
+# implementation note: npm deps for the in-repo canvas app on fresh linked worktrees.
+# implementation note: parked SPA — only provision when WORKBAY_PROVISION_WEB is set.
+# Use $(if …) (not ifdef) so the assignment line stays present for text dogfood
+# and the expanded value is empty by default / the npm command when opted in.
+# WB_PROVISION_WEB_ON is the single derived predicate every gate below shares.
+#
+# Canonical rule (locked with bootstrap_lane._provision_web_enabled): only the
+# literal spelling "1" enables. Bare $(if $(WORKBAY_PROVISION_WEB),…) would treat
+# "0" as ON; a case-sensitive filter-out of {0,false,no,off} treated FALSE/OFF/NO
+# as ON while Python's .lower() treated them as OFF. Prefer a single truthy
+# token over dual case-folding: unset / 0 / false / FALSE / no / off / true /
+# yes / anything else → OFF. Documented in docs/workbay/environment-variables.md.
+WB_PROVISION_WEB_ON := $(filter 1,$(WORKBAY_PROVISION_WEB))
+
+# Pull in package-owned Make fragments. implementation note S3: the shipped overlay
+# fragments are co-located under the payload; the internal-only evals fragment
+# stays at its pre-S3 location, so include it separately. Use `-include` so a
+# missing fragment never blocks the root `Makefile`. Paths are judge-absolute:
+# GNU make chdirs for `-C` before resolving relative includes, so a
+# subject-relative glob would load (or miss) the subject's checkout.
+-include $(JUDGE_ROOT)/packages/workbay-system/workbay_system/payload/Makefile.d/*.mk
+-include $(JUDGE_ROOT)/packages/workbay-system/Makefile.d/evals.mk
+
+.DEFAULT_GOAL := help
+
+.PHONY: help
+help:
+	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  \033[1;36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+# ----- implementation note retrieval-eval (offline batch; smoke fixture by default) ---
+# Writes a markdown report. Smoke data is synthetic / non-authoritative — no S3
+# verdict. Real runs need operator S1 ground truth + WORKBAY_RETRIEVAL_EVAL_SNAPSHOT.
+RETRIEVAL_EVAL_PYTHON ?= $(abspath .venv/bin/python)
+RETRIEVAL_EVAL_PKG_SRC := $(abspath packages/mcp-workbay-handoff/src)
+RETRIEVAL_EVAL_OUT ?= tmp/retrieval-eval-report.md
+RETRIEVAL_EVAL_FIXTURE ?= smoke
+
+.PHONY: retrieval-eval
+retrieval-eval: ## implementation note offline retrieval-eval harness → markdown report (default: synthetic smoke)
+	@mkdir -p "$(dir $(RETRIEVAL_EVAL_OUT))"
+	@PYTHONPATH="$(RETRIEVAL_EVAL_PKG_SRC)$(if $(PYTHONPATH),:$(PYTHONPATH),)" \
+		$(RETRIEVAL_EVAL_PYTHON) -m workbay_handoff_mcp.embeddings.retrieval_eval_cli \
+		--fixture "$(RETRIEVAL_EVAL_FIXTURE)" \
+		--out "$(RETRIEVAL_EVAL_OUT)"
+
+# ----- gates ----------------------------------------------------------------
+
+.PHONY: sync
+sync: ## Re-sync the workspace root .venv from uv.lock (implementation note D1)
+	uv sync
+	@$(MAKE) dev-install  # uv sync reinstalls copies (no PEP 660); re-heal src redirects
+
+.PHONY: sync-handoff-embeddings
+sync-handoff-embeddings: ## Provision mcp-workbay-handoff[embeddings] into root .venv (implementation note)
+	# Durable path: root pyproject [dependency-groups].dev pins
+	# mcp-workbay-handoff[embeddings], so `uv sync` / `uv sync --group dev` keep
+	# numpy/onnxruntime/tokenizers in the root .venv that mcp_launch.py execs.
+	# Scope: the root .venv dev workspace only (the local server/worker path).
+	# An isolated `uv tool install` console or `uv run` env is NOT covered here —
+	# reprovision those with `uv tool install --with 'mcp-workbay-handoff[embeddings]' ...`
+	# or the equivalent extra on that env. Schema skew on those same tool installs
+	# is a separate gap (REV-A-002) closed by scripts/uv_tool_schema_drift.py +
+	# `make sync-uv-tool-schema-drift` and the doctor `uv_tool_schema_skew` facet.
+	# After sync: if doctor reports embedding_backfill_gap, run
+	# `make backfill-handoff-embeddings`, then operator-owned MCP restart.
+	# Do not invoke the backfill from this recipe — inference is opt-in.
+	uv sync --group dev
+	@$(MAKE) dev-install  # re-heal src redirects reverted by uv sync
+
+.PHONY: backfill-handoff-embeddings
+backfill-handoff-embeddings: ## Opt-in backfill of historical concept embeddings (never run by sync). Pass BACKFILL_ARGS="--dry-run" / "--limit N" / "--kinds kind1,kind2".
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m workbay_handoff_mcp.scripts.backfill_concept_embeddings $(BACKFILL_ARGS)
+
+.PHONY: sync-version-drift-venv
+sync-version-drift-venv: ## Re-derive drifted version_of installs in the root .venv (uv sync --reinstall-package + best-effort cache clean; WD-04)
+	@names=$$("$(SYSTEM_PYTHON)" scripts/version_of_drift.py --print-drifted-names); \
+	if [ -z "$$names" ]; then \
+		echo "sync-version-drift-venv: no drift"; \
+	else \
+		args=""; for n in $$names; do args="$$args --reinstall-package $$n"; done; \
+		uv sync $$args; \
+		for n in $$names; do uv cache clean "$$n" 2>/dev/null || true; done; \
+	fi
+	@$(MAKE) dev-install  # re-heal src redirects reverted by any uv sync above
+
+.PHONY: sync-uv-tool-schema-drift
+sync-uv-tool-schema-drift: ## Reinstall uv tools whose vendored HANDOFF_SCHEMA_VERSION differs from in-tree source (REV-A-002)
+	"$(SYSTEM_PYTHON)" scripts/uv_tool_schema_drift.py --reinstall
+
+.PHONY: preflight
+preflight: ## Run the pre-release checklist (clean tree, tests, contract, rehearsal)
+	$(RELEASE) preflight $(FLAGS)
+
+.PHONY: test
+test: ## Run every package's pytest suite
+	@for pkg in $(PACKAGES); do \
+	    echo "==> $$pkg"; \
+	    scripts/assert_gate_interpreter.sh "$(WORKSPACE_PYTHON)" "$$pkg" || exit 1; \
+	    (cd packages/$$pkg && "$(WORKSPACE_PYTHON)" -m pytest -q) || exit 1; \
+	done
+
+# The contract test runs `workbay_handoff_mcp`, `workbay_orchestrator_mcp`, and
+# `workbay_protocol` in-process against each other. Resolve all three from the
+# worktree's own `src/` via PYTHONPATH (mirroring `check-system`) so the gate
+# needs no editable install and survives worktree teardown — a stale ambient
+# editable install pointing at a removed worktree must not break this gate.
+CONTRACT_PYTHONPATH := $(CURDIR)/packages/workbay-protocol/src:$(CURDIR)/packages/mcp-workbay-handoff/src:$(CURDIR)/packages/mcp-workbay-orchestrator/src$(if $(PYTHONPATH),:$(PYTHONPATH))
+WORKSPACE_PYTHON ?= $(CURDIR)/.venv/bin/python
+
+# FXGATE-VENVREAP-01: before package-scoped pytest, assert the interpreter is
+# present+executable. On failure emit GATE_INTERPRETER_VANISHED (exit 78) so a
+# reaped .venv is never mistaken for a suite regression. Helper:
+# scripts/assert_gate_interpreter.sh. Used by check-protocol / check-system /
+# check-system-integration / check-bootstrap and the convenience `test` loop.
+
+.PHONY: test-contract
+test-contract: ## Run the cross-package protocol contract test
+	@REQ='import pytest, fastmcp'; \
+	PY="$(WORKSPACE_PYTHON)"; \
+	if ! test -x "$$PY"; then \
+	    echo "test-contract: workspace .venv missing at $$PY — run \`make sync\` first." >&2; \
+	    exit 1; \
+	fi; \
+	if ! "$$PY" -c "$$REQ" >/dev/null 2>&1; then \
+	    echo "test-contract: $$PY cannot import pytest+fastmcp — run \`make sync\`." >&2; \
+	    exit 1; \
+	fi; \
+	cd packages/mcp-workbay-orchestrator && \
+	    PYTHONPATH="$(CONTRACT_PYTHONPATH)" "$$PY" -m pytest tests/test_protocol_contract.py -q
+
+# workbay-system owns no installable package — its suite pins the plugin,
+# skill, and Make-target contracts and imports only `workbay_handoff_mcp` and
+# `workbay_protocol`. Run it against the sibling `src/` trees via PYTHONPATH
+# (mirroring CI's workbay-system job) so the gate needs no editable install;
+# the subprocess-spawning plan-target tests inherit and prepend to PYTHONPATH,
+# so `workbay_protocol` resolves inside those subprocesses too. Use the
+# workspace root ``.venv`` (implementation note D5). Override with
+# ``make check-system SYSTEM_PYTHON=/path/to/python``.
+SYSTEM_PYTHON ?= $(WORKSPACE_PYTHON)
+SYSTEM_PYTHONPATH := $(CURDIR)/packages/workbay-protocol/src:$(CURDIR)/packages/mcp-workbay-handoff/src$(if $(PYTHONPATH),:$(PYTHONPATH))
+
+DISK_FLOOR_MB ?= 3072
+.PHONY: check-disk-space
+check-disk-space: ## Preflight: fail fast if a working volume (tmp or uv cache) is nearly full
+	@rc=0; \
+	for vol in "$${TMPDIR:-/tmp}" "$$(uv cache dir 2>/dev/null)"; do \
+	    [ -n "$$vol" ] && [ -e "$$vol" ] || continue; \
+	    if ! avail=$$(df -Pm "$$vol" 2>/dev/null | awk 'NR==2{print $$4}'); then \
+	        echo "check-disk-space: FAIL — could not read free space for $$vol (df failed)." >&2; \
+	        exit 1; \
+	    fi; \
+	    case "$$avail" in ''|*[!0-9]*) \
+	        echo "check-disk-space: FAIL — could not read free space for $$vol (df/awk returned '$$avail')." >&2; \
+	        exit 1;; \
+	    esac; \
+	    if [ "$$avail" -lt "$(DISK_FLOOR_MB)" ]; then \
+	        echo "check-disk-space: FAIL — only $$avail MB free on $$vol (floor $(DISK_FLOOR_MB) MB)." >&2; \
+	        echo "  Reclaim: 'uv cache prune' (or 'rm -rf \"$$(uv cache dir)\"'); check 'df -h'." >&2; \
+	        rc=1; \
+	    else \
+	        echo "check-disk-space: OK — $$avail MB free on $$vol."; \
+	    fi; \
+	done; \
+	exit $$rc
+
+.PHONY: check-runtime-state
+check-runtime-state: ## Preflight: fail fast if local projection runtime state is unsafe
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" DISK_FLOOR_MB="$(DISK_FLOOR_MB)" $(SYSTEM_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay_lifecycle/handlers/check_runtime_state.py
+
+.PHONY: check-protocol
+check-protocol: check-disk-space ## Run the workbay-protocol suite (env-alias/schema/grammar/packaging contracts)
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-protocol"
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest packages/workbay-protocol/tests -q
+
+PYTEST_WORKERS ?= 4
+# Lazy (=) so the probe only runs when a parallel test recipe expands it;
+# auto-serial when the interpreter lacks pytest-xdist (never pass -n 0).
+SYSTEM_XDIST_AVAILABLE = $(shell $(SYSTEM_PYTHON) -c "import xdist" 2>/dev/null && echo 1)
+
+.PHONY: check-system
+check-system: check-disk-space ## Run the workbay-system FAST suite (plugin/skill/Make-target contracts) + scripts/ unit tests, EXCLUDING integration-marked tests (PYTEST_WORKERS, default 4; 0 = serial; auto-serial when xdist missing). Integration tests run via check-system-integration; check-all runs both.
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-system"
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest packages/workbay-system/tests scripts/tests -m "not integration" -q --durations=25 $(if $(and $(filter-out 0,$(PYTEST_WORKERS)),$(SYSTEM_XDIST_AVAILABLE)),-n $(PYTEST_WORKERS),)
+
+.PHONY: check-hooks
+check-hooks: check-disk-space ## Run PreToolUse hook unit tests (root + payload twins as separate invocations)
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-hooks"
+	@# Twins share module basenames with no package marker; combined collection
+	@# emits dozens of spurious name-clash errors. Always run as two invocations.
+	@# Branch-naming publish gate must stay in this standing review target so a
+	@# one-sided refuse-arm flip on either twin is red on every check-hooks run.
+	@WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest -q \
+		scripts/hooks/test_active_task_context.py \
+		scripts/hooks/test_worktree_drift_ambiguity_fallback.py \
+		scripts/hooks/test_check_branch_naming.py \
+		scripts/hooks/test_guard_bash_lifecycle_primitives.py
+	@WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest -q \
+		packages/workbay-system/workbay_system/payload/scripts/hooks/test_active_task_context.py \
+		packages/workbay-system/workbay_system/payload/scripts/hooks/test_worktree_drift_ambiguity_fallback.py \
+		packages/workbay-system/workbay_system/payload/scripts/hooks/test_check_branch_naming.py \
+		packages/workbay-system/workbay_system/payload/scripts/hooks/test_guard_bash_lifecycle_primitives.py
+	@# Collection pin: branch-naming suite must be non-empty on both twins.
+	@root_n=$$(WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest --collect-only -q scripts/hooks/test_check_branch_naming.py 2>/dev/null | grep -c '::' || true); \
+	pay_n=$$(WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest --collect-only -q packages/workbay-system/workbay_system/payload/scripts/hooks/test_check_branch_naming.py 2>/dev/null | grep -c '::' || true); \
+	if [ "$$root_n" -le 0 ] || [ "$$pay_n" -le 0 ]; then \
+		echo "check-hooks: branch-naming collection empty (root=$$root_n payload=$$pay_n)" >&2; \
+		exit 1; \
+	fi; \
+	echo "check-hooks: branch-naming collected root=$$root_n payload=$$pay_n"
+	@# Same pin for the lifecycle-primitives guard suite: a silently empty
+	@# collection on either twin must be red, not green.
+	@root_n=$$(WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest --collect-only -q scripts/hooks/test_guard_bash_lifecycle_primitives.py 2>/dev/null | grep -c '::' || true); \
+	pay_n=$$(WORKBAY_DISABLE_PYTEST_PATH_GUARD=1 PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest --collect-only -q packages/workbay-system/workbay_system/payload/scripts/hooks/test_guard_bash_lifecycle_primitives.py 2>/dev/null | grep -c '::' || true); \
+	if [ "$$root_n" -le 0 ] || [ "$$pay_n" -le 0 ]; then \
+		echo "check-hooks: lifecycle-guard collection empty (root=$$root_n payload=$$pay_n)" >&2; \
+		exit 1; \
+	fi; \
+	echo "check-hooks: lifecycle-guard collected root=$$root_n payload=$$pay_n"
+
+# Read-only by construction: three pytest modules that only enumerate via
+# `git ls-files` and compare bytes. It must NEVER depend on `dogfood-link`,
+# which replaces scripts/hooks with a symlink — that mutated the tree mid-check,
+# deleted ~94 tracked files and dirtied main, and was removed from the check
+# path for exactly that reason. A gate that edits the tree it is auditing
+# cannot report on it.
+.PHONY: check-hook-twin-parity
+check-hook-twin-parity: ## Fail on root<->payload twin drift across the WHOLE hooks/lifecycle trees + remote_agent.sh (read-only; ~4s). Wired into check-all.
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-hook-twin-parity"
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest -q --tb=line \
+		packages/workbay-system/tests/hooks/test_hooks_root_payload_parity_0158.py \
+		packages/workbay-system/tests/test_remote_agent_root_payload_parity.py \
+		packages/workbay-system/tests/test_lifecycle_root_payload_parity.py
+
+.PHONY: check-system-integration
+check-system-integration: check-disk-space ## Run workbay-system integration-marked tests SERIALLY (subprocess make/CLI/uv/scratch-DB heavy; xdist-free to avoid concurrent uv-sync disk peak on 8GB)
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-system-integration"
+	@PYTHONPATH="$(SYSTEM_PYTHONPATH)" $(SYSTEM_PYTHON) -m pytest packages/workbay-system/tests scripts/tests -m integration -q --durations=25
+
+.PHONY: check-workbay
+check-workbay: check-disk-space ## Run the workbay front-door suite (console-script delegation + packaging/privacy)
+	uv run --project packages/workbay --extra dev python -m pytest packages/workbay/tests -q
+
+.PHONY: check-bootstrap
+check-bootstrap: check-disk-space ## Run the workbay-bootstrap suite (CLI/install/overlay/embedding-provision) — mirrors GitHub CI; also usable as a remote-gate TARGET (clean clone avoids local stale-editable skew)
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-bootstrap"
+	@$(SYSTEM_PYTHON) -m pytest packages/workbay-bootstrap/tests -q
+
+.PHONY: check-mcp-pins
+check-mcp-pins: ## Verify managed MCP-server uvx pins agree across both pin sites + the published version
+	python scripts/check_mcp_pin_drift.py
+
+.PHONY: mcp-pins-sync
+mcp-pins-sync: ## Regenerate bootstrap _mcp_pins.py from the canonical mcp_servers.yaml (implementation note)
+	python scripts/mcp_pins.py sync
+
+.PHONY: mcp-pins-check
+mcp-pins-check: ## Fail if bootstrap _mcp_pins.py drifts from the canonical mcp_servers.yaml
+	python scripts/mcp_pins.py check
+
+.PHONY: stack-pins-sync
+stack-pins-sync: ## Regenerate workbay anchor exact pins from sibling pyproject versions
+	python scripts/stack_pins.py sync
+
+.PHONY: stack-pins-check
+stack-pins-check: ## Fail if workbay anchor pins drift from sibling pyproject versions
+	python scripts/stack_pins.py check
+
+.PHONY: version-literal-check
+version-literal-check: ## Fail if a package __init__ hand-copies a __version__ literal instead of deriving it from pyproject
+	python scripts/check_version_literals.py
+
+.PHONY: distribution-url-check
+distribution-url-check: ## Fail if the public repo URL is hardcoded in src or drifts from the workbay_protocol.brand SSOT
+	python scripts/check_distribution_urls.py
+
+.PHONY: distribution-prose-check
+distribution-prose-check: ## Fail if a consumer install doc reintroduces retired PyPI launch grammar (git-only project)
+	python scripts/check_distribution_prose.py
+
+.PHONY: distribution-tag-check
+distribution-tag-check: ## Fail if consumer install docs pin different monorepo tags (stale-tag divergence)
+	python scripts/check_distribution_tag.py
+
+.PHONY: check-release-version-drift
+check-release-version-drift: ## Fail if a publishable package's shipped payload changed since its version was set (no bump). Runs inside `make preflight`.
+	python scripts/check_release_version_drift.py
+
+.PHONY: check-release-tag-provenance
+# PROVENANCE_OFFLINE is a TRUTH knob, not a presence knob. Make's $(if) tests
+# for a NON-EMPTY STRING, so a bare $(if $(PROVENANCE_OFFLINE),...) reads
+# PROVENANCE_OFFLINE=0 and PROVENANCE_OFFLINE=no as "offline" — an operator
+# writing =0 to force the strict ONLINE form would silently get the degraded
+# one. Filter against an explicit truthy set instead: anything outside it
+# (0, no, empty, a typo) takes the STRICTER online form, so a misread knob
+# fails closed. (canon RES-04)
+check-release-tag-provenance: ## Verify the newest release tag is annotated, reachable on the dev origin, and maps to the published distro SHA (RELEASE_TAG=<tag> to pin; PROVENANCE_OFFLINE=1|true|yes skips the distro fetch)
+	python scripts/check_release_tag_provenance.py $(RELEASE_TAG) $(if $(filter 1 true yes,$(PROVENANCE_OFFLINE)),--offline,)
+
+.PHONY: sync-overlay-canon check-overlay-drift
+sync-overlay-canon: ## Derive tracked root docs/workbay twins from payload canon (DRY_RUN=1 reports only)
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "sync-overlay-canon"
+	@$(SYSTEM_PYTHON) scripts/sync_overlay_canon.py $(if $(filter 1 true yes,$(DRY_RUN)),--dry-run,)
+
+check-overlay-drift: ## Fail when root docs/workbay/{contracts,rules,templates} drift from payload canon (git ls-files enumerated; read-only)
+	@# Same interpreter convention as every other gate here: a reaped/absent
+	@# .venv must read as GATE_INTERPRETER_VANISHED (exit 78), not as a bare
+	@# `python` silently resolving to some other stack. The script itself is
+	@# stdlib-only, so it needs no PYTHONPATH.
+	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-overlay-drift"
+	@$(SYSTEM_PYTHON) scripts/check_overlay_drift.py
+
+.PHONY: check-remote
+check-remote: ## Run gate suites on the remote offload host: [TARGETS="check-system test-handoff"] (default host = runbook gate user; override via WORKBAY_REMOTE_GATE_HOST or .workbay/remote-gate.env)
+	@bash scripts/remote_gate.sh run $(TARGETS)
+
+# Reports the gate's verdict to GitHub instead of just to this terminal:
+# one commit status per target, so the gate host stands in for the
+# `test.yml` Actions run. Default TARGETS is the CI-parity set inside the
+# script — pass TARGETS= to gate a subset.
+.PHONY: ci-report
+ci-report: ## Run the remote gate and publish one GitHub commit status per target: [TARGETS="check-system"] [CI_REPORT_FLAGS=--dry-run]
+	@bash scripts/ci_report.sh $(CI_REPORT_FLAGS) $(TARGETS)
+
+.PHONY: offload-flock
+offload-flock: ## Dispatch a grok-remote lane flock from a manifest: MANIFEST=<lanes.tsv> OUT_DIR=<dir> (TSV cols: lane_id kind brief_path branch [schema_path]; kind=review|edit). Passes --schema always (kind defaults materialised into OUT_DIR; optional 5th col overrides), --out for edit lanes only, --result-out always, and reads exit 4 per lane kind.
+	@bash scripts/offload_flock.sh --manifest $(MANIFEST) --out-dir $(OUT_DIR)
+
+.PHONY: handoff-write
+handoff-write: ## Envelope-safe handoff CLI write: ARGS="review-runs --operation record ...". Prints the full envelope unfiltered and exits nonzero on ok:false (the raw CLI exits 0). NOTE: ARGS is word-split, so any argument containing spaces (most --description values) must go through scripts/handoff_write.sh directly.
+	@bash scripts/handoff_write.sh $(ARGS)
+
+# Rollback arm: scripts/restore_lane_status_snapshot.py
+.PHONY: lane-reap
+lane-reap: ## Dry-run conclusive-dead lane reaper (repo-wide). Pass REAP_ARGS="--apply [--reclaim-worktrees] [--task-ref X]" to apply; --apply / --reclaim-worktrees only via REAP_ARGS.
+	.venv/bin/mcp-workbay-orchestrator --workspace-root . lane-reap $(REAP_ARGS)
+
+.PHONY: lane-census
+lane-census: ## Dry-run stale remote-lane census. Pass CENSUS_ARGS="--task-ref X [--apply] [--max-batch N] [--json]" to scope/apply.
+	.venv/bin/mcp-workbay-orchestrator --workspace-root . lane-census $(CENSUS_ARGS)
+
+.PHONY: test-handoff check-handoff
+test-handoff: ## Run mcp-workbay-handoff pytest (PYTEST_TARGETS= overrides default tests/)
+	$(MAKE) -C packages/mcp-workbay-handoff test-handoff
+
+check-handoff: ## Lint + mypy + tests for mcp-workbay-handoff
+	$(MAKE) -C packages/mcp-workbay-handoff check-handoff
+
+# Root passthroughs for the two per-package pytest suites that only exist as
+# sub-makes. `scripts/remote_gate.sh` validates each TARGET against
+# [A-Za-z0-9_.-], so `-C packages/...` cannot be a gate target; without these
+# the remote gate cannot reach the mcp-workbay-orchestrator and
+# workbay-codex-bridge CI jobs. Pytest-only on purpose: these mirror the
+# `test.yml` jobs of the same name, whose lint/mypy half is already covered by
+# `format-check` and `check-all`'s check-orchestrator / check-bridge.
+.PHONY: test-orchestrator test-bridge
+test-orchestrator: ## Run the mcp-workbay-orchestrator pytest suite (CI job parity; no lint/mypy)
+	$(MAKE) -C packages/mcp-workbay-orchestrator test-orchestrator
+
+test-bridge: ## Run the workbay-codex-bridge pytest suite (CI job parity; no lint/mypy)
+	$(MAKE) -C packages/workbay-codex-bridge test-bridge
+
+.PHONY: format-py
+format-py: ## Auto-format the Python packages (ruff fix-lint + format); single source for format-all + format-check
+	$(MAKE) -C packages/mcp-workbay-handoff format-handoff
+	$(MAKE) -C packages/mcp-workbay-orchestrator format-orchestrator
+	$(MAKE) -C packages/workbay-codex-bridge format-bridge
+
+.PHONY: format-all
+format-all: format-py ## Auto-format every package (Python via ruff; canvas-web via eslint when WORKBAY_PROVISION_WEB=1)
+
+.PHONY: format-check
+format-check: ## CI gate: fail if Python lint/format would change any file (read-only ruff check + format --check; does not write)
+	$(MAKE) -C packages/mcp-workbay-handoff lint-handoff
+	$(MAKE) -C packages/mcp-workbay-orchestrator lint-orchestrator
+	$(MAKE) -C packages/workbay-codex-bridge lint-bridge
+	@echo "format-check: OK — Python lint/format check is clean; no format drift."
+
+# `check-all` is the local pre-push gate. It runs the lint+mypy+test suites that
+# resolve cleanly from the worktree's own src/ (PYTHONPATH gates — no editable
+# install, so they survive worktree teardown). Two coverage classes are gated in
+# CI `test.yml` instead, NOT here: the `workbay-bootstrap` full suite
+# (install/adopt/e2e — needs real editable installs) and the `*_sdist_privacy`
+# packaging tests for stack/protocol that resolve published deps. `stack-pins-check`
+# below covers workbay's pin consistency; protocol's non-packaging suite runs
+# via `check-protocol`. Keep this list and the CI job matrix in sync when adding a
+# publishable package so neither gate silently drops it.
+.PHONY: check-all
+.PHONY: brand-check
+brand-check: ## Fail on forbidden prior-brand tokens in tracked source (implementation note D1)
+	@python scripts/check_brand.py
+
+# Monorepo override: the shipped macro (payload/Makefile.d/check.mk) defaults
+# WORKBAY_CHECKALL_ENGINE to the consumer path; point it at the payload engine
+# for this repo's own check-all. Plain := so it wins regardless of include order.
+WORKBAY_CHECKALL_ENGINE := packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py
+
+# RLSE-05 guard: `check-protocol` (below) routes through the
+# $(call workbay_checkall_cache,...) macro from payload/Makefile.d/check.mk,
+# auto-loaded via the `-include ...Makefile.d/*.mk` near the top. GNU make
+# expands an UNDEFINED $(call) to empty, which would silently drop check-protocol
+# from check-all. Fail LOUDLY at parse time if that fragment did not load.
+ifndef WORKBAY_CHECK_MK_LOADED
+$(error payload/Makefile.d/check.mk did not load: $$(call workbay_checkall_cache,...) would expand empty and silently drop check-protocol from check-all)
+endif
+
+# Same class as the check.mk guard: `-include …/Makefile.d/*.mk` is silent
+# when lane-gate.mk is absent, so lane-check disappears and a failing lane
+# is handed off as skipped / merge_ready. Fail at parse time instead.
+ifndef WORKBAY_LANE_GATE_MK_LOADED
+$(error payload/Makefile.d/lane-gate.mk did not load: a silent -include would drop lane-check and hand failing lanes off as skipped/merge_ready)
+endif
+
+check-all: check-disk-space ## Format+lint+mypy+tests for every package; expensive suites stamp-skip when unchanged (CHECK_ALL_FRESH=1 forces full run)
+	$(MAKE) check-runtime-state
+	$(MAKE) check-dev-editables
+	$(MAKE) format-all
+	$(MAKE) brand-check
+	$(MAKE) check-hook-twin-parity
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-handoff --paths packages/mcp-workbay-handoff packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml packages/mcp-workbay-orchestrator/src packages/mcp-workbay-orchestrator/pyproject.toml packages/workbay-codex-bridge/src packages/workbay-codex-bridge/pyproject.toml packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/mcp-workbay-handoff check-handoff
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-orchestrator --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/mcp-workbay-orchestrator packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml packages/mcp-workbay-handoff/src packages/mcp-workbay-handoff/pyproject.toml packages/workbay-codex-bridge/src packages/workbay-codex-bridge/pyproject.toml packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/mcp-workbay-orchestrator check-orchestrator
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-bridge --paths packages/workbay-codex-bridge packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/workbay-codex-bridge check-bridge
+	$(call workbay_checkall_cache,check-protocol,packages/workbay-protocol packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock,$(MAKE) check-protocol)
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-system --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/workbay-system scripts config .claude docs/workbay Makefile pyproject.toml uv.lock packages/mcp-workbay-handoff/src/workbay_handoff_mcp/api.py packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/api.py packages/workbay-protocol/src/workbay_protocol/tool_serving_index.py -- $(MAKE) check-system
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-hooks --paths scripts/hooks packages/workbay-system/workbay_system/payload/scripts/hooks Makefile -- $(MAKE) check-hooks
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-system-integration --paths packages/workbay-system scripts config .claude docs/workbay Makefile pyproject.toml uv.lock -- $(MAKE) check-system-integration
+	python3 packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-workbay --paths packages/workbay Makefile pyproject.toml uv.lock -- $(MAKE) check-workbay
+	$(MAKE) check-overlay-gates
+	$(MAKE) check-overlay-drift
+	$(MAKE) check-mcp-pins
+	$(MAKE) mcp-pins-check
+	$(MAKE) stack-pins-check
+	$(MAKE) export-public-check
+	$(MAKE) check-uvlock-current
+	$(MAKE) check-make-version
+	$(MAKE) version-literal-check
+	$(MAKE) distribution-url-check
+	$(MAKE) distribution-prose-check
+	$(MAKE) distribution-tag-check
+	$(MAKE) check-harness-coherence
+	$(MAKE) check-telemetry-fresh
+	$(MAKE) check-harness-sync
+	$(MAKE) test-contract
+
+# internal: installed hook-surface coherence gate. Fails on any
+# error-severity finding (config naming an unresolvable script; mixed-snapshot
+# hook mounts); warnings (stale clone, hybrid receipt) stay green.
+
+.PHONY: check-telemetry-fresh
+check-telemetry-fresh: ## Fail when agent-errors spool is stale or harvest lags (implementation note / OBS-08)
+	PYTHONPATH=packages/workbay-bootstrap/src:packages/mcp-workbay-handoff/src .venv/bin/python -m workbay_bootstrap doctor --target . --only-telemetry
+
+
+.PHONY: crap-report
+# PATHS is whitespace-separated; paths containing spaces are not supported via PATHS.
+# Use ONE_PATH for a single path that may contain spaces (passed through as one --path).
+crap-report: ## Rank methods by CRAP (advisory). COVERAGE=path [PATHS=whitespace-separated; paths with spaces unsupported] [ONE_PATH=single path, may contain spaces] [THRESHOLD=30] [TOP=50] [JSON_OUT=] [MD_OUT=] [INCLUDE_UNMEASURED=1]
+	@test -n "$(COVERAGE)" || { echo "crap-report: COVERAGE=<coverage.json> is required" >&2; exit 2; }
+	@test -x "$(WORKSPACE_PYTHON)" || { \
+		echo "crap-report: missing $(WORKSPACE_PYTHON) — run from a task worktree after task-start, or set WORKSPACE_PYTHON=" >&2; \
+		exit 2; \
+	}
+	@"$(WORKSPACE_PYTHON)" -c "import radon" 2>/dev/null || { \
+		echo "crap-report: install radon into .venv: uv sync  (or: uv pip install 'radon>=6.0.0')" >&2; \
+		exit 2; \
+	}
+	@"$(WORKSPACE_PYTHON)" packages/workbay-system/scripts/crap_report/cli.py \
+		--coverage "$(COVERAGE)" \
+		--repo-root "$(CURDIR)" \
+		$(if $(PATHS),$(foreach p,$(PATHS),--path "$(p)"),) \
+		$(if $(ONE_PATH),--path "$(ONE_PATH)",) \
+		--threshold $(or $(THRESHOLD),30) \
+		--top $(or $(TOP),50) \
+		$(if $(JSON_OUT),--json-out "$(JSON_OUT)",) \
+		$(if $(MD_OUT),--md-out "$(MD_OUT)",) \
+		$(if $(ALLOW_EMPTY),--allow-empty,) \
+		$(if $(INCLUDE_TESTS),--include-tests,) \
+		$(if $(INCLUDE_UNMEASURED),--include-unmeasured,) \
+		$(if $(SCAN_ALL_PATHS),--scan-all-paths,)
+
+.PHONY: crap-coverage
+crap-coverage: ## Produce coverage.json for CRAP dogfood. [PYTEST_ARGS=packages/workbay-system/tests -q] [COV_SOURCE=packages/workbay-system]
+	@test -x "$(WORKSPACE_PYTHON)" || { \
+		echo "crap-coverage: missing $(WORKSPACE_PYTHON) — activate .venv / task-start first" >&2; \
+		exit 2; \
+	}
+	@"$(WORKSPACE_PYTHON)" -c "import coverage" 2>/dev/null || { \
+		echo "crap-coverage: install coverage into .venv: uv pip install coverage" >&2; \
+		exit 2; \
+	}
+	@rm -f .coverage coverage.json
+	@"$(WORKSPACE_PYTHON)" -m coverage run --branch \
+		--source=$(or $(COV_SOURCE),packages/workbay-system) \
+		-m pytest $(or $(PYTEST_ARGS),packages/workbay-system/tests -q)
+	@"$(WORKSPACE_PYTHON)" -m coverage json -o coverage.json
+	@echo "crap-coverage: wrote coverage.json — next: make crap-report COVERAGE=coverage.json MD_OUT=.task-state/crap.md"
+
+
+.PHONY: check-harness-coherence
+check-harness-coherence: ## Assess installed hook-surface coherence at the repo root
+	# internal: a check MUST be side-effect-free. The former
+	# `ensure-hook-surfaces` prerequisite mutated the tree mid-check (dogfood-link
+	# replaced the tracked scripts/hooks/ dir with a payload symlink, deleting ~94
+	# tracked files and dirtying main). Coherence is an assessment; it passes
+	# without the wiring. Wire surfaces explicitly via `make ensure-hook-surfaces`
+	# / `make ensure-hooks-path` (repair path), never inside a check-* target.
+	uv run --project packages/workbay-bootstrap python -m workbay_bootstrap.coherence $(CURDIR)
+
+.PHONY: check-harness-sync
+check-harness-sync: plugins-build ## Verify rendered harness content matches harness-protocol.yaml
+	uv run --project packages/workbay-system workbay-overlay-tooling check-harness-sync
+
+.PHONY: test-rehearsal check-git-overlay-install check-legacy-overlay-guard check-overlay-gates overlay-install-venv
+test-rehearsal: ## Run the bootstrap install rehearsal test
+	cd packages/workbay-bootstrap && python -m pytest tests/test_bootstrap_install_rehearsal.py -q
+
+# implementation note D3/C: these two gates exercise the git_overlay clone->consumer
+# install path that the worktree-source dogfood never hits. Unlike check-system /
+# test-contract (PYTHONPATH against src/), they need a provisioned interpreter for
+# bootstrap's transitive third-party deps, so they install into
+# $(OVERLAY_EVAL_VENV) (.venv-overlay-eval) and must never touch the shared
+# root .venv. The reinstall runs on EVERY invocation on purpose: hatchling
+# editable installs are copies (no PEP 660), so skipping the reinstall would run
+# the gate against a stale copy and mask source regressions. The recipe is shared
+# (overlay-install-venv) so the install command is defined once.
+# Each gate lists its test files in a variable and verifies every file exists
+# before invoking pytest: pytest exits 0 when handed only missing paths
+# ("no tests ran"), so a renamed/typo'd path would otherwise drop coverage while
+# staying green.
+GIT_OVERLAY_INSTALL_TESTS := \
+	packages/workbay-bootstrap/tests/test_git_overlay_relative_target.py \
+	packages/workbay-bootstrap/tests/test_git_overlay_markerless_claude.py \
+	packages/workbay-bootstrap/tests/test_git_overlay_consumer_install.py \
+	packages/workbay-bootstrap/tests/test_git_overlay_cache_macro.py
+LEGACY_OVERLAY_GUARD_TESTS := \
+	packages/workbay-bootstrap/tests/test_legacy_agentic_overlay_guard.py
+
+# The overlay consumer-install eval installs bootstrap/system as COPIES (no
+# PEP 660). Run it in a dedicated throwaway venv, NOT the shared root .venv:
+# copying into .venv would revert the dev-install src redirects that back the
+# live MCP server, so `make check-all` would end by regressing the very
+# editables check-dev-editables verifies at its top (internal).
+OVERLAY_EVAL_VENV := .venv-overlay-eval
+
+overlay-install-venv:
+	uv venv --clear $(OVERLAY_EVAL_VENV)  # fresh each run: a scratch-install eval must certify from a clean base
+	# Pin transitive deps (e.g. pytest) to the workspace lock so the eval venv
+	# does not float with the index. Constraints file is gitignored.
+	# --no-emit-workspace: workspace members export as unnamed file:// entries,
+	# which uv pip rejects as constraints; only third-party pins are wanted here.
+	uv export --frozen --no-hashes --no-emit-workspace --output-file $(OVERLAY_EVAL_VENV)-constraints.txt
+	uv pip install -q -c $(OVERLAY_EVAL_VENV)-constraints.txt -e 'packages/workbay-bootstrap[dev]' -e packages/workbay-system --python $(OVERLAY_EVAL_VENV)/bin/python
+
+# Aggregate used by check-all: provision the throwaway overlay-eval venv once,
+# then run both gate pytest sets. Standalone targets below keep their own
+# overlay-install-venv dep for direct use.
+check-overlay-gates: overlay-install-venv ## implementation note D3+C: both overlay eval gates (single venv provision)
+	@for f in $(GIT_OVERLAY_INSTALL_TESTS); do \
+		test -f "$$f" || { echo "check-git-overlay-install: missing test file $$f" >&2; exit 1; }; \
+	done
+	$(OVERLAY_EVAL_VENV)/bin/pytest $(GIT_OVERLAY_INSTALL_TESTS) -q
+	@for f in $(LEGACY_OVERLAY_GUARD_TESTS); do \
+		test -f "$$f" || { echo "check-legacy-overlay-guard: missing test file $$f" >&2; exit 1; }; \
+	done
+	$(OVERLAY_EVAL_VENV)/bin/pytest $(LEGACY_OVERLAY_GUARD_TESTS) -q
+
+check-git-overlay-install: overlay-install-venv ## implementation note D3: git_overlay consumer scratch-install eval gate
+	@for f in $(GIT_OVERLAY_INSTALL_TESTS); do \
+		test -f "$$f" || { echo "check-git-overlay-install: missing test file $$f" >&2; exit 1; }; \
+	done
+	$(OVERLAY_EVAL_VENV)/bin/pytest $(GIT_OVERLAY_INSTALL_TESTS) -q
+
+check-legacy-overlay-guard: overlay-install-venv ## implementation note C: legacy agentic-system overlay install refusal gate
+	@for f in $(LEGACY_OVERLAY_GUARD_TESTS); do \
+		test -f "$$f" || { echo "check-legacy-overlay-guard: missing test file $$f" >&2; exit 1; }; \
+	done
+	$(OVERLAY_EVAL_VENV)/bin/pytest $(LEGACY_OVERLAY_GUARD_TESTS) -q
+
+# implementation note S3: the git-hooks surface is the one repo-root path git forces
+# (core.hooksPath cannot live inside packages/). Wire scripts/hooks as a tracked
+# in-tree symlink into the co-located payload so a fresh clone self-wires with no
+# bootstrap, then rewire core.hooksPath. Both steps are idempotent.
+.PHONY: ensure-hooks-path
+ensure-hooks-path: ensure-hook-surfaces ## Wire scripts/hooks + .github/hooks -> payload + rewire core.hooksPath
+	@desired=scripts/hooks/git; \
+	    current=$$(git config --get core.hooksPath 2>/dev/null || true); \
+	    if [ "$$current" != "$$desired" ]; then \
+	        git config core.hooksPath "$$desired"; \
+	        echo "==> core.hooksPath: '$$current' -> '$$desired'"; \
+	    fi
+
+.PHONY: dogfood-link
+dogfood-link: ## (Re)create the tracked repo-root git-hooks symlink into the payload
+	@link=scripts/hooks; \
+	    target=../packages/workbay-system/workbay_system/payload/scripts/hooks; \
+	    if [ "$$(readlink "$$link" 2>/dev/null)" != "$$target" ]; then \
+	        rm -rf "$$link"; \
+	        ln -s "$$target" "$$link"; \
+	        echo "==> linked $$link -> $$target"; \
+	    fi
+
+.PHONY: ensure-github-hooks-link
+ensure-github-hooks-link: ## Symlink .github/hooks into the co-located payload (implementation note)
+	@link=.github/hooks; \
+	    target=../packages/workbay-system/workbay_system/payload/.github/hooks; \
+	    if [ "$$(readlink "$$link" 2>/dev/null)" != "$$target" ]; then \
+	        rm -rf "$$link"; \
+	        mkdir -p .github; \
+	        ln -s "$$target" "$$link"; \
+	        echo "==> linked $$link -> $$target"; \
+	    fi
+
+.PHONY: ensure-hook-surfaces
+ensure-hook-surfaces: dogfood-link ensure-github-hooks-link ## Wire scripts/hooks + .github/hooks to payload
+
+# ----- release --------------------------------------------------------------
+
+# Shared post-bump helper: rewrite of packages/*/pyproject.toml version pins
+# leaves the tracked root uv.lock stale until this runs. Both release-prepare
+# and release-bump-drifted call it so the make surface cannot finish a bump
+# with a dirty lock. scripts/release_prepare.py also regenerates the lock on
+# its write path (same --dry-run guard) so a direct python invocation cannot
+# leave the lock stale. No-op when FLAGS contains --dry-run so previews do
+# not mutate the tree.
+#
+# Error semantics must not rely on .SHELLFLAGS: Apple's GNU Make 3.81 ignores
+# it silently, so chain with && (not bare `;`) and keep the dry-run match
+# whitespace-normalized.
+.PHONY: release-uv-lock
+release-uv-lock: ## Regenerate root uv.lock after a version bump (no-op when FLAGS contains --dry-run)
+	@FLAGS_NORM=$$(printf '%s' '$(FLAGS)' | tr -s '[:space:]' ' '); \
+	case " $$FLAGS_NORM " in \
+	  *" --dry-run "*) echo "release-uv-lock: skipped (FLAGS contains --dry-run)";; \
+	  *) \
+	    uv lock && \
+	    echo "release-uv-lock: regenerated uv.lock — commit it with the version bump";; \
+	esac
+
+.PHONY: release-prepare
+release-prepare: ## Prepare one package release: make release-prepare PKG=<name> BUMP=patch|minor|major|X.Y.Z
+	@test -n "$(PKG)" || { echo "PKG is required (e.g. PKG=workbay-protocol)"; exit 2; }
+	@test -n "$(BUMP)" || { echo "BUMP is required (e.g. BUMP=patch)"; exit 2; }
+	python scripts/release_prepare.py $(PKG) $(BUMP) $(FLAGS)
+	$(MAKE) release-uv-lock FLAGS="$(FLAGS)"
+
+.PHONY: release-bump-drifted
+release-bump-drifted: ## One-shot: bump every drifted git-mirror package (patch) in dependency order, cascade floors, re-sync the workbay anchor pins + bump it. FLAGS=--dry-run to preview.
+	python scripts/release_bump_drifted.py $(FLAGS)
+	$(MAKE) release-uv-lock FLAGS="$(FLAGS)"
+
+.PHONY: release-status
+release-status: ## Show package tag release state (git-only) and the suggested next monorepo tag
+	$(RELEASE) status $(FLAGS)
+
+.PHONY: release-plan
+release-plan: ## Show the computed release plan; pass FLAGS=--json for machine-readable output
+	$(RELEASE) plan $(TAG) $(FLAGS)
+
+.PHONY: check-release-manifest
+check-release-manifest: ## Validate config/release/packages.json package paths and metadata
+	python $(MANIFEST_HELPER) validate
+
+
+.PHONY: export-public-check
+export-public-check: ## Fail if the public export would leak a forbidden token/path (runs the scrub gate in a throwaway tree; ~3s). Wired into check-all + preflight.
+	python scripts/export_public.py --check
+
+.PHONY: check-uvlock-current
+check-uvlock-current: ## Fail if root uv.lock is stale relative to workspace pyprojects (uv lock --check; no write). Wired into check-all + preflight.
+	uv lock --check
+
+# Advisory only: GNU Make < 3.82 ignores .SHELLFLAGS with no warning (Apple
+# ships 3.81). Never fails — a hard gate would break the maintainer host.
+.PHONY: check-make-version
+check-make-version: ## Advisory: warn when GNU Make is older than 3.82 (.SHELLFLAGS ignored); never fails
+	@ver="$(MAKE_VERSION)"; \
+	major=$${ver%%.*}; \
+	rest=$${ver#*.}; \
+	minor=$${rest%%.*}; \
+	if [ "$$major" -lt 3 ] 2>/dev/null || { [ "$$major" -eq 3 ] && [ "$$minor" -lt 82 ]; }; then \
+	  echo "check-make-version: WARNING: GNU Make $$ver is older than 3.82; .SHELLFLAGS is ignored (no -eu/pipefail). Recipes must not rely on .SHELLFLAGS for error semantics." >&2; \
+	else \
+	  echo "check-make-version: GNU Make $$ver supports .SHELLFLAGS (>= 3.82)"; \
+	fi
+
+.PHONY: changelog-ready-check
+changelog-ready-check: ## Fail if a git-mirror package's current-version CHANGELOG entry is missing or a bare TODO stub. Release-time gate (runs inside preflight).
+	python scripts/check_changelog_ready.py $(if $(PKG),--package $(PKG),)
+
+.PHONY: check-consumer-install
+check-consumer-install: ## Replay the documented consumer install against an export tree (implementation note S2); OUT=/path/to/export required
+	@test -n "$(OUT)" || { echo "OUT is required (e.g. OUT=/tmp/workbay-public)"; exit 2; }
+	python scripts/check_consumer_install.py "$(OUT)"
+
+.PHONY: release-public
+release-public: ## Orchestrate the public-release flow (dry-run by default); FLAGS=--execute to push/tag after confirmation, FLAGS=--json for machine-readable output
+	python scripts/release_public.py $(FLAGS)
+
+.PHONY: release-monorepo
+# The provenance line below is the post-push CONFIRMATION step: origin presence
+# and the distro-SHA match are the two facts that cannot exist until after
+# `git push origin`, so they are verified here. The facts that CAN be checked
+# before publication (annotated object, well-formed distro: line) are gated
+# inside release.sh cmd_monorepo, between `git tag -a` and `git push origin` —
+# a violation there aborts the cut instead of being reported once the tag is
+# already on origin and installable. (canon RLSE-02, RLSE-11)
+#
+# PROVENANCE_OFFLINE= is a deliberate CLEARING override, not dead text. Make
+# imports the environment as variables, so an exported PROVENANCE_OFFLINE from
+# the operator's shell would otherwise reach this sub-make and expand
+# `--offline`, skipping BOTH ls-remote checks — the entire point of the gate at
+# release time. A command-line override outranks the environment, so this pins
+# the fatal ONLINE form regardless of the caller's shell. (RLSE-02, RES-04)
+#
+# --dry-run rehearsals create NO tag (release.sh cmd_monorepo has an explicit
+# DRY_RUN branch that tags nothing and returns 0), so running the check would
+# report a violation describing a state the operator deliberately asked for.
+# Echo a typed not-applicable line instead. (canon RLSE-05)
+release-monorepo: ## Cut the consumer-facing monorepo tag: make release-monorepo TAG=v0.1.3
+	@test -n "$(TAG)" || { echo "TAG is required (e.g. TAG=v0.1.3)"; exit 2; }
+	$(RELEASE) monorepo $(TAG) $(FLAGS)
+	@$(if $(findstring --dry-run,$(FLAGS)),echo "release-monorepo: SKIP check-release-tag-provenance -- FLAGS carries --dry-run so no tag was cut and there is nothing to verify",$(MAKE) check-release-tag-provenance RELEASE_TAG=$(TAG) PROVENANCE_OFFLINE=)
+
+
+.PHONY: dry-run-monorepo
+dry-run-monorepo: ## Preview release-monorepo: make dry-run-monorepo TAG=v0.1.3
+	@test -n "$(TAG)" || { echo "TAG is required (e.g. TAG=v0.1.3)"; exit 2; }
+	$(RELEASE) --dry-run monorepo $(TAG) $(FLAGS)
+
+# ----- housekeeping ---------------------------------------------------------
+
+.PHONY: clean
+clean: ## Remove all packages/*/dist build artifacts
+	@for pkg in $(PACKAGES); do rm -rf packages/$$pkg/dist; done
+	@echo "cleaned $(PACKAGES:%=packages/%/dist)"
+
+.PHONY: versions
+versions: ## Print each package's pyproject version
+	@for pkg in $(PACKAGES); do \
+	    v=$$(grep -m1 '^version' packages/$$pkg/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/'); \
+	    printf "  %-26s %s\n" "$$pkg" "$$v"; \
+	done
+
+.PHONY: tags
+tags: ## List release-related tags on origin
+	@git ls-remote --tags origin | awk '{print $$2}' | sed 's|refs/tags/||' | grep -E '^(v[0-9]|.+-v[0-9])' | sort -V
+
+.PHONY: smoke
+smoke: ## One-shot smoke install of the latest monorepo tag into /tmp
+	@latest=$$(git tag -l 'v[0-9]*' | sort -V | tail -1); \
+	test -n "$$latest" || { echo "no v* monorepo tag found"; exit 1; }; \
+	dir=/tmp/workbay-smoke-$$$$-$$(date +%s); \
+	echo "==> smoke testing $$latest in $$dir"; \
+	mkdir -p "$$dir" && cd "$$dir" && git init -q && \
+	R="git+https://github.com/darce/workbay.git@$$latest" && \
+	uvx --no-sources \
+	    --with "$$R#subdirectory=packages/workbay-protocol" \
+	    --with "$$R#subdirectory=packages/workbay-system" \
+	    --from "$$R#subdirectory=packages/workbay-bootstrap" \
+	    workbay-bootstrap install --target "$$dir" --remote-ref "$$latest"
+
+# The dogfood target installs the overlay into a CONSUMER repo. Installing the
+# published mirror overlay (git_overlay) back into the source monorepo is a
+# self-target anti-pattern (source + target + running-env at once) and is
+# refused: validate the published overlay with `make check-git-overlay-install`
+# (hermetic, isolated), or refresh this monorepo's overlay from in-tree source
+# with `make dogfood DOGFOOD_SOURCE=worktree`. See
+# docs/assessments/self-host-dogfood-release-coupling-smell.
+# Auto-stashes any dirty state in the vendored .workbay/remote/ snapshot
+# clone, since that path is bootstrap-managed and not a dev surface.
+# Override the tag with `make dogfood TAG=v0.1.42`.
+# Override the source branch with
+# `make dogfood DOGFOOD_REMOTE_URL=<private-monorepo-remote> DOGFOOD_REF=main`.
+# Install from the git-mirror package delivery path with
+# `make dogfood DOGFOOD_SOURCE=package`. Defaults are git+ specs (no PyPI).
+# Override ref with TAG=/DOGFOOD_REF=/DOGFOOD_PACKAGE_REF=, or full specs with e.g.
+# `DOGFOOD_BOOTSTRAP_SPEC=git+https://github.com/darce/workbay.git@v0.7.3\#subdirectory=packages/workbay-bootstrap`
+# `DOGFOOD_SYSTEM_SPEC=git+https://github.com/darce/workbay.git@v0.7.3\#subdirectory=packages/workbay-system`.
+# Opt into harness Stop adapters (any mode) with e.g.
+# `make dogfood DOGFOOD_INSTALL_FLAGS=--install-claude-stop-hook-local`.
+.PHONY: check-dev-editables dev-install
+check-dev-editables: ## Fail when workspace editables regressed to copy-install (implementation note)
+	@python3 scripts/check_dev_editables_liveness.py --repo $(CURDIR) --venv $(if $(VENV),$(VENV),$(CURDIR)/.venv)
+
+dev-install: ## Replace copy-editables with checkout-local src redirects (implementation note)
+	@$(if $(VENV),$(VENV),$(CURDIR)/.venv)/bin/python scripts/dev_install.py --venv $(if $(VENV),$(VENV),$(CURDIR)/.venv) --repo $(CURDIR) $(if $(DEV_INSTALL_ARGS),$(DEV_INSTALL_ARGS),)
+
+.PHONY: dogfood
+dogfood: ## Install latest/TAG git overlay, package (git-mirror uv specs), or worktree into this repo
+	@source="$(DOGFOOD_SOURCE)"; \
+	if [ "$$source" = "package" ]; then \
+	    bootstrap_spec="$(DOGFOOD_BOOTSTRAP_SPEC)"; \
+	    system_spec="$(DOGFOOD_SYSTEM_SPEC)"; \
+	    uvx_flags="$(DOGFOOD_UVX_FLAGS)"; \
+	    echo "==> dogfood installing package overlay into $(CURDIR)"; \
+	    echo "==> using $$bootstrap_spec with $$system_spec"; \
+	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" \
+	        workbay-bootstrap install --source package --target "$(CURDIR)" $(DOGFOOD_INSTALL_FLAGS) && \
+	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" \
+	        workbay-bootstrap status --target "$(CURDIR)"; \
+	    exit $$?; \
+	fi; \
+	if [ "$$source" = "worktree" ]; then \
+	    echo "==> dogfood installing worktree overlay into $(CURDIR)"; \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap install --source worktree --target "$(CURDIR)" $(DOGFOOD_INSTALL_FLAGS) && \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap status --target "$(CURDIR)"; \
+	    exit $$?; \
+	fi; \
+	if [ "$$source" != "git_overlay" ]; then \
+	    echo "DOGFOOD_SOURCE must be 'git_overlay', 'package', or 'worktree' (got '$$source')" >&2; \
+	    exit 2; \
+	fi; \
+	if [ -z "$(DOGFOOD_ALLOW_SELF_TARGET)" ] && [ -e "$(CURDIR)/packages/workbay-bootstrap/pyproject.toml" ]; then \
+	    echo "refuse: 'make dogfood' (git_overlay) into the source monorepo is a self-target install." >&2; \
+	    echo "  The repo is source + target + running-env at once; installing the published mirror overlay onto it conflates concerns and mutates live state (see docs/assessments/self-host-dogfood-release-coupling-smell)." >&2; \
+	    echo "  Validate the published overlay (hermetic, isolated):  make check-git-overlay-install" >&2; \
+	    echo "  Refresh this monorepo's overlay from in-tree source:  make dogfood DOGFOOD_SOURCE=worktree" >&2; \
+	    echo "  (escape hatch, discouraged: DOGFOOD_ALLOW_SELF_TARGET=1)" >&2; \
+	    exit 2; \
+	fi; \
+	remote_url="$(DOGFOOD_REMOTE_URL)"; \
+	ref="$(DOGFOOD_REF)"; \
+	tag="$(TAG)"; \
+	if [ -n "$$ref" ]; then \
+	    tag="$$ref"; \
+	fi; \
+	if [ -z "$$tag" ]; then \
+	    resolved_remote="$$remote_url"; \
+	    if [ -z "$$resolved_remote" ] && [ -d .workbay/remote/.git ]; then \
+	        resolved_remote=$$(git -C .workbay/remote remote get-url origin 2>/dev/null || true); \
+	    fi; \
+	    if [ -n "$$resolved_remote" ]; then \
+	        tag=$$(git ls-remote --tags --refs "$$resolved_remote" 'v[0-9]*' 2>/dev/null | awk -F/ '{print $$NF}' | sort -V | tail -1); \
+	    fi; \
+	    if [ -z "$$tag" ]; then \
+	        tag=$$(git tag -l 'v[0-9]*' | sort -V | tail -1); \
+	        echo "==> no remote tag resolved; using latest LOCAL monorepo tag $$tag" >&2; \
+	    else \
+	        echo "==> using latest published monorepo tag $$tag (remote $${resolved_remote:-n/a})"; \
+	    fi; \
+	    test -n "$$tag" || { echo "no v* monorepo tag found (remote or local)" >&2; exit 1; }; \
+	fi; \
+	clone=.workbay/remote; \
+	if [ -d "$$clone/.git" ]; then \
+	    if ! git -C "$$clone" diff --quiet || ! git -C "$$clone" diff --cached --quiet; then \
+	        ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	        echo "==> stashing dirty state in $$clone (pre-dogfood-$$tag-$$ts)"; \
+	        git -C "$$clone" stash push -u -m "pre-dogfood-$$tag-$$ts" >/dev/null; \
+	    fi; \
+	fi; \
+	echo "==> dogfood installing $$tag into $(CURDIR)"; \
+	if [ -n "$$remote_url" ]; then \
+	    echo "==> using remote $$remote_url"; \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap install --target "$(CURDIR)" --remote-url "$$remote_url" --remote-ref "$$tag" $(DOGFOOD_INSTALL_FLAGS) && \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap status --target "$(CURDIR)"; \
+	else \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap install --target "$(CURDIR)" --remote-ref "$$tag" $(DOGFOOD_INSTALL_FLAGS) && \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap status --target "$(CURDIR)"; \
+	fi
+
+# >>> WORKBAY_BOOTSTRAP LIFECYCLE INCLUDE >>>
+# Resolve against the judge, never CURDIR. A subject-local Makefile.d/lane-gate.mk
+# must not override the rail that is supposed to be judging it.
+ifeq ($(wildcard $(JUDGE_ROOT)/packages/workbay-system/Makefile.d/*.mk),)
+-include $(JUDGE_ROOT)/Makefile.d/*.mk
+endif
+# <<< WORKBAY_BOOTSTRAP LIFECYCLE INCLUDE <<<

@@ -1,0 +1,313 @@
+{
+  "$defs": {
+    "PartialFinding": {
+      "additionalProperties": false,
+      "description": "Salvaged finding preserved independently of verdict serialization.",
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "severity": {
+          "minLength": 1,
+          "title": "Severity",
+          "type": "string"
+        },
+        "source_offset": {
+          "minimum": 0,
+          "title": "Source Offset",
+          "type": "integer"
+        },
+        "stable_id": {
+          "minLength": 1,
+          "title": "Stable Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stable_id",
+        "severity",
+        "description",
+        "source_offset"
+      ],
+      "title": "PartialFinding",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "verdict": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "terminal_kind": {
+            "const": "verdict"
+          }
+        },
+        "required": [
+          "terminal_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verdict": {
+            "enum": [
+              "pass",
+              "pass_with_findings",
+              "fail"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_kind": {
+            "enum": [
+              "verdict",
+              "unparseable"
+            ]
+          }
+        },
+        "required": [
+          "terminal_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "analysis_ended_at": {
+            "format": "date-time",
+            "not": {
+              "pattern": "[\\r\\n]"
+            },
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          },
+          "finalization_started_at": {
+            "format": "date-time",
+            "not": {
+              "pattern": "[\\r\\n]"
+            },
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "analysis_ended_at",
+          "finalization_started_at"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_kind": {
+            "const": "timeout"
+          }
+        },
+        "required": [
+          "terminal_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "analysis_ended_at": {
+            "format": "date-time",
+            "not": {
+              "pattern": "[\\r\\n]"
+            },
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "analysis_ended_at"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_kind": {
+            "const": "transport_failure"
+          }
+        },
+        "required": [
+          "terminal_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "analysis_ended_at": {
+            "type": "null"
+          },
+          "finalization_started_at": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_kind": {
+            "enum": [
+              "verdict",
+              "timeout",
+              "unparseable"
+            ]
+          }
+        },
+        "required": [
+          "terminal_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "retryable": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "description": "One review attempt against an exact candidate SHA and bounded lens.",
+  "properties": {
+    "analysis_budget_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Analysis Budget Seconds",
+      "type": "integer"
+    },
+    "analysis_ended_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "not": {
+            "pattern": "[\\r\\n]"
+          },
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Analysis Ended At"
+    },
+    "candidate_sha": {
+      "maxLength": 40,
+      "minLength": 40,
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Candidate Sha",
+      "type": "string"
+    },
+    "finalization_budget_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Finalization Budget Seconds",
+      "type": "integer"
+    },
+    "finalization_started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "not": {
+            "pattern": "[\\r\\n]"
+          },
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Finalization Started At"
+    },
+    "finding_fingerprint": {
+      "minLength": 1,
+      "title": "Finding Fingerprint",
+      "type": "string"
+    },
+    "input_bytes": {
+      "exclusiveMinimum": 0,
+      "title": "Input Bytes",
+      "type": "integer"
+    },
+    "input_digest": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Input Digest",
+      "type": "string"
+    },
+    "lens_id": {
+      "minLength": 1,
+      "title": "Lens Id",
+      "type": "string"
+    },
+    "partial_findings": {
+      "items": {
+        "$ref": "#/$defs/PartialFinding"
+      },
+      "title": "Partial Findings",
+      "type": "array"
+    },
+    "retryable": {
+      "default": false,
+      "title": "Retryable",
+      "type": "boolean"
+    },
+    "terminal_kind": {
+      "enum": [
+        "verdict",
+        "timeout",
+        "unparseable",
+        "transport_failure"
+      ],
+      "title": "Terminal Kind",
+      "type": "string"
+    },
+    "verdict": {
+      "anyOf": [
+        {
+          "enum": [
+            "pass",
+            "pass_with_findings",
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Verdict"
+    }
+  },
+  "required": [
+    "candidate_sha",
+    "lens_id",
+    "input_digest",
+    "input_bytes",
+    "finding_fingerprint",
+    "terminal_kind",
+    "analysis_budget_seconds",
+    "finalization_budget_seconds"
+  ],
+  "title": "ReviewAttemptOutcomeV2",
+  "type": "object"
+}
