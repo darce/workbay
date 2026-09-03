@@ -1,0 +1,25 @@
+name: review-parallel
+scope: harness
+description: Use when a branch review benefits from N independent parallel reviewers.
+  Triggers on `/wb-review-slice`, explicit `reviewers_count>=2` requests, or review-coverage
+  targets that require more than one pass over the same diff.
+mode: execution
+context_budget: 150
+makefile_target: null
+mcp_tools:
+- review_findings
+- review_runs
+- record_event
+- get_handoff_state
+- set_handoff_state
+- get_latest_slice_review_packet
+- reconcile_review_findings
+- search_handoff
+- semantic_reinjection_packet
+- materialize_offload_lane_manifest
+- list_available_backends
+- run_structured_turn
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false
