@@ -1,0 +1,234 @@
+{
+  "$defs": {
+    "ContextEntry": {
+      "additionalProperties": false,
+      "description": "One ranked semantic entity in a coordinator-built context packet.",
+      "properties": {
+        "entity_id": {
+          "minLength": 1,
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "entity_kind": {
+          "minLength": 1,
+          "title": "Entity Kind",
+          "type": "string"
+        },
+        "score": {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "title": "Score",
+          "type": "number"
+        },
+        "snippet": {
+          "title": "Snippet",
+          "type": "string"
+        },
+        "task_ref": {
+          "anyOf": [
+            {
+              "description": "Short task identifier, e.g. 'internal' or 'internal'.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Ref"
+        }
+      },
+      "required": [
+        "entity_kind",
+        "entity_id",
+        "score",
+        "snippet"
+      ],
+      "title": "ContextEntry",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "entries": {
+            "minItems": 1
+          },
+          "score_semantics": {
+            "const": "cosine_rank",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entries",
+          "score_semantics"
+        ]
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "unavailable"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "entries": {
+            "maxItems": 0
+          },
+          "reason": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      }
+    }
+  ],
+  "description": "Coordinator-precomputed semantic packet. Workers never load ONNX.",
+  "properties": {
+    "artifact_digest": {
+      "anyOf": [
+        {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifact Digest"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/ContextEntry"
+      },
+      "title": "Entries",
+      "type": "array"
+    },
+    "invocation_mode": {
+      "enum": [
+        "onnx_query",
+        "stored_vector_query",
+        "degraded"
+      ],
+      "title": "Invocation Mode",
+      "type": "string"
+    },
+    "provider_class": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider Class"
+    },
+    "query_model_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Query Model Id"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "score_semantics": {
+      "anyOf": [
+        {
+          "const": "cosine_rank",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Score Semantics"
+    },
+    "server_start_sha": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "minLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Server Start Sha"
+    },
+    "server_started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "not": {
+            "pattern": "[\\r\\n]"
+          },
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Server Started At"
+    },
+    "status": {
+      "enum": [
+        "selected",
+        "unavailable"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "store_model_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Store Model Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "status",
+    "invocation_mode"
+  ],
+  "title": "LaneContextPacket",
+  "type": "object"
+}
