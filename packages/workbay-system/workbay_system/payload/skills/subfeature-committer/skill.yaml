@@ -1,0 +1,12 @@
+name: subfeature-committer
+description: Commit one already-isolated finished slice. Use /commit2git instead when
+  multiple slices need grouping.
+mode: advisory
+context_budget: 120
+makefile_target: null
+mcp_tools: []
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: true

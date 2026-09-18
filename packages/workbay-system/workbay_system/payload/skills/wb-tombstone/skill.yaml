@@ -1,0 +1,12 @@
+name: wb-tombstone
+scope: harness
+description: Shared redirect for retired portable command ids. Echo the invoking
+  tombstone row's description and makefile_target; do not invent per-id branches.
+mode: advisory
+context_budget: 40
+makefile_target: null
+mcp_tools: []
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

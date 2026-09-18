@@ -1,0 +1,15 @@
+name: refactor
+description: Produce a structured refactoring evaluation for a codebase area and sequence
+  the highest-value remediation work.
+mode: advisory
+context_budget: 200
+makefile_target: null
+mcp_tools:
+- review_findings
+- record_event
+- get_handoff_state
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false
