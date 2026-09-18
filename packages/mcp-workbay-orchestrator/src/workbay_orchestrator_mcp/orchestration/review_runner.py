@@ -1,0 +1,1929 @@
+#!/usr/bin/env python3
+"""Self-review runner: build a review prompt, execute Codex, validate findings, optionally record to MCP."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, TypedDict
+
+PACKAGE_SRC = Path(__file__).resolve().parents[2]
+if str(PACKAGE_SRC) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_SRC))
+
+from workbay_orchestrator_mcp.orchestration._env import WORKER_REASONING_EFFORT_CHOICES, apply_backend_runtime_hints
+from workbay_orchestrator_mcp.orchestration.backend_registry import (
+    backend_supports_adapter_timeout_bounds,
+    backend_supports_token_budget_cycle_bounds,
+    get_adapter,
+    get_backend_choices,
+    get_backend_spec,
+    validate_backend,
+)
+from workbay_orchestrator_mcp.orchestration.lane_manifest import get_lane_config
+
+if TYPE_CHECKING:
+    from workbay_handoff_mcp.core import ReviewFindingDetails, WriteActor
+    from workbay_handoff_mcp.enums import ReviewKind, ReviewScopeSource
+    from workbay_handoff_mcp.review_findings import BatchFindingItem
+
+REPO_ROOT = PACKAGE_SRC.parents[2]
+from workbay_orchestrator_mcp._assets import bundled_rules_dir  # noqa: E402
+
+DEFAULT_RULES_DIR = bundled_rules_dir()
+RULES_DIR = DEFAULT_RULES_DIR
+
+BACKEND_CHOICES = get_backend_choices()
+logger = logging.getLogger(__name__)
+
+RELATED_PRIOR_WORK_LIMIT = 5
+RELATED_PRIOR_WORK_SNIPPET_MAX_CHARS = 400
+logger = logging.getLogger(__name__)
+
+# Stack guide selection by file extension
+STACK_GUIDES: dict[str, str] = {
+    ".py": "branch-review-python.md",
+    ".ts": "branch-review-typescript.md",
+    ".tsx": "branch-review-typescript.md",
+    ".js": "branch-review-typescript.md",
+    ".jsx": "branch-review-typescript.md",
+    ".php": "branch-review-php.md",
+}
+
+REVIEW_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["findings", "summary", "result_parse"],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "severity",
+                    "category",
+                    "file_path",
+                    "line_start",
+                    "line_end",
+                    "description",
+                    "fix",
+                ],
+                "properties": {
+                    "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "category": {
+                        "type": "string",
+                        "enum": ["ANTIPATTERN", "DEAD_CODE", "COMPLEXITY", "GAP"],
+                    },
+                    "file_path": {"type": "string"},
+                    "line_start": {"type": ["integer", "null"]},
+                    "line_end": {"type": ["integer", "null"]},
+                    "description": {"type": "string", "minLength": 1},
+                    "fix": {"type": ["string", "null"]},
+                },
+            },
+        },
+        "summary": {"type": "string", "minLength": 1},
+        # implementation note D9: harvest skips any result whose result_parse is not "ok".
+        # Null means "ok" for clean reviews under strict structured outputs.
+        "result_parse": {
+            "type": ["string", "null"],
+            "enum": ["ok", "degraded", None],
+        },
+    },
+}
+
+
+def strict_output_schema_violations(schema: dict[str, Any]) -> list[str]:
+    """Return recursive object-shape violations for a strict output schema."""
+    violations: list[str] = []
+
+    def walk(node: Any, path: tuple[str | int, ...]) -> None:
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, (*path, index))
+            return
+        if not isinstance(node, dict):
+            return
+
+        node_type = node.get("type")
+        is_object = (
+            node_type == "object" or (isinstance(node_type, list) and "object" in node_type) or "properties" in node
+        )
+        location = "$" + "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in path)
+        if is_object:
+            if node.get("additionalProperties") is not False:
+                violations.append(f"{location}: additionalProperties must be false")
+            properties = node.get("properties")
+            required = node.get("required")
+            property_names = set(properties) if isinstance(properties, dict) else set()
+            required_names = set(required) if isinstance(required, list) else set()
+            if not isinstance(properties, dict):
+                violations.append(f"{location}: properties must be an object")
+            if not isinstance(required, list):
+                violations.append(f"{location}: required must be an array")
+            elif property_names != required_names:
+                missing = sorted(property_names - required_names)
+                extra = sorted(required_names - property_names)
+                violations.append(
+                    f"{location}: required must include exactly every properties key (missing={missing}, extra={extra})"
+                )
+
+        for key, child in node.items():
+            walk(child, (*path, key))
+
+    walk(schema, ())
+    return violations
+
+
+def review_result_is_harvestable(result: dict[str, Any] | None) -> bool:
+    """Return True when a review result may enter the findings harvest (D9).
+
+    Accepts review-runner output (top-level ``result_parse``) and worker
+    ``BackendResult.to_dict()`` terminals (``blockers`` /
+    ``raw_payload.result_parse`` / ``raw_payload.result_degraded``).
+    Absent or null ``result_parse`` means ``ok`` for clean reviews.
+    """
+    if not isinstance(result, dict):
+        return False
+    parse = result.get("result_parse")
+    if parse is not None and parse != "ok":
+        return False
+    blockers = result.get("blockers")
+    if isinstance(blockers, list) and "result_unparseable" in blockers:
+        return False
+    raw = result.get("raw_payload")
+    if isinstance(raw, dict):
+        if raw.get("result_degraded") is True:
+            return False
+        raw_parse = raw.get("result_parse")
+        if raw_parse is not None and raw_parse != "ok":
+            return False
+    return True
+
+
+# In-lane smoke review is non-authoritative for grok-cli; unparseable output is an
+# expected backend-capability miss, not an engine error ([OBS-08] typed degradation).
+REVIEW_SKIPPED_UNPARSEABLE = "skipped_unparseable"
+_RAW_TAIL_CHARS = 800
+
+
+class ReviewAdmissionDeferred(RuntimeError):
+    """The review turn was deferred by remote VM admission (retryable).
+
+    Raised when the review backend's result carries the ``admission_deferred``
+    marker (remote_agent.sh exit 75): no review ran, so the payload must not
+    tolerant-degrade to ``skipped_unparseable`` → converged. Callers translate
+    this into the retryable ``admission_deferred`` outcome
+    (``worker_daemon._review_phase`` → ``StopIteration("admission_deferred")``)
+    instead of a terminal review error.
+    """
+
+
+class ReviewTransportFailure(RuntimeError):
+    """A review backend failed before producing a review product."""
+
+    def __init__(self, *, provider_error_code: str, retryable: bool) -> None:
+        self.provider_error_code = provider_error_code
+        self.retryable = retryable
+        super().__init__(
+            f"review transport failure ({provider_error_code}; retryable={str(retryable).lower()}), no review output"
+        )
+
+
+class ReviewNoProduct(RuntimeError):
+    """The review backend returned a typed non-product envelope.
+
+    Raised when exhausted empty salvage is stamped on a non-empty
+    ``needs_guidance`` payload (``salvage_patch_cause=patch_empty`` and
+    ``redispatch_exhausted=true``): no review ran, so the payload must not
+    tolerant-degrade to ``skipped_unparseable`` → converged. Distinct from
+    provider-refusal ``ReviewTransportFailure``.
+    """
+
+
+def _is_exhausted_empty_salvage(raw_result: Any) -> bool:
+    """True when the backend stamped exhausted empty salvage, not a review product.
+
+    Branch on the public cause fields, never on the provider-refusal action.
+    """
+    return (
+        isinstance(raw_result, dict)
+        and raw_result.get("salvage_patch_cause") == "patch_empty"
+        and raw_result.get("redispatch_exhausted") is True
+    )
+
+
+def finding_stable_id(finding: dict[str, Any]) -> str:
+    """Stable identity for a review finding across fix cycles.
+
+    Shared by ``findings_repeated_state`` and ``worker_daemon._finding_stable_id``
+    so both callers use one scheme: severity:category:file_path:line_start.
+    """
+    return (
+        f"{finding.get('severity', '')}:"
+        f"{finding.get('category', '')}:"
+        f"{finding.get('file_path', '')}:"
+        f"{finding.get('line_start', 0)}"
+    )
+
+
+def findings_converged(findings: list[dict[str, Any]]) -> bool:
+    """Return True when findings contain zero HIGH and zero MEDIUM issues.
+
+    LOW findings remain advisory and do not keep the review cycle running.
+    """
+    high = sum(1 for f in findings if f.get("severity") == "high")
+    medium = sum(1 for f in findings if f.get("severity") == "medium")
+    return high == 0 and medium == 0
+
+
+def findings_repeated_state(prev_finding_ids: set[str], findings: list[dict[str, Any]]) -> bool:
+    """Return True when the current finding set is identical to the previous cycle.
+
+    Identical means nothing new appeared and nothing was resolved, using the
+    shared ``finding_stable_id`` scheme. An unparseable review is not a
+    repeated state — callers must not feed ``skipped_unparseable`` into this.
+    """
+    current_ids = {finding_stable_id(f) for f in findings}
+    return current_ids == set(prev_finding_ids)
+
+
+# ---------------------------------------------------------------------------
+# Changed-file discovery
+# ---------------------------------------------------------------------------
+
+
+def _git_stdout(worktree_path: Path, *args: str) -> str | None:
+    """Run a git command in the worktree; return stripped stdout, or None on failure."""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _changed_files(worktree_path: Path) -> list[str]:
+    """Return workspace-relative paths of UNCOMMITTED changes in the lane worktree."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    staged = subprocess.run(
+        ["git", "diff", "--name-only", "--cached"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    files: set[str] = set()
+    for proc in (result, staged, untracked):
+        if proc.returncode == 0:
+            files.update(line.strip() for line in proc.stdout.splitlines() if line.strip())
+    return sorted(files)
+
+
+def _resolve_committed_base(worktree_path: Path) -> tuple[str, str] | None:
+    """Resolve ``(merge_base_sha, base_ref)`` for the lane branch's committed diff.
+
+    Tries ``main`` then ``origin/main`` then ``master``. When those miss (repo
+    whose trunk is not main/master), falls back to the origin default branch via
+    ``refs/remotes/origin/HEAD`` (e.g. ``origin/develop``). Returns None when no
+    base resolves (detached repo without a discoverable base, or git failure).
+    """
+    for base in ("main", "origin/main", "master"):
+        if _git_stdout(worktree_path, "rev-parse", "--verify", "--quiet", base) is None:
+            continue
+        merge_base = _git_stdout(worktree_path, "merge-base", base, "HEAD")
+        if merge_base:
+            return merge_base, base
+    # Trunk is not main/master: use origin's default branch when configured.
+    origin_head = _git_stdout(worktree_path, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
+    if origin_head:
+        merge_base = _git_stdout(worktree_path, "merge-base", origin_head, "HEAD")
+        if merge_base:
+            return merge_base, origin_head
+    return None
+
+
+def _committed_branch_files(worktree_path: Path) -> tuple[list[str], str | None]:
+    """Committed lane scope: files changed on the branch since its base fork point.
+
+    Fallback for a clean worktree where all lane work is already committed —
+    e.g. a ported-back grok-remote commit (WIDTH2-H-01): the review must see
+    the branch's committed file set, not an empty scope.
+    Returns ``(files, base_ref)``; ``([], None)`` when no base resolves.
+    """
+    resolved = _resolve_committed_base(worktree_path)
+    if resolved is None:
+        return [], None
+    merge_base, base = resolved
+    diff = _git_stdout(worktree_path, "diff", "--name-only", merge_base, "HEAD")
+    if diff is None:
+        return [], None
+    files = sorted({line.strip() for line in diff.splitlines() if line.strip()})
+    return files, base
+
+
+def _branch_diff_scope(worktree_path: Path) -> tuple[list[str], str | None]:
+    """Branch-diff scope with committed fallback: ``(changed_files, scope_reason)``.
+
+    Uncommitted changes win (the historical behavior). On a clean worktree the
+    scope falls back to the committed branch diff vs the base fork point so a
+    freshly-committed lane never reviews an empty file set (WIDTH2-H-01).
+    """
+    dirty = _changed_files(worktree_path)
+    if dirty:
+        return dirty, None
+    committed, base = _committed_branch_files(worktree_path)
+    if committed:
+        return committed, f"clean worktree; scope from committed branch diff vs merge-base({base})"
+    return [], None
+
+
+def _assert_recordable_review_scope(
+    *,
+    record_findings: bool,
+    dirty_files: list[str],
+    scope_source: ReviewScopeSource,
+) -> None:
+    """Reject recorded branch-diff reviews that still point at dirty local changes.
+
+    Keyed on the actual UNCOMMITTED set, not the resolved scope: a clean
+    worktree whose scope fell back to the committed branch diff is exactly the
+    committed state findings should map to, so it must record.
+    """
+    if not record_findings:
+        return
+    if scope_source != "branch_diff":
+        return
+    if not dirty_files:
+        return
+    raise RuntimeError(
+        "review_runner.py refuses to record findings for branch_diff scope when the worktree has uncommitted "
+        "changes. Commit or stash the dirty paths first, or rerun with --latest-slice so MCP findings map to "
+        "a committed slice packet instead of the working tree."
+    )
+
+
+def _diff_stat(worktree_path: Path) -> str:
+    """Return a compact diff stat for the lane worktree (unstaged + staged)."""
+    parts: list[str] = []
+    for cmd in (
+        ["git", "diff", "--stat", "HEAD"],
+        ["git", "diff", "--stat", "--cached"],
+    ):
+        result = subprocess.run(
+            cmd,
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts.append(result.stdout.strip())
+    if not parts:
+        # Clean worktree: mirror _branch_diff_scope's committed fallback so the
+        # review prompt still carries a diff stat for a fully-committed lane.
+        resolved = _resolve_committed_base(worktree_path)
+        if resolved is not None:
+            committed_stat = _git_stdout(worktree_path, "diff", "--stat", resolved[0], "HEAD")
+            if committed_stat:
+                parts.append(committed_stat)
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Stack guide auto-detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_stack_guides(changed_files: list[str]) -> list[str]:
+    """Return deduplicated list of stack guide filenames relevant to the changed files."""
+    guides: dict[str, str] = {}
+    for file_path in changed_files:
+        ext = Path(file_path).suffix.lower()
+        guide = STACK_GUIDES.get(ext)
+        if guide and guide not in guides:
+            guides[guide] = guide
+    return list(guides.values())
+
+
+def _resolve_rules_dir(*, orchestrator_root: str | Path | None = None, rules_dir: str | Path | None = None) -> Path:
+    """Resolve the review-rules directory.
+
+    Order: explicit ``rules_dir`` arg > module-level ``RULES_DIR`` override
+    (test/CLI hook) > package-bundled defaults. The legacy
+    ``<orchestrator_root>/docs/workbay/rules`` lookup is no longer
+    consulted: review guides ship with the package itself.
+    """
+    if rules_dir is not None:
+        return Path(rules_dir).expanduser().resolve()
+    if RULES_DIR != DEFAULT_RULES_DIR:
+        return RULES_DIR
+    return RULES_DIR
+
+
+def _read_guide(
+    filename: str, *, orchestrator_root: str | Path | None = None, rules_dir: str | Path | None = None
+) -> str:
+    """Read a review guide file from the rules directory."""
+    guide_path = _resolve_rules_dir(orchestrator_root=orchestrator_root, rules_dir=rules_dir) / filename
+    if not guide_path.is_file():
+        return ""
+    return guide_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering
+# ---------------------------------------------------------------------------
+
+
+class ReviewScope(TypedDict):
+    changed_files: list[str]
+    review_kind: ReviewKind
+    scope_source: ReviewScopeSource
+    scope_reason: str | None
+
+
+def _guide_heading(filename: str) -> str:
+    return Path(filename).stem.replace("-", " ").replace("_", " ").upper()
+
+
+def _lookup_related_prior_work(
+    *,
+    lane_objective: str,
+    changed_files: list[str],
+    task_ref: str | None,
+) -> dict[str, Any] | None:
+    """Return advisory semantic matches, omitting typed empty states.
+
+    Expected import, filesystem, and database availability failures are
+    observable but non-gating. Unexpected failures propagate so programming
+    defects cannot masquerade as an ordinary empty semantic result.
+    """
+    query_parts: list[str] = []
+    objective = lane_objective.strip()
+    if objective:
+        query_parts.append(f"Lane objective: {objective[:1_200]}")
+    if changed_files:
+        bounded_files = [path[:300] for path in changed_files[:50]]
+        query_parts.append("Changed files:\n" + "\n".join(bounded_files))
+    if not query_parts:
+        return None
+
+    try:
+        from workbay_handoff_mcp import api as handoff_api  # noqa: PLC0415
+        from workbay_handoff_mcp.runtime import RuntimeNotConfiguredError  # noqa: PLC0415
+    except ImportError as exc:
+        logger.warning(
+            "prior-work lookup unavailable (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+    try:
+        result = handoff_api.find_related_prior_work(
+            text="\n".join(query_parts),
+            task_ref=task_ref,
+            limit=RELATED_PRIOR_WORK_LIMIT,
+        )
+    except (OSError, RuntimeNotConfiguredError, sqlite3.Error) as exc:
+        logger.warning(
+            "prior-work lookup unavailable (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not isinstance(result, dict) or result.get("status") != "ok_with_results":
+        return None
+    matches = result.get("results")
+    if not isinstance(matches, list) or not matches:
+        return None
+    return result
+
+
+def _render_related_prior_work(prior_work: Mapping[str, Any] | None) -> list[str]:
+    """Render bounded matches without treating empty states as evidence."""
+    if not isinstance(prior_work, Mapping) or prior_work.get("status") != "ok_with_results":
+        return []
+    matches = prior_work.get("results")
+    if not isinstance(matches, list):
+        return []
+
+    rendered: list[str] = []
+    for match in matches[:RELATED_PRIOR_WORK_LIMIT]:
+        if not isinstance(match, Mapping):
+            continue
+        snippet = " ".join(str(match.get("snippet") or "").split())
+        if not snippet:
+            continue
+        snippet = snippet[:RELATED_PRIOR_WORK_SNIPPET_MAX_CHARS]
+        score = match.get("score")
+        score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "?"
+        kind = str(match.get("entity_kind") or "?").strip() or "?"
+        entity_id = str(match.get("entity_id") or "?").strip() or "?"
+        rendered.append(f"- {score_text} {kind} {entity_id}: {snippet}")
+    return rendered
+
+
+def _build_review_prompt(
+    *,
+    changed_files: list[str],
+    diff_stat: str,
+    stack_guides: list[str],
+    main_guide_filename: str = "branch-review-guide.md",
+    lane_id: str | None = None,
+    prior_work: Mapping[str, Any] | None = None,
+    orchestrator_root: str | Path | None = None,
+    rules_dir: str | Path | None = None,
+) -> str:
+    """Assemble the full review prompt from guide content, stack guides, and diff context."""
+    sections: list[str] = []
+
+    sections.append("You are a code reviewer. Review the following lane changes using the checklist below.")
+    sections.append(
+        "Return ONLY a JSON object matching the required output schema. Do not include markdown fences or commentary."
+    )
+
+    if lane_id:
+        sections.append(f"\nLane: {lane_id}")
+
+    prior_work_lines = _render_related_prior_work(prior_work)
+    if prior_work_lines:
+        sections.append("\n--- RELATED HISTORICAL PRIOR WORK ---\n")
+        sections.append(
+            "These rank-only semantic matches are advisory historical context; they do not establish that an issue "
+            "was adjudicated or resolved, or that it is absent from this branch. Use them to understand earlier "
+            "work, but report any defect independently present in the current diff. They must not filter, gate, "
+            "or auto-close any finding you independently identify."
+        )
+        sections.extend(prior_work_lines)
+
+    # Main review guide
+    main_guide = _read_guide(main_guide_filename, orchestrator_root=orchestrator_root, rules_dir=rules_dir)
+    if main_guide:
+        sections.append(f"\n--- {_guide_heading(main_guide_filename)} ---\n")
+        sections.append(main_guide)
+
+    # Stack-specific guides
+    for guide_name in stack_guides:
+        guide_content = _read_guide(guide_name, orchestrator_root=orchestrator_root, rules_dir=rules_dir)
+        if guide_content:
+            sections.append(f"\n--- {_guide_heading(guide_name)} ---\n")
+            sections.append(guide_content)
+
+    # Changed files
+    sections.append("\n--- CHANGED FILES ---\n")
+    if changed_files:
+        for f in changed_files:
+            sections.append(f"- {f}")
+    else:
+        sections.append("(no changed files detected)")
+
+    # Diff stat
+    if diff_stat:
+        sections.append("\n--- DIFF STAT ---\n")
+        sections.append(diff_stat)
+
+    sections.append("\n--- INSTRUCTIONS ---\n")
+    sections.append(
+        "Walk through each checklist item for the changed files above. "
+        "For each issue found, add a finding to the findings array with severity, category, "
+        "file_path, description, and optionally line_start, line_end, and fix. "
+        "If no issues are found, return an empty findings array with a summary noting the review was clean."
+    )
+
+    return "\n".join(sections)
+
+
+def _resolve_review_scope(
+    *,
+    worktree_path: Path,
+    task_ref: str | None,
+    orchestrator_root: Path | None,
+    review_kind: ReviewKind | str | None,
+    use_latest_slice: bool,
+) -> ReviewScope:
+    from workbay_handoff_mcp.enums import ReviewKind, ReviewScopeSource  # noqa: PLC0415
+
+    preferred_review_kind = ReviewKind(review_kind) if review_kind is not None else ReviewKind.BRANCH
+    if use_latest_slice and task_ref and orchestrator_root is not None:
+        from workbay_handoff_mcp import RuntimeConfig, configure_runtime  # noqa: PLC0415
+
+        from workbay_orchestrator_mcp.lanes import get_latest_slice_review_packet  # noqa: PLC0415
+
+        runtime = RuntimeConfig.for_repo(orchestrator_root)
+        configure_runtime(runtime)
+        payload = _load_mcp_payload(
+            get_latest_slice_review_packet(
+                task_ref=task_ref,
+                review_kind=preferred_review_kind.value,
+            )
+        )
+        if payload.get("ok"):
+            packet = payload["packet"]
+            return {
+                "changed_files": list(packet.get("changed_files") or []),
+                "review_kind": ReviewKind(str(packet.get("review_kind") or ReviewKind.BRANCH.value)),
+                "scope_source": ReviewScopeSource(
+                    str(packet.get("scope_source") or ReviewScopeSource.SLICE_PACKET.value)
+                ),
+                "scope_reason": None,
+            }
+        fallback_files, fallback_reason = _branch_diff_scope(worktree_path)
+        packet_reason = str(payload.get("error") or "latest slice packet lookup failed")
+        return {
+            "changed_files": fallback_files,
+            "review_kind": preferred_review_kind,
+            "scope_source": ReviewScopeSource.BRANCH_DIFF,
+            "scope_reason": f"{packet_reason}; {fallback_reason}" if fallback_reason else packet_reason,
+        }
+
+    branch_files, branch_reason = _branch_diff_scope(worktree_path)
+    return {
+        "changed_files": branch_files,
+        "review_kind": preferred_review_kind,
+        "scope_source": ReviewScopeSource.BRANCH_DIFF,
+        "scope_reason": branch_reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Finding ID generation
+# ---------------------------------------------------------------------------
+
+
+def _generate_finding_id(lane_id: str | None, index: int, finding: dict[str, Any]) -> str:
+    """Return PREFIX-lanehash-S-contenthash; index is ignored for compatibility.
+
+    Lane normalization preserves punctuation; content uses stripped category/path,
+    the line number, and whitespace-collapsed lowercase description. Report order
+    and operation tokens never enter the key. Recording adds duplicate suffixes.
+    """
+    lane = (lane_id or "review").strip().lower()
+    prefix = lane.upper().replace("-", "")[:6]
+    lane_key = hashlib.sha256(lane.encode()).hexdigest()[:16]
+    content = [
+        str(finding.get("category") or "").strip().lower(),
+        str(finding.get("file_path") or "").strip(),
+        finding.get("line_start"),
+        " ".join(str(finding.get("description") or "").lower().split()),
+    ]
+    content_key = hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[
+        :24
+    ]
+    severity_char = {"high": "H", "medium": "M", "low": "L"}.get(str(finding.get("severity", "")).strip().lower(), "X")
+    return f"{prefix}-{lane_key}-{severity_char}-{content_key}"
+
+
+# ---------------------------------------------------------------------------
+# Codex execution
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Result validation
+# ---------------------------------------------------------------------------
+
+
+def _load_mcp_payload(payload: dict[str, Any] | str | bytes | bytearray) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    loaded = json.loads(payload)
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Expected MCP payload object, got {type(loaded).__name__}.")
+    return loaded
+
+
+def _raw_tail(result: Any, *, max_chars: int = _RAW_TAIL_CHARS) -> str:
+    """Bounded tail of a review payload for typed degrade diagnostics ([OBS-04])."""
+    if isinstance(result, dict):
+        try:
+            text = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = str(result)
+    else:
+        text = str(result)
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _unparseable_review_result(result: Any, *, reason: str) -> dict[str, Any]:
+    """Typed degrade for unparseable smoke-review output ([OBS-08], [OBS-04], D9)."""
+    harvested = _findings_from_blockers(result)
+    if harvested:
+        summary = "Smoke review unparseable; salvaged reviewer blockers as findings."
+        if isinstance(result, dict):
+            original = result.get("summary")
+            if isinstance(original, str) and original.strip():
+                summary = original
+        return {
+            "findings": harvested,
+            "summary": summary,
+            "raw_tail": _raw_tail(result),
+            "result_parse": "ok",
+        }
+    return {
+        "review": REVIEW_SKIPPED_UNPARSEABLE,
+        "findings": [],
+        "summary": f"Smoke review unparseable ({reason}); non-authoritative degrade.",
+        "raw_tail": _raw_tail(result),
+        # implementation note D9: empty findings + result_parse=degraded is not a clean review.
+        "result_parse": "degraded",
+    }
+
+
+# Engine-generated blockers are control markers, not reviewer defects.
+_BLOCKER_CONTROL_TOKENS = frozenset({"result_unparseable", "admission_deferred"})
+_BLOCKER_CONTROL_PREFIXES = frozenset({"Review did not converge after"})
+_BLOCKER_SEVERITY_RE = re.compile(r"\b(HIGH|MEDIUM|LOW)\b", re.IGNORECASE)
+_BLOCKER_FILE_PATH_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+")
+
+
+def _findings_from_blockers(result: Any) -> list[dict[str, Any]]:
+    """Salvage schema-valid findings from a handoff-shaped ``blockers`` list.
+
+    Used only on the tolerant missing-findings path. Unlabelled reviewer
+    blockers default to high so the harvest fails closed ([SECD-05]).
+    """
+    if not isinstance(result, dict):
+        return []
+    blockers = result.get("blockers")
+    if not isinstance(blockers, list) or not blockers:
+        return []
+    findings: list[dict[str, Any]] = []
+    for item in blockers:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        if text in _BLOCKER_CONTROL_TOKENS or any(text.startswith(prefix) for prefix in _BLOCKER_CONTROL_PREFIXES):
+            continue
+        severity_match = _BLOCKER_SEVERITY_RE.search(text)
+        severity = severity_match.group(1).lower() if severity_match else "high"
+        path_match = _BLOCKER_FILE_PATH_RE.search(text)
+        findings.append(
+            {
+                "severity": severity,
+                "category": "GAP",
+                "file_path": path_match.group(0) if path_match else "unknown",
+                "description": item,
+                "finding_source": "blockers",
+            }
+        )
+    return findings
+
+
+def _finding_field_error(finding: Any, index: int) -> str | None:
+    """Return a per-finding validation error, or None when the item is well-formed."""
+    valid_severities = {"high", "medium", "low"}
+    valid_categories = {"ANTIPATTERN", "DEAD_CODE", "COMPLEXITY", "GAP"}
+    if not isinstance(finding, dict):
+        return f"Finding [{index}] is not an object."
+    for required in ("severity", "category", "file_path", "description"):
+        if required not in finding:
+            return f"Finding [{index}] missing required field '{required}'."
+    severity = str(finding["severity"]).lower()
+    if severity not in valid_severities:
+        return f"Finding [{index}] has invalid severity '{finding['severity']}'. Valid: {sorted(valid_severities)}"
+    if finding["category"] not in valid_categories:
+        return f"Finding [{index}] has invalid category '{finding['category']}'. Valid: {sorted(valid_categories)}"
+    if not isinstance(finding["description"], str) or not finding["description"].strip():
+        return f"Finding [{index}] has empty description."
+    return None
+
+
+def _validate_review_result(result: Any, *, tolerant: bool = False) -> dict[str, Any]:
+    """Validate the review result against the expected schema shape.
+
+    When ``tolerant`` is True (grok-family smoke review):
+    - Only a **non-empty** object that fails review-schema parsing degrades to
+      typed ``skipped_unparseable`` ([OBS-08]). Empty/missing ``raw_payload`` is a
+      transport failure (VM unreachable, exit-78/3, etc.) and raises exactly like
+      the strict path so blockers/handoff_action are not masked as converged
+      (0144 R3 / HIGH-2).
+    - When the findings key is present as a list, salvage well-formed items and
+      drop invalid ones with a note in ``raw_tail`` ([OBS-04]).
+    Codex / non-tolerant paths stay strict (any field error raises).
+    """
+    # Empty/missing payload = transport failure: never tolerant-degrade.
+    # Strict-path failure shape (mirror RuntimeError messages below).
+    if result is None:
+        raise RuntimeError(f"Review result must be an object, got {type(result).__name__}.")
+    if isinstance(result, dict) and not result:
+        raise RuntimeError("Review result missing required 'findings' key.")
+
+    try:
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Review result must be an object, got {type(result).__name__}.")
+        if "summary" not in result:
+            raise RuntimeError("Review result missing required 'summary' key.")
+        if "findings" not in result:
+            if not tolerant:
+                raise RuntimeError("Review result missing required 'findings' key.")
+            out = dict(result)
+            harvested = _findings_from_blockers(result)
+            out["raw_tail"] = _raw_tail(result)
+            if harvested:
+                out["findings"] = harvested
+                out["result_parse"] = "ok"
+                out.pop("blockers", None)
+                return out
+            out["findings"] = []
+            out["_missing_findings_key"] = True
+            return out
+        findings = result.get("findings")
+        if not isinstance(findings, list):
+            raise RuntimeError("Review result 'findings' must be an array.")
+        if not isinstance(result["summary"], str) or not result["summary"].strip():
+            raise RuntimeError("Review result 'summary' must be a non-empty string.")
+
+        salvaged: list[Any] = []
+        dropped: list[str] = []
+        for i, finding in enumerate(findings):
+            err = _finding_field_error(finding, i)
+            if err is None:
+                normalized = dict(finding)
+                normalized["severity"] = str(finding["severity"]).lower()
+                salvaged.append(normalized)
+                continue
+            if not tolerant:
+                raise RuntimeError(err)
+            dropped.append(err)
+
+        if not dropped:
+            out = dict(result)
+            out["findings"] = salvaged
+            return out
+
+        # Tolerant salvage: keep valid findings; note drops in raw_tail ([OBS-04]).
+        # S1-A-01: the note is bounded via _raw_tail/_RAW_TAIL_CHARS — a large
+        # malformed findings array would otherwise inflate raw_tail without limit
+        # (50KB+ observed); the drop COUNT survives ahead of the capped detail.
+        out = dict(result)
+        out["findings"] = salvaged
+        note = f"dropped {len(dropped)} invalid finding(s): {_raw_tail('; '.join(dropped))}"
+        prior_tail = out.get("raw_tail")
+        if isinstance(prior_tail, str) and prior_tail.strip():
+            out["raw_tail"] = f"{_raw_tail(prior_tail)}\n{note}"
+        else:
+            out["raw_tail"] = note
+        return out
+    except RuntimeError as exc:
+        if tolerant:
+            return _unparseable_review_result(result, reason=str(exc))
+        raise
+
+
+# ---------------------------------------------------------------------------
+# MCP recording
+# ---------------------------------------------------------------------------
+
+
+class FindingsPersistResult(TypedDict):
+    legacy_reconciliation: Literal["reconciled", "none", "unknown"]
+    legacy_cause: str | None
+    recorded_ids: list[str]
+    unrecorded_ids: list[str]
+    unrecorded_findings: list[dict[str, Any]]
+    causes: dict[str, str]
+
+
+_TERMINAL_ID_COLLISION_NEEDLE = "is terminal (status="
+_TERMINAL_ID_COLLISION_HINT = "Use a new finding_id."
+_TERMINAL_ID_REKEY_START = 2
+_TERMINAL_ID_REKEY_MAX_ATTEMPTS = 8
+_REKEY_DESCRIPTION_TEMPLATE = "[re-keyed from {original_id}: terminal id collision] "
+
+
+def _is_terminal_finding_id_collision(cause: str) -> bool:
+    text = str(cause)
+    return _TERMINAL_ID_COLLISION_NEEDLE in text and _TERMINAL_ID_COLLISION_HINT in text
+
+
+def _rekeyed_finding_id(original_id: str, attempt: int) -> str:
+    return f"{original_id}-R{attempt}"
+
+
+def _rekeyed_description(original_id: str, description: str) -> str:
+    prefix = _REKEY_DESCRIPTION_TEMPLATE.format(original_id=original_id)
+    if str(description).startswith(prefix):
+        return str(description)
+    return prefix + str(description)
+
+
+class FindingsPersistError(RuntimeError):
+    """No writes acknowledged; retain reconciliation evidence for rescue."""
+
+    def __init__(self, message: str, persist: FindingsPersistResult):
+        super().__init__(message)
+        self.persist = persist
+
+
+class LegacyFindingAmbiguityWarning(UserWarning):
+    """Multiple positional rows match a content-addressed finding."""
+
+
+class LegacyFindingLaneWarning(UserWarning):
+    """A positional match has missing or conflicting lane attribution."""
+
+
+def _persist_result(
+    recorded_ids: list[str],
+    *,
+    unrecorded_ids: list[str] | None = None,
+    unrecorded_findings: list[dict[str, Any]] | None = None,
+    causes: dict[str, str] | None = None,
+    legacy_reconciliation: Literal["reconciled", "none", "unknown"] = "none",
+) -> FindingsPersistResult:
+    return {
+        "legacy_reconciliation": legacy_reconciliation,
+        "legacy_cause": (causes or {}).get("legacy_reconciliation"),
+        "recorded_ids": list(recorded_ids),
+        "unrecorded_ids": list(unrecorded_ids or []),
+        "unrecorded_findings": list(unrecorded_findings or []),
+        "causes": dict(causes or {}),
+    }
+
+
+def _persist_shortfall_block(source: Any) -> dict[str, Any]:
+    """Copy recorded/unrecorded ids, verbatim refused bodies, and causes.
+
+    Accepts a structured persist result or ``FindingsPersistError`` (REF-26).
+    Consumers (harvest exception/partial/salvage and ``run_review``) must not
+    pick a subset of these keys — a refused body has to stay nameable (OBS-08).
+    """
+    persist = source.persist if isinstance(source, FindingsPersistError) else source
+    if not isinstance(persist, Mapping):
+        persist = {}
+    findings = persist.get("unrecorded_findings") or []
+    return {
+        "recorded_ids": list(persist.get("recorded_ids") or []),
+        "unrecorded_ids": list(persist.get("unrecorded_ids") or []),
+        "unrecorded_findings": [dict(item) for item in findings if isinstance(item, Mapping)],
+        "causes": dict(persist.get("causes") or {}),
+    }
+
+
+def _record_findings(
+    findings: list[dict[str, Any]],
+    *,
+    task_ref: str,
+    session: str,
+    lane_id: str | None = None,
+    orchestrator_root: Path,
+    reconcile_committed: bool = False,
+    operation_token: str | None = None,
+) -> FindingsPersistResult:
+    """Record each finding into MCP, salvaging failed batches row by row.
+
+    Returns recorded/unrecorded ids after salvage. Raises only when zero rows
+    landed — a subset write is a persist result, not an exception.
+
+    A per-row persist ``ok`` is commit-ok: the writer committed that row on
+    this connection. It is not crash-durable; WAL ``synchronous=NORMAL`` can
+    still lose a committed row across a host crash before the next checkpoint.
+    """
+
+    from workbay_handoff_mcp import RuntimeConfig, batch_record_review_findings, configure_runtime
+
+    runtime = RuntimeConfig.for_repo(orchestrator_root)
+    configure_runtime(runtime)
+
+    import sqlite3
+
+    from workbay_handoff_mcp import list_review_findings
+    from workbay_handoff_mcp.runtime import RuntimeNotConfiguredError
+
+    legacy_rows = []
+    offset = 0
+    legacy_cause = None
+    # A fresh state has no positional rows; let the writer initialize it.
+    while findings and (runtime.db_path.exists() or reconcile_committed):
+        try:
+            response = _load_mcp_payload(
+                list_review_findings(
+                    task_ref=task_ref,
+                    status="all",
+                    limit=500,
+                    offset=offset,
+                )
+            )
+        except (sqlite3.Error, RuntimeNotConfiguredError) as exc:
+            legacy_cause = f"{type(exc).__name__}: {exc}"[:500]
+            break
+        data = response.get("data") or {}
+        if not response.get("ok"):
+            if data.get("error") == "Finding not found for task.":
+                break
+            legacy_cause = str(data.get("error") or response.get("error") or "legacy read returned non-ok")
+            break
+        rows = data.get("findings")
+        if not isinstance(rows, list):
+            legacy_cause = "legacy finding reconciliation invalid"
+            break
+        legacy_rows.extend(rows)
+        if not data.get("has_more"):
+            break
+        if not rows:
+            legacy_cause = "legacy finding reconciliation pagination stalled"
+            break
+        offset += len(rows)
+    snapshot_state: Literal["none", "ok", "unknown"] = "unknown" if legacy_cause else "ok" if legacy_rows else "none"
+    if legacy_cause:
+        legacy_cause = legacy_cause[:500]
+        # DATA-03 / CARD-03: an unavailable compatibility snapshot must not
+        # block writes or masquerade as proof that no legacy rows exist.
+        legacy_rows = []
+        logger.warning(
+            "legacy_reconciliation=unknown (task_ref=%s session=%s lane_id=%s): %s",
+            task_ref,
+            session,
+            lane_id,
+            legacy_cause,
+        )
+    legacy_ids: set[str] = set()
+
+    def persist_result(
+        recorded_ids: list[str],
+        *,
+        unrecorded_ids: list[str] | None = None,
+        unrecorded_findings: list[dict[str, Any]] | None = None,
+        causes: dict[str, str] | None = None,
+    ) -> FindingsPersistResult:
+        return _persist_result(
+            recorded_ids,
+            unrecorded_ids=unrecorded_ids,
+            unrecorded_findings=unrecorded_findings,
+            causes={**(causes or {}), **({"legacy_reconciliation": legacy_cause} if legacy_cause else {})},
+            legacy_reconciliation=("unknown" if legacy_cause else "reconciled" if legacy_ids else "none"),
+        )
+
+    actor: WriteActor = {}
+    if lane_id:
+        actor["lane_id"] = lane_id
+
+    batch_items: list[BatchFindingItem] = []
+    recorded_ids: list[str] = []
+    original_findings_by_id: dict[str, dict[str, Any]] = {}
+    occurrences: dict[str, int] = {}
+    # Canonical order also assigns duplicate ordinals consistently when ancillary
+    # fields (such as a suggested fix) differ but the finding identity is equal.
+    ordered = sorted(
+        findings, key=lambda f: (_generate_finding_id(lane_id, 0, f), json.dumps(f, sort_keys=True, ensure_ascii=False))
+    )
+    for finding in ordered:
+        base_id = _generate_finding_id(lane_id, 0, finding)
+        occurrences[base_id] = occurrences.get(base_id, 0) + 1
+        ordinal = occurrences[base_id]
+        finding_id = base_id if ordinal == 1 else f"{base_id}-{ordinal}"
+        prefix, _, severity, _ = base_id.split("-", 3)
+        candidates = [
+            row
+            for row in legacy_rows
+            if re.fullmatch(rf"{re.escape(prefix)}-{severity}-[0-9]+", str(row.get("finding_id") or ""))
+            and str(row.get("file_path") or "").strip() == str(finding.get("file_path") or "").strip()
+            and row.get("line_start") == finding.get("line_start")
+            and " ".join(str(row.get("description") or "").lower().split())
+            == " ".join(
+                f"[{str(finding.get('category') or '').strip()}] {finding.get('description') or ''}".lower().split()
+            )
+        ]
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            stored_lane = candidate.get("lane_id")
+            # Lane-less historical rows may alias only as the sole content
+            # match in this task. A truncated prefix is never lane identity.
+            lane_less = stored_lane in (None, "")
+            if lane_less or not lane_id or stored_lane != lane_id:
+                import warnings
+
+                warnings.warn(
+                    f"Legacy finding {candidate['finding_id']} has lane_id={stored_lane!r}; "
+                    f"replay lane_id={lane_id!r}: "
+                    + ("aliasing sole lane-less content match" if lane_less else "keeping separate hashed finding"),
+                    LegacyFindingLaneWarning,
+                    stacklevel=2,
+                )
+            if (lane_less or (lane_id and stored_lane == lane_id)) and candidate["finding_id"] not in legacy_ids:
+                # Keep the original row intact, including all lifecycle metadata.
+                # Each positional row can alias only one occurrence per report.
+                finding_id = candidate["finding_id"]
+                legacy_ids.add(finding_id)
+        elif len(candidates) > 1:
+            import warnings
+
+            warnings.warn(
+                f"Ambiguous legacy finding {base_id}: " + ", ".join(sorted(row["finding_id"] for row in candidates)),
+                LegacyFindingAmbiguityWarning,
+                stacklevel=2,
+            )
+        recorded_ids.append(finding_id)
+        original_findings_by_id[finding_id] = dict(finding)
+
+        details: ReviewFindingDetails = {}
+        if "line_start" in finding and isinstance(finding["line_start"], int):
+            details["line_start"] = finding["line_start"]
+        if "line_end" in finding and isinstance(finding["line_end"], int):
+            details["line_end"] = finding["line_end"]
+        if "fix" in finding and isinstance(finding["fix"], str):
+            details["fix"] = finding["fix"]
+
+        batch_items.append(
+            {
+                "finding_id": finding_id,
+                "severity": finding["severity"],
+                "file_path": finding["file_path"],
+                "description": f"[{finding['category']}] {finding['description']}",
+                "details": details if details else None,
+            }
+        )
+
+    def record(items: list[BatchFindingItem]) -> dict[str, Any]:
+        acknowledged = [{"finding_id": item["finding_id"]} for item in items if item["finding_id"] in legacy_ids]
+        items = [item for item in items if item["finding_id"] not in legacy_ids]
+        pending = []
+        if reconcile_committed and snapshot_state == "ok":
+            # All statuses came from the single complete snapshot. An unknown
+            # snapshot skips replay and lets the idempotent writer persist IDs.
+            for item in items:
+                rows = [row for row in legacy_rows if row.get("finding_id") == item["finding_id"]]
+                if any(
+                    row.get("finding_id") == item["finding_id"]
+                    and (
+                        (operation_token or row.get("session") == session)
+                        and all(row.get(key) == item[key] for key in ("severity", "file_path", "description"))
+                    )
+                    for row in rows
+                ):
+                    acknowledged.append({"finding_id": item["finding_id"]})
+                else:
+                    pending.append(item)
+                    if rows and not operation_token:
+                        # Legacy receipts lack an operation token. An
+                        # existing row with changed attribution is ambiguous;
+                        # do not reopen it in an attempt to reconcile history.
+                        raise RuntimeError("review replay legacy finding identity mismatch")
+        else:
+            pending = items
+        if not pending:
+            return {"ok": True, "data": {"written": len(acknowledged), "results": acknowledged}}
+        response = _load_mcp_payload(
+            batch_record_review_findings(
+                session=session,
+                findings=pending,
+                actor=actor if actor else None,
+                task_ref=task_ref,
+            )
+        )
+        if acknowledged and response.get("ok"):
+            data = response.get("data") or {}
+            data["results"] = list(data.get("results") or []) + acknowledged
+            data["written"] = int(data.get("written") or 0) + len(acknowledged)
+            response["data"] = data
+        return response
+
+    def failure_cause(result: dict[str, Any] | Exception) -> str:
+        if isinstance(result, Exception):
+            return f"{type(result).__name__}: {result}"
+        error = result.get("error")
+        data = result.get("data")
+        if error is None and isinstance(data, dict):
+            error = data.get("error")
+        if error is not None and str(error).strip():
+            return str(error)
+        returned = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+        return f"response omitted 'error'; returned payload={returned}"
+
+    def envelope_data(result: dict[str, Any]) -> dict[str, Any]:
+        data = result.get("data")
+        return data if isinstance(data, dict) else {}
+
+    def acknowledged_count(data: dict[str, Any]) -> int | None:
+        for key in ("written", "findings_recorded_count"):
+            value = data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    def acknowledged_ids(result: dict[str, Any], expected_ids: list[str]) -> list[str]:
+        """Ids a claimed-ok receipt actually persisted.
+
+        Top-level ``ok`` is not enough. ``data.written`` (or
+        ``data.findings_recorded_count``) must be present and compared with
+        the submitted batch, and ``data.results`` must name those ids. A
+        missing count is unproven, not agreement.
+        """
+        if not result.get("ok"):
+            return []
+        expected = list(expected_ids)
+        data = envelope_data(result)
+        written = acknowledged_count(data)
+        results = data.get("results")
+        matched: list[str] = []
+        if isinstance(results, list):
+            seen: set[str] = set()
+            expected_set = set(expected)
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                finding_id = item.get("finding_id")
+                if isinstance(finding_id, str) and finding_id in expected_set and finding_id not in seen:
+                    seen.add(finding_id)
+                    matched.append(finding_id)
+        if written is None:
+            return []
+        if written != len(expected):
+            return matched
+        if not isinstance(results, list):
+            return []
+        if set(matched) != set(expected):
+            return matched
+        return list(expected)
+
+    def persist_receipt_ok(result: dict[str, Any] | Exception, expected_ids: list[str]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        acknowledged = acknowledged_ids(result, expected_ids)
+        return len(acknowledged) == len(expected_ids) and set(acknowledged) == set(expected_ids)
+
+    def receipt_cause(result: dict[str, Any] | Exception, expected_ids: list[str]) -> str:
+        if persist_receipt_ok(result, expected_ids):
+            return failure_cause(result)
+        if isinstance(result, dict) and result.get("ok"):
+            data = envelope_data(result)
+            acknowledged = acknowledged_ids(result, expected_ids)
+            unconfirmed = [finding_id for finding_id in expected_ids if finding_id not in acknowledged]
+            return (
+                "claimed-ok persist receipt did not acknowledge "
+                f"{len(expected_ids)} row(s): submitted={len(expected_ids)} "
+                f"acknowledged={len(acknowledged)} unconfirmed={unconfirmed!r} "
+                f"data.written={data.get('written')!r} "
+                f"results={data.get('results')!r}"
+            )
+        return failure_cause(result)
+
+    try:
+        batch_result: dict[str, Any] | Exception = record(batch_items)
+    except Exception as exc:
+        batch_result = exc
+    if persist_receipt_ok(batch_result, recorded_ids):
+        return persist_result(recorded_ids)
+
+    # A claimed-ok receipt that names a proper subset is already the
+    # acknowledgement. Publish only those ids; do not re-interpret the same
+    # envelope as per-row success and do not raise past the caller.
+    if isinstance(batch_result, dict) and batch_result.get("ok"):
+        acknowledged = acknowledged_ids(batch_result, recorded_ids)
+        if acknowledged:
+            unrecorded_ids = [finding_id for finding_id in recorded_ids if finding_id not in acknowledged]
+            causes = {
+                "batch": receipt_cause(batch_result, recorded_ids),
+                **{finding_id: "not confirmed by persist receipt" for finding_id in unrecorded_ids},
+            }
+            unrecorded_findings = [
+                dict(original_findings_by_id[finding_id])
+                for finding_id in unrecorded_ids
+                if finding_id in original_findings_by_id
+            ]
+            logger.warning(
+                "review finding persist shortfall (task_ref=%s session=%s lane_id=%s recorded=%s unrecorded=%s): %s",
+                task_ref,
+                session,
+                lane_id,
+                acknowledged,
+                unrecorded_ids,
+                causes,
+            )
+            return persist_result(
+                acknowledged,
+                unrecorded_ids=unrecorded_ids,
+                unrecorded_findings=unrecorded_findings,
+                causes=causes,
+            )
+
+    # Commit-ok authority, not crash-durable storage: a per-row ok means the
+    # writer committed that row, not that the bytes survived a host crash
+    # (session synchronous=NORMAL under WAL). Salvage stable-ID rows
+    # independently, then fail only when zero rows landed ([DATA-14],
+    # [RLSE-05], [OBS-04], [OBS-08], [AGT-10], [REF-37]; CARD-07). A subset
+    # write returns the recorded/unrecorded ids so harvest can name both sets.
+    recorded_after_failure: list[str] = []
+    fallback_failures: dict[str, str] = {}
+    rekeyed_from: dict[str, str] = {}
+    for item in batch_items:
+        finding_id = item["finding_id"]
+        try:
+            item_result: dict[str, Any] | Exception = record([item])
+        except Exception as exc:
+            item_result = exc
+        if persist_receipt_ok(item_result, [finding_id]):
+            recorded_after_failure.append(finding_id)
+            continue
+        cause = receipt_cause(item_result, [finding_id])
+        if _is_terminal_finding_id_collision(cause):
+            accepted_id: str | None = None
+            last_cause = cause
+            for attempt in range(
+                _TERMINAL_ID_REKEY_START,
+                _TERMINAL_ID_REKEY_START + _TERMINAL_ID_REKEY_MAX_ATTEMPTS,
+            ):
+                candidate_id = _rekeyed_finding_id(finding_id, attempt)
+                rekeyed_item = {
+                    **item,
+                    "finding_id": candidate_id,
+                    "description": _rekeyed_description(finding_id, str(item["description"])),
+                }
+                try:
+                    rekey_result: dict[str, Any] | Exception = record([rekeyed_item])
+                except Exception as exc:
+                    rekey_result = exc
+                if persist_receipt_ok(rekey_result, [candidate_id]):
+                    accepted_id = candidate_id
+                    break
+                last_cause = receipt_cause(rekey_result, [candidate_id])
+                if not _is_terminal_finding_id_collision(last_cause):
+                    break
+            if accepted_id is not None:
+                recorded_after_failure.append(accepted_id)
+                rekeyed_from[finding_id] = accepted_id
+                fallback_failures[finding_id] = f"{finding_id} -> {accepted_id}"
+                continue
+            fallback_failures[finding_id] = last_cause
+        else:
+            fallback_failures[finding_id] = cause
+
+    unrecorded_ids = [
+        finding_id
+        for finding_id in recorded_ids
+        if finding_id not in recorded_after_failure and finding_id not in rekeyed_from
+    ]
+    unrecorded_findings = [
+        dict(original_findings_by_id[finding_id])
+        for finding_id in unrecorded_ids
+        if finding_id in original_findings_by_id
+    ]
+    if not unrecorded_ids:
+        logger.warning(
+            "review finding batch failed but row-by-row recovery recorded all %d findings "
+            "(task_ref=%s session=%s lane_id=%s): %s",
+            len(recorded_ids),
+            task_ref,
+            session,
+            lane_id,
+            failure_cause(batch_result),
+        )
+        return persist_result(
+            recorded_after_failure,
+            causes=fallback_failures or None,
+        )
+
+    causes = {"batch": failure_cause(batch_result), **fallback_failures}
+    if recorded_after_failure:
+        logger.warning(
+            "review finding persist shortfall (task_ref=%s session=%s lane_id=%s recorded=%s unrecorded=%s): %s",
+            task_ref,
+            session,
+            lane_id,
+            recorded_after_failure,
+            unrecorded_ids,
+            causes,
+        )
+        return persist_result(
+            recorded_after_failure,
+            unrecorded_ids=unrecorded_ids,
+            unrecorded_findings=unrecorded_findings,
+            causes=causes,
+        )
+
+    raise FindingsPersistError(
+        "batch_record_review_findings failed: "
+        f"{failure_cause(batch_result)}; expected={len(recorded_ids)}, "
+        f"recorded={len(recorded_after_failure)}, unrecorded={len(unrecorded_ids)}; "
+        f"unrecorded_ids={unrecorded_ids}; fallback_failures={fallback_failures}",
+        persist_result(
+            [],
+            unrecorded_ids=unrecorded_ids,
+            unrecorded_findings=unrecorded_findings,
+            causes=causes,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API for daemon callers
+# ---------------------------------------------------------------------------
+
+
+def run_review(
+    *,
+    worktree_path: Path,
+    lane_id: str | None = None,
+    task_ref: str | None = None,
+    session: str | None = None,
+    orchestrator_root: Path | None = None,
+    backend: str = "codex-cli",
+    reasoning_effort: str | None = None,
+    speed: str | None = None,
+    model: str | None = None,
+    codex_bin: str | None = None,
+    codex_args: list[str] | None = None,
+    grok_bin: str | None = None,
+    grok_args: list[str] | None = None,
+    adapter_max_turns: int | None = None,
+    adapter_timeout: int | None = None,
+    # Grok-family adapter constructor fields retained for programmatic callers.
+    grok_max_turns: int | None = None,
+    grok_timeout: int | None = None,
+    review_kind: ReviewKind | str | None = None,
+    use_latest_slice: bool = False,
+    record_findings: bool = False,
+    final_result_path: Path | None = None,
+    dry_run: bool = False,
+    progress_callback: Callable[..., None] | None = None,
+    rules_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run a full review cycle: discover changes, build prompt, execute backend, validate, optionally record.
+
+    implementation note S3 (GK-0145-02): when the lane manifest pins ``preferred_backend``, that
+    pin is authoritative from *any* starting backend (defense-in-depth; the pin is
+    materialized by ``materialize_offload_lane_manifest``). With no pin, the starting
+    backend is used unchanged.
+    """
+    from workbay_handoff_mcp.enums import ReviewKind  # noqa: PLC0415
+
+    # 1. Load manifest for overrides
+    lane_cfg: dict[str, Any] = {}
+    if task_ref and lane_id:
+        lane_cfg = (
+            get_lane_config(task_ref, lane_id, orchestrator_root=str(orchestrator_root) if orchestrator_root else None)
+            or {}
+        )
+
+    # Priority: Manifest pin > starting backend (CLI/default). Pin-honor is Plan
+    # 0145 S3 (GK-0145-02) — defense-in-depth for materialize_offload_lane_manifest.
+    backend_name = backend
+    if lane_cfg.get("preferred_backend"):
+        backend_name = str(lane_cfg["preferred_backend"])
+    backend_name = validate_backend(backend_name)
+    # S3R gate fix: reviews obey the install's execution_mode too — a stale
+    # local pin (or explicit local backend) must not route a review locally
+    # under remote_only. Same failure semantics as a bad pin: raise, and let
+    # the caller's existing review-failure mapping surface it.
+    from workbay_orchestrator_mcp.orchestration.offload_profiles import (  # noqa: PLC0415
+        resolve_offload_backend_for_execution_mode,
+    )
+
+    _, _remote_err = resolve_offload_backend_for_execution_mode(backend_name, repo_root=worktree_path)
+    if _remote_err is not None:
+        raise RuntimeError(_remote_err)
+
+    model_name = model or lane_cfg.get("preferred_model")
+    speed = speed if speed is not None else lane_cfg.get("preferred_speed")
+
+    env = None
+    if orchestrator_root is not None:
+        from workbay_orchestrator_mcp.orchestration._env import pythonpath_env
+
+        env = pythonpath_env(orchestrator_root, task_ref=task_ref, lane_id=lane_id)
+    elif reasoning_effort:
+        env = {}
+    if env is not None:
+        apply_backend_runtime_hints(env, reasoning_effort=reasoning_effort)
+    scope = _resolve_review_scope(
+        worktree_path=worktree_path,
+        task_ref=task_ref,
+        orchestrator_root=orchestrator_root,
+        review_kind=review_kind,
+        use_latest_slice=use_latest_slice,
+    )
+    changed = scope["changed_files"]
+    _assert_recordable_review_scope(
+        record_findings=record_findings,
+        dirty_files=_changed_files(worktree_path),
+        scope_source=scope["scope_source"],
+    )
+    stat = _diff_stat(worktree_path)
+    guides = _detect_stack_guides(changed)
+    prior_work = _lookup_related_prior_work(
+        lane_objective=str(lane_cfg.get("objective") or ""),
+        changed_files=changed,
+        task_ref=task_ref,
+    )
+    prompt = _build_review_prompt(
+        changed_files=changed,
+        diff_stat=stat,
+        stack_guides=guides,
+        main_guide_filename=(
+            "planning-review-guide.md" if scope["review_kind"] == ReviewKind.PLANNING else "branch-review-guide.md"
+        ),
+        lane_id=lane_id,
+        prior_work=prior_work,
+        orchestrator_root=orchestrator_root,
+        rules_dir=rules_dir,
+    )
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "backend": backend_name,
+            "prompt": prompt,
+            "findings": [],
+            "summary": "Dry-run mode: no review executed.",
+            "converged": True,
+            "changed_files": changed,
+            "stack_guides": guides,
+            "review_kind": scope["review_kind"],
+            "scope_source": scope["scope_source"],
+            "scope_reason": scope["scope_reason"],
+        }
+
+    # Get adapter and execute. Per-backend ctor kwargs (a non-codex CLI adapter
+    # rejects codex_bin/codex_args at construction), mirroring lane_exec.
+    # Grok-family cycle-bounds capability covers grok-cli and grok-remote so
+    # derived max_turns/timeout reach RemoteExecAdapter (0144 S5a / [RES-02]).
+    # Routing note: supports_token_budget_cycle_bounds implies the grok CTOR
+    # kwargs (grok_bin/grok_args/max_turns/timeout). A backend bounded by wall
+    # clock alone declares supports_adapter_timeout_bounds instead and takes the
+    # branch below, which passes `timeout` and nothing else — so it is never
+    # handed grok kwargs it cannot accept.
+    adapter_kwargs: dict[str, Any] = {}
+    if backend_name == "codex-cli":
+        adapter_kwargs = {"codex_bin": codex_bin, "codex_args": codex_args}
+    elif backend_supports_token_budget_cycle_bounds(backend_name):
+        adapter_kwargs = {"grok_bin": grok_bin, "grok_args": grok_args}
+        cycle_max_turns = grok_max_turns if grok_max_turns is not None else adapter_max_turns
+        cycle_timeout = grok_timeout if grok_timeout is not None else adapter_timeout
+        if cycle_max_turns is not None:
+            adapter_kwargs["max_turns"] = cycle_max_turns
+        if cycle_timeout is not None:
+            adapter_kwargs["timeout"] = cycle_timeout
+        # Materialize the worktree-scoped Composer-only config for standalone
+        # review turns that never ran the execute-phase bootstrap, so the
+        # attribution config-env is present, not just the prompt-suffix belt
+        # (s5-a-008). Idempotent (merge-don't-clobber). Best-effort: a review of a
+        # worktree without lane context still runs on the prompt-suffix guarantee.
+        # Local grok-cli only — remote turns do not consume a local Composer config.
+        if backend_name == "grok-cli" and orchestrator_root is not None and task_ref and lane_id:
+            try:
+                from workbay_orchestrator_mcp.orchestration.bootstrap_lane import (
+                    ensure_grok_lane_config,  # noqa: PLC0415
+                )
+
+                ensure_grok_lane_config(worktree_path, model_name)
+            except Exception as exc:
+                # Never fail a review on config — that contract stays — but do
+                # not swallow identity/materialize faults into silent degrade
+                # with no .grok/config.toml [OBS-08] (RELAND-A-001).
+                print(
+                    f"WARNING: grok lane config materialization failed during "
+                    f"review (continuing without .grok/config.toml): "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+    elif backend_supports_adapter_timeout_bounds(backend_name):
+        # Wall-clock-only family: pass the derived bound and NOTHING else.
+        # Without this branch the timeout was derived and advertised but never
+        # applied, so the adapter silently fell back to its ctor default.
+        if adapter_timeout is not None:
+            adapter_kwargs = {"timeout": adapter_timeout}
+    schema_violations = strict_output_schema_violations(REVIEW_OUTPUT_SCHEMA)
+    if schema_violations:
+        raise RuntimeError(
+            "Review output schema violates strict structured-output mode: " + "; ".join(schema_violations)
+        )
+    adapter = get_adapter(backend_name, **adapter_kwargs)
+    result = adapter.execute(
+        prompt=prompt,
+        schema=REVIEW_OUTPUT_SCHEMA,
+        worktree_path=worktree_path,
+        model=model_name,
+        reasoning_effort=reasoning_effort,
+        speed=speed,
+        env=env,
+        progress_callback=progress_callback,
+    )
+    raw_result = result.raw_payload
+    # Retryable VM admission defer (remote_agent.sh exit 75): the marker dict is
+    # non-empty, so it would otherwise tolerant-degrade to skipped_unparseable →
+    # converged, masking the defer. No review ran — surface the typed defer so
+    # the caller re-dispatches instead of converging (r07163433 HIGH-2).
+    if isinstance(raw_result, dict) and raw_result.get("admission_deferred"):
+        defer_reason = str(raw_result.get("defer_reason") or "vm_admission")
+        raise ReviewAdmissionDeferred(
+            f"review turn deferred by VM admission ({defer_reason}); retryable, no review output"
+        )
+    # A typed transport result is not review content.  Reject it before the
+    # tolerant parser can turn its non-empty marker payload into an empty,
+    # converged skipped_unparseable review.
+    if result.handoff_action == "transport_failure" or (
+        isinstance(raw_result, dict) and raw_result.get("transport_failure")
+    ):
+        raw_transport = raw_result if isinstance(raw_result, dict) else {}
+        raise ReviewTransportFailure(
+            provider_error_code=str(raw_transport.get("provider_error_code") or "turn_failed"),
+            retryable=bool(raw_transport.get("retryable", False)),
+        )
+    # Exhausted empty salvage is also not review content. The envelope is a
+    # non-empty needs_guidance marker (salvage_patch_cause=patch_empty AND
+    # redispatch_exhausted), so the empty-payload hard fail does not fire and
+    # the tolerant parser would otherwise return skipped_unparseable /
+    # findings=[] / converged. Reject it the same way admission-defer and
+    # provider refusal are rejected: no review product, do not converge.
+    # Branch on the stamped cause fields, never on the provider-refusal action.
+    if _is_exhausted_empty_salvage(raw_result):
+        raise ReviewNoProduct(
+            "review turn produced exhausted empty salvage "
+            "(salvage_patch_cause=patch_empty, redispatch_exhausted); no review output"
+        )
+    from workbay_orchestrator_mcp.orchestration.lane_result import adapter_refusal_metadata
+
+    refusal = adapter_refusal_metadata(raw_result)
+    if refusal is not None:
+        # Fail closed: an adapter refusal contains no review product.
+        return {
+            **refusal,
+            "review": "refused",
+            "findings": [],
+            "converged": False,
+            "summary": result.summary,
+            "changed_files": changed,
+            "stack_guides": guides,
+            "review_kind": scope["review_kind"],
+            "scope_source": scope["scope_source"],
+            "scope_reason": scope["scope_reason"],
+        }
+
+    # Grok --no-subagents smoke review often emits handoff-shaped JSON (or prose
+    # fragments) without findings/summary — tolerate that as a typed degrade so a
+    # green self-verify is never hard-failed ([OBS-08]). Codex stays strict.
+    # Capability-gated (not a grok-cli name literal) so grok-remote gets the same
+    # tolerant degrade the grok family needs (0144 R2). Empty raw_payload still
+    # fails loud (0144 R3 / HIGH-2): transport failures must not become
+    # skipped_unparseable → converged.
+    # Two ways a result arrives as prose: the grok family narrates despite
+    # carrying --json-schema, and a backend with NO schema flag at all can only
+    # narrate. Gating on the grok-family predicate alone inverted the intent —
+    # it routed cursor, the one lane CLI that cannot produce structured output,
+    # to STRICT validation while schema-capable grok got the tolerant path.
+    _spec = get_backend_spec(backend_name)
+    tolerant = backend_supports_token_budget_cycle_bounds(backend_name) or not (
+        _spec and _spec.capabilities.supports_structured_output
+    )
+    validated = _validate_review_result(raw_result, tolerant=tolerant)
+    review_status = validated.get("review")
+    findings = list(validated.get("findings") or [])
+    summary = str(validated.get("summary") or "")
+
+    # implementation note D9: absent result_parse means ok (backward-compatible clean reviews).
+    result_parse = str(validated.get("result_parse") or "ok")
+    if review_status == REVIEW_SKIPPED_UNPARSEABLE:
+        result_parse = "degraded"
+    # Convergence = "the fix loop may stop"; harvestability = "these findings may
+    # be recorded". A non-authoritative degrade is both converged (nothing to fix)
+    # and unharvestable (empty findings are not a clean review). Keep them separate.
+    output: dict[str, Any] = {
+        "findings": findings,
+        "summary": summary,
+        "converged": findings_converged(findings),
+        "changed_files": changed,
+        "stack_guides": guides,
+        "review_kind": scope["review_kind"],
+        "scope_source": scope["scope_source"],
+        "scope_reason": scope["scope_reason"],
+        "result_parse": result_parse,
+    }
+    if review_status == REVIEW_SKIPPED_UNPARSEABLE:
+        # Explicit discriminator so the pass engine can branch without archaeology.
+        output["review"] = REVIEW_SKIPPED_UNPARSEABLE
+    if validated.pop("_missing_findings_key", False):
+        output["review"] = REVIEW_SKIPPED_UNPARSEABLE
+        output["result_parse"] = "degraded"
+    # Always forward salvage/degrade notes ([OBS-04]): mixed valid/invalid findings
+    # keep salvaged items while raw_tail records dropped items — not only on full
+    # skipped_unparseable degrade (BR-0108-S1-05).
+    if "raw_tail" in validated:
+        output["raw_tail"] = validated["raw_tail"]
+
+    if output.get("review") is not None:
+        review_status = str(output["review"])
+    operation_token = None
+    if final_result_path is not None:
+        import uuid
+
+        operation_token = uuid.uuid4().hex
+        from workbay_orchestrator_mcp.orchestration.pass_rescue import _atomic_write
+
+        # Publish the review product before any coordinator side effect. The
+        # engine reads this carrier even when recording below raises.
+        carrier = {
+            **output,
+            "review_result_carrier": True,
+            "review_operation_token": operation_token,
+            "raw_payload": raw_result,
+            "details": "GROK_REVIEW_FINDINGS_JSON\n" + json.dumps(findings),
+        }
+        final_result_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(final_result_path, json.dumps(carrier))
+    if record_findings and review_status != REVIEW_SKIPPED_UNPARSEABLE and review_result_is_harvestable(output):
+        if not task_ref:
+            raise RuntimeError("--task-ref is required when --record-findings is set.")
+        if not session:
+            raise RuntimeError("--session is required when --record-findings is set.")
+        if not orchestrator_root:
+            raise RuntimeError("--orchestrator-root is required when --record-findings is set.")
+        try:
+            persist = _record_findings(
+                findings,
+                task_ref=task_ref,
+                session=session,
+                lane_id=lane_id,
+                orchestrator_root=orchestrator_root,
+                **({"operation_token": operation_token} if operation_token else {}),
+            )
+        except FindingsPersistError as exc:
+            shortfall = _persist_shortfall_block(exc)
+            output["legacy_reconciliation"] = exc.persist.get("legacy_reconciliation", "none")
+            output["legacy_cause"] = exc.persist.get("legacy_cause", shortfall["causes"].get("legacy_reconciliation"))
+            output["recorded_finding_ids"] = shortfall["recorded_ids"]
+            output["error"] = "record_failed"
+            output.update(shortfall)
+            if final_result_path is not None:
+                carrier.update(output)
+                _atomic_write(final_result_path, json.dumps(carrier))
+            raise
+        shortfall = _persist_shortfall_block(persist)
+        recorded_ids = shortfall["recorded_ids"]
+        unrecorded_ids = shortfall["unrecorded_ids"]
+        unrecorded_findings = shortfall["unrecorded_findings"]
+        causes = shortfall["causes"]
+        output["legacy_reconciliation"] = persist.get("legacy_reconciliation", "none")
+        output["legacy_cause"] = persist.get("legacy_cause", causes.get("legacy_reconciliation"))
+        if causes:
+            output["causes"] = causes
+        output["recorded_finding_ids"] = recorded_ids
+        if final_result_path is not None:
+            # Retain the pre-write carrier until this atomic replacement lands.
+            carrier.update(output)
+            carrier.update(shortfall)
+            _atomic_write(final_result_path, json.dumps(carrier))
+        if unrecorded_ids:
+            output["unrecorded_ids"] = unrecorded_ids
+            output["unrecorded_findings"] = unrecorded_findings
+            output["causes"] = causes
+            output["error"] = "record_failed"
+            logger.warning(
+                "review finding persist shortfall (task_ref=%s session=%s lane_id=%s recorded=%s unrecorded=%s): %s",
+                task_ref,
+                session,
+                lane_id,
+                recorded_ids,
+                unrecorded_ids,
+                causes,
+            )
+            raise RuntimeError(
+                "review finding persist shortfall: "
+                f"recorded_ids={recorded_ids} unrecorded_ids={unrecorded_ids} causes={causes}"
+            )
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Self-review runner: execute structured code review via Codex.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("schema", help="Print the review output JSON schema.")
+
+    run_parser = subparsers.add_parser("run", help="Execute a review against a lane worktree.")
+    run_parser.add_argument("--worktree-path", required=True, help="Path to the lane worktree.")
+    run_parser.add_argument("--lane-id", help="Lane identifier for finding ID generation.")
+    run_parser.add_argument("--task-ref", help="Task reference (required with --record-findings).")
+    run_parser.add_argument("--session", help="Session identifier (required with --record-findings).")
+    run_parser.add_argument("--orchestrator-root", help="Orchestrator root path (required with --record-findings).")
+    run_parser.add_argument(
+        "--rules-dir",
+        help="Optional review-rules directory override. Defaults to the package-bundled rules.",
+    )
+    run_parser.add_argument(
+        "--backend",
+        default="codex-cli",
+        choices=BACKEND_CHOICES,
+        help="Execution backend to use (default: codex-cli).",
+    )
+    run_parser.add_argument(
+        "--reasoning-effort",
+        choices=WORKER_REASONING_EFFORT_CHOICES,
+        help="Optional reasoning effort hint for codex-subagent review turns.",
+    )
+    run_parser.add_argument("--model", help="Explicit model to use (e.g. gpt-5.4-mini).")
+    run_parser.add_argument("--grok-bin", help="Explicit path to the grok binary.")
+    run_parser.add_argument("--grok-args", help="Extra args for grok exec (space-separated).")
+    run_parser.add_argument(
+        "--adapter-max-turns",
+        "--grok-max-turns",
+        dest="adapter_max_turns",
+        type=int,
+        default=None,
+        help="Per-invocation adapter turn cap (default: adapter/backend default; --grok-max-turns is deprecated).",
+    )
+    run_parser.add_argument(
+        "--adapter-timeout",
+        "--grok-timeout",
+        dest="adapter_timeout",
+        type=int,
+        default=None,
+        help="Per-invocation adapter wall-clock timeout seconds (default: adapter/backend default; --grok-timeout is deprecated).",
+    )
+    run_parser.add_argument(
+        "--review-kind",
+        choices=("branch", "planning"),
+        help="Preferred review workflow. Packet-backed planning reviews only match docs-only slices.",
+    )
+    run_parser.add_argument(
+        "--latest-slice",
+        action="store_true",
+        help="Resolve changed files from the latest completed slice packet when available, with branch-diff fallback.",
+    )
+    run_parser.add_argument(
+        "--record-findings",
+        action="store_true",
+        help="Record findings into MCP before returning.",
+    )
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the assembled prompt and skip Codex/MCP side effects.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+
+    if args.command == "schema":
+        print(json.dumps(REVIEW_OUTPUT_SCHEMA, indent=2))
+        return 0
+
+    worktree_path = Path(args.worktree_path).expanduser().resolve()
+    orchestrator_root = Path(args.orchestrator_root).expanduser().resolve() if args.orchestrator_root else None
+    rules_dir = Path(args.rules_dir).expanduser().resolve() if args.rules_dir else None
+
+    result = run_review(
+        worktree_path=worktree_path,
+        lane_id=args.lane_id,
+        task_ref=args.task_ref,
+        session=args.session,
+        orchestrator_root=orchestrator_root,
+        backend=args.backend,
+        reasoning_effort=args.reasoning_effort,
+        model=args.model,
+        grok_bin=args.grok_bin,
+        grok_args=args.grok_args.split() if args.grok_args else None,
+        adapter_max_turns=args.adapter_max_turns,
+        adapter_timeout=args.adapter_timeout,
+        review_kind=args.review_kind,
+        use_latest_slice=args.latest_slice,
+        record_findings=args.record_findings,
+        dry_run=args.dry_run,
+        rules_dir=rules_dir,
+    )
+
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
