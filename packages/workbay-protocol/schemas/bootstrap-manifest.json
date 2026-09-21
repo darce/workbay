@@ -1,0 +1,485 @@
+{
+  "$defs": {
+    "EmbeddingsInferenceReceipt": {
+      "additionalProperties": true,
+      "description": "Additive inference evidence; never a substitute for operator policy.",
+      "properties": {
+        "artifact_digests": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Digests"
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Id"
+        },
+        "probe_result": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Result"
+        },
+        "probe_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Version"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision"
+        },
+        "runtime_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Version"
+        },
+        "verified_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verified At"
+        }
+      },
+      "title": "EmbeddingsInferenceReceipt",
+      "type": "object"
+    },
+    "EmbeddingsOperatorPolicy": {
+      "additionalProperties": true,
+      "description": "Persisted operator embeddings policy (implementation note E1).\n\nDistinct from ``embeddings_mode``, which remains the install receipt.\n``policy_revision`` is monotonic. ``origin`` records how the policy\nwas chosen; omitted history cannot be recovered as explicit intent.",
+      "properties": {
+        "embeddings_policy": {
+          "enum": [
+            "off",
+            "preferred",
+            "required"
+          ],
+          "title": "Embeddings Policy",
+          "type": "string"
+        },
+        "intent": {
+          "enum": [
+            "known",
+            "unknown"
+          ],
+          "title": "Intent",
+          "type": "string"
+        },
+        "origin": {
+          "enum": [
+            "explicit",
+            "migrated",
+            "default"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "policy_revision": {
+          "minimum": 1,
+          "title": "Policy Revision",
+          "type": "integer"
+        },
+        "reinjection_policy": {
+          "enum": [
+            "off",
+            "on"
+          ],
+          "title": "Reinjection Policy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "embeddings_policy",
+        "reinjection_policy",
+        "policy_revision",
+        "origin",
+        "intent"
+      ],
+      "title": "EmbeddingsOperatorPolicy",
+      "type": "object"
+    },
+    "OverlayConfigEntry": {
+      "additionalProperties": true,
+      "description": "A consumer-tool config that bootstrap wrote (e.g. .vscode/mcp.json).\n\n``action`` is the string the install flow emits today\n(``created``, ``updated``, ``set``, ``unchanged``). Modeled as a\nfree string rather than a Literal so the contract does not block\nbootstrap from introducing new actions before the protocol bumps.",
+      "properties": {
+        "action": {
+          "description": "What bootstrap did to the config (e.g. 'created', 'updated', 'set', 'unchanged').",
+          "minLength": 1,
+          "title": "Action",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "action"
+      ],
+      "title": "OverlayConfigEntry",
+      "type": "object"
+    },
+    "OverlaySurface": {
+      "additionalProperties": true,
+      "description": "A single overlay surface entry (e.g. skills, commands, hooks).",
+      "properties": {
+        "path": {
+          "description": "Repo-relative surface path (e.g. '.claude/skills/handoff-lifecycle').",
+          "title": "Path",
+          "type": "string"
+        },
+        "source": {
+          "description": "Origin tier: 'shared' (symlinked from workbay-system), 'local' (target-owned), 'overlapping' (target overrides shared), 'generated' (per-agent surface produced by generate_agent_workflows.py during install \u2014 implementation note step 1), 'lifecycle' (implementation note hoisted Make fragment + runner package \u2014 copied, not symlinked, so the consumer can run `make context` without the workbay-system packaging tree).",
+          "enum": [
+            "shared",
+            "local",
+            "overlapping",
+            "generated",
+            "lifecycle"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "source"
+      ],
+      "title": "OverlaySurface",
+      "type": "object"
+    },
+    "StackSource": {
+      "additionalProperties": false,
+      "description": "Install-ledger source provenance for the package stack.\n\n``resolved_from`` is required. ``ref`` / ``sha`` are recorded only when\nknown: an unattested git claim (``{\"resolved_from\": \"git\"}``) is a legal\nderive-path output and must round-trip.",
+      "properties": {
+        "ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Requested revision (git) or source URL (local) when known.",
+          "title": "Ref"
+        },
+        "resolved_from": {
+          "description": "How the stack packages were resolved: a git checkout, a local file:// install, or an unresolvable/index source.",
+          "enum": [
+            "git",
+            "local",
+            "unknown"
+          ],
+          "title": "Resolved From",
+          "type": "string"
+        },
+        "sha": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Resolved 40-char git commit id when known.",
+          "title": "Sha"
+        }
+      },
+      "required": [
+        "resolved_from"
+      ],
+      "title": "StackSource",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Top-level shape of ``.workbay-overlay.json``.\n\nValidated on write by ``workbay-bootstrap.install`` so the file\ncannot drift silently. Consumers (drift detectors, doctor commands)\nparse the same model on read.",
+  "properties": {
+    "codemap_mode": {
+      "anyOf": [
+        {
+          "enum": [
+            "enforced",
+            "available",
+            "off"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Codemap-first source-discovery policy recorded at install time. 'enforced' refuses source discovery in favor of codemap; 'available' allows with an advisory; 'off' allows. None when omitted from an older ledger \u2014 omission is not explicit available or off. Typed reads live in capability_mode.",
+      "title": "Codemap Mode"
+    },
+    "configs": {
+      "items": {
+        "$ref": "#/$defs/OverlayConfigEntry"
+      },
+      "title": "Configs",
+      "type": "array"
+    },
+    "embeddings_inference_receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EmbeddingsInferenceReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Additive current-inference receipt (model identity, digests, probe). Absent until real verification evidence exists; enable must not manufacture this field."
+    },
+    "embeddings_mode": {
+      "default": "unspecified",
+      "description": "Semantic-embeddings capability recorded at install time. 'verified' (install --with-embeddings) means the [embeddings] extra and digest pin were hard-verified at install, so semantic features may rely on them; 'disabled' (install --no-embeddings) means the operator opted out; 'unspecified' \u2014 the default, and the value assumed when the field is absent from an older manifest \u2014 preserves best-effort provisioning behavior. Historical 'verified' is a provisioning receipt, not a promise of current inference.",
+      "enum": [
+        "unspecified",
+        "verified",
+        "disabled"
+      ],
+      "title": "Embeddings Mode",
+      "type": "string"
+    },
+    "embeddings_operator_policy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EmbeddingsOperatorPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Operator embeddings/reinjection policy (implementation note E1). None when an older ledger has not been migrated. Distinct from embeddings_mode, which remains the install receipt enum."
+    },
+    "execution_mode": {
+      "default": "local_ok",
+      "description": "Offload execution policy recorded at install time. 'remote_only' (install --with-remote) declares that subagent implementation work must dispatch to the remote gate backend; 'local_ok' \u2014 the default, and the value assumed when the field is absent from an older manifest \u2014 keeps local offload allowed.",
+      "enum": [
+        "local_ok",
+        "remote_only"
+      ],
+      "title": "Execution Mode",
+      "type": "string"
+    },
+    "mcp_servers": {
+      "description": "Sorted list of managed MCP server names bootstrap last wrote into ``.mcp.json`` / ``.vscode/mcp.json`` / ``.codex/config.toml``. Read by ``sync_mcp_configs(prune_removed_managed=True)`` as the authoritative previously-managed provenance so third-party launchers in those files are preserved across syncs.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Mcp Servers",
+      "type": "array"
+    },
+    "package_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Installed workbay-system distribution version (package source).",
+      "title": "Package Version"
+    },
+    "plugin_overrides_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional explicit plugin override root recorded by bootstrap so later doctor/update/repair runs can reuse a non-default internal override location.",
+      "title": "Plugin Overrides Path"
+    },
+    "remote_ref": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Remote Ref"
+    },
+    "remote_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Resolved 40-char git SHA at install time (git_overlay source).",
+      "title": "Remote Sha"
+    },
+    "remote_url": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Remote Url"
+    },
+    "schema_version": {
+      "description": "Manifest schema version.",
+      "minimum": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_kind": {
+      "default": "git_overlay",
+      "description": "Overlay delivery source: 'git_overlay' (a clone checked out at remote_ref), 'package' (an installed workbay-system distribution), or 'worktree' (the repo's own working tree / HEAD). Defaults to 'git_overlay' so manifests written before internal validate unchanged.",
+      "enum": [
+        "git_overlay",
+        "package",
+        "worktree"
+      ],
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "stack_distribution": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Meta-package anchor distribution recorded by package-source install/update when it is installed (implementation note: 'workbay'). None for legacy/pre-stack installs.",
+      "title": "Stack Distribution"
+    },
+    "stack_members": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Mapping of stack member distribution name -> exact version pinned by the installed anchor's metadata. Doctor compares the live environment against this expectation (stack_drift).",
+      "title": "Stack Members"
+    },
+    "stack_source": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StackSource"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Source provenance for the package stack (requested ref, resolved SHA, and how it was obtained) so 'is this really vX.Y.Z?' is answerable from the ledger. None for git_overlay/worktree installs and for older package manifests that predate the field."
+    },
+    "stack_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Installed version of the stack anchor distribution at install/update time (package source only).",
+      "title": "Stack Version"
+    },
+    "surfaces": {
+      "items": {
+        "$ref": "#/$defs/OverlaySurface"
+      },
+      "title": "Surfaces",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "BootstrapManifest",
+  "type": "object"
+}
