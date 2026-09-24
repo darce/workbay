@@ -1,0 +1,155 @@
+{
+  "task_ref": "example-multi-lane-task",
+  "task_plan_path": "docs/tasks/example-multi-lane-task-plan.md",
+  "default_done_definition": "Ready for orchestrator branch review with lane-local verification complete.",
+  "merge_order": ["domain", "api", "ui"],
+  "heading_to_lane": {
+    "Phase 1: Domain Model and Storage": "domain",
+    "Phase 2: API Contract and Adapter": "api",
+    "Phase 3: User Interface": "ui"
+  },
+  "plan_routing_hints": [
+    {
+      "heading": "Phase 4: Integration Tests",
+      "text_prefix": "Domain integration test:",
+      "lane": "domain"
+    },
+    {
+      "heading": "Phase 4: Integration Tests",
+      "text_prefix": "API integration test:",
+      "lane": "api"
+    },
+    {
+      "heading": "Phase 4: Integration Tests",
+      "text_prefix": "UI integration test:",
+      "lane": "ui"
+    }
+  ],
+  "routing": [
+    {
+      "prefix": "services/domain/",
+      "lane": "domain"
+    },
+    {
+      "prefix": "services/api/",
+      "lane": "api"
+    },
+    {
+      "prefix": "apps/web/",
+      "lane": "ui"
+    },
+    {
+      "prefix": "docs/tasks/example-multi-lane-task-plan.md",
+      "lane": "domain"
+    }
+  ],
+  "lanes": {
+    "domain": {
+      "branch": "codex/example-domain",
+      "worktree_path": "{orchestrator_root}-example-domain",
+      "title": "Domain",
+      "objective": "Implement the domain model and persistence slice.",
+      "app_root": "services/domain",
+      "owned_paths": [
+        "services/domain/**",
+        "docs/tasks/example-multi-lane-task-plan.md"
+      ],
+      "required_docs": [
+        "docs/workbay/instructions.md",
+        "docs/tasks/example-multi-lane-task-plan.md"
+      ],
+      "test_commands": [
+        "cd services/domain && PYENV_VERSION=example-service pytest tests/unit",
+        "cd services/domain && PYENV_VERSION=example-service mypy src"
+      ],
+      "capability_tags": ["python-tooling-ready"],
+      "preflight_commands": [
+        "test -d services/domain"
+      ],
+      "preflight_failure_summary": "domain runtime preflight failed; local service dependencies are not ready.",
+      "preflight_failure_details": "This lane depends on repo-local service dependencies. Provision the lane before assigning implementation work.",
+      "non_goals": [
+        "Do not edit API adapter files.",
+        "Do not edit UI files."
+      ],
+      "commit_paths": [
+        "services/domain",
+        "docs/tasks/example-multi-lane-task-plan.md"
+      ],
+      "commit_subject": "update domain model",
+      "route_hints": ["domain", "domain lane", "storage lane"],
+      "guidance_fallbacks": [
+        {
+          "match_all": ["remaining", "domain", "implementation", "target"],
+          "match_any": ["status_version", "provenance", "repository"],
+          "subject": "domain status provenance and filtering",
+          "message": "Implement the domain status provenance/filtering slice in services/domain/src/repositories/item_repository.py and related domain-owned tests/services. Add status_version stamping/return for get_status(), exclude inactive rows from status reads, and keep API adapter changes out of this lane."
+        }
+      ],
+      "tooling_paths": ["services/domain/Makefile"]
+    },
+    "api": {
+      "branch": "codex/example-api",
+      "worktree_path": "{orchestrator_root}-example-api",
+      "title": "API",
+      "objective": "Implement the API contract and adapter slice.",
+      "app_root": "services/api",
+      "owned_paths": [
+        "services/api/**"
+      ],
+      "required_docs": [
+        "docs/workbay/instructions.md",
+        "docs/tasks/example-multi-lane-task-plan.md"
+      ],
+      "test_commands": [
+        "cd services/api && PYENV_VERSION=example-service pytest tests/api",
+        "cd services/api && PYENV_VERSION=example-service mypy src"
+      ],
+      "non_goals": [
+        "Do not edit domain internals outside the adapter boundary.",
+        "Do not edit UI files."
+      ],
+      "commit_paths": [
+        "services/api"
+      ],
+      "commit_subject": "update API adapter",
+      "route_hints": ["api", "api lane", "adapter lane"],
+      "guidance_fallbacks": [],
+      "tooling_paths": ["services/api/Makefile"]
+    },
+    "ui": {
+      "branch": "codex/example-ui",
+      "worktree_path": "{orchestrator_root}-example-ui",
+      "title": "UI",
+      "objective": "Implement the user interface slice.",
+      "owned_paths": ["apps/web/**"],
+      "required_docs": [
+        "docs/workbay/instructions.md",
+        "docs/tasks/example-multi-lane-task-plan.md"
+      ],
+      "test_commands": [
+        "cd apps/web && npm run test -- --run",
+        "cd apps/web && npm run typecheck"
+      ],
+      "capability_tags": ["node-tooling-ready"],
+      "preflight_commands": [
+        "test -d apps/web/node_modules"
+      ],
+      "preflight_failure_summary": "ui runtime preflight failed; lane-local Node dependencies are not ready.",
+      "preflight_failure_details": "This lane depends on a lane-local Node runtime. Provision dependencies before assigning UI work.",
+      "non_goals": [
+        "Do not edit API or domain files unless explicitly assigned."
+      ],
+      "commit_paths": ["apps/web"],
+      "commit_subject": "update user interface",
+      "route_hints": ["ui", "frontend lane"],
+      "guidance_fallbacks": [],
+      "tooling_paths": []
+    }
+  },
+  "downstream": {
+    "domain": ["api", "ui"],
+    "api": ["ui"],
+    "ui": []
+  }
+}

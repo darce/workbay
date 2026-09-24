@@ -1,0 +1,1237 @@
+"""Off-box model catalogue and entitlement discovery (plans 0195/0221).
+
+Catalogue parse, remote-gate listing, TTL cache, pin selection, and scoped
+publish live here so ``offload_profiles`` stays the profile/bound table.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from typing import Any, Literal
+
+from workbay_orchestrator_mcp.orchestration import backend_registry
+from workbay_orchestrator_mcp.orchestration.cursor_lane_config import (
+    seed_cursor_effort_slugs_from_catalogue,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+MODEL_DISCOVERY_FAILED_WARNING = "model_discovery_failed"
+TRACKED_PIN_NOT_IN_CATALOGUE_WARNING = "tracked_pin_not_in_catalogue"
+PIN_HOME_UNDECLARED = "pin_home_undeclared"
+MODEL_DISCOVERY_TTL_S = 60.0
+
+# SSH ConnectTimeout must sit under the process budget. An 8s subprocess
+# kill classified a still-connecting gate as MODEL_DISCOVERY_FAILED even
+# though the VM would have answered within the declared 10s connect window.
+SSH_CONNECT_TIMEOUT_S = 10
+LOCAL_LIST_MODELS_TIMEOUT_S = 8.0
+REMOTE_LIST_MODELS_LISTING_BUDGET_S = 8.0
+REMOTE_LIST_MODELS_PROCESS_TIMEOUT_S = SSH_CONNECT_TIMEOUT_S + REMOTE_LIST_MODELS_LISTING_BUDGET_S
+MODEL_ENTITLEMENT_PROBE_TIMEOUT_S = 45.0
+MODEL_ENTITLEMENT_PROBE_PROMPT = "ping"
+MODEL_ENTITLEMENT_PROBE_MAX_WORKERS = 4
+MODEL_DISCOVERY_COALESCE_WAIT_S = 3 * (MODEL_ENTITLEMENT_PROBE_TIMEOUT_S + SSH_CONNECT_TIMEOUT_S)
+
+CatalogueSource = Literal["probed", "tracked_unprobeable", "tracked_probe_failed"]
+ModelEntitlementStatus = Literal[
+    "entitled",
+    "not_entitled",
+    "unknown_slug",
+    "quota_exhausted",
+    "probe_failed",
+    "probe_unsupported",
+]
+
+_REMOTE_LIST_MODELS_SSH_OPTS: tuple[str, ...] = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    f"ConnectTimeout={SSH_CONNECT_TIMEOUT_S}",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=4",
+)
+_REMOTE_LIST_MODELS_PATH = "$HOME/.grok/bin:$HOME/.local/bin:$PATH"
+_EFFORT_TOKENS: tuple[str, ...] = ("xhigh", "high", "medium", "low")
+_VERSIONISH_RE = re.compile(r"^\d+(?:\.\d+)*$")
+_TRAILING_QUALIFIER = frozenset({"preview", "latest", "sol", "fast", "rc"})
+_MODEL_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]*$")
+_NOT_A_MODEL_SLUG = frozenset(
+    {
+        "you",
+        "usage",
+        "error",
+        "warning",
+        "model",
+        "models",
+        "id",
+        "name",
+        "available",
+        "unavailable",
+    }
+)
+
+_discovery_cache: dict[tuple[str, str, str], tuple[float, "ModelDiscovery"]] = {}
+_cache_lock = threading.Lock()
+_publish_lock = threading.Lock()
+_live_entitlement_catalogues: dict[str, frozenset[str]] = {}
+# Per backend: the slug set a bounded sweep interrogated, or ``None`` when the
+# published catalogue came from an exhaustive listing.
+_live_entitlement_interrogated: dict[str, frozenset[str] | None] = {}
+
+
+@dataclass
+class _DiscoveryFlight:
+    event: threading.Event
+    result: "ModelDiscovery | None" = None
+
+
+_discovery_flights: dict[tuple[str, str, str], _DiscoveryFlight] = {}
+
+
+class PinHomeUndeclaredError(RuntimeError):
+    """Dispatchable backend has no declared list-argv / tracked pin."""
+
+    warning = PIN_HOME_UNDECLARED
+
+
+@dataclass(frozen=True)
+class PinHome:
+    """Registry-declared catalogue home for one backend."""
+
+    tracked_pin: str
+    env_key: str
+    list_argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ModelEntitlementResult:
+    """Typed outcome of one candidate probe.
+
+    ``reason`` retains the bounded provider diagnostic for operator action;
+    callers never need to infer the state by matching it themselves.
+    """
+
+    slug: str
+    status: ModelEntitlementStatus
+    reason: str | None = None
+    returncode: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelDiscovery:
+    """Resolved pin for one off-box backend after env / catalogue / tracked."""
+
+    backend_id: str
+    resolved_model: str
+    tracked_pin: str
+    catalogue: tuple[str, ...]
+    source: str  # env | discovery | tracked
+    warning: str | None = None
+    gate_host: str | None = None
+    catalogue_source: CatalogueSource = "tracked_unprobeable"
+    # Which slugs the sweep actually asked about. ``None`` means the source was
+    # an exhaustive listing, so absence from ``catalogue`` IS a denial. A tuple
+    # means a bounded per-candidate sweep: a slug outside it was never
+    # interrogated, and silence is not denial.
+    interrogated: tuple[str, ...] | None = None
+    catalogue_version: str | None = None
+    catalogue_digest: str | None = None
+    catalogue_captured_at: float | None = None
+    # ``None`` means capabilities were not observed; an empty tuple is an
+    # observed listing without capability proof. Names alone are not proof.
+    catalogue_capabilities: tuple[tuple[str, str], ...] | None = None
+    # Observed advertised efforts per (model, transport). ``None`` means the
+    # native producer did not report an effort dimension.
+    catalogue_advertised_efforts: tuple[tuple[tuple[str, str], tuple[str, ...]], ...] | None = None
+    # Native ACP observation is optional on a names listing. Absence stays off
+    # ``warning`` so a resolved probe keeps the pre-branch ``warning is None``.
+    native_metadata_warning: str | None = None
+
+
+def _spec_declares_dispatchable_off_box(spec: Any) -> bool:
+    caps = getattr(spec, "capabilities", None)
+    return bool(getattr(caps, "dispatchable_off_box", False))
+
+
+def _backend_probe_runs_off_box(backend_id: str) -> bool:
+    spec = backend_registry.BACKENDS.get(backend_id)
+    return spec is not None and _spec_declares_dispatchable_off_box(spec)
+
+
+def pin_home_for(backend_id: str) -> PinHome:
+    """Read list-argv / env / tracked-pin from the registry row.
+
+    A dispatchable backend that omits the fields fails closed with
+    :class:`PinHomeUndeclaredError` — never a swallowed ``KeyError``.
+
+    implementation note S4: a row may declare a tracked pin + env key with NO
+    ``list_models_argv`` (catalogue-less home, e.g. openrouter-remote, whose
+    provider catalogue must never feed the allow-list). Such a home resolves
+    env > tracked only and is never probed.
+    """
+    spec = backend_registry.BACKENDS.get(backend_id)
+    if spec is None:
+        raise KeyError(f"no model-pin home for backend {backend_id!r}")
+    argv = getattr(spec, "list_models_argv", None)
+    tracked = (getattr(spec, "tracked_model", None) or "").strip()
+    env_key = (getattr(spec, "allowed_model_env", None) or "").strip()
+    if tracked and env_key:
+        return PinHome(tracked_pin=tracked, env_key=env_key, list_argv=tuple(argv or ()))
+    if _spec_declares_dispatchable_off_box(spec):
+        raise PinHomeUndeclaredError(
+            f"{PIN_HOME_UNDECLARED}: backend {backend_id!r} is "
+            "dispatchable_off_box but declares no list-argv/tracked pin"
+        )
+    raise KeyError(f"no model-pin home for backend {backend_id!r}")
+
+
+def _looks_like_model_slug(slug: str) -> bool:
+    """Refuse English/help-text tokens so a failed CLI cannot invent a pin."""
+    if not slug or slug.lower() in _NOT_A_MODEL_SLUG:
+        return False
+    if any(ch.isspace() for ch in slug):
+        return False
+    if not _MODEL_SLUG_RE.fullmatch(slug):
+        return False
+    return ("-" in slug) or ("." in slug)
+
+
+def _catalogue_item_slug(item: Any) -> str | None:
+    if isinstance(item, str):
+        slug = item.strip()
+        return slug if _looks_like_model_slug(slug) else None
+    if isinstance(item, dict):
+        for key in ("id", "model", "name", "slug"):
+            value = item.get(key)
+            if isinstance(value, str) and _looks_like_model_slug(value.strip()):
+                return value.strip()
+    return None
+
+
+def _slugs_from_json(data: Any) -> list[str]:
+    slugs: list[str] = []
+    items: Any = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("models")
+        if items is None:
+            items = data.get("data")
+    if isinstance(items, list):
+        for item in items:
+            slug = _catalogue_item_slug(item)
+            if slug:
+                slugs.append(slug)
+    return slugs
+
+
+def parse_model_catalogue(stdout: str) -> tuple[str, ...]:
+    """Parse a CLI listing into published slugs. Never invents a slug."""
+    text = (stdout or "").strip()
+    if not text:
+        return ()
+    slugs: list[str] = []
+    if text[0] in "[{":
+        try:
+            slugs = _slugs_from_json(json.loads(text))
+        except json.JSONDecodeError:
+            slugs = []
+    if not slugs:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            candidate = _catalogue_item_slug(line.split()[0])
+            if candidate:
+                slugs.append(candidate)
+    return tuple(dict.fromkeys(slugs))
+
+
+def _family_stem(stem: str) -> str:
+    kept: list[str] = []
+    for part in stem.split("-"):
+        lowered = part.lower()
+        if _VERSIONISH_RE.fullmatch(part):
+            break
+        if lowered in _TRAILING_QUALIFIER or lowered.startswith("rc"):
+            break
+        kept.append(part)
+    return "-".join(kept) if kept else stem
+
+
+def slug_shape(slug: str) -> tuple[str, str | None, bool]:
+    """Return ``(family, effort, fast)`` for same-shape catalogue matching."""
+    text = (slug or "").strip()
+    fast = text.endswith("-fast")
+    stem = text[: -len("-fast")] if fast else text
+    effort: str | None = None
+    for token in _EFFORT_TOKENS:
+        suffix = f"-{token}"
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            effort = token
+            stem = stem[: -len(suffix)]
+            break
+    return _family_stem(stem), effort, fast
+
+
+def _common_prefix_len(left: str, right: str) -> int:
+    n = 0
+    for a, b in zip(left, right, strict=False):
+        if a != b:
+            break
+        n += 1
+    return n
+
+
+def _same_shape_match(tracked_pin: str, published: Sequence[str]) -> str | None:
+    """Prefer a unique same-family / same-effort / same-fast published slug."""
+    want = slug_shape(tracked_pin)
+    if not want[0]:
+        return None
+    matches = [slug for slug in published if slug_shape(slug) == want]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    ranked = sorted(
+        matches,
+        key=lambda slug: (_common_prefix_len(slug, tracked_pin), len(slug)),
+        reverse=True,
+    )
+    best = ranked[0]
+    tied = [slug for slug in ranked if _common_prefix_len(slug, tracked_pin) == _common_prefix_len(best, tracked_pin)]
+    if len(tied) != 1:
+        return None
+    return best
+
+
+def select_from_catalogue(
+    catalogue: Sequence[str],
+    *,
+    tracked_pin: str,
+    env_override: str | None,
+) -> tuple[str, str, str | None]:
+    """Return ``(resolved, source, warning)``. Never invents a slug."""
+    published = tuple(slug.strip() for slug in catalogue if isinstance(slug, str) and slug.strip())
+    if env_override:
+        return env_override, "env", None
+    if not published:
+        return tracked_pin, "tracked", MODEL_DISCOVERY_FAILED_WARNING
+    if tracked_pin in published:
+        return tracked_pin, "discovery", None
+    match = _same_shape_match(tracked_pin, published)
+    if match is not None:
+        return match, "discovery", None
+    return tracked_pin, "tracked", TRACKED_PIN_NOT_IN_CATALOGUE_WARNING
+
+
+def _resolve_offbox_probe_host() -> str:
+    """Host a normal remote turn uses (env, then ``.workbay/remote-gate.env``)."""
+    from workbay_protocol.remote_probe import resolve_remote_gate_host  # noqa: PLC0415
+
+    host = (resolve_remote_gate_host(None) or "").strip()
+    if not host:
+        repo_root = backend_registry._resolve_remote_probe_repo_root()
+        host = (resolve_remote_gate_host(repo_root) or "").strip()
+    if not host:
+        raise RuntimeError(
+            "model catalogue probe: remote gate host is not configured "
+            "(set WORKBAY_REMOTE_GATE_HOST); cannot list models on the VM"
+        )
+    if host.startswith("-") or any(ch.isspace() for ch in host):
+        raise RuntimeError(f"model catalogue probe: remote gate host is malformed: {host!r}")
+    return host
+
+
+def resolve_probe_gate_host(backend_id: str) -> str | None:
+    """Gate host identity for cache keys and receipts. Empty when not off-box."""
+    if not _backend_probe_runs_off_box(backend_id):
+        return None
+    try:
+        return _resolve_offbox_probe_host()
+    except RuntimeError:
+        return None
+
+
+def build_remote_list_models_argv(argv: Sequence[str], *, host: str) -> list[str]:
+    """SSH argv that runs the listing command on the remote gate VM."""
+    remote_cmd = f"export PATH={_REMOTE_LIST_MODELS_PATH}; " + " ".join(shlex.quote(str(part)) for part in argv)
+    return ["ssh", *_REMOTE_LIST_MODELS_SSH_OPTS, "--", host, remote_cmd]
+
+
+def _bounded_probe_reason(text: str, *, limit: int = 1_000) -> str | None:
+    reason = (text or "").strip()
+    if not reason:
+        return None
+    if len(reason) <= limit:
+        return reason
+    return reason[-limit:]
+
+
+def _classify_model_probe(
+    slug: str,
+    completed: subprocess.CompletedProcess[str],
+) -> ModelEntitlementResult:
+    stdout = (
+        completed.stdout.decode(errors="replace") if isinstance(completed.stdout, bytes) else completed.stdout or ""
+    )
+    stderr = (
+        completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else completed.stderr or ""
+    )
+    diagnostic = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+    lowered = diagnostic.lower()
+    reason = _bounded_probe_reason(diagnostic)
+
+    # Quota is an account-wide resource state, not evidence about this slug.
+    if "you've hit your usage limit" in lowered or "you have hit your usage limit" in lowered:
+        return ModelEntitlementResult(slug, "quota_exhausted", reason, completed.returncode)
+    if "quota exceeded" in lowered or "usage quota" in lowered:
+        return ModelEntitlementResult(slug, "quota_exhausted", reason, completed.returncode)
+    if "not supported when using codex with a chatgpt account" in lowered:
+        return ModelEntitlementResult(slug, "not_entitled", reason, completed.returncode)
+    metadata_missing = (
+        ("model metadata for" in lowered and "not found" in lowered)
+        or "unknown model" in lowered
+        or "model not found" in lowered
+    )
+    if completed.returncode != 0 and metadata_missing:
+        return ModelEntitlementResult(slug, "unknown_slug", reason, completed.returncode)
+    if completed.returncode != 0:
+        return ModelEntitlementResult(slug, "probe_failed", reason or "probe exited non-zero", completed.returncode)
+    # Diagnostics alone are not an answer.  A live model writes the exec event
+    # stream to stdout; rc=0 plus stderr-only noise must not prove entitlement.
+    if not stdout.strip():
+        return ModelEntitlementResult(slug, "probe_failed", "probe returned no stdout response", completed.returncode)
+    saw_terminal = False
+    saw_response = False
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return ModelEntitlementResult(slug, "probe_failed", reason or "malformed probe JSONL", completed.returncode)
+        if not isinstance(event, dict):
+            return ModelEntitlementResult(slug, "probe_failed", reason or "invalid probe event", completed.returncode)
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            return ModelEntitlementResult(slug, "probe_failed", reason, completed.returncode)
+        if event_type == "turn.completed":
+            saw_terminal = True
+        if event_type == "item.completed":
+            item = event.get("item")
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "agent_message"
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+            ):
+                saw_response = True
+    if not saw_terminal or not saw_response:
+        return ModelEntitlementResult(
+            slug,
+            "probe_failed",
+            reason or "probe stream lacked a terminal success response",
+            completed.returncode,
+        )
+    return ModelEntitlementResult(slug, "entitled", None, completed.returncode)
+
+
+def _run_model_entitlement_probe(
+    backend_id: str,
+    argv: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one isolated probe locally or through the declared off-box path."""
+    transport = list(argv)
+    timeout_s = MODEL_ENTITLEMENT_PROBE_TIMEOUT_S
+    if _backend_probe_runs_off_box(backend_id):
+        host = _resolve_offbox_probe_host()
+        # Bound the VM process group independently of SSH; reserve escalation
+        # within the host budget and isolate the model from transport stdin.
+        transport = build_remote_list_models_argv(
+            [
+                "timeout",
+                "-k",
+                "1",
+                str(max(1, timeout_s - 2)),
+                "bash",
+                "-c",
+                "trap 'sleep 2; exit 124' HUP INT TERM; \"$@\"",
+                "workbay-model-probe",
+                *argv,
+            ],
+            host=host,
+        )
+        transport[-1] += " </dev/null"
+        timeout_s += SSH_CONNECT_TIMEOUT_S
+    return subprocess.run(
+        transport,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
+    )
+
+
+def probe_model_entitlement(
+    backend_id: str,
+    candidates: Sequence[str],
+    *,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str] | str] | None = None,
+) -> dict[str, ModelEntitlementResult]:
+    """Probe candidate slugs with live controls before and after the sweep.
+
+    The command prefix and control slug come from :class:`BackendSpec`; this
+    wrapper contains no backend-name policy.  A dead control invalidates all
+    candidate answers.  Account-wide quota exhaustion remains distinct because
+    retrying another slug cannot repair it.
+    """
+    normalized = tuple(dict.fromkeys(slug.strip() for slug in candidates if isinstance(slug, str) and slug.strip()))
+    spec = backend_registry.get_backend_spec(backend_id)
+    prefix = tuple(spec.probe_model_argv or ())
+    if not prefix:
+        return {
+            slug: ModelEntitlementResult(
+                slug,
+                "probe_unsupported",
+                f"backend {backend_id!r} declares no probe_model_argv",
+            )
+            for slug in normalized
+        }
+
+    control_slug = (spec.tracked_model or "").strip()
+    if not control_slug:
+        return {
+            slug: ModelEntitlementResult(
+                slug,
+                "probe_failed",
+                f"backend {backend_id!r} declares no tracked-model control",
+            )
+            for slug in normalized
+        }
+
+    def invoke(slug: str) -> ModelEntitlementResult:
+        argv = (*prefix, "-m", slug, MODEL_ENTITLEMENT_PROBE_PROMPT)
+        try:
+            raw = runner(argv) if runner is not None else _run_model_entitlement_probe(backend_id, argv)
+            if isinstance(raw, str):
+                completed = subprocess.CompletedProcess(list(argv), 0, stdout=raw, stderr="")
+            elif isinstance(raw, subprocess.CompletedProcess):
+                completed = raw
+            else:
+                return ModelEntitlementResult(
+                    slug,
+                    "probe_failed",
+                    f"probe runner returned unsupported result type {type(raw).__name__}",
+                )
+        except (OSError, subprocess.TimeoutExpired, RuntimeError, TypeError, ValueError) as exc:
+            return ModelEntitlementResult(slug, "probe_failed", _bounded_probe_reason(str(exc)))
+        return _classify_model_probe(slug, completed)
+
+    before = invoke(control_slug)
+    with ThreadPoolExecutor(max_workers=max(1, min(MODEL_ENTITLEMENT_PROBE_MAX_WORKERS, len(normalized)))) as pool:
+        futures = {slug: pool.submit(invoke, slug) for slug in normalized}
+        # Preserve caller order even though probes complete independently.
+        observed = {slug: futures[slug].result() for slug in normalized}
+    after = invoke(control_slug)
+    controls = (before, after)
+    if any(result.status == "quota_exhausted" for result in controls):
+        exhausted_control = next(result for result in controls if result.status == "quota_exhausted")
+        return {
+            slug: ModelEntitlementResult(
+                slug,
+                "quota_exhausted",
+                exhausted_control.reason,
+                exhausted_control.returncode,
+            )
+            for slug in normalized
+        }
+    if any(result.status != "entitled" for result in controls):
+        details = "; ".join(
+            f"{position} control {result.status}: {result.reason or 'no diagnostic'}"
+            for position, result in zip(("before", "after"), controls, strict=True)
+            if result.status != "entitled"
+        )
+        return {slug: ModelEntitlementResult(slug, "probe_failed", details) for slug in normalized}
+    return observed
+
+
+def _run_completed(argv: Sequence[str], *, timeout_s: float, label: str) -> str:
+    try:
+        completed = subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{label}: {exc}") from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(f"{label} {list(argv)!r} exited {completed.returncode}: {stderr}")
+    return completed.stdout or ""
+
+
+def _run_list_models_locally(argv: Sequence[str], *, timeout_s: float = LOCAL_LIST_MODELS_TIMEOUT_S) -> str:
+    return _run_completed(argv, timeout_s=timeout_s, label="model catalogue probe failed")
+
+
+def _run_list_models_on_remote_gate(
+    argv: Sequence[str], *, timeout_s: float = REMOTE_LIST_MODELS_PROCESS_TIMEOUT_S
+) -> str:
+    host = _resolve_offbox_probe_host()
+    transport = build_remote_list_models_argv(argv, host=host)
+    return _run_completed(transport, timeout_s=timeout_s, label="model catalogue probe failed on remote gate")
+
+
+def _run_list_models(
+    argv: Sequence[str],
+    *,
+    timeout_s: float | None = None,
+    backend_id: str | None = None,
+) -> str:
+    """Run a listing argv locally, or on the VM when *backend_id* is off-box."""
+    if backend_id and _backend_probe_runs_off_box(backend_id):
+        return _run_list_models_on_remote_gate(
+            argv,
+            timeout_s=REMOTE_LIST_MODELS_PROCESS_TIMEOUT_S if timeout_s is None else timeout_s,
+        )
+    return _run_list_models_locally(
+        argv,
+        timeout_s=LOCAL_LIST_MODELS_TIMEOUT_S if timeout_s is None else timeout_s,
+    )
+
+
+def _cache_key(backend_id: str, gate_host: str | None, env_override: str | None) -> tuple[str, str, str]:
+    return (backend_id, gate_host or "", env_override or "")
+
+
+def _lookup_cached(
+    key: tuple[str, str, str],
+    *,
+    tracked_pin: str,
+    env_override: str | None,
+) -> ModelDiscovery | None:
+    with _cache_lock:
+        cached = _discovery_cache.get(key)
+        if cached is None:
+            return None
+        expires_at, discovery = cached
+        if time.monotonic() >= expires_at:
+            _discovery_cache.pop(key, None)
+            return None
+    if env_override and discovery.resolved_model != env_override:
+        return replace(
+            discovery,
+            resolved_model=env_override,
+            tracked_pin=tracked_pin,
+            source="env",
+            warning=None,
+        )
+    return discovery
+
+
+def _store_cached(key: tuple[str, str, str], discovery: ModelDiscovery) -> None:
+    with _cache_lock:
+        _discovery_cache[key] = (time.monotonic() + MODEL_DISCOVERY_TTL_S, discovery)
+
+
+def clear_model_discovery_cache() -> None:
+    """Drop the TTL cache (tests / host change)."""
+    with _cache_lock:
+        _discovery_cache.clear()
+
+
+def _probe_catalogue(
+    backend_id: str,
+    argv: Sequence[str],
+    *,
+    runner: Callable[[Sequence[str]], Any] | None,
+) -> tuple[tuple[str, ...], str | None]:
+    try:
+
+        def _default_runner(listing_argv: Sequence[str]) -> str:
+            return _run_list_models(listing_argv, backend_id=backend_id)
+
+        raw = (runner or _default_runner)(argv)
+        if not isinstance(raw, str):
+            raise TypeError(f"catalogue runner returned {type(raw).__name__}, expected str")
+        published = parse_model_catalogue(raw)
+        if not published:
+            return (), MODEL_DISCOVERY_FAILED_WARNING
+        return published, None
+    except (RuntimeError, OSError, TypeError, ValueError) as exc:
+        _LOGGER.warning(
+            "%s: %s; degrading to tracked pin",
+            MODEL_DISCOVERY_FAILED_WARNING,
+            exc,
+        )
+        return (), MODEL_DISCOVERY_FAILED_WARNING
+
+
+def _native_transport_for(backend_id: str) -> str | None:
+    try:
+        from workbay_orchestrator_mcp.orchestration.resolved_role_config import (  # noqa: PLC0415
+            native_transport_for_backend,
+        )
+
+        return native_transport_for_backend(backend_id)
+    except Exception:  # noqa: BLE001 — discovery must degrade, not invent transport
+        return None
+
+
+def native_metadata_producer_for(backend_id: str) -> Any | None:
+    """Resolve the declared native metadata producer. Patch this in tests."""
+    spec = backend_registry.BACKENDS.get(backend_id)
+    path = getattr(spec, "native_metadata_producer_path", None) if spec is not None else None
+    if not path:
+        return None
+    module_name, attr = str(path).rsplit(".", 1)
+    return getattr(importlib.import_module(module_name), attr)
+
+
+def invoke_native_metadata_producer(
+    backend_id: str,
+    *,
+    model: str,
+    effort: str | None = None,
+    gate_host: str | None = None,
+) -> Any:
+    """Run the BackendSpec native metadata producer, or return None when undeclared."""
+    producer = native_metadata_producer_for(backend_id)
+    if producer is None:
+        return None
+    bound_host = gate_host
+    if _backend_probe_runs_off_box(backend_id):
+        try:
+            bound_host = _resolve_offbox_probe_host()
+        except RuntimeError as exc:
+            from workbay_orchestrator_mcp.orchestration.adapters.grok_cli import (  # noqa: PLC0415
+                NativeMetadataError,
+            )
+
+            raise NativeMetadataError("unavailable", str(exc)) from exc
+    elif bound_host:
+        from workbay_orchestrator_mcp.orchestration.adapters.grok_cli import (  # noqa: PLC0415
+            NativeMetadataError,
+        )
+
+        raise NativeMetadataError("mismatch", "local native metadata must not bind a remote gate host")
+    return producer(
+        backend_id=backend_id,
+        model=model,
+        effort=effort,
+        gate_host=bound_host,
+    )
+
+
+def _observe_native_metadata(
+    backend_id: str,
+    *,
+    model: str,
+    effort: str | None,
+    gate_host: str | None,
+) -> tuple[Any | None, str | None]:
+    spec = backend_registry.BACKENDS.get(backend_id)
+    if spec is None or not getattr(spec, "native_metadata_producer_path", None):
+        return None, None
+    if not model:
+        return None, "native_metadata_unavailable"
+    try:
+        evidence = invoke_native_metadata_producer(
+            backend_id,
+            model=model,
+            effort=effort,
+            gate_host=gate_host,
+        )
+    except Exception as exc:  # noqa: BLE001 — typed producer refusals degrade listing to names-only
+        kind = getattr(exc, "kind", None)
+        if kind == "unsupported_effort" and effort is not None:
+            observed, observed_warning = _observe_native_metadata(
+                backend_id, model=model, effort=None, gate_host=gate_host
+            )
+            if observed is not None:
+                return observed, f"native_metadata_{kind}"
+            return None, observed_warning or f"native_metadata_{kind}"
+        if kind in {"timeout", "malformed", "unavailable", "unsupported_model", "unsupported_effort", "mismatch"}:
+            return None, f"native_metadata_{kind}"
+        return None, "native_metadata_unavailable"
+    return evidence, None
+
+
+def _advertised_efforts_from_native(evidence: Any) -> tuple[tuple[tuple[str, str], tuple[str, ...]], ...]:
+    selected = str(getattr(evidence, "selected_model", "") or "").strip()
+    transport = str(getattr(evidence, "transport", "") or "").strip()
+    tokens = tuple(str(item).strip() for item in getattr(evidence, "advertised_efforts", ()) if str(item).strip())
+    if not selected or not transport:
+        return ()
+    return (((selected, transport), tokens),)
+
+
+def merge_native_metadata(discovery: ModelDiscovery | None, evidence: Any) -> ModelDiscovery:
+    """Attach observed native capabilities onto a listing discovery."""
+    from workbay_orchestrator_mcp.orchestration.resolved_role_config import catalogue_digest  # noqa: PLC0415
+
+    capabilities = tuple((str(model), str(transport)) for model, transport in evidence.capabilities)
+    listed = tuple(discovery.catalogue) if discovery is not None else ()
+    advertised = tuple(str(item) for item in evidence.advertised_models if str(item).strip())
+    models = tuple(dict.fromkeys((*listed, *advertised)))
+    advertised_efforts = _advertised_efforts_from_native(evidence)
+    version = (
+        f"acp:{evidence.agent_version}"
+        if evidence.agent_version
+        else (discovery.catalogue_version if discovery is not None else "discovery:probed")
+    )
+    if discovery is None:
+        return ModelDiscovery(
+            backend_id=str(evidence.backend_id),
+            resolved_model=str(evidence.selected_model),
+            tracked_pin=str(evidence.selected_model),
+            catalogue=models,
+            source="discovery",
+            catalogue_source="probed",
+            gate_host=evidence.gate_host,
+            catalogue_version=version,
+            catalogue_digest=catalogue_digest(models, capabilities, version, advertised_efforts),
+            catalogue_captured_at=float(evidence.captured_at),
+            catalogue_capabilities=capabilities,
+            catalogue_advertised_efforts=advertised_efforts,
+        )
+    return replace(
+        discovery,
+        catalogue=models,
+        catalogue_capabilities=capabilities,
+        catalogue_advertised_efforts=advertised_efforts,
+        catalogue_version=version,
+        catalogue_digest=catalogue_digest(models, capabilities, version, advertised_efforts),
+        catalogue_captured_at=float(evidence.captured_at),
+        gate_host=evidence.gate_host if evidence.gate_host is not None else discovery.gate_host,
+        catalogue_source="probed",
+        source="discovery" if models else discovery.source,
+    )
+
+
+def authoritative_catalogue_snapshot(discovery: ModelDiscovery | None) -> Any:
+    """Build the observed catalogue snapshot. Names alone are not capability proof."""
+    if discovery is None:
+        return None
+    from workbay_orchestrator_mcp.orchestration.resolved_role_config import (  # noqa: PLC0415
+        CatalogueSnapshot,
+        catalogue_digest,
+    )
+
+    capabilities_raw = getattr(discovery, "catalogue_capabilities", None)
+    captured_at_raw = getattr(discovery, "catalogue_captured_at", None)
+    if capabilities_raw is None or captured_at_raw is None:
+        return None
+    models = tuple(str(item) for item in getattr(discovery, "catalogue", ()) if str(item).strip())
+    capabilities = tuple((str(model), str(transport)) for model, transport in capabilities_raw)
+    advertised_efforts = tuple(getattr(discovery, "catalogue_advertised_efforts", None) or ())
+    captured_at = captured_at_raw
+    version = getattr(discovery, "catalogue_version", None) or (
+        f"discovery:{getattr(discovery, 'catalogue_source', 'probed')}"
+    )
+    digest = getattr(discovery, "catalogue_digest", None) or catalogue_digest(
+        models, capabilities, version, advertised_efforts
+    )
+    return CatalogueSnapshot(
+        version=version,
+        digest=digest,
+        models=models,
+        capabilities=capabilities,
+        captured_at=captured_at,
+        advertised_efforts=advertised_efforts,
+    )
+
+
+def _finish_discovery(
+    *,
+    backend_id: str,
+    tracked_pin: str,
+    published: tuple[str, ...],
+    env_override: str | None,
+    warning: str | None,
+    gate_host: str | None,
+    catalogue_source: CatalogueSource,
+    cache: bool,
+    cache_key: tuple[str, str, str],
+    interrogated: tuple[str, ...] | None = None,
+    capabilities: tuple[tuple[str, str], ...] | None = None,
+    catalogue_version: str | None = None,
+    captured_at: float | None = None,
+    advertised_efforts: tuple[tuple[tuple[str, str], tuple[str, ...]], ...] | None = None,
+    native_metadata_warning: str | None = None,
+) -> ModelDiscovery:
+    resolved, source, select_warning = select_from_catalogue(
+        published, tracked_pin=tracked_pin, env_override=env_override
+    )
+    warning = warning or select_warning
+    if warning == MODEL_DISCOVERY_FAILED_WARNING and source != "env":
+        resolved, source = tracked_pin, "tracked"
+    from workbay_orchestrator_mcp.orchestration.resolved_role_config import catalogue_digest  # noqa: PLC0415
+
+    version = catalogue_version or f"discovery:{catalogue_source}"
+    if captured_at is None:
+        captured_at = time.monotonic() if published or capabilities else None
+    digest = (
+        catalogue_digest(published, capabilities or (), version, advertised_efforts or ())
+        if capabilities is not None
+        else None
+    )
+    discovery = ModelDiscovery(
+        backend_id=backend_id,
+        resolved_model=resolved,
+        tracked_pin=tracked_pin,
+        catalogue=published,
+        source=source,
+        warning=warning,
+        gate_host=gate_host,
+        catalogue_source=catalogue_source,
+        interrogated=interrogated,
+        catalogue_version=version,
+        catalogue_digest=digest,
+        catalogue_captured_at=captured_at,
+        catalogue_capabilities=capabilities,
+        catalogue_advertised_efforts=advertised_efforts,
+        native_metadata_warning=native_metadata_warning,
+    )
+    if cache:
+        _store_cached(cache_key, discovery)
+    return discovery
+
+
+def _resolve_from_listing(
+    backend_id: str,
+    pin: PinHome,
+    *,
+    catalogue: Sequence[str] | None,
+    probe: bool,
+    runner: Callable[[Sequence[str]], Any] | None,
+    env_override: str | None,
+    gate_host: str | None,
+    cache: bool,
+    cache_key: tuple[str, str, str],
+    request_model: str | None = None,
+    request_effort: str | None = None,
+) -> ModelDiscovery:
+    if catalogue is not None:
+        published = tuple(slug.strip() for slug in catalogue if isinstance(slug, str) and slug.strip())
+        warning = MODEL_DISCOVERY_FAILED_WARNING if not published else None
+        catalogue_source: CatalogueSource = "probed" if published else "tracked_probe_failed"
+    else:
+        published, warning = _probe_catalogue(backend_id, pin.list_argv, runner=runner)
+        catalogue_source = "probed" if published else "tracked_probe_failed"
+    native_caps: tuple[tuple[str, str], ...] | None = ()
+    native_efforts: tuple[tuple[tuple[str, str], tuple[str, ...]], ...] | None = None
+    native_version: str | None = None
+    native_captured_at: float | None = None
+    native_metadata_warning: str | None = None
+    # Explicit catalogue names and listing-runner stubs stay names-only.
+    # Off-box listing already used remote transport; native ACP is a second
+    # spawn and must not pollute the listing warning when it is absent.
+    # A live local PATH/process probe with a declared producer observes ACP.
+    if catalogue is None and runner is None and not _backend_probe_runs_off_box(backend_id):
+        selected = (request_model or env_override or pin.tracked_pin or "").strip()
+        evidence, native_warning = _observe_native_metadata(
+            backend_id,
+            model=selected,
+            effort=request_effort,
+            gate_host=gate_host,
+        )
+        if evidence is not None:
+            native_caps = evidence.capabilities
+            native_efforts = _advertised_efforts_from_native(evidence)
+            if evidence.agent_version:
+                native_version = f"acp:{evidence.agent_version}"
+            native_captured_at = evidence.captured_at
+            advertised = tuple(str(item) for item in evidence.advertised_models if str(item).strip())
+            if not published:
+                published = advertised
+            elif evidence.selected_model and evidence.selected_model not in published:
+                published = published + (str(evidence.selected_model),)
+        elif native_warning:
+            native_metadata_warning = native_warning
+            native_caps = ()
+    return _finish_discovery(
+        backend_id=backend_id,
+        tracked_pin=pin.tracked_pin,
+        published=published,
+        env_override=env_override,
+        warning=warning,
+        gate_host=gate_host,
+        catalogue_source=catalogue_source,
+        cache=cache,
+        cache_key=cache_key,
+        capabilities=native_caps,
+        catalogue_version=native_version,
+        captured_at=native_captured_at,
+        advertised_efforts=native_efforts,
+        native_metadata_warning=native_metadata_warning,
+    )
+
+
+def resolve_offbox_model(
+    backend_id: str,
+    *,
+    catalogue: Sequence[str] | None = None,
+    probe: bool = False,
+    runner: Callable[[Sequence[str]], Any] | None = None,
+    cache: bool = True,
+    request_model: str | None = None,
+    request_effort: str | None = None,
+) -> ModelDiscovery:
+    """Resolve one backend's pin: env > catalogue/probe > tracked."""
+    pin = pin_home_for(backend_id)
+    env_override = (os.environ.get(pin.env_key) or "").strip() or None
+    gate_host = resolve_probe_gate_host(backend_id)
+    key = _cache_key(backend_id, gate_host, env_override)
+    if catalogue is not None:
+        return _resolve_from_listing(
+            backend_id,
+            pin,
+            catalogue=catalogue,
+            probe=probe,
+            runner=runner,
+            env_override=env_override,
+            gate_host=gate_host,
+            cache=cache,
+            cache_key=key,
+            request_model=request_model,
+            request_effort=request_effort,
+        )
+    if cache:
+        cached = _lookup_cached(key, tracked_pin=pin.tracked_pin, env_override=env_override)
+        if cached is not None:
+            return cached
+    spec = backend_registry.get_backend_spec(backend_id)
+    if probe and spec.probe_model_argv:
+        owner = True
+        flight: _DiscoveryFlight | None = None
+        if cache:
+            with _cache_lock:
+                flight = _discovery_flights.get(key)
+                if flight is None:
+                    flight = _DiscoveryFlight(event=threading.Event())
+                    _discovery_flights[key] = flight
+                else:
+                    owner = False
+            if not owner:
+                if flight.event.wait(timeout=MODEL_DISCOVERY_COALESCE_WAIT_S) and flight.result is not None:
+                    return flight.result
+                return _finish_discovery(
+                    backend_id=backend_id,
+                    tracked_pin=pin.tracked_pin,
+                    published=(),
+                    env_override=env_override,
+                    warning=MODEL_DISCOVERY_FAILED_WARNING,
+                    gate_host=gate_host,
+                    catalogue_source="tracked_probe_failed",
+                    cache=False,
+                    cache_key=key,
+                )
+        try:
+            tiers = spec.model_tiers
+            candidates = tuple(tiers) if isinstance(tiers, Mapping) and tiers else (pin.tracked_pin,)
+            entitlements = probe_model_entitlement(backend_id, candidates, runner=runner)
+            published = tuple(slug for slug, result in entitlements.items() if result.status == "entitled")
+            statuses = {result.status for result in entitlements.values()}
+            warning = None if published else MODEL_DISCOVERY_FAILED_WARNING
+            catalogue_source: CatalogueSource = "probed" if published else "tracked_probe_failed"
+            if "probe_unsupported" in statuses:
+                catalogue_source = "tracked_unprobeable"
+            transport = _native_transport_for(backend_id)
+            entitled_capabilities = tuple((slug, transport) for slug in published) if transport else ()
+            result = _finish_discovery(
+                backend_id=backend_id,
+                tracked_pin=pin.tracked_pin,
+                published=published,
+                env_override=env_override,
+                warning=warning,
+                gate_host=gate_host,
+                catalogue_source=catalogue_source,
+                cache=cache,
+                cache_key=key,
+                interrogated=candidates,
+                capabilities=entitled_capabilities if published else (),
+            )
+            if flight is not None:
+                flight.result = result
+            return result
+        finally:
+            if flight is not None:
+                with _cache_lock:
+                    _discovery_flights.pop(key, None)
+                    flight.event.set()
+    # A catalogue-less home (empty list_argv) is never probed: env > tracked.
+    if probe and pin.list_argv:
+        return _resolve_from_listing(
+            backend_id,
+            pin,
+            catalogue=None,
+            probe=True,
+            runner=runner,
+            env_override=env_override,
+            gate_host=gate_host,
+            cache=cache,
+            cache_key=key,
+            request_model=request_model,
+            request_effort=request_effort,
+        )
+    return ModelDiscovery(
+        backend_id=backend_id,
+        resolved_model=env_override or pin.tracked_pin,
+        tracked_pin=pin.tracked_pin,
+        catalogue=(),
+        source="env" if env_override else "tracked",
+        warning=None,
+        gate_host=gate_host,
+        catalogue_source="tracked_unprobeable",
+    )
+
+
+def snapshot_published_pins() -> dict[str, str | None]:
+    """Capture ``BACKENDS[].allowed_model`` for test restore."""
+    return {
+        name: spec.allowed_model for name, spec in backend_registry.BACKENDS.items() if spec.allowed_model is not None
+    }
+
+
+def restore_published_pins(snapshot: Mapping[str, str | None]) -> None:
+    """Restore ``BACKENDS[].allowed_model`` from :func:`snapshot_published_pins`."""
+    with _publish_lock:
+        _live_entitlement_catalogues.clear()
+        _live_entitlement_interrogated.clear()
+        for name, model in snapshot.items():
+            spec = backend_registry.BACKENDS.get(name)
+            if spec is None:
+                continue
+            backend_registry.BACKENDS[name] = replace(spec, allowed_model=model)
+
+
+def _publish_one(backend_id: str, discovery: ModelDiscovery) -> None:
+    spec = backend_registry.BACKENDS.get(backend_id)
+    if spec is not None and spec.probe_model_argv and discovery.catalogue_source == "probed":
+        _live_entitlement_catalogues[backend_id] = frozenset(discovery.catalogue)
+        _live_entitlement_interrogated[backend_id] = (
+            frozenset(discovery.interrogated) if discovery.interrogated is not None else None
+        )
+    elif spec is not None and spec.probe_model_argv:
+        # A newer unresolved sweep cannot leave an older positive set looking
+        # current. Callers fall back to the curated/pinned policy until the
+        # next successful live sweep.
+        _live_entitlement_catalogues.pop(backend_id, None)
+        _live_entitlement_interrogated.pop(backend_id, None)
+    if spec is not None and spec.allowed_model is not None:
+        backend_registry.BACKENDS[backend_id] = replace(spec, allowed_model=discovery.resolved_model)
+    if spec is not None and spec.model_family == "cursor" and discovery.catalogue:
+        seed_cursor_effort_slugs_from_catalogue(discovery.catalogue)
+    from workbay_orchestrator_mcp.orchestration.offload_profiles import (  # noqa: PLC0415
+        OFFLOAD_AGENT_PROFILES,
+    )
+
+    profile = OFFLOAD_AGENT_PROFILES.get(backend_id)
+    if profile is None or profile.pinned_model is None:
+        return
+    OFFLOAD_AGENT_PROFILES[backend_id] = replace(
+        profile,
+        pinned_model=discovery.resolved_model,
+        default_model=discovery.resolved_model,
+    )
+
+
+def publish_resolved_model_pins(discoveries: Mapping[str, ModelDiscovery]) -> None:
+    """Rebind ``allowed_model`` on the probed backend only.
+
+    Does not alias a remote catalogue onto a local CLI sibling and does not
+    mutate process-global ``DEFAULT_*_MODEL`` names.
+    """
+    with _publish_lock:
+        for backend_id, discovery in discoveries.items():
+            _publish_one(backend_id, discovery)
+
+
+def live_entitled_models_for(backend_id: str) -> frozenset[str] | None:
+    """Return the latest successful live entitlement set, when one was published."""
+    with _publish_lock:
+        return _live_entitlement_catalogues.get(backend_id)
+
+
+def live_entitlement_answers_for(backend_id: str, model: str) -> bool:
+    """Whether the published sweep actually has an answer about ``model``.
+
+    A bounded per-candidate sweep only interrogates the curated tier slugs. An
+    operator env pin outside that table was never asked about, so its absence
+    from the entitled catalogue is silence, not a denial. An exhaustive listing
+    (``interrogated is None``) does answer for every slug.
+    """
+    with _publish_lock:
+        if backend_id not in _live_entitlement_catalogues:
+            return False
+        interrogated = _live_entitlement_interrogated.get(backend_id)
+        return interrogated is None or model in interrogated
+
+
+@contextmanager
+def published_model_pins(discoveries: Mapping[str, ModelDiscovery]) -> Iterator[None]:
+    """Publish pins and restore ``BACKENDS.allowed_model`` on exit (tests)."""
+    snapshot = snapshot_published_pins()
+    try:
+        publish_resolved_model_pins(discoveries)
+        yield
+    finally:
+        restore_published_pins(snapshot)
+        from workbay_orchestrator_mcp.orchestration.cursor_lane_config import (  # noqa: PLC0415
+            reset_cursor_effort_slugs,
+        )
+
+        reset_cursor_effort_slugs()
+        clear_model_discovery_cache()
+
+
+def build_offload_dispatch_receipt(
+    backend_id: str,
+    *,
+    served_model: str | None = None,
+    discovery: ModelDiscovery | None = None,
+    catalogue: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Lane receipt naming resolved weights and the harness (pins 19/21)."""
+    try:
+        resolved = discovery or resolve_offbox_model(backend_id, catalogue=catalogue)
+    except (KeyError, PinHomeUndeclaredError):
+        return {
+            "backend_id": backend_id,
+            "resolved_model": served_model,
+            "served_model": served_model,
+            "tracked_pin": None,
+            "pin_source": "unpinned",
+        }
+    payload: dict[str, Any] = {
+        "backend_id": backend_id,
+        "resolved_model": resolved.resolved_model,
+        "served_model": served_model,
+        "tracked_pin": resolved.tracked_pin,
+        "pin_source": resolved.source,
+    }
+    if resolved.warning:
+        payload["discovery_warning"] = resolved.warning
+    if resolved.gate_host:
+        payload["gate_host"] = resolved.gate_host
+    return payload
