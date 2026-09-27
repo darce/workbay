@@ -1,0 +1,38 @@
+#!/bin/sh
+# Git pre-commit hook: hard-block commits on non-conforming branch
+# names (internal). Override with
+# WORKBAY_ALLOW_NONCONFORMING_BRANCH=1 (audited; never blocks the
+# commit when set). Pre-push enforces a separate gate that does NOT
+# inherit this override (implementation note).
+#
+# Installed via the bootstrap installer, which sets core.hooksPath to
+# scripts/hooks/git per implementation note.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+# Resolve guard scripts relative to this hook's own location (one level up from
+# the git/ hook dir), not $REPO_ROOT — works in nested-source / hoisted consumer
+# layouts where the git root is not the shared hook source (implementation note ask G).
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+GUARD_DIR="$(dirname "$HOOK_DIR")"
+
+# Commit-time root-branch backstop. Fail-OPEN if the
+# script is missing (overlay drift / partial install) so a vanished check never
+# hard-blocks every commit in every worktree; only its own exit 1 blocks.
+if [ -f "$HOOK_DIR/check_root_branch.py" ]; then
+    python3 "$HOOK_DIR/check_root_branch.py" || exit $?
+fi
+
+if [ -f "$GUARD_DIR/check_branch_naming.py" ]; then
+    python3 "$GUARD_DIR/check_branch_naming.py" --trigger pre-commit || exit $?
+fi
+
+# Refuse checklist glyph edits on archived plans (main).
+if [ -f "$GUARD_DIR/guard_archived_plan_checklist.py" ]; then
+    python3 "$GUARD_DIR/guard_archived_plan_checklist.py" || exit $?
+fi
+
+exit 0

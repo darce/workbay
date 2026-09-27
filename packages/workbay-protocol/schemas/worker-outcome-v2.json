@@ -1,0 +1,152 @@
+{
+  "$defs": {
+    "CeremonyStatus": {
+      "additionalProperties": false,
+      "description": "Orchestration/reporting ceremony, independent of landed work.",
+      "properties": {
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "stopped",
+                "exhausted",
+                "failed",
+                "transport_closed",
+                "compaction_failed",
+                "mcp_write_rejected"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How the worker run ended as ceremony; null when ceremony succeeded.",
+          "title": "Kind"
+        },
+        "retryable": {
+          "default": false,
+          "description": "Whether the ceremony failure is retryable.",
+          "title": "Retryable",
+          "type": "boolean"
+        }
+      },
+      "title": "CeremonyStatus",
+      "type": "object"
+    },
+    "LandedWork": {
+      "additionalProperties": false,
+      "description": "Product-work provenance, independent of orchestration ceremony.",
+      "properties": {
+        "commit_sha": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "minLength": 40,
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exact 40-char lowercase hex SHA of the landed commit, if any.",
+          "title": "Commit Sha"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Git ref that holds the landed commit.",
+          "title": "Ref"
+        },
+        "tests_passed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether the worker's recorded tests passed for this tip.",
+          "title": "Tests Passed"
+        }
+      },
+      "title": "LandedWork",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "merge_ready": {
+            "const": true
+          }
+        },
+        "required": [
+          "merge_ready"
+        ]
+      },
+      "then": {
+        "properties": {
+          "landed": {
+            "properties": {
+              "commit_sha": {
+                "maxLength": 40,
+                "minLength": 40,
+                "pattern": "^[0-9a-f]{40}$",
+                "type": "string"
+              },
+              "ref": {
+                "minLength": 1,
+                "not": {
+                  "pattern": "[\\r\\n]"
+                },
+                "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "commit_sha",
+              "ref"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "description": "Typed worker result: landed work and ceremony status are independent.",
+  "properties": {
+    "ceremony": {
+      "$ref": "#/$defs/CeremonyStatus"
+    },
+    "landed": {
+      "$ref": "#/$defs/LandedWork"
+    },
+    "merge_ready": {
+      "default": false,
+      "description": "True only when this outcome is an explicit merge-ready claim.",
+      "title": "Merge Ready",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "landed",
+    "ceremony"
+  ],
+  "title": "WorkerOutcomeV2",
+  "type": "object"
+}

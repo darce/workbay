@@ -1,0 +1,16 @@
+name: rescue-lane
+description: Rescue a broken or blocked lane branch. Creates rescue branch, cherry-picks
+  clean commits, verifies contracts, logs MCP decision.
+mode: execution
+context_budget: 150
+makefile_target: null
+mcp_tools:
+- get_lane_activity
+- lane_communication
+- worker_reports
+- record_event
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: true
