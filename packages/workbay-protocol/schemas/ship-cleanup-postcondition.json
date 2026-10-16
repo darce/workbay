@@ -1,0 +1,107 @@
+{
+  "$defs": {
+    "ShipStage": {
+      "description": "Ordered ship-transaction cursor. ``wb ship`` persists one of these.",
+      "enum": [
+        "preflight",
+        "merge",
+        "integration_verify",
+        "mark_done",
+        "close_lanes",
+        "archive",
+        "remove_worktree",
+        "delete_branch",
+        "local_reap",
+        "remote_reap_verify",
+        "render",
+        "complete"
+      ],
+      "title": "ShipStage",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "remote_cleanup": {
+            "enum": [
+              "required",
+              "verified",
+              "failed"
+            ]
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "remote_receipts_present": {
+            "const": false
+          }
+        },
+        "required": [
+          "remote_receipts_present"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_cleanup": {
+            "const": "not_applicable"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "remote_receipts_present": {
+            "const": true
+          },
+          "stage": {
+            "const": "complete"
+          }
+        },
+        "required": [
+          "stage",
+          "remote_receipts_present"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_cleanup": {
+            "const": "verified"
+          }
+        }
+      }
+    }
+  ],
+  "description": "Cleanup postcondition bound to a ship-stage cursor.\n\nRemote cleanup is required iff remote-resource receipts exist. No\nreceipts must be explicitly ``not_applicable``; ``complete`` cannot\nhide a required-but-unverified remote release.",
+  "properties": {
+    "remote_cleanup": {
+      "enum": [
+        "not_applicable",
+        "required",
+        "verified",
+        "failed"
+      ],
+      "title": "Remote Cleanup",
+      "type": "string"
+    },
+    "remote_receipts_present": {
+      "title": "Remote Receipts Present",
+      "type": "boolean"
+    },
+    "stage": {
+      "$ref": "#/$defs/ShipStage"
+    }
+  },
+  "required": [
+    "stage",
+    "remote_receipts_present",
+    "remote_cleanup"
+  ],
+  "title": "ShipCleanupPostcondition",
+  "type": "object"
+}
