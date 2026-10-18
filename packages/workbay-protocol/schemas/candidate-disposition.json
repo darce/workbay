@@ -1,0 +1,290 @@
+{
+  "$defs": {
+    "CandidateControlState": {
+      "description": "Finite candidate control machine. Legacy rows read as ``unknown``.",
+      "enum": [
+        "unknown",
+        "implementing",
+        "candidate_pending",
+        "candidate_validated",
+        "reviewed",
+        "shipping",
+        "done",
+        "rejected_with_evidence",
+        "blocked_external"
+      ],
+      "title": "CandidateControlState",
+      "type": "string"
+    },
+    "LandedTip": {
+      "additionalProperties": false,
+      "description": "One landed tip under a candidate, with a monotone disposition.",
+      "properties": {
+        "commit_sha": {
+          "maxLength": 40,
+          "minLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Commit Sha",
+          "type": "string"
+        },
+        "disposition": {
+          "enum": [
+            "unknown",
+            "undisposed",
+            "integrated",
+            "rejected_with_named_evidence"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ref"
+        }
+      },
+      "required": [
+        "commit_sha",
+        "disposition"
+      ],
+      "title": "LandedTip",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "candidate_sha": {
+            "maxLength": 40,
+            "minLength": 40,
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_sha"
+        ]
+      },
+      "if": {
+        "properties": {
+          "control_state": {
+            "const": "unknown"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "blocked_from_state": {
+            "type": "null"
+          },
+          "landed_tips": {
+            "items": {
+              "properties": {
+                "disposition": {
+                  "const": "unknown"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "properties": {
+          "blocked_from_state": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "control_state": {
+            "const": "blocked_external"
+          }
+        },
+        "required": [
+          "control_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "blocked_from_state": {
+            "enum": [
+              "candidate_pending",
+              "candidate_validated",
+              "implementing",
+              "rejected_with_evidence",
+              "reviewed",
+              "shipping"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "blocked_from_state"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "control_state": {
+            "enum": [
+              "done",
+              "shipping"
+            ]
+          }
+        },
+        "required": [
+          "control_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "landed_tips": {
+            "items": {
+              "properties": {
+                "disposition": {
+                  "enum": [
+                    "integrated",
+                    "rejected_with_named_evidence"
+                  ]
+                }
+              },
+              "required": [
+                "disposition"
+              ]
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "landed_tips"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "control_state": {
+            "const": "rejected_with_evidence"
+          }
+        },
+        "required": [
+          "control_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "landed_tips": {
+            "contains": {
+              "properties": {
+                "disposition": {
+                  "const": "rejected_with_named_evidence"
+                }
+              },
+              "required": [
+                "disposition"
+              ]
+            },
+            "items": {
+              "properties": {
+                "disposition": {
+                  "enum": [
+                    "integrated",
+                    "rejected_with_named_evidence"
+                  ]
+                }
+              },
+              "required": [
+                "disposition"
+              ]
+            },
+            "minContains": 1,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "landed_tips"
+        ]
+      }
+    }
+  ],
+  "description": "Exact-SHA candidate record. Legacy rows remain ``unknown`` until initialized.",
+  "properties": {
+    "blocked_from_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CandidateControlState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Control state restored by unblock; required iff blocked_external."
+    },
+    "candidate_sha": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "minLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Candidate Sha"
+    },
+    "control_state": {
+      "$ref": "#/$defs/CandidateControlState",
+      "default": "unknown"
+    },
+    "finding_fingerprint": {
+      "default": "",
+      "title": "Finding Fingerprint",
+      "type": "string"
+    },
+    "landed_tips": {
+      "items": {
+        "$ref": "#/$defs/LandedTip"
+      },
+      "title": "Landed Tips",
+      "type": "array"
+    },
+    "repeated_state_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Repeated State Count",
+      "type": "integer"
+    },
+    "task_ref": {
+      "description": "Short task identifier, e.g. 'internal' or 'internal'.",
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Task Ref",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_ref"
+  ],
+  "title": "CandidateDisposition",
+  "type": "object"
+}
