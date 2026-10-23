@@ -1,0 +1,10 @@
+[Unit]
+Description=Wake WorkBay VM lane queue when jobs change
+
+[Path]
+PathChanged=%h/workbay-sandbox/.jobs
+PathModified=%h/workbay-sandbox/.jobs
+Unit=workbay-lane-queue.service
+
+[Install]
+WantedBy=default.target

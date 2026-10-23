@@ -1,0 +1,12 @@
+name: commit2git
+description: Split uncommitted changes into clean commits grouped by completed slice
+  or sub-feature while staying in the current worktree.
+mode: advisory
+context_budget: 200
+makefile_target: null
+mcp_tools: []
+tdd_gate: false
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: true
