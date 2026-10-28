@@ -1,0 +1,3741 @@
+"""Harvest-driven reaper for finished remote VM lane sandboxes.
+
+This is the row-aware orchestrator complement to the standalone VM sweep in
+``scripts/remote_agent.sh`` (RES-07). Marker-owned sandboxes with a row require
+a terminal status (``closed`` / ``merged`` / ``closed_stale``). A sandbox
+without a row is retired when its key maps to a branch identity pinned under
+``refs/reclaimed``; other known branches still require a bounded probe proving
+the clean, idle sandbox's exported blobs equal that host branch tip. Retired
+sandboxes must also meet the idle floor. A non-terminal row is never harvested.
+Callers also pass ``exclude_keys`` for the invoking pass.
+``review`` is openable and is not a status shortcut. Rowless sandboxes whose
+keys cannot be derived from this repository's refs or registry branches are
+foreign and report-only. ``sandbox_bytes`` excludes those foreign bytes.
+
+Liveness is never taken from a local snapshot. Listing reports lease / lock /
+pid for classification. Deletion acquires ``$ROOT/.lane-lock-<key>``
+non-blocking and holds it across the re-probe (marker, lease, pid) and the
+``rm`` inside one ``flock -n`` invocation. Occupancy coordination with
+dispatch is that per-lane lock: ``scripts/remote_agent.sh`` holds
+``$ROOT/.lane-lock-<key>`` for the dispatch lifetime and does not take
+``$ROOT/.reap.lock``. A probe that does not retain the lock is not a lock.
+
+``echo REAPED`` is emitted only after the sandbox path is absent
+(``[ ! -e "$_sd" ]``, the same shape as the TTL reaper). A surviving path
+emits ``SKIPPED_GONE_FAILED`` and is not recorded as reaped.
+
+Residual tech-debt:
+- Dispatch materialization does not take ``$ROOT/.reap.lock``; per-lane locks
+  remain the shared check/act coordination boundary.
+- Listing still uses the self-releasing ``_lane_lock_held`` probe
+  (``flock -n ... true``); only delete holds the per-lane lock across
+  check and act.
+- Production apply-path caller lives in ``lane_census.census_lanes``.
+  ``TERMINAL_ROW_STATUSES`` is an alias of
+  ``lane_worktree._TERMINAL_LANE_STATUSES``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import os
+import re
+import subprocess
+import tarfile
+import tempfile
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from workbay_orchestrator_mcp.orchestration.lane_worktree import (
+    _TERMINAL_LANE_STATUSES,
+)
+
+__all__ = (
+    "KIND_LOCK_HELD",
+    "KIND_PROBE_FAILED",
+    "KIND_SANDBOX_HARVESTED",
+    "KIND_SANDBOX_FOREIGN",
+    "KIND_SANDBOX_LIVE",
+    "KIND_SANDBOX_RETIRED_OURS",
+    "KIND_SANDBOX_ROWLESS_OURS",
+    "KIND_SANDBOX_UNHARVESTED",
+    "KIND_SANDBOX_UNMAPPED",
+    "LANE_OCCUPANT_LIVE_FUNCTION",
+    "MergedMarkerWriteResult",
+    "RemoteSandboxReapReport",
+    "SSH_TIMEOUT_S",
+    "SandboxVerdict",
+    "TERMINAL_ROW_STATUSES",
+    "release_remote_lane_lease",
+    "plan_remote_sandboxes",
+    "reap_owned_probe_process",
+    "reap_remote_sandboxes",
+    "write_merged_marker",
+)
+
+KIND_SANDBOX_HARVESTED = "sandbox_harvested"
+KIND_SANDBOX_FOREIGN = "sandbox_foreign"
+KIND_SANDBOX_LIVE = "sandbox_live"
+KIND_SANDBOX_RETIRED_OURS = "sandbox_retired_ours"
+KIND_SANDBOX_ROWLESS_OURS = "sandbox_rowless_ours"
+KIND_SANDBOX_UNMAPPED = "sandbox_unmapped"
+KIND_SANDBOX_UNHARVESTED = "sandbox_unharvested"
+KIND_LOCK_HELD = "lock_held"
+KIND_PROBE_FAILED = "probe_failed"
+
+TERMINAL_ROW_STATUSES = _TERMINAL_LANE_STATUSES
+
+EVIDENCE_REAP_CANDIDATE_LIMIT = 32
+_REMOTE_PRODUCT_HISTORY_LIMIT = 256
+_EVIDENCE_KEY_RE = re.compile(r"^attempt-evidence-[A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{8}-[0-9]+-[0-9a-f]{16}$")
+_EVIDENCE_LISTING_RE = re.compile(r"^EVIDENCE (?P<key>\S+) age=(?P<age>[0-9]+)(?: bytes=(?P<bytes>[0-9]+))?(?: status=(?P<status>evidence_completed|retained_unmarked|retained_post_merge_attempt|skipped_unsafe))?$")
+_EVIDENCE_TRUNCATED_RE = re.compile(r"^EVIDENCE_TRUNCATED remaining=(?P<remaining>[0-9]+)$")
+
+SSH_TIMEOUT_S = 30.0
+GIT_TIMEOUT_S = 5.0
+REMOTE_LIST_TIMEOUT_PER_SANDBOX_S = 2.0
+REMOTE_LIST_TIMEOUT_MAX_S = 900.0
+
+_DEFAULT_AGENT_ROOT = "workbay-sandbox"
+_DEFAULT_AGENT_ROOTS = ("workbay-sandbox", "grok-sandbox")
+_LANE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{8}$")
+_DIRECTORY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SANDBOX_KEY_RE = re.compile(rf"^(?:{_LANE_KEY_RE.pattern[1:-1]}|{_EVIDENCE_KEY_RE.pattern[1:-1]})$")
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_LISTING_RE = re.compile(
+    r"^SANDBOX (?P<key>.+?) tip=(?P<tip>\S+) occupant=(?P<occupant>live|idle) "
+    r"lock=(?P<lock>held|free)(?: tree=(?P<tree>\S+))?"
+    r"(?: idle=(?P<idle>[0-9]+))?(?: bytes=(?P<bytes>[0-9]+))?$"
+)
+_REAP_LINE_RE = re.compile(
+    r"^(?P<status>REAPED|SKIPPED_LIVE|SKIPPED_LOCK|SKIPPED_GONE_FAILED|SKIPPED_UNMARKED|SKIPPED_CHANGED) (?P<key>\S+)(?: (?P<detail>[A-Za-z0-9_.:-]+))?$"
+)
+_REAP_HOLD_REASONS = frozenset({"held_lock", "held_live_lease", "held_live_process"})
+_HEADER_LIST = "# WORKBAY_REMOTE_SANDBOX_REAP op=list"
+_HEADER_PROBE_PREFIX = "# WORKBAY_REMOTE_SANDBOX_REAP op=probe key="
+_HEADER_REAP_PREFIX = "# WORKBAY_REMOTE_SANDBOX_REAP op=reap keys="
+DEFAULT_IDLE_SECONDS = 21_600
+
+LANE_OCCUPANT_LIVE_FUNCTION = """_lane_occupant_live() {
+  _lk="${1:-}"
+  [ -n "$_lk" ] || return 0
+  _lf="$ROOT/.lane-live-$_lk"
+  [ -f "$_lf" ] || return 1
+  _expiry=
+  _issued=
+  _released=
+  while IFS= read -r _lline || [ -n "$_lline" ]; do
+    case "$_lline" in
+      expiry=*) _expiry="${_lline#expiry=}" ;;
+      issued=*) _issued="${_lline#issued=}" ;;
+      released=*) _released="${_lline#released=}" ;;
+    esac
+  done < "$_lf" || return 0
+  case "$_expiry" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  case "$_issued" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  case "$_released" in
+    1) return 1 ;;
+    ''|0) ;;
+    *) return 0 ;;
+  esac
+  _now=$(date +%s)
+  if [ "$_now" -ge "$_expiry" ]; then
+    return 1
+  fi
+  return 0
+}"""
+
+SshRunner = Callable[..., Any]
+RefLister = Callable[[Path], Sequence[str]]
+TreeEntries = dict[str, tuple[str, str, str]]
+
+
+@dataclass(frozen=True)
+class _RowlessProof:
+    tree: str
+    generation: str
+    host_tip: str = ""
+    mapped_product: bool = False
+    key: str = ""
+    tip: str = ""
+    artifacts: str = ""
+    translated_source_commit: str = ""
+
+
+@dataclass(frozen=True)
+class SandboxVerdict:
+    sandbox_key: str
+    lane_id: str | None
+    branch: str | None
+    kind: str
+    tip_sha: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class EvidenceVerdict:
+    key: str
+    status: str
+    reason: str = ""
+    age_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class _ListedEvidence:
+    key: str
+    age_seconds: int
+    bytes_used: int
+    status: str = "retained_unmarked"
+
+
+@dataclass
+class RemoteSandboxReapReport:
+    evidence: list[EvidenceVerdict] = field(default_factory=list)
+    evidence_truncated: bool = False
+    evidence_candidates_remaining: int = 0
+    verdicts: list[SandboxVerdict] = field(default_factory=list)
+    reaped: list[str] = field(default_factory=list)
+    dry_run: bool = True
+    probe_error: str | None = None
+    skipped: bool = False
+    skip_reason: str | None = None
+    gauge: dict[str, int | None] = field(
+        default_factory=lambda: {
+            "sandbox_count": 0,
+            "sandbox_bytes": 0,
+            "oldest_idle_seconds": 0,
+            "foreign_sandbox_count": 0,
+            "foreign_sandbox_bytes": 0,
+            "retired_ours_count": 0,
+            "retired_ours_bytes": 0,
+            "rowless_ours_count": 0,
+        }
+    )
+
+    @property
+    def evidence_retained_unmarked(self) -> int:
+        return sum(item.status == "retained_unmarked" for item in self.evidence)
+
+    @property
+    def evidence_retained_post_merge(self) -> int:
+        return sum(item.status == "retained_post_merge_attempt" for item in self.evidence)
+
+    @property
+    def would_reap(self) -> list[str]:
+        """Keys that a dry-run classified as safe to reap."""
+        if not self.dry_run:
+            return []
+        return [
+            verdict.sandbox_key
+            for verdict in self.verdicts
+            if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+        ]
+
+    @property
+    def skipped_live(self) -> list[str]:
+        return [verdict.sandbox_key for verdict in self.verdicts if verdict.kind == KIND_SANDBOX_LIVE]
+
+    @property
+    def skipped_locked(self) -> list[str]:
+        return [verdict.sandbox_key for verdict in self.verdicts if verdict.kind == KIND_LOCK_HELD]
+
+    @property
+    def holds(self) -> list[dict[str, str]]:
+        """Non-candidate outcomes, with stable reason codes for callers."""
+        candidate_kinds = {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+        skip_kinds = {KIND_SANDBOX_LIVE, KIND_LOCK_HELD}
+        reaped = set(self.reaped)
+        holds: list[dict[str, str]] = []
+        for verdict in self.verdicts:
+            if verdict.kind in skip_kinds or verdict.sandbox_key in reaped:
+                continue
+            if verdict.kind in candidate_kinds and self.dry_run:
+                continue
+            holds.append(
+                {
+                    "key": verdict.sandbox_key,
+                    "reason": _typed_hold_reason(verdict),
+                }
+            )
+        return holds
+
+
+@dataclass(frozen=True)
+class MergedMarkerWriteResult:
+    """Typed result for the best-effort VM merged-marker write.
+
+    ``written`` names keys whose marker was (re)published; ``kept`` names keys
+    whose existing marker already recorded this completion and was left
+    untouched. Both count as delivered.
+    """
+
+    ok: bool
+    written: tuple[str, ...] = ()
+    error: str | None = None
+    kept: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ListedSandbox:
+    key: str
+    tip_sha: str | None
+    tree_sha: str | None
+    occupant_live: bool
+    lock_held: bool
+    idle_seconds: int
+    bytes_used: int | None
+
+
+class _RemoteSandboxListing(list[_ListedSandbox | _ListedEvidence]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.evidence_truncated = False
+        self.evidence_candidates_remaining = 0
+        self.invalid_keys: list[str] = []
+
+
+@dataclass(frozen=True)
+class _MappedRow:
+    lane_id: str | None
+    branch: str | None
+    status: str | None
+    branch_tip_sha: str | None = None
+    landing_commit_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class _AmbiguousRows:
+    rows: tuple[_MappedRow, ...]
+
+
+@dataclass(frozen=True)
+class _ReclaimedPin:
+    branch: str
+    commit_sha: str | None
+    error: str | None = None
+
+
+def plan_remote_sandboxes(
+    task_ref: str,
+    *,
+    ssh_runner: SshRunner,
+    primary_repo: Path | str,
+    rows: Sequence[Mapping[str, Any] | Any],
+    sandbox_root: str | None = None,
+    actor: Any = None,
+    exclude_keys: Sequence[str] | None = None,
+    idle_seconds: int = DEFAULT_IDLE_SECONDS,
+    ref_lister: RefLister | None = None,
+    target_keys: Sequence[str] | None = None,
+    target_tip_sha: str | None = None,
+) -> RemoteSandboxReapReport:
+    """Report harvest verdicts for marker-gated remote VM sandboxes; never delete."""
+    return _reap_remote_sandbox_pass(
+        task_ref,
+        ssh_runner=ssh_runner,
+        primary_repo=primary_repo,
+        rows=rows,
+        sandbox_root=sandbox_root,
+        dry_run=True,
+        actor=actor,
+        exclude_keys=exclude_keys,
+        idle_seconds=idle_seconds,
+        ref_lister=ref_lister,
+        target_keys=target_keys,
+        target_tip_sha=target_tip_sha,
+    )
+
+
+def reap_remote_sandboxes(
+    task_ref: str,
+    *,
+    ssh_runner: SshRunner,
+    primary_repo: Path | str,
+    rows: Sequence[Mapping[str, Any] | Any],
+    sandbox_root: str | None = None,
+    actor: Any = None,
+    exclude_keys: Sequence[str] | None = None,
+    idle_seconds: int = DEFAULT_IDLE_SECONDS,
+    ref_lister: RefLister | None = None,
+    target_keys: Sequence[str] | None = None,
+    target_tip_sha: str | None = None,
+) -> RemoteSandboxReapReport:
+    """Reap harvested marker-gated remote VM sandboxes.
+
+    Only ``sandbox_harvested`` and ``sandbox_retired_ours`` keys are sent to
+    the remote delete script.
+    A probe/parse failure refuses the whole pass: ``probe_error`` is set
+    and ``reaped`` is empty. Call ``plan_remote_sandboxes`` to preview.
+    """
+    return _reap_remote_sandbox_pass(
+        task_ref,
+        ssh_runner=ssh_runner,
+        primary_repo=primary_repo,
+        rows=rows,
+        sandbox_root=sandbox_root,
+        dry_run=False,
+        actor=actor,
+        exclude_keys=exclude_keys,
+        idle_seconds=idle_seconds,
+        ref_lister=ref_lister,
+        target_keys=target_keys,
+        target_tip_sha=target_tip_sha,
+    )
+
+
+# Strict reader for an existing ``.merged/<key>.json``. The marker mtime is the
+# evidence-release cutoff, so only a parsed, non-empty receipt that is not a
+# spelling of the new one prints REPLACE; doubt keeps the marker (SECD-05).
+_MERGED_MARKER_DECISION_PY = r"""import json, os, re, stat, sys
+SHA = re.compile(r"[0-9a-f]{7,40}")
+def unique(pairs):
+    body = dict(pairs)
+    if len(body) != len(pairs):
+        raise ValueError("duplicate key")
+    return body
+def reject(token):
+    raise ValueError(token)
+def decide(path, receipt, aliases):
+    if not receipt:
+        return "KEEP"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "KEEP"
+        raw = b""
+        while len(raw) <= 65536:
+            chunk = os.read(fd, 65537 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    if len(raw) > 65536:
+        return "KEEP"
+    body = json.loads(raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject)
+    existing = body.get("receipt_sha") if isinstance(body, dict) else None
+    if not isinstance(existing, str) or SHA.fullmatch(existing) is None:
+        return "KEEP"
+    for alias in aliases:
+        if SHA.fullmatch(alias) and (alias.startswith(existing) or existing.startswith(alias)):
+            return "KEEP"
+    return "REPLACE"
+try:
+    print(decide(sys.argv[1], sys.argv[2], sys.argv[2:]))
+except Exception:
+    print("KEEP")
+"""
+
+# Same validity test as ``_evidence_completion_status``: anything else is no
+# marker and is published. A reader failure keeps the marker (CARD-07).
+_MERGED_MARKER_KEPT_FUNCTION = (
+    """_merged_marker_kept() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -s "$1" ] || return 1
+  _decision=$(python3 - "$@" <<'WORKBAY_MERGED_MARKER_PY'
+"""
+    + _MERGED_MARKER_DECISION_PY
+    + """WORKBAY_MERGED_MARKER_PY
+) || return 0
+  [ "$_decision" != REPLACE ]
+}"""
+)
+_RECEIPT_ALIAS_LIMIT = 32
+
+
+def _receipt_aliases(repo: Path | None, receipt_sha: str) -> tuple[str, ...]:
+    """Return other host-proven spellings of the completion ``receipt_sha`` names.
+
+    Writers spell one landing two ways: lane_land, landing_cleanup and a merged
+    close publish the no-ff landing commit, while lane_postmerge publishes the
+    branch tip it merged (the landing commit's second parent). Aliases are the
+    commit, its merged parents, and merges that merged it, so a respelled
+    replay of one completion cannot advance the cutoff (CARD-04: a replayed key
+    is not a second key). Lookup failure degrades to exact receipt equality.
+    """
+    if not receipt_sha or repo is None:
+        return ()
+    head, error = _run_local_git(repo, "rev-list", "--parents", "-n", "1", receipt_sha)
+    fields = head.split()
+    if error is not None or not fields or any(_SHA_RE.fullmatch(field) is None for field in fields):
+        return ()
+    commit = fields[0]
+    aliases = [commit, *fields[2:]]
+    merges, error = _run_local_git(repo, "rev-list", "--merges", "--parents", "--all", f"^{commit}")
+    if error is None:
+        aliases.extend(line.split()[0] for line in merges.splitlines() if commit in line.split()[2:])
+    return tuple(alias for alias in dict.fromkeys(aliases) if alias != receipt_sha)[:_RECEIPT_ALIAS_LIMIT]
+
+
+def write_merged_marker(
+    branches: Sequence[str | Mapping[str, Any] | Any] | str,
+    *,
+    repo_root: Path | str | None = None,
+    runner: SshRunner | None = None,
+) -> MergedMarkerWriteResult:
+    """Atomically mark landed branches in the remote VM's ``.merged`` directory.
+
+    ``branches`` may contain branch names or row/receipt objects with a
+    ``branch`` field and optional ``receipt_sha`` / ``landed_at`` fields.
+    ``landing_commit_sha`` and ``branch_tip_sha`` are accepted receipt-SHA
+    aliases. One bounded SSH writes each marker to a uniquely created sibling
+    temporary file and atomically renames it to
+    ``$ROOT/.merged/<derived-key>.json``. The default SSH runner resolves its
+    host from the explicit ``repo_root``; it never guesses from the caller's
+    current directory. Inject ``runner`` at the SSH boundary in tests and
+    callers; failures return a typed result and never undo a completed close.
+
+    Publication is idempotent (FLOW-05, API-02): the marker mtime is the
+    evidence-release cutoff, so a valid marker is kept byte- and
+    mtime-identical (``KEPT``) unless both it and the new receipt are
+    non-empty and name different completions. Receipt spellings are resolved
+    against ``repo_root`` (``_receipt_aliases``).
+    """
+    try:
+        items: Sequence[Any] = [branches] if isinstance(branches, str) else list(branches)
+        if not items:
+            return MergedMarkerWriteResult(ok=True)
+        landed_at_default = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        markers: list[tuple[str, dict[str, str]]] = []
+        seen: dict[str, str] = {}
+        for item in items:
+            branch = item if isinstance(item, str) else _row_text(item, "branch")
+            if not isinstance(branch, str) or not branch.strip() or "\n" in branch or "\r" in branch:
+                return MergedMarkerWriteResult(ok=False, error="branch is empty or malformed")
+            branch = branch.strip()
+            receipt_sha = ""
+            landed_at = landed_at_default
+            if not isinstance(item, str):
+                receipt_sha = (
+                    _row_text(item, "receipt_sha")
+                    or _row_text(item, "landing_commit_sha")
+                    or _row_text(item, "branch_tip_sha")
+                    or ""
+                )
+                landed_at = _row_text(item, "landed_at") or landed_at_default
+            if receipt_sha and _SHA_RE.fullmatch(receipt_sha) is None:
+                return MergedMarkerWriteResult(ok=False, error=f"malformed receipt SHA for {branch!r}")
+            key = _derive_lane_key(branch)
+            previous_branch = seen.get(key)
+            if previous_branch is not None:
+                if previous_branch != branch:
+                    return MergedMarkerWriteResult(ok=False, error="merged marker key collision")
+                continue
+            seen[key] = branch
+            markers.append((key, {"branch": branch, "receipt_sha": receipt_sha, "landed_at": landed_at}))
+
+        root = _resolve_sandbox_root(None)
+        if root is None:
+            return MergedMarkerWriteResult(ok=False, error="sandbox_root is empty or unsafe")
+        workspace_root = Path(repo_root).expanduser() if repo_root is not None else None
+        script_lines = [
+            "# WORKBAY_REMOTE_MERGED_MARKER op=write",
+            f"ROOT={_sh_single_quote(root)}",
+            'case "$ROOT" in /*) ;; *) ROOT="$HOME/$ROOT" ;; esac',
+            "set -eu",
+            "umask 077",
+            "_tmp=",
+            'trap \'if [ -n "$_tmp" ]; then rm -f -- "$_tmp"; fi\' EXIT HUP INT TERM',
+            'mkdir -p -- "$ROOT/.merged"',
+            _MERGED_MARKER_KEPT_FUNCTION,
+        ]
+        for index, (key, body) in enumerate(markers):
+            delimiter = f"WORKBAY_MERGED_MARKER_JSON_{index}"
+            receipt_args = " ".join(
+                _sh_single_quote(sha)
+                for sha in (body["receipt_sha"], *_receipt_aliases(workspace_root, body["receipt_sha"]))
+            )
+            script_lines.extend(
+                (
+                    f'_marker="$ROOT/.merged/{key}.json"',
+                    f'if _merged_marker_kept "$_marker" {receipt_args}; then',
+                    f"printf 'KEPT %s\\n' '{key}'",
+                    "else",
+                    f'_tmp=$(mktemp "$ROOT/.merged/{key}.json.tmp.XXXXXX")',
+                    f"cat > \"$_tmp\" <<'{delimiter}'",
+                    json.dumps(body, separators=(",", ":"), ensure_ascii=True),
+                    delimiter,
+                    'mv -f -- "$_tmp" "$_marker"',
+                    f"printf 'WROTE %s\\n' '{key}'",
+                    "fi",
+                )
+            )
+        script = "\n".join(script_lines)
+        if runner is None:
+            if workspace_root is None:
+                return MergedMarkerWriteResult(ok=False, error="repo_root is required to resolve the remote gate host")
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                return MergedMarkerWriteResult(ok=False, error="default merged marker writer is forbidden under pytest")
+            from workbay_orchestrator_mcp.orchestration.lane_census import (  # noqa: PLC0415
+                _default_sandbox_ssh_runner,
+            )
+
+            raw = _default_sandbox_ssh_runner(script, timeout=SSH_TIMEOUT_S, workspace_root=workspace_root)
+        else:
+            raw = runner(script, timeout=SSH_TIMEOUT_S)
+        stdout, stderr, returncode = _coerce_ssh_result(raw)
+        # KEPT is delivered: the marker already records this completion.
+        receipts = tuple(
+            (verb, key)
+            for verb, _, key in (line.partition(" ") for line in stdout.splitlines())
+            if verb in {"WROTE", "KEPT"} and key in seen
+        )
+        written = tuple(key for verb, key in receipts if verb == "WROTE")
+        kept = tuple(key for verb, key in receipts if verb == "KEPT")
+        if returncode not in (0, None):
+            detail = (stderr or stdout or f"exit {returncode}").strip()
+            return MergedMarkerWriteResult(
+                ok=False,
+                written=written,
+                kept=kept,
+                error=f"ssh exited {returncode}: {detail[:300]}",
+            )
+        expected = tuple(key for key, _body in markers)
+        if tuple(key for _verb, key in receipts) != expected:
+            return MergedMarkerWriteResult(
+                ok=False, written=written, kept=kept, error="merged marker write receipt mismatch"
+            )
+        return MergedMarkerWriteResult(ok=True, written=written, kept=kept)
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        return MergedMarkerWriteResult(ok=False, error=f"ssh timed out: {exc}"[:300])
+    except OSError as exc:
+        return MergedMarkerWriteResult(ok=False, error=f"ssh failed: {exc}"[:300])
+    except Exception as exc:  # noqa: BLE001 — lifecycle close must not be undone by the VM hook
+        return MergedMarkerWriteResult(ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
+
+
+def reap_remote_evidence(
+    *, ssh_runner: SshRunner, dry_run: bool = True, sandbox_root: str | None = None
+) -> RemoteSandboxReapReport:
+    """Evidence-only maintenance using the same listing and retention policy."""
+    report = RemoteSandboxReapReport(dry_run=dry_run)
+    root = _resolve_sandbox_root(sandbox_root)
+    if root is None:
+        return _fail(report, "sandbox_root is empty or unsafe")
+    listed, error = _list_remote_sandboxes(ssh_runner, root, timeout=None)
+    if error:
+        return _fail(report, error)
+    report.evidence_truncated = listed.evidence_truncated
+    report.evidence_candidates_remaining = listed.evidence_candidates_remaining
+    report.verdicts = [
+        SandboxVerdict(item.key, None, None, KIND_SANDBOX_UNHARVESTED, item.tip_sha, "script_excluded_unreported")
+        for item in listed
+        if isinstance(item, _ListedSandbox)
+    ]
+    report.verdicts.extend(
+        SandboxVerdict(key, None, None, KIND_SANDBOX_UNHARVESTED, None, "invalid_key_spelling")
+        for key in listed.invalid_keys
+    )
+    report.evidence = _purge_evidence(
+        [item for item in listed if isinstance(item, _ListedEvidence)],
+        ssh_runner,
+        root,
+        dry_run=dry_run,
+        timeout=None,
+    )
+    return report
+
+
+def _purge_evidence(
+    evidence: Sequence[_ListedEvidence],
+    ssh_runner: SshRunner,
+    root: str,
+    *,
+    dry_run: bool,
+    timeout: float | None = SSH_TIMEOUT_S,
+) -> list[EvidenceVerdict]:
+    verdicts: list[EvidenceVerdict] = []
+    for item in evidence:
+        if not _EVIDENCE_KEY_RE.fullmatch(item.key):
+            verdict = EvidenceVerdict(item.key, "skipped_unsafe", "malformed evidence name")
+        elif item.status != "evidence_completed":
+            verdict = EvidenceVerdict(item.key, item.status)
+        elif dry_run:
+            verdict = EvidenceVerdict(item.key, "would_reap")
+        else:
+            output, error = _run_ssh(ssh_runner, _build_evidence_reap_script(root, item.key), timeout=timeout)
+            status = output.strip()
+            if error or status not in {"reaped", "retained_unmarked", "retained_post_merge_attempt", "skipped_unsafe", "skipped_live"}:
+                verdict = EvidenceVerdict(
+                    item.key, "skipped_unsafe", error or f"unexpected evidence reap response: {output!r}"
+                )
+            else:
+                verdict = EvidenceVerdict(item.key, status)
+        verdicts.append(replace(verdict, age_seconds=item.age_seconds))
+    return verdicts
+
+
+def _reap_remote_sandbox_pass(
+    task_ref: str,
+    *,
+    ssh_runner: SshRunner,
+    primary_repo: Path | str,
+    rows: Sequence[Mapping[str, Any] | Any],
+    sandbox_root: str | None = None,
+    dry_run: bool,
+    actor: Any = None,
+    exclude_keys: Sequence[str] | None = None,
+    idle_seconds: int,
+    ref_lister: RefLister | None,
+    target_keys: Sequence[str] | None,
+    target_tip_sha: str | None,
+) -> RemoteSandboxReapReport:
+    """Classify sandboxes and, when ``dry_run`` is false, delete harvested keys."""
+    report = RemoteSandboxReapReport(dry_run=dry_run)
+    scoped = (task_ref or "").strip()
+    if not scoped:
+        return _fail(report, "task_ref is empty")
+    root = _resolve_sandbox_root(sandbox_root)
+    if root is None:
+        return _fail(report, "sandbox_root is empty or unsafe")
+    repo = Path(primary_repo)
+    excluded = frozenset(str(key) for key in (exclude_keys or ()) if str(key))
+
+    scoped_target_keys: tuple[str, ...] | None = None
+    if target_keys is not None:
+        scoped_target_keys = tuple(dict.fromkeys(str(key) for key in target_keys if str(key)))
+        if any(not _LANE_KEY_RE.fullmatch(key) for key in scoped_target_keys):
+            return _fail(report, "refusing to reap unsafe target sandbox key")
+
+    if scoped_target_keys is None:
+        inventory, inventory_error = _list_remote_sandboxes(
+            ssh_runner,
+            root,
+            timeout=SSH_TIMEOUT_S,
+            inventory_only=True,
+        )
+        if inventory_error is not None:
+            return _fail(report, inventory_error)
+        report.verdicts.extend(
+            SandboxVerdict(key, None, None, KIND_SANDBOX_UNHARVESTED, None, "invalid_key_spelling")
+            for key in inventory.invalid_keys
+        )
+        listing_count = len(inventory)
+        # Probe only the enumerated sandbox keys: additions wait for the next
+        # sweep, so concurrent growth cannot exceed this pass's work budget.
+        sandbox_keys = tuple(item.key for item in inventory if isinstance(item, _ListedSandbox))
+    else:
+        listing_count = len(scoped_target_keys)
+        sandbox_keys = scoped_target_keys
+    listed, list_error = _list_remote_sandboxes(
+        ssh_runner,
+        root,
+        timeout=_remote_list_timeout(listing_count),
+        target_keys=scoped_target_keys,
+        directory_keys=sandbox_keys if scoped_target_keys is None else None,
+    )
+    if list_error is not None:
+        return _fail(report, list_error)
+    invalid_keys = {verdict.sandbox_key for verdict in report.verdicts}
+    report.verdicts.extend(
+        SandboxVerdict(key, None, None, KIND_SANDBOX_UNHARVESTED, None, "invalid_key_spelling")
+        for key in listed.invalid_keys
+        if key not in invalid_keys
+    )
+    report.evidence_truncated = listed.evidence_truncated
+    report.evidence_candidates_remaining = listed.evidence_candidates_remaining
+    evidence = [item for item in listed if isinstance(item, _ListedEvidence)]
+    listed = [item for item in listed if isinstance(item, _ListedSandbox)]
+    scoped_keys = frozenset(scoped_target_keys or ())
+    if target_keys is None:
+        report.evidence = _purge_evidence(evidence, ssh_runner, root, dry_run=dry_run)
+        actionable = listed
+    else:
+        # A landing cleanup must not reap unrelated attempt evidence or walk
+        # sibling sandboxes as orphans. Full rows still participate in the
+        # ownership map below; only matching keys are actionable.
+        actionable = [item for item in listed if item.key in scoped_keys]
+    if not actionable:
+        return report
+    mapped_rows = _index_rows(rows, task_ref=scoped)
+    ref_branches: list[str] = []
+    retired_pins: list[_ReclaimedPin] = []
+    if any(_map_key(item.key, mapped_rows) is None for item in actionable):
+        try:
+            ref_branches = list((ref_lister or _list_repo_branches)(repo))
+        except Exception as exc:  # noqa: BLE001 — ownership ambiguity must fail closed
+            return _fail(report, f"known branch listing failed: {exc}")
+        try:
+            retired_pins = _list_repo_reclaimed_pins(repo)
+        except Exception as exc:  # noqa: BLE001 — ownership ambiguity must fail closed
+            return _fail(report, f"reclaimed branch listing failed: {exc}")
+    known_keys = _known_branch_keys(repo, rows, ref_lister=lambda _repo: ref_branches)
+    known_branches = _known_branches(rows, ref_branches)
+    branches_by_key: dict[str, list[str]] = {}
+    for branch in known_branches:
+        branches_by_key.setdefault(_derive_lane_key(_branch_identity(branch)), []).append(branch)
+    retired_branches_by_key: dict[str, list[str]] = {}
+    retired_pins_by_branch: dict[str, _ReclaimedPin] = {}
+    live_branch_identities = {_branch_identity(branch) for branch in ref_branches}
+    for pin in retired_pins:
+        branch = pin.branch
+        if _branch_identity(branch) in live_branch_identities:
+            continue
+        retired_pins_by_branch.setdefault(branch, pin)
+        retired_branches_by_key.setdefault(_derive_lane_key(branch), []).append(branch)
+
+    foreign_keys: set[str] = set()
+    rowless_ours_keys: set[str] = set()
+    for item in actionable:
+        if _map_key(item.key, mapped_rows) is not None:
+            continue
+        if item.key in retired_branches_by_key:
+            continue
+        if item.key in known_keys:
+            rowless_ours_keys.add(item.key)
+        else:
+            foreign_keys.add(item.key)
+
+    harvested_keys: list[str] = []
+    rowless_proofs: dict[str, _RowlessProof] = {}
+    for item in actionable:
+        branch_candidates = branches_by_key.get(item.key, [])
+        verdict = _classify(
+            item,
+            mapped_rows,
+            repo,
+            ssh_runner=ssh_runner,
+            sandbox_root=root,
+            rowless_branch=branch_candidates[0] if len(branch_candidates) == 1 else None,
+            rowless_ours=item.key in known_keys,
+            retired_branches=(
+                retired_branches_by_key.get(item.key, ()) if _map_key(item.key, mapped_rows) is None else ()
+            ),
+            retired_pin=(
+                retired_pins_by_branch.get(retired_branches_by_key[item.key][0])
+                if _map_key(item.key, mapped_rows) is None and len(retired_branches_by_key.get(item.key, ())) == 1
+                else None
+            ),
+            exclude_keys=excluded,
+            idle_seconds=max(0, int(idle_seconds)),
+            rowless_proofs=rowless_proofs,
+            target_tip_sha=target_tip_sha,
+        )
+        report.verdicts.append(verdict)
+        if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}:
+            harvested_keys.append(item.key)
+
+    retired_key_set = {verdict.sandbox_key for verdict in report.verdicts if verdict.kind == KIND_SANDBOX_RETIRED_OURS}
+    for item in listed:
+        mapped = _map_key(item.key, mapped_rows)
+        if isinstance(mapped, _MappedRow) and (mapped.status or "").strip().lower() in TERMINAL_ROW_STATUSES:
+            retired_key_set.add(item.key)
+    retired_ours_keys = frozenset(retired_key_set)
+    report.gauge = _gauge_for(
+        listed if target_keys is None else actionable,
+        foreign_keys=frozenset(foreign_keys),
+        retired_ours_keys=retired_ours_keys,
+        rowless_ours_keys=frozenset(rowless_ours_keys),
+    )
+
+    if dry_run or not harvested_keys:
+        return report
+
+    reap_lines, reap_error = _reap_remote_sandboxes(
+        ssh_runner, root, harvested_keys, rowless_proofs=rowless_proofs, idle_seconds=max(0, int(idle_seconds))
+    )
+    if reap_error is not None:
+        report.verdicts = [
+            SandboxVerdict(
+                sandbox_key=verdict.sandbox_key,
+                lane_id=verdict.lane_id,
+                branch=verdict.branch,
+                kind=(
+                    KIND_PROBE_FAILED
+                    if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+                    else verdict.kind
+                ),
+                tip_sha=verdict.tip_sha,
+                reason=(
+                    reap_error
+                    if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+                    else verdict.reason
+                ),
+            )
+            for verdict in report.verdicts
+        ]
+        if not any(verdict.kind == KIND_PROBE_FAILED for verdict in report.verdicts):
+            report.verdicts.append(
+                SandboxVerdict(
+                    sandbox_key="",
+                    lane_id=None,
+                    branch=None,
+                    kind=KIND_PROBE_FAILED,
+                    tip_sha=None,
+                    reason=reap_error,
+                )
+            )
+        report.probe_error = reap_error
+        report.reaped = []
+        return report
+
+    if reap_lines == ["LOCK_HELD"]:
+        report.verdicts = [
+            SandboxVerdict(
+                sandbox_key=verdict.sandbox_key,
+                lane_id=verdict.lane_id,
+                branch=verdict.branch,
+                kind=(
+                    KIND_LOCK_HELD
+                    if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+                    else verdict.kind
+                ),
+                tip_sha=verdict.tip_sha,
+                reason=(
+                    "remote .reap.lock is held"
+                    if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+                    else verdict.reason
+                ),
+            )
+            for verdict in report.verdicts
+        ]
+        if not any(verdict.kind == KIND_LOCK_HELD for verdict in report.verdicts):
+            report.verdicts.append(
+                SandboxVerdict(
+                    sandbox_key="",
+                    lane_id=None,
+                    branch=None,
+                    kind=KIND_LOCK_HELD,
+                    tip_sha=None,
+                    reason="remote .reap.lock is held",
+                )
+            )
+        report.reaped = []
+        return report
+
+    by_key = {verdict.sandbox_key: verdict for verdict in report.verdicts}
+    reaped: list[str] = []
+    updated: list[SandboxVerdict] = []
+    seen_reap_keys: set[str] = set()
+    for line in reap_lines:
+        match = _REAP_LINE_RE.match(line)
+        if match is None:
+            return _fail(report, f"unexpected reap output: {line!r}")
+        key = match.group("key")
+        status = match.group("status")
+        seen_reap_keys.add(key)
+        prior = by_key.get(key)
+        lane_id = prior.lane_id if prior else None
+        branch = prior.branch if prior else None
+        tip_sha = prior.tip_sha if prior else None
+        if status == "REAPED":
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=KIND_SANDBOX_HARVESTED,
+                    tip_sha=tip_sha,
+                    reason=prior.reason if prior else "reaped",
+                )
+            )
+            reaped.append(key)
+            _record_keyed_decision(
+                task_ref=scoped,
+                lane_id=lane_id or "unmapped",
+                tip_sha=tip_sha,
+                actor=actor,
+                sandbox_key=key,
+                reason=prior.reason if prior else "reaped",
+            )
+        elif status == "SKIPPED_CHANGED":
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=(
+                        KIND_PROBE_FAILED
+                        if match.group("detail") in {"content_deadline", "content_unknown", "content_unsafe_path"}
+                        else KIND_SANDBOX_UNHARVESTED
+                    ),
+                    tip_sha=tip_sha,
+                    reason="remote re-probe: rowless generation, tree, cleanliness or idle proof changed"
+                    + (f": {match.group('detail')}" if match.group("detail") else ""),
+                )
+            )
+        elif status == "SKIPPED_LIVE":
+            hold_reason = _typed_reap_hold_reason(match.group("detail"), "remote re-probe: lease or pid live")
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=KIND_SANDBOX_LIVE,
+                    tip_sha=tip_sha,
+                    reason=hold_reason,
+                )
+            )
+        elif status == "SKIPPED_GONE_FAILED":
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=KIND_PROBE_FAILED,
+                    tip_sha=tip_sha,
+                    reason="SKIPPED_GONE_FAILED: remote delete left sandbox path in place",
+                )
+            )
+        elif status == "SKIPPED_UNMARKED":
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=KIND_SANDBOX_UNMAPPED,
+                    tip_sha=tip_sha,
+                    reason="remote re-probe: sandbox marker missing",
+                )
+            )
+        else:
+            hold_reason = _typed_reap_hold_reason(match.group("detail"), "remote re-probe: lane lock held")
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key,
+                    lane_id=lane_id,
+                    branch=branch,
+                    kind=KIND_LOCK_HELD,
+                    tip_sha=tip_sha,
+                    reason=hold_reason,
+                )
+            )
+
+    kept = [verdict for verdict in report.verdicts if verdict.sandbox_key not in seen_reap_keys]
+    report.verdicts = kept + updated
+    report.reaped = reaped
+    reaped_set = set(reaped)
+    report.gauge = _gauge_for(
+        [item for item in listed if item.key not in reaped_set],
+        foreign_keys=frozenset(foreign_keys),
+        retired_ours_keys=frozenset(
+            verdict.sandbox_key for verdict in report.verdicts if verdict.kind == KIND_SANDBOX_RETIRED_OURS
+        ),
+        rowless_ours_keys=frozenset(rowless_ours_keys),
+    )
+    return report
+
+
+def _gauge_for(
+    items: Sequence[_ListedSandbox],
+    *,
+    foreign_keys: frozenset[str] = frozenset(),
+    retired_ours_keys: frozenset[str] = frozenset(),
+    rowless_ours_keys: frozenset[str] = frozenset(),
+) -> dict[str, int | None]:
+    """Return repository-owned pressure separately from foreign VM usage."""
+    foreign = [item for item in items if item.key in foreign_keys]
+    retired = [item for item in items if item.key in retired_ours_keys]
+
+    def _byte_total(values: Sequence[_ListedSandbox]) -> int | None:
+        if any(item.bytes_used is None for item in values):
+            return None
+        return sum(item.bytes_used or 0 for item in values)
+
+    gauge = {
+        "sandbox_count": len(items),
+        "sandbox_bytes": _byte_total([item for item in items if item.key not in foreign_keys]),
+        "oldest_idle_seconds": max((item.idle_seconds for item in items), default=0),
+        "foreign_sandbox_count": len(foreign),
+        "foreign_sandbox_bytes": _byte_total(foreign),
+        "rowless_ours_count": sum(item.key in rowless_ours_keys for item in items),
+    }
+    if retired:
+        gauge["retired_ours_count"] = len(retired)
+        gauge["retired_ours_bytes"] = _byte_total(retired)
+    return gauge
+
+
+def _fail(report: RemoteSandboxReapReport, error: str) -> RemoteSandboxReapReport:
+    report.probe_error = error
+    report.reaped = []
+    if not any(verdict.kind == KIND_PROBE_FAILED for verdict in report.verdicts):
+        report.verdicts.append(
+            SandboxVerdict(
+                sandbox_key="",
+                lane_id=None,
+                branch=None,
+                kind=KIND_PROBE_FAILED,
+                tip_sha=None,
+                reason=error,
+            )
+        )
+    else:
+        report.verdicts = [
+            SandboxVerdict(
+                sandbox_key=verdict.sandbox_key,
+                lane_id=verdict.lane_id,
+                branch=verdict.branch,
+                kind=KIND_PROBE_FAILED,
+                tip_sha=verdict.tip_sha,
+                reason=error,
+            )
+            if verdict.kind in {KIND_SANDBOX_HARVESTED, KIND_SANDBOX_RETIRED_OURS}
+            else verdict
+            for verdict in report.verdicts
+        ]
+    return report
+
+
+def _typed_reap_hold_reason(detail: str | None, legacy_reason: str) -> str:
+    """Preserve new reason tokens while marking values this host cannot classify."""
+    if not detail:
+        return legacy_reason
+    return detail if detail in _REAP_HOLD_REASONS else f"unknown_hold_reason:{detail}"
+
+
+def _typed_hold_reason(verdict: SandboxVerdict) -> str:
+    """Map free-form classification details onto a stable hold reason."""
+    reason = verdict.reason.lower()
+    if reason in {"script_excluded_unreported", "invalid_key_spelling"}:
+        return reason
+    if reason.startswith("response_keys_mismatch:"):
+        return "response_keys_mismatch"
+    if verdict.kind == KIND_PROBE_FAILED:
+        return "probe_failed"
+    if verdict.kind == KIND_SANDBOX_FOREIGN:
+        return "foreign_sandbox"
+    if verdict.kind == KIND_SANDBOX_UNMAPPED:
+        return "sandbox_unmapped"
+    if verdict.kind == KIND_SANDBOX_ROWLESS_OURS:
+        return "idle_below_threshold" if "below threshold" in reason else "rowless_ours_unverified"
+    if verdict.kind == KIND_SANDBOX_UNHARVESTED:
+        if "unknown_reader_acquisition_fence" in reason:
+            return "unknown_reader_acquisition_fence"
+        if "unknown_incoming_source_custody" in reason:
+            return "unknown_incoming_source_custody"
+        if "unknown_reference_census" in reason:
+            return "unknown_reference_census"
+        if "unknown_cache_reference_census" in reason:
+            return "unknown_cache_reference_census"
+        if "excluded invoking-pass identity" in reason:
+            return "excluded_invoking_pass_identity"
+        if "ambiguous" in reason or "collision" in reason:
+            return "ambiguous_ownership"
+        if "below threshold" in reason:
+            return "idle_below_threshold"
+        if "pin proof" in reason or "pin is unresolvable" in reason:
+            return "pin_proof_unavailable"
+        return "unharvested"
+    return "unclassified_hold"
+
+
+def _resolve_sandbox_root(sandbox_root: str | None) -> str | None:
+    raw = (
+        sandbox_root if sandbox_root is not None else os.environ.get("WORKBAY_REMOTE_AGENT_ROOT") or _DEFAULT_AGENT_ROOT
+    )
+    value = raw.strip()
+    if not value or ".." in value or "\n" in value or "\r" in value:
+        return None
+    return value
+
+
+def reap_remote_lane_sandbox(
+    task_ref: str,
+    *,
+    lane_id: str,
+    branch: str,
+    expected_tip: str,
+    primary_repo: Path | str,
+    rows: Sequence[Mapping[str, Any] | Any],
+    ssh_runner: SshRunner | None = None,
+    sandbox_roots: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Reap one lane key, using every registry row to preserve ownership."""
+    key = _derive_lane_key(_branch_identity(branch))
+    if not _LANE_KEY_RE.fullmatch(key):
+        return {"ok": False, "status": "pending", "reason": "remote_lane_key_invalid", "sandbox_key": key}
+    if sandbox_roots is None:
+        configured = os.environ.get("WORKBAY_REMOTE_AGENT_ROOT")
+        roots = list(
+            dict.fromkeys(
+                ([configured.strip()] if configured and configured.strip() else []) + list(_DEFAULT_AGENT_ROOTS)
+            )
+        )
+    else:
+        roots = list(dict.fromkeys(item.strip() for item in sandbox_roots if isinstance(item, str) and item.strip()))
+    if not roots:
+        roots = list(_DEFAULT_AGENT_ROOTS)
+    run_remote = ssh_runner
+    if run_remote is None:
+
+        def run_remote(script: str, *, timeout: float) -> Any:
+            from workbay_orchestrator_mcp.orchestration.lane_census import (  # noqa: PLC0415
+                _default_sandbox_ssh_runner,
+            )
+
+            return _default_sandbox_ssh_runner(script, timeout=timeout, workspace_root=primary_repo)
+
+    attempted: list[str] = []
+    for root in roots:
+        attempted.append(root)
+        report = reap_remote_sandboxes(
+            task_ref,
+            ssh_runner=run_remote,
+            primary_repo=primary_repo,
+            rows=rows,
+            sandbox_root=root,
+            idle_seconds=0,
+            target_keys=[key],
+            target_tip_sha=expected_tip,
+        )
+        if report.probe_error:
+            return {
+                "ok": False,
+                "status": "pending",
+                "reason": "remote_probe_failed",
+                "detail": report.probe_error,
+                "sandbox_key": key,
+                "sandbox_root": root,
+                "attempted_roots": attempted,
+            }
+        verdict = next((item for item in report.verdicts if item.sandbox_key == key), None)
+        if verdict is None:
+            # A successful complete listing proves this root has no target.
+            continue
+        if key in report.reaped:
+            continue
+        return {
+            "ok": False,
+            "status": "pending",
+            "reason": verdict.kind,
+            "detail": verdict.reason,
+            "sandbox_key": key,
+            "sandbox_root": root,
+            "attempted_roots": attempted,
+        }
+    return {
+        "ok": True,
+        "status": "complete",
+        "reason": "reaped_or_absent",
+        "sandbox_key": key,
+        "attempted_roots": attempted,
+    }
+
+
+def _index_rows(
+    rows: Sequence[Mapping[str, Any] | Any],
+    *,
+    task_ref: str,
+) -> list[tuple[_MappedRow, str]]:
+    del task_ref  # classification still treats repository absence as unproven globally
+    indexed: list[tuple[_MappedRow, str]] = []
+    for row in rows:
+        branch = _row_text(row, "branch")
+        mapped = _MappedRow(
+            lane_id=_row_text(row, "lane_id"),
+            branch=branch,
+            status=_row_text(row, "status"),
+            branch_tip_sha=_row_text(row, "branch_tip_sha"),
+            landing_commit_sha=_row_text(row, "landing_commit_sha"),
+        )
+        derived = _derive_lane_key(branch) if branch else ""
+        indexed.append((mapped, derived))
+    return indexed
+
+
+def _list_repo_branches(primary_repo: Path) -> list[str]:
+    """List every local, salvage, and remote branch known to this repository."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary_repo),
+                "for-each-ref",
+                "--format=%(refname) %(symref)",
+                "refs/heads",
+                "refs/salvage",
+                "refs/remotes",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(str(exc)) from exc
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"git exited {proc.returncode}").strip()[:300])
+    # Symbolic remote HEAD aliases are not original branch identities.
+    return [line.strip() for line in proc.stdout.splitlines() if len(line.split()) == 1]
+
+
+def _list_repo_reclaimed_pins(primary_repo: Path) -> list[_ReclaimedPin]:
+    """Return branch identities and resolvable commits encoded by reclaimed refs.
+
+    Landed feature branches use refs/reclaimed/<prefix>-<lane>; older pins may
+    preserve the branch path directly as refs/reclaimed/feature/<name>. A
+    lane-id/SHA pin does not encode its branch and is deliberately ignored.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary_repo),
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/reclaimed",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(str(exc)) from exc
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"git exited {proc.returncode}").strip()[:300])
+
+    identities: list[_ReclaimedPin] = []
+    seen: set[str] = set()
+    for line in proc.stdout.splitlines():
+        ref = line.strip()
+        prefix = "refs/reclaimed/"
+        if not ref.startswith(prefix):
+            continue
+        pin_name = ref.removeprefix(prefix)
+        if pin_name.startswith("feature/"):
+            branch = pin_name
+        elif "/" not in pin_name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*", pin_name):
+            branch = f"feature/{pin_name}"
+        else:
+            continue
+        if branch in seen:
+            continue
+        seen.add(branch)
+        commit_output, commit_error = _run_local_git(
+            primary_repo, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"
+        )
+        commit_sha = commit_output.strip().lower() if commit_error is None else ""
+        if re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None:
+            identities.append(
+                _ReclaimedPin(
+                    branch=branch,
+                    commit_sha=None,
+                    error=commit_error or "reclaimed ref did not resolve to a commit",
+                )
+            )
+        else:
+            identities.append(_ReclaimedPin(branch=branch, commit_sha=commit_sha))
+    return identities
+
+
+def _branch_identity(ref: str) -> str:
+    """Keep the qualified lookup ref separate from the dispatcher's branch name."""
+    if ref.startswith("refs/remotes/"):
+        return ref.removeprefix("refs/remotes/").partition("/")[2]
+    if ref.startswith("refs/heads/"):
+        return ref.removeprefix("refs/heads/")
+    if ref.startswith("refs/salvage/"):
+        return ref.removeprefix("refs/")
+    # Injected short branch names have no namespace evidence to strip safely.
+    return ref
+
+
+def _known_branches(
+    rows: Sequence[Mapping[str, Any] | Any],
+    ref_branches: Sequence[str],
+) -> list[str]:
+    branches: list[str] = []
+    seen: set[str] = set()
+    for branch in [*ref_branches, *(_row_text(row, "branch") for row in rows)]:
+        if not branch or branch in seen:
+            continue
+        seen.add(branch)
+        branches.append(branch)
+    return branches
+
+
+def _known_branch_keys(
+    primary_repo: Path | str,
+    rows: Sequence[Mapping[str, Any] | Any],
+    *,
+    ref_lister: RefLister | None = None,
+) -> frozenset[str]:
+    """Return keys derived from all repository refs and all registry rows."""
+    repo = Path(primary_repo)
+    ref_branches = (ref_lister or _list_repo_branches)(repo)
+    return frozenset(_derive_lane_key(_branch_identity(branch)) for branch in _known_branches(rows, ref_branches))
+
+
+def _classify(
+    item: _ListedSandbox,
+    indexed_rows: Sequence[tuple[_MappedRow, str]],
+    repo: Path,
+    *,
+    ssh_runner: SshRunner,
+    sandbox_root: str,
+    rowless_branch: str | None = None,
+    rowless_ours: bool = False,
+    retired_branches: Sequence[str] = (),
+    retired_pin: _ReclaimedPin | None = None,
+    exclude_keys: frozenset[str] = frozenset(),
+    idle_seconds: int = DEFAULT_IDLE_SECONDS,
+    rowless_proofs: dict[str, _RowlessProof] | None = None,
+    target_tip_sha: str | None = None,
+) -> SandboxVerdict:
+    mapped = _map_key(item.key, indexed_rows)
+    if mapped is None and not rowless_ours and not retired_branches:
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=None,
+            branch=None,
+            kind=KIND_SANDBOX_FOREIGN,
+            tip_sha=item.tip_sha,
+            reason="key is not derived from any branch known to this repository",
+        )
+    if item.occupant_live:
+        row = mapped if isinstance(mapped, _MappedRow) else None
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=row.lane_id if row else None,
+            branch=row.branch if row else rowless_branch,
+            kind=KIND_SANDBOX_LIVE,
+            tip_sha=item.tip_sha,
+            reason="unexpired lease or live pid under sandbox",
+        )
+    if item.lock_held:
+        row = mapped if isinstance(mapped, _MappedRow) else None
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=row.lane_id if row else None,
+            branch=row.branch if row else rowless_branch,
+            kind=KIND_LOCK_HELD,
+            tip_sha=item.tip_sha,
+            reason="lane lock held",
+        )
+    if item.key in exclude_keys:
+        row = mapped if isinstance(mapped, _MappedRow) else None
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=row.lane_id if row else None,
+            branch=row.branch if row else rowless_branch,
+            kind=KIND_SANDBOX_UNHARVESTED,
+            tip_sha=item.tip_sha,
+            reason="excluded invoking-pass identity",
+        )
+    if isinstance(mapped, _AmbiguousRows):
+        alias = _terminal_alias_product(mapped.rows, item, repo, target_tip_sha)
+        if alias is not None:
+            branch, tip = alias
+            # A preserved ancestor need not carry its host's later commits.
+            # Authenticate complete host custody locally, then revalidate the
+            # exact remote witness rather than requiring host descendants there.
+            probe_tip = item.tip_sha if item.tip_sha and _tip_is_ancestor(repo, item.tip_sha, tip) else tip
+            raw, error = _run_ssh(
+                ssh_runner, _build_rowless_probe_script(sandbox_root, item.key, host_tip=probe_tip, mapped_product=True)
+            )
+            detail = error
+            if error is None:
+                _entries, proof, clean, parse_error = _parse_rowless_probe(raw)
+                detail = parse_error or ("remote product tree changed" if clean else raw.strip())
+                if (
+                    clean
+                    and parse_error is None
+                    and proof is not None
+                    and proof.tree == item.tree_sha
+                    and proof.key == item.key
+                    and proof.tip == item.tip_sha
+                ):
+                    if _mapped_history_preserved(repo, proof, tip):
+                        if rowless_proofs is not None:
+                            rowless_proofs[item.key] = replace(proof, host_tip=probe_tip, mapped_product=True)
+                        return _rowless_verdict(
+                            item,
+                            branch,
+                            KIND_SANDBOX_HARVESTED,
+                            "terminal aliases share preserved host landing ancestry",
+                        )
+                    detail = "mapped reachable_history or synthetic-base translation is unpreserved"
+            return _rowless_verdict(
+                item,
+                branch,
+                KIND_SANDBOX_UNHARVESTED,
+                f"terminal alias remote proof failed: {detail or 'missing proof'}",
+            )
+        statuses = sorted({(row.status or "unknown").strip().lower() for row in mapped.rows})
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=None,
+            branch=None,
+            kind=KIND_SANDBOX_UNHARVESTED,
+            tip_sha=item.tip_sha,
+            reason=f"ambiguous ownership across {len(mapped.rows)} lane rows (statuses: {','.join(statuses)})",
+        )
+    row = mapped
+    if row is None:
+        if len(retired_branches) > 1:
+            return SandboxVerdict(
+                sandbox_key=item.key,
+                lane_id=None,
+                branch=None,
+                kind=KIND_SANDBOX_UNHARVESTED,
+                tip_sha=item.tip_sha,
+                reason=f"ambiguous reclaimed branch identity across {len(retired_branches)} branches",
+            )
+        if retired_branches:
+            branch = retired_branches[0]
+            if item.idle_seconds < idle_seconds:
+                return SandboxVerdict(
+                    sandbox_key=item.key,
+                    lane_id=None,
+                    branch=branch,
+                    kind=KIND_SANDBOX_UNHARVESTED,
+                    tip_sha=item.tip_sha,
+                    reason=f"retired sandbox idle {item.idle_seconds}s below threshold {idle_seconds}s",
+                )
+            if retired_pin is None:
+                return SandboxVerdict(
+                    sandbox_key=item.key,
+                    lane_id=None,
+                    branch=branch,
+                    kind=KIND_SANDBOX_UNHARVESTED,
+                    tip_sha=item.tip_sha,
+                    reason="reclaimed pin proof unavailable",
+                )
+            if retired_pin.commit_sha is None:
+                return SandboxVerdict(
+                    sandbox_key=item.key,
+                    lane_id=None,
+                    branch=branch,
+                    kind=KIND_SANDBOX_UNHARVESTED,
+                    tip_sha=item.tip_sha,
+                    reason=f"reclaimed pin is unresolvable: {retired_pin.error or 'commit lookup failed'}",
+                )
+            return _classify_reclaimed_pin(
+                item,
+                branch,
+                retired_pin.commit_sha,
+                repo,
+                ssh_runner=ssh_runner,
+                sandbox_root=sandbox_root,
+                rowless_proofs=rowless_proofs,
+            )
+        if rowless_branch is None:
+            return SandboxVerdict(
+                sandbox_key=item.key,
+                lane_id=None,
+                branch=None,
+                kind=KIND_SANDBOX_UNHARVESTED,
+                tip_sha=item.tip_sha,
+                reason="ambiguous known-branch key collision",
+            )
+        if item.idle_seconds < idle_seconds:
+            return SandboxVerdict(
+                sandbox_key=item.key,
+                lane_id=None,
+                branch=rowless_branch,
+                kind=KIND_SANDBOX_ROWLESS_OURS,
+                tip_sha=item.tip_sha,
+                reason=f"rowless ours idle {item.idle_seconds}s below threshold {idle_seconds}s",
+            )
+        return _classify_rowless_ours(
+            item,
+            repo,
+            rowless_branch,
+            ssh_runner=ssh_runner,
+            sandbox_root=sandbox_root,
+            rowless_proofs=rowless_proofs,
+        )
+    status = (row.status or "").strip().lower()
+    if target_tip_sha is not None:
+        preserved, reason = _remote_lane_product_preserved(
+            item,
+            repo,
+            expected_tip=target_tip_sha,
+            landing_commit=row.landing_commit_sha,
+        )
+        if not preserved:
+            return SandboxVerdict(
+                sandbox_key=item.key,
+                lane_id=row.lane_id,
+                branch=row.branch,
+                kind=KIND_SANDBOX_UNHARVESTED,
+                tip_sha=item.tip_sha,
+                reason=reason,
+            )
+    if status in TERMINAL_ROW_STATUSES:
+        # Status establishes ownership eligibility, never source preservation.
+        host_tip = target_tip_sha or row.branch_tip_sha
+        if host_tip is not None:
+            preserved, detail = _remote_lane_product_preserved(
+                item, repo, expected_tip=host_tip, landing_commit=row.landing_commit_sha
+            )
+        else:
+            host_tip, _entries, error = _host_branch_blobs(repo, row.branch or "")
+            preserved = (
+                error is None and item.tip_sha is not None and _tip_is_ancestor(repo, item.tip_sha, host_tip or "")
+            )
+            detail = error or "remote tip is not preserved on the local lane branch"
+        if not preserved:
+            return SandboxVerdict(
+                item.key,
+                row.lane_id,
+                row.branch,
+                KIND_SANDBOX_UNHARVESTED,
+                item.tip_sha,
+                f"lane row status {status}: source proof unavailable: {detail}",
+            )
+        probe_tip = (
+            item.tip_sha if item.tip_sha and _tip_is_ancestor(repo, item.tip_sha, host_tip or "") else host_tip or ""
+        )
+        raw, error = _run_ssh(
+            ssh_runner, _build_rowless_probe_script(sandbox_root, item.key, host_tip=probe_tip, mapped_product=True)
+        )
+        _entries, proof, clean, parse_error = _parse_rowless_probe(raw)
+        if (
+            error
+            or parse_error
+            or not clean
+            or proof is None
+            or proof.key != item.key
+            or proof.tip != item.tip_sha
+            or (item.tree_sha is not None and proof.tree != item.tree_sha)
+        ):
+            return SandboxVerdict(
+                item.key,
+                row.lane_id,
+                row.branch,
+                KIND_SANDBOX_UNHARVESTED,
+                item.tip_sha,
+                f"lane row status {status}: remote proof failed: {error or parse_error or raw.strip() or 'identity changed'}",
+            )
+        if not _mapped_history_preserved(repo, proof, host_tip or ""):
+            return SandboxVerdict(
+                item.key,
+                row.lane_id,
+                row.branch,
+                KIND_SANDBOX_UNHARVESTED,
+                item.tip_sha,
+                "mapped reachable_history or synthetic-base translation is unpreserved",
+            )
+        if rowless_proofs is not None:
+            rowless_proofs[item.key] = replace(proof, host_tip=probe_tip, mapped_product=True)
+        return SandboxVerdict(
+            sandbox_key=item.key,
+            lane_id=row.lane_id,
+            branch=row.branch,
+            kind=KIND_SANDBOX_HARVESTED,
+            tip_sha=item.tip_sha,
+            reason=f"lane row status {status}",
+        )
+    return SandboxVerdict(
+        sandbox_key=item.key,
+        lane_id=row.lane_id,
+        branch=row.branch,
+        kind=KIND_SANDBOX_UNHARVESTED,
+        tip_sha=item.tip_sha,
+        reason="row is non-terminal",
+    )
+
+
+def _classify_rowless_ours(
+    item: _ListedSandbox,
+    repo: Path,
+    branch: str,
+    *,
+    ssh_runner: SshRunner,
+    sandbox_root: str,
+    rowless_proofs: dict[str, _RowlessProof] | None = None,
+) -> SandboxVerdict:
+    host_tip, host_entries, host_error = _host_branch_blobs(repo, branch)
+    if host_error is not None:
+        return _rowless_verdict(item, branch, KIND_PROBE_FAILED, host_error)
+
+    raw, probe_error = _run_ssh(
+        ssh_runner, _build_rowless_probe_script(sandbox_root, item.key, host_tip=host_tip or "")
+    )
+    if probe_error is not None:
+        return _rowless_verdict(item, branch, KIND_PROBE_FAILED, probe_error)
+    remote_entries, proof, clean, parse_error = _parse_rowless_probe(raw)
+    if parse_error is not None:
+        return _rowless_verdict(item, branch, KIND_PROBE_FAILED, parse_error)
+    if not clean:
+        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, f"rowless ours sandbox is dirty: {raw.strip()}")
+
+    assert host_entries is not None
+    assert remote_entries is not None
+    for path in sorted(host_entries.keys() | remote_entries.keys()):
+        if host_entries.get(path) != remote_entries.get(path):
+            return _rowless_verdict(
+                item,
+                branch,
+                KIND_SANDBOX_UNHARVESTED,
+                f"rowless ours differs from host tip at {path}",
+            )
+    assert proof is not None
+    if rowless_proofs is not None:
+        rowless_proofs[item.key] = replace(proof, host_tip=host_tip or "")
+    return _rowless_verdict(
+        item,
+        branch,
+        KIND_SANDBOX_HARVESTED,
+        f"rowless_ours_content_equal_to_host_tip {branch}@{host_tip}",
+    )
+
+
+def _classify_reclaimed_pin(
+    item: _ListedSandbox,
+    branch: str,
+    pin_sha: str,
+    repo: Path,
+    *,
+    ssh_runner: SshRunner,
+    sandbox_root: str,
+    rowless_proofs: dict[str, _RowlessProof] | None = None,
+) -> SandboxVerdict:
+    if re.fullmatch(r"[0-9a-f]{40}", pin_sha) is None:
+        return _rowless_verdict(
+            item, branch, KIND_SANDBOX_UNHARVESTED, "reclaimed pin is unresolvable: malformed commit SHA"
+        )
+    try:
+        raw, probe_error = _run_ssh(ssh_runner, _build_rowless_probe_script(sandbox_root, item.key, host_tip=pin_sha))
+    except Exception as exc:  # noqa: BLE001 — failed content proof is never reap authority
+        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, f"reclaimed pin proof failed: {exc}")
+    if probe_error is not None:
+        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, f"reclaimed pin proof failed: {probe_error}")
+    _entries, proof, clean, parse_error = _parse_rowless_probe(raw)
+    if parse_error is not None:
+        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, f"reclaimed pin proof failed: {parse_error}")
+    if not clean:
+        return _rowless_verdict(
+            item,
+            branch,
+            KIND_SANDBOX_UNHARVESTED,
+            f"reclaimed pin sandbox is dirty: {raw.strip() or 'clean proof missing'}",
+        )
+    if proof is None:
+        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, "reclaimed pin proof missing")
+    if rowless_proofs is not None:
+        rowless_proofs[item.key] = replace(proof, host_tip=pin_sha)
+    return SandboxVerdict(
+        sandbox_key=item.key,
+        lane_id=None,
+        branch=branch,
+        kind=KIND_SANDBOX_RETIRED_OURS,
+        tip_sha=pin_sha,
+        reason=f"reclaimed pin content proof passed at {pin_sha}",
+    )
+
+
+def _rowless_verdict(item: _ListedSandbox, branch: str, kind: str, reason: str) -> SandboxVerdict:
+    return SandboxVerdict(
+        sandbox_key=item.key,
+        lane_id=None,
+        branch=branch,
+        kind=kind,
+        tip_sha=item.tip_sha,
+        reason=reason,
+    )
+
+
+def _host_branch_blobs(repo: Path, branch: str) -> tuple[str | None, TreeEntries | None, str | None]:
+    if not branch or branch.startswith("-") or ".." in branch or "\n" in branch or "\r" in branch:
+        return None, None, f"unsafe known branch name: {branch!r}"
+    # This proof reads the branch tip and its tree directly. A shallow host
+    # clone can still prove exact content equality when that tip is available;
+    # ancestry traversal is not part of this rowless content check.
+    tip_proc, tip_error = _run_local_git(repo, "rev-parse", "--verify", "--end-of-options", f"{branch}^{{commit}}")
+    if tip_error is not None:
+        return None, None, f"host tip probe failed for {branch}: {tip_error}"
+    tip = tip_proc.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", tip):
+        return None, None, f"host tip probe returned malformed sha for {branch}"
+    tree_output, tree_error = _run_local_git(repo, "ls-tree", "-r", "--full-tree", tip)
+    if tree_error is not None:
+        return None, None, f"host tree probe failed for {branch}: {tree_error}"
+    entries, parse_error = _parse_ls_tree_lines(tree_output.splitlines())
+    if parse_error is not None:
+        return None, None, f"host tree parse failed for {branch}: {parse_error}"
+    # Use the dispatch exporter itself: arbitrary missing paths are not proof of
+    # export exclusion. Do not extract the archive or load its contents in RAM.
+    try:
+        with tempfile.TemporaryFile() as archive:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "archive", "--format=tar", tip],
+                stdout=archive,
+                stderr=subprocess.PIPE,
+                timeout=GIT_TIMEOUT_S,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            if proc.returncode:
+                return None, None, f"host export failed for {branch}: git exited {proc.returncode}"
+            archive.seek(0)
+            with tarfile.open(fileobj=archive, mode="r|") as exported:
+                paths = {member.name for member in exported if not member.isdir()}
+        if not paths <= entries.keys():
+            return None, None, f"host export contains unknown paths for {branch}"
+    except (OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
+        return None, None, f"host export failed for {branch}: {exc}"
+    return tip, {path: entries[path] for path in paths}, None
+
+
+def _run_local_git(repo: Path, *args: str) -> tuple[str, str | None]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "", str(exc)
+    if proc.returncode != 0:
+        return "", (proc.stderr or proc.stdout or f"git exited {proc.returncode}").strip()[:300]
+    return proc.stdout, None
+
+
+def _parse_rowless_probe(raw: str) -> tuple[TreeEntries | None, _RowlessProof | None, bool, str | None]:
+    lines = raw.splitlines()
+    if len(lines) == 1 and re.fullmatch(r"DIRTY(?: [a-z_]+)?", lines[0]):
+        return {}, None, False, None
+    if len(lines) == 1 and re.fullmatch(r"PROBE_FAILED [a-z_]+", lines[0]):
+        return None, None, False, lines[0]
+    if (
+        len(lines) < 6
+        or lines[0] != "CLEAN"
+        or not re.fullmatch(r"TREE [0-9a-f]{40}", lines[1])
+        or not re.fullmatch(r"GENERATION [0-9a-f]{64}", lines[2])
+        or not re.fullmatch(r"KEY " + _LANE_KEY_RE.pattern[1:-1], lines[3])
+        or not re.fullmatch(r"HEAD [0-9a-f]{40}", lines[4])
+        or not re.fullmatch(r"ARTIFACTS [0-9a-f]{64}", lines[5])
+    ):
+        return None, None, False, "unexpected rowless sandbox probe output"
+    proof = _RowlessProof(
+        tree=lines[1].split()[1],
+        generation=lines[2].split()[1],
+        key=lines[3].split()[1],
+        tip=lines[4].split()[1],
+        artifacts=lines[5].split()[1],
+    )
+    tree_start = 6
+    if len(lines) > 6 and lines[6].startswith("SOURCE_COMMIT "):
+        if not re.fullmatch(r"SOURCE_COMMIT [0-9a-f]{40}", lines[6]):
+            return None, None, False, "malformed synthetic source translation"
+        proof = replace(proof, translated_source_commit=lines[6].split()[1])
+        tree_start = 7
+    entries, error = _parse_ls_tree_lines(lines[tree_start:])
+    if error is not None:
+        return None, None, False, f"unexpected rowless sandbox tree output: {error}"
+    return entries, proof, True, None
+
+
+def _parse_ls_tree_lines(lines: Sequence[str]) -> tuple[TreeEntries, str | None]:
+    entries: TreeEntries = {}
+    for line in lines:
+        match = re.fullmatch(r"(100644|100755|120000) (blob) ([0-9a-f]{40})\t([^\r\n]+)", line)
+        if match is None:
+            return {}, repr(line)
+        path = match.group(4)
+        if path.startswith('"'):
+            return {}, f"unsupported quoted path {path!r}"
+        if path in entries:
+            return {}, f"duplicate path {path!r}"
+        entries[path] = (match.group(1), match.group(2), match.group(3))
+    return entries, None
+
+
+def _exclusion_keys_for_rows(rows: Sequence[Mapping[str, Any] | Any]) -> list[str]:
+    """Derived sandbox keys for non-terminal rows in the invoking pass."""
+    keys: list[str] = []
+    for row in rows:
+        status = (_row_text(row, "status") or "").strip().lower()
+        if status in TERMINAL_ROW_STATUSES:
+            continue
+        branch = _row_text(row, "branch")
+        if not branch:
+            continue
+        keys.append(_derive_lane_key(branch))
+    return keys
+
+
+def _map_key(key: str, indexed_rows: Sequence[tuple[_MappedRow, str]]) -> _MappedRow | _AmbiguousRows | None:
+    exact = [row for row, derived in indexed_rows if derived and derived == key]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return _AmbiguousRows(tuple(exact))
+    return None
+
+
+def _terminal_alias_product(
+    rows: Sequence[_MappedRow], item: _ListedSandbox, repo: Path, target_tip: str | None
+) -> tuple[str, str] | None:
+    """Require all aliases to belong to one landed history, without choosing a row."""
+    branches = {row.branch for row in rows}
+    if len(branches) != 1 or None in branches:
+        return None
+    if any((row.status or "").strip().lower() not in TERMINAL_ROW_STATUSES for row in rows):
+        return None
+    tips = {row.branch_tip_sha or "" for row in rows}
+    if any(re.fullmatch(r"[0-9a-f]{40}", tip) is None for tip in tips):
+        return None
+    receipts = [row for row in rows if (row.status or "").strip().lower() == "merged"]
+    if not receipts:
+        return None
+    # Every merged receipt must itself prove preservation; a good sibling receipt
+    # cannot hide malformed or unlanded evidence on another alias.
+    for row in receipts:
+        if not _remote_lane_product_preserved(
+            item, repo, expected_tip=row.branch_tip_sha or "", landing_commit=row.landing_commit_sha
+        )[0]:
+            return None
+    products = {
+        row.branch_tip_sha
+        for row in receipts
+        if all(_tip_is_ancestor(repo, tip, row.branch_tip_sha or "") for tip in tips)
+        and (
+            target_tip is None
+            or _remote_lane_product_preserved(
+                item, repo, expected_tip=target_tip, landing_commit=row.landing_commit_sha
+            )[0]
+        )
+    }
+    if len(products) != 1:
+        return None
+    return next(iter(branches)), next(iter(products))
+
+
+def _derive_lane_key(branch: str) -> str:
+    """Mirror ``remote_agent.sh`` / ``offload_pass._remote_lane_key``."""
+    digest = hashlib.sha256(branch.encode("utf-8", errors="surrogatepass")).hexdigest()[:8]
+    key = re.sub(r"[^A-Za-z0-9-]", "-", branch)[:40]
+    while key.startswith("-"):
+        key = key[1:]
+    return f"{key or 'lane'}-{digest}"
+
+
+def _row_text(row: Mapping[str, Any] | Any, key: str) -> str | None:
+    if isinstance(row, Mapping):
+        raw = row.get(key)
+    else:
+        raw = getattr(row, key, None)
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value or None
+
+
+def _tip_is_ancestor(repo: Path, tip_sha: str, branch: str) -> bool:
+    if not _SHA_RE.fullmatch(tip_sha):
+        return False
+    if not branch or branch.startswith("-") or ".." in branch or "\n" in branch:
+        return False
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", tip_sha, branch],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _mapped_history_preserved(repo: Path, proof: _RowlessProof, host_tip: str) -> bool:
+    """Authenticate exact ancestry or the unchanged parentless native base.
+
+    The remote guard permits translation only for HEAD == sandbox_base_commit;
+    any descendants need exact reachable ancestry, including reverted work.
+    A sidecar claim alone cannot authenticate its corresponding host commit.
+    """
+    # A shallow/partial/grafted host tip is not complete object custody even
+    # when the remote HEAD object happens to be present there.
+    shallow, error = _run_local_git(repo, "rev-parse", "--is-shallow-repository")
+    if error is not None or shallow.strip() != "false":
+        return False
+    grafts, error = _run_local_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "info/grafts")
+    if error is not None or not grafts.strip() or os.path.lexists(grafts.strip()):
+        return False
+    source = proof.translated_source_commit or proof.tip
+    if not _tip_is_ancestor(repo, source, host_tip):
+        return False
+    _objects, error = _run_local_git(
+        repo, "--no-replace-objects", "rev-list", "--objects", "--missing=error", "--quiet", source, "--"
+    )
+    if error is not None:
+        return False
+    tree, error = _run_local_git(
+        repo, "--no-replace-objects", "rev-parse", "--verify", "--end-of-options", f"{source}^{{tree}}"
+    )
+    return error is None and tree.strip() == proof.tree
+
+
+def _remote_lane_product_preserved(
+    item: _ListedSandbox,
+    repo: Path,
+    *,
+    expected_tip: str,
+    landing_commit: str | None,
+) -> tuple[bool, str]:
+    """Establish mapped product eligibility, before complete history proof.
+
+    History-stripped remote work can have a different commit SHA even when its
+    complete tree is the same. The registered host lane tip must be an ancestor
+    of the recorded landing commit, and the remote tree must match one of the
+    bounded host-tip ancestry trees. A later feature integration may have a
+    different final tree. Tree equality alone does not preserve reachable
+    history; _mapped_history_preserved and the locked remote inventory are
+    additionally required before retirement.
+    """
+    if re.fullmatch(r"[0-9a-f]{40}", expected_tip) is None:
+        return False, "registered host lane tip is malformed"
+    if re.fullmatch(r"[0-9a-f]{40}", landing_commit or "") is None:
+        return False, "host landing ancestry evidence is unavailable"
+    if item.tip_sha is None:
+        return False, "remote sandbox tip is unavailable"
+    if not _tip_is_ancestor(repo, expected_tip, landing_commit or ""):
+        return False, "registered host lane tip is not preserved in the landing history"
+    if item.tip_sha == expected_tip:
+        return True, "exact remote commit is preserved in host landing history"
+    if item.tree_sha is None or re.fullmatch(r"[0-9a-f]{40}", item.tree_sha) is None:
+        return False, "remapped remote commit has no verifiable tree"
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        host_history = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "log",
+                f"--max-count={_REMOTE_PRODUCT_HISTORY_LIMIT}",
+                "--format=%T",
+                "--end-of-options",
+                expected_tip,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "host lane ancestry tree probe failed"
+    if host_history.returncode != 0:
+        return False, "host lane ancestry trees are unavailable"
+    preserved_trees = {
+        tree.lower()
+        for tree in host_history.stdout.splitlines()
+        if re.fullmatch(r"[0-9a-f]{40}", tree.lower()) is not None
+    }
+    if item.tree_sha.lower() not in preserved_trees:
+        return False, "remote sandbox tree is absent from preserved host lane history"
+    return True, "remapped remote tree is preserved in host lane history"
+
+
+def _list_remote_sandboxes(
+    ssh_runner: SshRunner,
+    root: str,
+    *,
+    timeout: float | None = SSH_TIMEOUT_S,
+    target_keys: Sequence[str] | None = None,
+    inventory_only: bool = False,
+    directory_keys: Sequence[str] | None = None,
+) -> tuple[_RemoteSandboxListing, str | None]:
+    result, error = _run_ssh(
+        ssh_runner,
+        _build_list_script(
+            root,
+            target_keys=target_keys,
+            inventory_only=inventory_only,
+            directory_keys=directory_keys,
+            operation_timeout=timeout,
+        ),
+        timeout=timeout,
+    )
+    if error is not None:
+        return _RemoteSandboxListing(), error
+    listed = _RemoteSandboxListing()
+    for raw_line in result.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Existing marker writers also use an empty legacy receipt. It carries
+        # no age-based decisions; nonzero counts still fail without typed holds.
+        if line == "EVIDENCE_YOUNG count=0":
+            continue
+        evidence_match = _EVIDENCE_LISTING_RE.fullmatch(line)
+        if evidence_match:
+            if not _DIRECTORY_KEY_RE.fullmatch(evidence_match["key"]):
+                return [], f"unsafe evidence key in listing: {evidence_match['key']!r}"
+            listed.append(
+                _ListedEvidence(
+                    evidence_match["key"],
+                    int(evidence_match["age"]),
+                    int(evidence_match["bytes"] or 0),
+                    evidence_match["status"] or "retained_unmarked",
+                )
+            )
+            continue
+        truncated_match = _EVIDENCE_TRUNCATED_RE.fullmatch(line)
+        if truncated_match:
+            listed.evidence_truncated = True
+            listed.evidence_candidates_remaining = int(truncated_match["remaining"])
+            continue
+        match = _LISTING_RE.match(line)
+        if match is None:
+            return [], f"unexpected listing line: {line!r}"
+        key = match.group("key")
+        if not (_DIRECTORY_KEY_RE if inventory_only else _SANDBOX_KEY_RE).fullmatch(key):
+            listed.invalid_keys.append(key)
+            continue
+        tip_raw = match.group("tip")
+        tip_sha = tip_raw.lower() if _SHA_RE.fullmatch(tip_raw.lower()) else None
+        tree_raw = match.group("tree")
+        tree_sha = tree_raw.lower() if tree_raw and _SHA_RE.fullmatch(tree_raw.lower()) else None
+        listed.append(
+            _ListedSandbox(
+                key=key,
+                tip_sha=tip_sha,
+                tree_sha=tree_sha,
+                occupant_live=match.group("occupant") == "live",
+                lock_held=match.group("lock") == "held",
+                idle_seconds=int(match.group("idle") or 0),
+                bytes_used=int(match.group("bytes")) if match.group("bytes") is not None else None,
+            )
+        )
+    return listed, None
+
+
+def _remote_list_timeout(sandbox_count: int) -> float:
+    """Scale the bounded SSH listing budget with the amount of requested work."""
+    estimated = SSH_TIMEOUT_S + max(0, int(sandbox_count) - 1) * REMOTE_LIST_TIMEOUT_PER_SANDBOX_S
+    return min(REMOTE_LIST_TIMEOUT_MAX_S, estimated)
+
+
+def _reap_remote_sandboxes(
+    ssh_runner: SshRunner,
+    root: str,
+    keys: Sequence[str],
+    *,
+    rowless_proofs: Mapping[str, _RowlessProof] | None = None,
+    idle_seconds: int = DEFAULT_IDLE_SECONDS,
+) -> tuple[list[str], str | None]:
+    safe_keys = [key for key in keys if _LANE_KEY_RE.fullmatch(key)]
+    if len(safe_keys) != len(keys):
+        return [], "refusing to reap unsafe sandbox key"
+    result, error = _run_ssh(
+        ssh_runner, _build_reap_script(root, safe_keys, rowless_proofs=rowless_proofs, idle_seconds=idle_seconds)
+    )
+    if error is not None:
+        return [], error
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    if lines == ["LOCK_HELD"]:
+        return lines, None
+    response_keys: list[str] = []
+    for line in lines:
+        if line == "LOCK_HELD":
+            return [], "mixed LOCK_HELD with per-key reap lines"
+        match = _REAP_LINE_RE.match(line)
+        if match is None:
+            return [], f"unexpected reap output: {line!r}"
+        response_keys.append(match.group("key"))
+    if len(response_keys) != len(safe_keys) or set(response_keys) != set(safe_keys):
+        expected = ",".join(safe_keys)
+        received = ",".join(response_keys)
+        return [], f"response_keys_mismatch: expected={expected} received={received}"
+    return lines, None
+
+
+def _run_ssh(ssh_runner: SshRunner, script: str, *, timeout: float | None = SSH_TIMEOUT_S) -> tuple[str, str | None]:
+    try:
+        parameters = inspect.signature(ssh_runner).parameters.values()
+    except (TypeError, ValueError):
+        accepts_timeout = True
+    else:
+        accepts_timeout = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "timeout"
+                and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            )
+            for parameter in parameters
+        )
+    if not accepts_timeout:
+        return "", "ssh runner does not accept timeout"
+
+    try:
+        raw = ssh_runner(script, timeout=timeout)
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        return "", f"ssh timed out: {exc}"
+    except OSError as exc:
+        return "", f"ssh failed: {exc}"
+    except TypeError as exc:
+        return "", f"ssh failed: TypeError: {exc}"
+    stdout, stderr, returncode = _coerce_ssh_result(raw)
+    if returncode not in (0, None):
+        detail = (stderr or stdout or f"exit {returncode}").strip()
+        return "", f"ssh exited {returncode}: {detail[:300]}"
+    return stdout, None
+
+
+def _coerce_ssh_result(raw: Any) -> tuple[str, str, int | None]:
+    if isinstance(raw, str):
+        return raw, "", 0
+    stdout = getattr(raw, "stdout", "") or ""
+    stderr = getattr(raw, "stderr", "") or ""
+    returncode = getattr(raw, "returncode", 0)
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    try:
+        code: int | None = int(returncode) if returncode is not None else 0
+    except (TypeError, ValueError):
+        code = 0
+    return str(stdout), str(stderr), code
+
+
+def _sh_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+# Executed on the VM, using only read-only, unprivileged operations. A VM without
+# a complete privileged procfs view returns UNKNOWN; no sudo/auth fallback.
+_REFERENCE_CENSUS_PY = r"""import os, re, stat, sys, time
+proc_root = "/proc"
+privileged = os.geteuid() == 0
+paths = [os.path.abspath(p) for p in sys.argv[1:4]]
+deadline = float(sys.argv[4])
+protected_inodes = set()
+def check_time():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("deadline")
+def reference(value):
+    value = value.removesuffix(" (deleted)")
+    return any(value == p or value.startswith(p + "/") for p in paths)
+def inode_reference(path):
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino) in protected_inodes
+def identity(task):
+    data = open(task + "/stat").read().rsplit(") ", 1)[1].split()
+    return data[19], data[0], int(data[6])
+def census():
+    check_time()
+    if not privileged:
+        raise RuntimeError("privileged_census_unavailable")
+    # hidepid can omit PIDs altogether; unreadable entries are not absence.
+    mounts = open(proc_root + "/self/mountinfo").read()
+    if not any(" - proc " in line and line.split()[4] == proc_root and
+               not re.search(r"hidepid=(?!0(?:,|\s|$))", line) for line in mounts.splitlines()):
+        raise RuntimeError("proc_view_unverified")
+    pids = {n for n in os.listdir(proc_root) if n.isdigit()}
+    if not pids:
+        raise RuntimeError("empty_census")
+    # Path-only FD checks miss an open alias that was subsequently unlinked.
+    # Inventory only the exact deletion paths, never a sibling sandbox.
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        for parent, dirs, files in os.walk(path, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
+            check_time()
+            for name in [None, *dirs, *files]:
+                check_time()
+                info = os.lstat(parent if name is None else os.path.join(parent, name))
+                protected_inodes.add((info.st_dev, info.st_ino))
+                if len(protected_inodes) > 200000:
+                    raise RuntimeError("inventory_limit")
+    unfenced_readers = False
+    for pid in sorted(pids):
+        check_time()
+        if int(pid) == os.getpid():
+            continue  # this read-only helper never opens a deletion target
+        base = proc_root + "/" + pid
+        before = identity(base)
+        tasks = set(os.listdir(base + "/task"))
+        if not tasks:
+            raise RuntimeError("partial_census")
+        for tid in sorted(tasks):
+            check_time()
+            task = base + "/task/" + tid
+            original = identity(task)
+            # Zombies and kernel threads have no user address space or files.
+            if original[1] != "Z" and not original[2] & 0x00200000:
+                # Stable PID/task generations do not freeze CWD/FD/env/maps.
+                # Arbitrary readers have not joined the native key/lease locks.
+                unfenced_readers = True
+                for name in ("cwd", "root", "exe"):
+                    if reference(os.readlink(task + "/" + name)) or inode_reference(task + "/" + name):
+                        return "BUSY process_" + name
+                fds = os.listdir(task + "/fd")
+                for fd in fds:
+                    check_time()
+                    if reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd):
+                        return "BUSY process_fd"
+                environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
+                if len(environ) > 8 * 1024 * 1024:
+                    raise RuntimeError("environment_limit")
+                for value in environ.split(b"\0"):
+                    for token in re.split(r"[=:\s]", os.fsdecode(value)):
+                        if reference(token):
+                            return "BUSY process_env"
+                with open(task + "/maps") as maps:
+                    for line in maps:
+                        check_time()
+                        fields = line.split(None, 5)
+                        device = fields[3].split(":") if len(fields) >= 5 else []
+                        mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
+                        if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
+                            return "BUSY process_maps"
+            if identity(task) != original:
+                raise RuntimeError("pid_generation_changed")
+        if identity(base) != before or set(os.listdir(base + "/task")) != tasks:
+            raise RuntimeError("pid_generation_changed")
+    if {n for n in os.listdir(proc_root) if n.isdigit()} != pids:
+        raise RuntimeError("partial_census")
+    return "UNKNOWN reader_acquisition_unfenced" if unfenced_readers else "IDLE"
+try:
+    print(census())
+except (OSError, ValueError, IndexError, RuntimeError) as exc:
+    print("UNKNOWN " + (str(exc) if isinstance(exc, RuntimeError) else "unreadable_census"))
+"""
+
+_ARTIFACT_IDENTITY_PY = r"""import hashlib, json, os, stat, sys, time
+root, key, mode, deadline = sys.argv[1:]
+deadline = float(deadline)
+sandbox = os.path.join(root, key)
+hash_value = hashlib.sha256()
+count = size = 0
+def check_time():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("deadline")
+def record(value):
+    hash_value.update(json.dumps(value, sort_keys=True).encode() + b"\n")
+def snapshot(path, label):
+    global count, size
+    check_time()
+    count += 1
+    if count > 200000:
+        raise RuntimeError("inventory_limit")
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        record([label, "absent"])
+        return
+    kind = stat.S_IFMT(before.st_mode)
+    if label.startswith(key + "/.git/") and label.endswith(".lock"):
+        raise RuntimeError("inflight_git_write")
+    record([label, kind, before.st_dev, before.st_ino, before.st_mode,
+            before.st_mtime_ns, before.st_ctime_ns, before.st_size])
+    if stat.S_ISLNK(kind):
+        target = os.readlink(path)
+        record(target)
+        # Never follow links. .venv is the only supported outside reference.
+        resolved = os.path.abspath(os.path.join(os.path.dirname(path), target))
+        if resolved != os.path.join(root, ".venv-lane-" + key) and not (
+            resolved == sandbox or resolved.startswith(sandbox + "/")
+        ):
+            raise RuntimeError("foreign_symlink")
+    elif stat.S_ISREG(kind):
+        if before.st_nlink != 1:
+            raise RuntimeError("incoming_hardlink")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError("identity_changed")
+            while True:
+                check_time()
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                size += len(block)
+                if size > 256 * 1024 * 1024:
+                    raise RuntimeError("inventory_limit")
+                hash_value.update(block)
+    elif stat.S_ISDIR(kind):
+        with os.scandir(path) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            snapshot(os.path.join(path, name), label + "/" + name)
+    else:
+        raise RuntimeError("unsupported_artifact_type")
+    after = os.lstat(path)
+    if (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size) != (
+        before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns, before.st_size
+    ):
+        raise RuntimeError("identity_changed")
+try:
+    if os.path.realpath(root) != root or os.path.islink(sandbox):
+        raise RuntimeError("redirected_root")
+    marker = os.path.join(sandbox, ".workbay-lane-sandbox")
+    marker_stat = os.lstat(marker)
+    if not stat.S_ISREG(marker_stat.st_mode):
+        raise RuntimeError("marker_type")
+    marker_bytes = open(marker, "rb").read(65537)
+    if marker_bytes != ("lane_key=" + key + "\n").encode():
+        raise RuntimeError("marker_key_mismatch")
+    if mode == "generation":
+        for path in (sandbox, sandbox + "/.git", marker):
+            st = os.lstat(path)
+            record([path, st.st_dev, st.st_ino, st.st_mtime_ns if path == marker else 0,
+                    st.st_ctime_ns if path == marker else 0])
+        record(marker_bytes.hex())
+    else:
+        # Exact-key inventory only; never traverse another sandbox/evidence key.
+        for name in (key, ".venv-lane-" + key, ".venv-sync-stamp-" + key, ".lane-live-" + key):
+            snapshot(os.path.join(root, name), name)
+    print(hash_value.hexdigest())
+except (OSError, RuntimeError, TypeError) as exc:
+    print("UNKNOWN " + (str(exc) if isinstance(exc, RuntimeError) else "artifact_unreadable"))
+    sys.exit(1)
+"""
+
+
+_REGULAR_FILE_READ_PY = r"""import os, stat, sys, time
+path, mode, deadline = sys.argv[1:]
+deadline = float(deadline)
+def check_time():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("deadline")
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+try:
+    # Open each directory without following replacement symlinks. NONBLOCK
+    # closes the regular-file-check -> FIFO-open race; fstat precedes reading.
+    parts = os.path.abspath(path).split("/")[1:]
+    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            check_time()
+            next_parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=parent)
+            os.close(parent)
+            parent = next_parent
+        before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("unsupported_type")
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+                raise RuntimeError("identity_changed")
+            if mode == "packed-refs":
+                size = 0
+                while True:
+                    check_time()
+                    line = stream.readline(65537)
+                    if not line:
+                        break
+                    size += len(line)
+                    if len(line) > 65536 or size > 256 * 1024 * 1024:
+                        raise RuntimeError("inventory_limit")
+                    fields = line.split()
+                    if len(fields) > 1 and fields[1].startswith(b"refs/replace/"):
+                        raise RuntimeError("replace_refs_present")
+                data = b""
+            else:
+                check_time()
+                data = stream.read(65537)
+                if len(data) > 65536:
+                    raise RuntimeError("inventory_limit")
+            check_time()
+            if identity(os.fstat(stream.fileno())) != identity(before):
+                raise RuntimeError("identity_changed")
+        if identity(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)) != identity(before):
+            raise RuntimeError("identity_changed")
+        if identity(os.lstat(path)) != identity(before):
+            raise RuntimeError("identity_changed")
+        sys.stdout.buffer.write(data)
+    finally:
+        os.close(parent)
+except (OSError, RuntimeError, ValueError):
+    sys.exit(1)
+"""
+
+_GIT_ADMIN_TYPES_PY = r"""import os, stat, sys, time
+path, deadline = sys.argv[1:]
+deadline = float(deadline)
+count = 0
+try:
+    for parent, dirs, files in os.walk(path, followlinks=False,
+                                      onerror=lambda exc: (_ for _ in ()).throw(exc)):
+        for name in [None, *dirs, *files]:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("deadline")
+            count += 1
+            if count > 200000:
+                raise RuntimeError("inventory_limit")
+            info = os.lstat(parent if name is None else os.path.join(parent, name))
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise RuntimeError("unsupported_git_admin_type")
+except (OSError, RuntimeError):
+    sys.exit(1)
+"""
+
+
+_CONTENT_PROOF_PY = r"""import hashlib, os, stat, subprocess, sys, time
+root, git, deadline = sys.argv[1:]
+deadline = float(deadline)
+
+def remaining():
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError
+    return left
+
+def run_git(*args, data=None):
+    return subprocess.run(
+        [git, "--work-tree=" + root, "--git-dir=" + root + "/.git", *args],
+        input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=True, timeout=remaining(), cwd=root,
+    ).stdout
+
+def refuse(reason):
+    if time.monotonic() >= deadline:
+        reason = "content_deadline"
+    print(reason)
+    sys.exit(1)
+
+try:
+    tree = run_git("ls-tree", "-r", "-z", "HEAD")
+    paths, expected = [], []
+    if tree and not tree.endswith(b"\0"):
+        refuse("content_unknown")
+    for entry in tree.split(b"\0")[:-1]:
+        remaining()
+        meta, path = entry.split(b"\t", 1)
+        mode, kind, oid = meta.split()
+        # --stdin-paths is line-delimited and C-unquotes a leading double quote.
+        # Never silently drop or reinterpret an entry that cannot be sent raw.
+        if b"\n" in path or path.startswith(b'"'):
+            refuse("content_unsafe_path")
+        if kind != b"blob":
+            refuse("raw_content")
+        info = os.lstat(os.path.join(os.fsencode(root), path))
+        if mode in (b"100644", b"100755"):
+            if not stat.S_ISREG(info.st_mode):
+                refuse("raw_content")
+            if bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                refuse("worktree_inventory")
+            paths.append(path)
+            expected.append(oid)
+        elif mode == b"120000":
+            if not stat.S_ISLNK(info.st_mode):
+                refuse("raw_content")
+            target = os.readlink(os.path.join(os.fsencode(root), path))
+            algorithm = "sha1" if len(oid) == 40 else "sha256"
+            actual = hashlib.new(algorithm, b"blob " + str(len(target)).encode() + b"\0" + target).hexdigest().encode()
+            if actual != oid:
+                refuse("raw_content")
+        else:
+            refuse("raw_content")
+    if paths:
+        hashes = run_git("hash-object", "--no-filters", "--stdin-paths", data=b"\n".join(paths) + b"\n")
+        # An incomplete/malformed batch is unknown; matching cardinality still
+        # requires byte-exact ordered hashes for every input path.
+        actual = hashes.split(b"\n")[:-1]
+        if not hashes.endswith(b"\n") or len(actual) != len(expected):
+            refuse("content_unknown")
+        if actual != expected:
+            refuse("raw_content")
+    remaining()
+except (TimeoutError, subprocess.TimeoutExpired):
+    refuse("content_deadline")
+except (OSError, ValueError, subprocess.CalledProcessError):
+    if time.monotonic() >= deadline:
+        refuse("content_deadline")
+    refuse("content_unknown")
+"""
+
+
+def _reference_helpers(*, operation_timeout: float | None = None) -> str:
+    # Carry the original SSH operation bound across transport and all guards;
+    # a clock skew can shorten it, but never grants a new cleanup budget.
+    # Listings inherit their caller's already-scaled budget. Probe/reap callers
+    # retain SSH_TIMEOUT_S; no helper invocation refreshes either deadline.
+    budget = SSH_TIMEOUT_S if operation_timeout is None else operation_timeout
+    deadline = time.time() + budget
+    return (
+        f"""
+# One original operation deadline, inherited by every fresh guard and removal.
+_guard_deadline=$(python3 -c 'import sys,time; print(time.monotonic() + max(0,min({budget},float(sys.argv[1])-time.time())))' {deadline!r})
+_guard_git=$(command -v git)
+_guard_remaining() {{
+  python3 -c 'import sys,time; left=float(sys.argv[1])-time.monotonic(); print(max(0,left)); sys.exit(left <= 0)' "$_guard_deadline"
+}}
+git() {{
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" "$_guard_git" "$@"
+}}
+_guard_regular_read() {{
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$1" "${{2:-read}}" "$_guard_deadline" <<'WORKBAY_REGULAR_READ_PY'
+"""
+        + _REGULAR_FILE_READ_PY
+        + """WORKBAY_REGULAR_READ_PY
+}
+_guard_git_admin_types() {
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$1/.git" "$_guard_deadline" <<'WORKBAY_ADMIN_TYPES_PY'
+"""
+        + _GIT_ADMIN_TYPES_PY
+        + """WORKBAY_ADMIN_TYPES_PY
+}
+_artifact_identity() {
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$ROOT" "$_sk" "$1" "$_guard_deadline" <<'WORKBAY_ARTIFACT_PY'
+"""
+        + _ARTIFACT_IDENTITY_PY
+        + """WORKBAY_ARTIFACT_PY
+}
+_reference_census() {
+  _remaining=$(_guard_remaining) || { echo 'UNKNOWN deadline'; return; }
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$_sd" "$ROOT/.venv-lane-$_sk" "$ROOT/.venv-sync-stamp-$_sk" "$_guard_deadline" <<'WORKBAY_REFERENCE_PY'
+"""
+        + _REFERENCE_CENSUS_PY
+        + """WORKBAY_REFERENCE_PY
+}
+"""
+    )
+
+
+def _bounded_native_script(payload: str, failure: str) -> str:
+    """Bound the entire lock-owning process group, including shell opens.
+
+    RES-02/RES-03 (Release It!, ch. 5): a checked path can be replaced before
+    Bash or Git opens it. The outer timeout kills every payload descendant;
+    inner timeouts stay in that group. Move, rather than recompute, the original
+    deadline so neither an administrative read nor lock acquisition refreshes it.
+    """
+    deadline_line = next(line for line in payload.splitlines() if line.startswith("_guard_deadline="))
+    payload = payload.replace(deadline_line + "\n", "", 1)
+    delimiter = "WORKBAY_BOUNDED_NATIVE_PAYLOAD"
+    assert delimiter not in payload
+    return f"""{payload.splitlines()[0]}
+set -eu
+{deadline_line}
+export _guard_deadline
+_remaining=$(python3 -c 'import sys,time; left=float(sys.argv[1])-time.monotonic(); print(max(0,left)); sys.exit(left <= 0)' "$_guard_deadline") || {{ echo {_sh_single_quote(failure)}; exit 0; }}
+if timeout --signal=KILL "$_remaining" bash -s <<'{delimiter}'
+{payload}{delimiter}
+then
+  :
+else
+  echo {_sh_single_quote(failure)}
+fi
+"""
+
+
+def _remote_helpers(root: str, *, operation_timeout: float | None = None) -> str:
+    quoted_root = _sh_single_quote(root)
+    return f"""
+ROOT={quoted_root}
+{_reference_helpers(operation_timeout=operation_timeout)}
+# Keep replacement refs planted after the guard from changing object inspection.
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_OPTIONAL_LOCKS=0
+case "$ROOT" in
+  /*) ;;
+  *) ROOT="$HOME/$ROOT" ;;
+esac
+{LANE_OCCUPANT_LIVE_FUNCTION}
+_evidence_completion_status() {{
+  _eck="$1"
+  _ecm="$2"
+  if [[ ! "$_eck" =~ ^attempt-evidence-([A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{{8}})-[0-9]+-[0-9a-f]{{16}}$ ]]; then
+    echo skipped_unsafe; return
+  fi
+  _ecmerged="$ROOT/.merged/${{BASH_REMATCH[1]}}.json"
+  if [ ! -f "$_ecmerged" ] || [ -L "$_ecmerged" ] || [ ! -s "$_ecmerged" ]; then
+    echo retained_unmarked
+  elif [ ! -f "$_ecm" ] || [ -L "$_ecm" ]; then
+    echo skipped_unsafe
+  elif [ "$_ecm" -nt "$_ecmerged" ]; then
+    echo retained_post_merge_attempt
+  else
+    echo evidence_completed
+  fi
+}}
+_lane_lock_held() {{
+  _lk="${{1:-}}"
+  [ -n "$_lk" ] || return 1
+  _llf="$ROOT/.lane-lock-$_lk"
+  if [ ! -f "$_llf" ]; then
+    return 1
+  fi
+  if flock -n "$_llf" true 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}}
+_pid_in_sandbox() {{
+  _sd="${{1:-}}"
+  [ -n "$_sd" ] || return 1
+  _snapshot="${{2:-}}"
+  if [ -n "$_snapshot" ] && [ -f "$_snapshot" ]; then
+    while IFS= read -r _target || [ -n "$_target" ]; do
+      case "$_target" in
+        "$_sd"|"$_sd"/*) return 0 ;;
+      esac
+    done < "$_snapshot"
+    return 1
+  fi
+  for _cwd in /proc/[0-9]*/cwd; do
+    [ -L "$_cwd" ] || continue
+    _target=$(readlink "$_cwd" 2>/dev/null) || continue
+    case "$_target" in
+      "$_sd"|"$_sd"/*) return 0 ;;
+    esac
+  done
+  return 1
+}}
+_sandbox_generation() {{
+  _artifact_identity generation
+}}
+_git_admin_shape_safe() {{
+  _base=
+  # Only a plain, self-contained repository can support the salvage proof.
+  # Check filesystem redirections before invoking Git at all.
+  _worktree_reason=git_directory_unverified
+  [ -d "$1/.git" ] && [ ! -L "$1/.git" ] || return 1
+  _worktree_reason=commondir_present
+  [ ! -e "$1/.git/commondir" ] && [ ! -L "$1/.git/commondir" ] || return 1
+  _worktree_reason=git_admin_shape_unverified
+  for _admin_path in refs objects info refs/replace objects/info; do
+    [ ! -L "$1/.git/$_admin_path" ] || return 1
+  done
+  # Superproject fsck cannot prove retained submodule objects were harvested.
+  _worktree_reason=submodule_repositories_present
+  [ ! -L "$1/.git/modules" ] || return 1
+  if [ -e "$1/.git/modules" ]; then
+    [ -d "$1/.git/modules" ] || return 1
+    ls -A "$1/.git/modules" >/dev/null || return 1
+    for _module in "$1/.git/modules/"* "$1/.git/modules/".[!.]* "$1/.git/modules/"..?*; do
+      [ ! -e "$_module" ] && [ ! -L "$_module" ] || return 1
+    done
+  fi
+  _worktree_reason=linked_worktrees_present
+  [ ! -L "$1/.git/worktrees" ] || return 1
+  for _linked in "$1/.git/worktrees/"* "$1/.git/worktrees/".[!.]* "$1/.git/worktrees/"..?*; do
+    [ ! -e "$_linked" ] && [ ! -L "$_linked" ] || return 1
+  done
+  _worktree_reason=grafts_present
+  [ ! -e "$1/.git/info/grafts" ] && [ ! -L "$1/.git/info/grafts" ] || return 1
+  _worktree_reason=replace_refs_present
+  [ ! -e "$1/.git/refs/replace" ] || return 1
+  [ ! -L "$1/.git/packed-refs" ] || return 1
+  if [ -e "$1/.git/packed-refs" ]; then
+    [ -f "$1/.git/packed-refs" ] || return 1
+    _guard_regular_read "$1/.git/packed-refs" packed-refs || return 1
+  fi
+  _worktree_reason=alternates_present
+  for _alternate in alternates http-alternates; do
+    [ ! -e "$1/.git/objects/info/$_alternate" ] && [ ! -L "$1/.git/objects/info/$_alternate" ] || return 1
+  done
+  _worktree_reason=shallow_present
+  if [ -e "$1/.git/shallow" ] || [ -L "$1/.git/shallow" ]; then
+    # Native dispatch declares its *parentless* synthetic base shallow. It
+    # hides no ancestry. Any other shallow boundary remains unsupported.
+    [ -f "$1/.git/shallow" ] && [ ! -L "$1/.git/shallow" ] || return 1
+    _base=$(_guard_regular_read "$1/.git/shallow") || return 1
+    [[ "$_base" =~ ^[0-9a-f]{{40}}$ ]] || return 1
+  fi
+  _worktree_reason=git_admin_shape_unverified
+  _guard_git_admin_types "$1" || return 1
+  _worktree_reason=shallow_present
+  if [ -n "$_base" ]; then
+    _base_object=$(git -C "$1" cat-file -p "$_base") || return 1
+    case "$_base_object" in *$'\\nparent '*) return 1 ;; esac
+    git -C "$1" merge-base --is-ancestor "$_base" HEAD || return 1
+  fi
+  _worktree_reason=git_common_dir_unverified
+  _common=$(git -C "$1" --work-tree="$1" --git-dir="$1/.git" rev-parse --path-format=absolute --git-common-dir) || return 1
+  [ "$_common" = "$1/.git" ] || return 1
+  _worktree_reason=linked_worktrees_present
+  _worktrees=$(git -C "$1" --work-tree="$1" --git-dir="$1/.git" worktree list --porcelain) || return 1
+  [ "$(printf '%s\\n' "$_worktrees" | awk '/^worktree / {{ n++ }} END {{ print n+0 }}')" -eq 1 ] || return 1
+  return 0
+}}
+_rowless_worktree_safe() {{
+  _git_admin_shape_safe "$1" || return 1
+  if [ "${{_proof_domain:-rowless}}" != mapped ]; then
+    _worktree_reason=shallow_present
+    [ ! -e "$1/.git/shallow" ] || return 1
+  fi
+  _worktree_reason=replace_refs_present
+  _replace_refs=$(git -C "$1" --work-tree="$1" --git-dir="$1/.git" for-each-ref --format='%(refname)' refs/replace/) || return 1
+  [ -z "$_replace_refs" ] || return 1
+  _worktree_reason=redirect_config
+  [ ! -e "$1/.git/objects/info/alternates" ] || return 1
+  [ ! -e "$1/.git/objects/info/http-alternates" ] || return 1
+  _redirects=$(git -C "$1" --work-tree="$1" --git-dir="$1/.git" config --no-includes --get-regexp '^(core\\.(worktree|hookspath)|include\\..*|includeif\\..*)$')
+  _rc=$?
+  [ "$_rc" -eq 1 ] && [ -z "$_redirects" ]
+}}
+_rowless_inventory_git() {{
+  git -c core.ignorecase=false -c core.filemode=true -c core.symlinks=true -c core.fsmonitor=false -c core.untrackedCache=false -c core.trustctime=true -c core.checkStat=default -C "$_inventory_root" --work-tree="$_inventory_root" --git-dir="$_inventory_root/.git" "$@"
+}}
+_rowless_inventory_safe() {{
+  _inventory_root="$1"
+  _source_commit=
+  _translated_source_commit=
+  _inventory_reason=worktree_inventory
+  # Rowless inventory exempts only the dispatcher-owned marker.
+  _inventory_status=$(_rowless_inventory_git status --porcelain=v2 --ignored=matching --untracked-files=all -- . ':(top,exclude,literal).workbay-lane-sandbox') || return 1
+  if [ "${{3:-rowless}}" = mapped ]; then
+    # remote_agent.sh provisions only this sibling venv symlink. Repository
+    # ignores designate dependency/test caches; arbitrary ignored source is kept.
+    while IFS= read -r _entry; do
+      case "$_entry" in
+        '') ;;
+        '! .venv')
+          [ -L "$1/.venv" ] &&
+            [ "$(readlink -- "$1/.venv")" = "$ROOT/.venv-lane-$_sk" ] || return 1 ;;
+        '! .pytest_cache/'|'! __pycache__/'|'! node_modules/') ;;
+        '! '*/.pytest_cache/|'! '*/__pycache__/|'! '*/node_modules/) ;;
+        '! .workbay-source-provenance')
+          [ -f "$1/.workbay-source-provenance" ] && [ ! -L "$1/.workbay-source-provenance" ] || return 1
+          _provenance=$(_guard_regular_read "$1/.workbay-source-provenance") || return 1
+          _base_tree=$(_rowless_inventory_git rev-parse "$_base^{{tree}}") || return 1
+          [[ "$_provenance" =~ ^source_commit=[0-9a-f]{{40}}$'\\n'source_tree=$_base_tree$'\\n'sandbox_base_commit=$_base$'\\n'sandbox_base_tree=$_base_tree$ ]] || return 1
+          _source_commit="${{_provenance%%$'\\n'*}}"
+          _source_commit="${{_source_commit#source_commit=}}" ;;
+        *) return 1 ;;
+      esac
+    done <<< "$_inventory_status"
+  else
+    [ -z "$_inventory_status" ] || return 1
+  fi
+  _inventory_reason=extra_refs
+  _head_ref=$(_rowless_inventory_git symbolic-ref -q HEAD) || return 1
+  _refs=$(_rowless_inventory_git for-each-ref --format='%(refname)') || return 1
+  # No host ref inventory is transferred: conservatively refuse every extra ref.
+  [ "$_refs" = "$_head_ref" ] || return 1
+  _inventory_reason=stash
+  _stash=$(_rowless_inventory_git stash list) || return 1
+  [ -z "$_stash" ] || return 1
+  _inventory_reason=reachable_history
+  if [ "${{3:-rowless}}" != mapped ]; then
+    [ "$(_rowless_inventory_git rev-parse --is-shallow-repository)" = false ] || return 1
+  fi
+  _inventory_reason=unreachable_objects
+  _objects=$(_rowless_inventory_git fsck --no-progress --unreachable --no-reflogs 2>&1) || return 1
+  [ -z "$_objects" ] || return 1
+  _inventory_reason=reachable_history
+  # Fail closed: tree equality cannot prove reverted implementation was harvested.
+  _host_tip="$2"
+  [[ "$_host_tip" =~ ^[0-9a-f]{{40}}$ ]] || return 1
+  if _rowless_inventory_git cat-file -e "$_host_tip^{{commit}}" 2>/dev/null; then
+    _additional=$(_rowless_inventory_git rev-list HEAD --not "$_host_tip" --) || return 1
+    [ -z "$_additional" ] || return 1
+  elif [ "${{3:-rowless}}" = mapped ] && [ -n "$_base" ] && [ -n "$_source_commit" ]; then
+    # Only the unchanged parentless synthetic root can be translated. Host
+    # ancestry and its exact tree are authenticated by the local planner.
+    # A commit/revert pair above that root is reachable source, not an export.
+    [ "$(_rowless_inventory_git rev-parse HEAD)" = "$_base" ] || return 1
+    _translated_source_commit="$_source_commit"
+  else
+    return 1
+  fi
+  _inventory_reason=index_diff
+  _rowless_inventory_git diff --cached --quiet || return 1
+  _inventory_reason=worktree_diff
+  _rowless_inventory_git diff --quiet || return 1
+}}
+_rowless_index_safe() {{
+  # RV4: status hides skip-worktree (S) and assume-unchanged (lowercase)
+  # entries. Refuse the proof even if their visible contents look unchanged.
+  _index_entries=$(git -C "$1" --work-tree="$1" --git-dir="$1/.git" ls-files -v 2>/dev/null) || return 1
+  while IFS= read -r _index_entry; do
+    case "$_index_entry" in
+      [a-zS]' '*) return 1 ;;
+    esac
+  done <<EOF
+$_index_entries
+EOF
+  return 0
+}}
+_rowless_content_safe() (
+  # RV9 / CARD-15: read every HEAD blob; stat-cache equality is not salvage proof.
+  # RV10: compare raw bytes; sandbox clean filters can hide edits from status.
+  # One original guard covers the tree, mode/symlink checks and batched hashing.
+  _remaining=$(_guard_remaining) || {{ echo content_deadline; exit 1; }}
+  _content_output=$(timeout --foreground --signal=KILL "$_remaining" python3 - "$1" "$_guard_git" "$_guard_deadline" <<'WORKBAY_CONTENT_PROOF_PY'
+{_CONTENT_PROOF_PY}WORKBAY_CONTENT_PROOF_PY
+  )
+  _rc=$?
+  case "$_rc" in
+    124|137) echo content_deadline; exit 1 ;;
+    0) exit 0 ;;
+    *) echo "${{_content_output:-content_unknown}}"; exit 1 ;;
+  esac
+)
+"""
+
+
+_DISPATCH_NONCE_RE = re.compile(r"^[0-9]+-[0-9a-f]{16}$")
+
+
+def _build_release_remote_lane_lease_script(root: str, lane_key: str, nonce: str) -> str:
+    """Build a fenced, tombstoning remote lease-release probe."""
+    if _LANE_KEY_RE.fullmatch(lane_key) is None:
+        raise ValueError("unsafe lane key")
+    if _DISPATCH_NONCE_RE.fullmatch(nonce) is None:
+        raise ValueError("unsafe dispatch nonce")
+    resolved_root = _resolve_sandbox_root(root)
+    if resolved_root is None:
+        raise ValueError("unsafe sandbox root")
+    quoted_root = _sh_single_quote(resolved_root)
+    quoted_nonce = _sh_single_quote(nonce)
+    return f"""set -eu
+ROOT={quoted_root}
+case \"$ROOT\" in
+  /*) ;;
+  *) ROOT=\"$HOME/$ROOT\" ;;
+esac
+_lf=\"$ROOT/.lane-live-{lane_key}\"
+_emit_release() {{
+  _status=\"$1\"
+  _expiry=\"$2\"
+  case \"$_expiry\" in
+    ''|*[!0-9]*) _expiry=null ;;
+  esac
+  printf '{{\"status\":\"%s\",\"expiry_epoch\":%s}}\\n' \"$_status\" \"$_expiry\"
+}}
+if [ ! -f \"$_lf\" ]; then
+  _emit_release not_found ''
+  exit 0
+fi
+_expiry=$(sed -n 's/^expiry=//p' \"$_lf\" 2>/dev/null | head -n1)
+_nonce=$(sed -n 's/^nonce=//p' \"$_lf\" 2>/dev/null | head -n1)
+if [ \"$_nonce\" != {quoted_nonce} ]; then
+  _emit_release fenced \"$_expiry\"
+  exit 0
+fi
+_released=$(sed -n 's/^released=//p' \"$_lf\" 2>/dev/null | head -n1)
+if [ \"$_released\" = 1 ]; then
+  _emit_release already_released \"$_expiry\"
+  exit 0
+fi
+_lock=\"$ROOT/.lane-lease-{lane_key}.lock\"
+exec 8>>\"$_lock\"
+flock -x 8
+# Re-read the nonce after taking the lease mutation lock. A different nonce
+# must never be replaced by this release operation.
+_nonce=$(sed -n 's/^nonce=//p' \"$_lf\" 2>/dev/null | head -n1)
+if [ \"$_nonce\" != {quoted_nonce} ]; then
+  _emit_release fenced \"$_expiry\"
+  exit 0
+fi
+_tmp=\"$_lf.release.$$\"
+{{
+  while IFS= read -r _line || [ -n \"$_line\" ]; do
+    case \"$_line\" in
+      released=*|released_at=*) ;;
+      *) printf '%s\\n' \"$_line\" ;;
+    esac
+  done < \"$_lf\"
+  printf 'released=1\\nreleased_at=%s\\n' \"$(date +%s)\"
+}} > \"$_tmp\"
+if ! mv -f \"$_tmp\" \"$_lf\"; then
+  rm -f \"$_tmp\"
+  _emit_release failed \"$_expiry\"
+  exit 0
+fi
+_emit_release released \"$_expiry\"
+"""
+
+
+def release_remote_lane_lease(
+    lane_key: str,
+    nonce: str,
+    *,
+    host: str | None = None,
+    sandbox_root: str | None = None,
+    ssh_runner: SshRunner | None = None,
+    timeout: float = SSH_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Release one remote lane lease only when its nonce still owns the file.
+
+    A release writes a ``released=1`` tombstone under the per-lease mutation
+    lock. The tombstone keeps the original expiry for diagnosis while
+    ``_lane_occupant_live`` treats it as non-occupying; a later dispatch may
+    safely replace it after acquiring the lane lock.
+    """
+    if _LANE_KEY_RE.fullmatch(str(lane_key)) is None:
+        return {"ok": False, "status": "invalid_lane_key", "expiry_epoch": None}
+    if _DISPATCH_NONCE_RE.fullmatch(str(nonce)) is None:
+        return {"ok": False, "status": "invalid_nonce", "expiry_epoch": None}
+    root = _resolve_sandbox_root(sandbox_root)
+    if root is None:
+        return {"ok": False, "status": "invalid_sandbox_root", "expiry_epoch": None}
+    destination = str(host or os.environ.get("WORKBAY_REMOTE_GATE_HOST") or "").strip()
+    if not destination or re.fullmatch(r"[A-Za-z0-9_.@:-]+", destination) is None:
+        return {"ok": False, "status": "invalid_host", "expiry_epoch": None}
+    if timeout <= 0:
+        return {"ok": False, "status": "invalid_timeout", "expiry_epoch": None}
+    script = _build_release_remote_lane_lease_script(root, lane_key, nonce)
+    runner = ssh_runner
+    try:
+        if runner is None:
+            completed = subprocess.run(
+                [
+                    "ssh",
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "--",
+                    destination,
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            raw: Any = completed
+        else:
+            try:
+                raw = runner(script, host=destination, timeout=timeout)
+            except TypeError:
+                raw = runner(script, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, TimeoutError) as exc:
+        return {"ok": False, "status": "transport_failed", "error": str(exc), "expiry_epoch": None}
+    stdout, stderr, returncode = _coerce_ssh_result(raw)
+    if returncode not in (0, None):
+        detail = (stderr or stdout or f"exit {returncode}").strip()
+        return {
+            "ok": False,
+            "status": "transport_failed",
+            "error": detail[:300],
+            "expiry_epoch": None,
+        }
+    try:
+        payload = json.loads(stdout.strip().splitlines()[-1])
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return {"ok": False, "status": "invalid_response", "error": stdout[-300:], "expiry_epoch": None}
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+        return {"ok": False, "status": "invalid_response", "error": stdout[-300:], "expiry_epoch": None}
+    expiry_raw = payload.get("expiry_epoch")
+    expiry = expiry_raw if isinstance(expiry_raw, int) and not isinstance(expiry_raw, bool) else None
+    status = payload["status"]
+    return {
+        "ok": status in {"released", "already_released", "not_found"},
+        "status": status,
+        "expiry_epoch": expiry,
+        "lane_key": lane_key,
+        "nonce": nonce,
+    }
+
+
+def _build_list_script(
+    root: str,
+    *,
+    target_keys: Sequence[str] | None = None,
+    inventory_only: bool = False,
+    directory_keys: Sequence[str] | None = None,
+    operation_timeout: float | None = None,
+) -> str:
+    if inventory_only:
+        return f"""{_HEADER_LIST}
+set -eu
+ROOT={_sh_single_quote(root)}
+for _sd in "$ROOT"/*/; do
+  [ -d "$_sd" ] || continue
+  [ -f "$_sd/.workbay-lane-sandbox" ] || [ -f "$_sd/.workbay-attempt-evidence" ] || continue
+  _sd="${{_sd%/}}"
+  _sk="${{_sd##*/}}"
+  printf 'SANDBOX %s tip=MISSING occupant=idle lock=free tree=MISSING idle=0\\n' "$_sk"
+done
+"""
+    helpers = _remote_helpers(root, operation_timeout=operation_timeout)
+    if target_keys is not None:
+        keys = tuple(dict.fromkeys(target_keys))
+        if any(not _LANE_KEY_RE.fullmatch(key) for key in keys):
+            raise ValueError("unsafe target sandbox key")
+        directories = " ".join(f'"$ROOT"/{_sh_single_quote(key)}' for key in keys) or "''"
+        return f"""{_HEADER_LIST}
+set -eu
+{helpers}
+_process_snapshot=$(mktemp /tmp/workbay-process-cwds.XXXXXX)
+trap 'rm -f "$_process_snapshot"' EXIT
+for _cwd in /proc/[0-9]*/cwd; do
+  [ -L "$_cwd" ] || continue
+  _target=$(readlink "$_cwd" 2>/dev/null) || continue
+  printf '%s\\n' "$_target" >> "$_process_snapshot"
+done
+for _sd in {directories}; do
+  [ -d "$_sd" ] || continue
+  _sd="${{_sd%/}}"
+  _sk="${{_sd##*/}}"
+  [ -f "$_sd/.workbay-lane-sandbox" ] || continue
+  _tip=MISSING
+  if _git_admin_shape_safe "$_sd" && _rev=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse HEAD 2>/dev/null); then
+    _tip="$_rev"
+  fi
+  _tree=MISSING
+  if [ "$_tip" != MISSING ]; then
+    _tree=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse "$_tip^{{tree}}" 2>/dev/null) || _tree=MISSING
+  fi
+  _occupant=idle
+  if _lane_occupant_live "$_sk" || _pid_in_sandbox "$_sd" "$_process_snapshot"; then
+    _occupant=live
+  fi
+  _lock=free
+  if _lane_lock_held "$_sk"; then
+    _lock=held
+  fi
+  _marker_mtime=$(stat -c %Y "$_sd/.workbay-lane-sandbox" 2>/dev/null || printf '0')
+  case "$_marker_mtime" in ''|*[!0-9]*) _marker_mtime=0 ;; esac
+  _now=$(date +%s)
+  _idle=$((_now - _marker_mtime))
+  [ "$_idle" -ge 0 ] || _idle=0
+  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s\\n' \\
+    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle"
+done
+"""
+    directory_loop = (
+        '"$ROOT"/*/'
+        if directory_keys is None
+        else (" ".join(f'"$ROOT"/{_sh_single_quote(key)}' for key in directory_keys) or "''")
+    )
+    return f"""{_HEADER_LIST}
+set -eu
+{helpers}
+_evidence_candidates=$(mktemp "${{TMPDIR:-/tmp}}/workbay-evidence-candidates.XXXXXX")
+_evidence_sorted="$_evidence_candidates.sorted"
+_process_snapshot=$(mktemp /tmp/workbay-process-cwds.XXXXXX)
+trap 'rm -f "$_evidence_candidates" "$_evidence_sorted" "$_process_snapshot"' EXIT
+for _cwd in /proc/[0-9]*/cwd; do
+  [ -L "$_cwd" ] || continue
+  _target=$(readlink "$_cwd" 2>/dev/null) || continue
+  printf '%s\\n' "$_target" >> "$_process_snapshot"
+done
+_evidence_now=$(date +%s)
+for _sd in {directory_loop}; do
+  [ -d "$_sd" ] || continue
+  _sd="${{_sd%/}}"
+  _sk="${{_sd##*/}}"
+  _em="$_sd/.workbay-attempt-evidence"
+  if [ -f "$_em" ]; then
+    _mtime=$(stat -c %Y "$_em" 2>/dev/null) || _mtime=
+    _status=$(_evidence_completion_status "$_sk" "$_em")
+    case "$_mtime" in ''|*[!0-9]*) _mtime=$_evidence_now; _status=skipped_unsafe ;; esac
+    _age=$(( _evidence_now - _mtime ))
+    [ "$_age" -ge 0 ] || _age=0
+    if [ "$_status" = evidence_completed ]; then
+      printf '%s\\t%s\\n' "$_age" "$_sk" >> "$_evidence_candidates"
+    else
+      printf 'EVIDENCE %s age=%s status=%s\\n' "$_sk" "$_age" "$_status"
+    fi
+    continue
+  fi
+  [ -f "$_sd/.workbay-lane-sandbox" ] || continue
+  _tip=MISSING
+  if _git_admin_shape_safe "$_sd" && _rev=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse HEAD 2>/dev/null); then
+    _tip="$_rev"
+  fi
+  _tree=MISSING
+  if [ "$_tip" != MISSING ]; then
+    _tree=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse "$_tip^{{tree}}" 2>/dev/null) || _tree=MISSING
+  fi
+  _occupant=idle
+  if _lane_occupant_live "$_sk" || _pid_in_sandbox "$_sd" "$_process_snapshot"; then
+    _occupant=live
+  fi
+  _lock=free
+  if _lane_lock_held "$_sk"; then
+    _lock=held
+  fi
+  _marker_mtime=$(stat -c %Y "$_sd/.workbay-lane-sandbox" 2>/dev/null || printf '0')
+  case "$_marker_mtime" in ''|*[!0-9]*) _marker_mtime=0 ;; esac
+  _now=$(date +%s)
+  _idle=$((_now - _marker_mtime))
+  [ "$_idle" -ge 0 ] || _idle=0
+  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s\\n' \\
+    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle"
+done
+_evidence_count=$(awk 'END {{print NR + 0}}' "$_evidence_candidates")
+if [ "$_evidence_count" -gt 0 ]; then
+  _tab=$(printf '\\t')
+  LC_ALL=C sort -t "$_tab" -k1,1nr -k2,2 "$_evidence_candidates" > "$_evidence_sorted"
+  awk -F '\\t' -v limit={EVIDENCE_REAP_CANDIDATE_LIMIT} \
+    'NR <= limit {{printf "EVIDENCE %s age=%s status=evidence_completed\\n", $2, $1}}' "$_evidence_sorted"
+fi
+_evidence_remaining=$((_evidence_count - {EVIDENCE_REAP_CANDIDATE_LIMIT}))
+if [ "$_evidence_remaining" -gt 0 ]; then
+  printf 'EVIDENCE_TRUNCATED remaining=%s\\n' "$_evidence_remaining"
+fi
+"""
+
+
+def _build_evidence_reap_script(root: str, key: str) -> str:
+    if not _SANDBOX_KEY_RE.fullmatch(key) or not _EVIDENCE_KEY_RE.fullmatch(key):
+        raise ValueError("unsafe evidence key")
+    lane_key = key.removeprefix("attempt-evidence-").rsplit("-", 2)[0]
+    if not _LANE_KEY_RE.fullmatch(lane_key):
+        raise ValueError("unsafe evidence lane key")
+    quoted_lane_key = _sh_single_quote(lane_key)
+    scope_units = " ".join(
+        _sh_single_quote(f"{prefix}-{lane_key}{suffix}.scope")
+        for prefix in ("workbay-lane", "grok-lane")
+        for suffix in ("", "-sv")
+    )
+    return f"""# WORKBAY_REMOTE_SANDBOX_REAP op=evidence key={key}
+set -eu
+{_remote_helpers(root)}
+exec 8>"$ROOT/.reap.lock"
+flock -n 8 || {{ echo skipped_unsafe; exit 0; }}
+_sd="$ROOT/{key}"
+[ -d "$_sd" ] && [ ! -L "$_sd" ] || {{ echo skipped_unsafe; exit 0; }}
+_em="$_sd/.workbay-attempt-evidence"
+[ -f "$_em" ] && [ ! -L "$_em" ] || {{ echo skipped_unsafe; exit 0; }}
+exec 9>>"$ROOT/.lane-lock-{lane_key}"
+flock -n 9 || {{ echo skipped_live; exit 0; }}
+_lane_scope_live() {{
+  _scope_output=
+  if command -v timeout >/dev/null 2>&1; then
+    _scope_output=$(timeout 10 systemctl --user list-units --type=scope --state=active --plain --no-legend {scope_units} 2>/dev/null) || return 0
+  else
+    printf '{{"outcome":"systemctl_unbounded_skipped","reason":"timeout_unavailable","operation":"list-units","at":%s}}\\n' \\
+      "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || true
+    return 0
+  fi
+  [ -n "$_scope_output" ]
+}}
+if _lane_occupant_live {quoted_lane_key} || _lane_scope_live; then
+  echo skipped_live
+  exit 0
+fi
+_mtime=$(stat -c %Y "$_em" 2>/dev/null) || {{ echo skipped_unsafe; exit 0; }}
+case "$_mtime" in ''|*[!0-9]*) echo skipped_unsafe; exit 0 ;; esac
+_age=$(( $(date +%s) - _mtime ))
+[ "$_age" -ge 0 ] || _age=0
+_status=$(_evidence_completion_status "{key}" "$_em")
+[ "$_status" = evidence_completed ] || {{ echo "$_status"; exit 0; }}
+if _lane_occupant_live {quoted_lane_key} || _lane_scope_live; then
+  echo skipped_live
+  exit 0
+fi
+printf '{{"key":"%s","outcome":"started","reason":"evidence_completed","age":%s,"actor":"maintenance","at":%s}}\\n' \\
+  "{key}" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || {{ echo skipped_unsafe; exit 0; }}
+rm -rf -- "$_sd"
+if [ ! -e "$_sd" ]; then
+  printf '{{"key":"%s","outcome":"reaped","reason":"evidence_completed","age":%s,"actor":"maintenance","at":%s}}\\n' \\
+    "{key}" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || true
+  echo reaped
+else
+  printf '{{"key":"%s","outcome":"incomplete","reason":"evidence_completed","age":%s,"actor":"maintenance","at":%s}}\\n' \\
+    "{key}" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || true
+  echo skipped_unsafe
+fi
+"""
+
+
+def _build_rowless_probe_script(root: str, key: str, *, host_tip: str = "", mapped_product: bool = False) -> str:
+    if not _LANE_KEY_RE.fullmatch(key):
+        raise ValueError("unsafe sandbox proof key")
+    quoted_key = _sh_single_quote(key)
+    payload = f"""{_HEADER_PROBE_PREFIX}{key}
+set -eu
+{_remote_helpers(root)}
+_sk={quoted_key}
+_proof_domain={"mapped" if mapped_product else "rowless"}
+_sd="$ROOT/$_sk"
+[ ! -L "$ROOT/.lane-lock-$_sk" ] && {{ [ ! -e "$ROOT/.lane-lock-$_sk" ] || [ -f "$ROOT/.lane-lock-$_sk" ]; }} || {{ echo PROBE_FAILED lock_identity; exit 0; }}
+exec 9>>"$ROOT/.lane-lock-$_sk" || {{ echo PROBE_FAILED; exit 0; }}
+flock -n 9 || {{ echo PROBE_FAILED; exit 0; }}
+if [ ! -f "$_sd/.workbay-lane-sandbox" ] || [ -L "$_sd/.workbay-lane-sandbox" ] || [ -L "$_sd" ]; then
+  echo PROBE_FAILED
+  exit 0
+fi
+_generation=$(_sandbox_generation "$_sd") || {{ echo PROBE_FAILED; exit 0; }}
+_rowless_worktree_safe "$_sd" || {{ echo "PROBE_FAILED $_worktree_reason"; exit 0; }}
+_rowless_index_safe "$_sd" || {{ echo "DIRTY index_flags"; exit 0; }}
+_content_reason=$(_rowless_content_safe "$_sd") || {{
+  if [ "$_content_reason" = raw_content ] || [ "$_content_reason" = worktree_inventory ]; then
+    if [ "$_content_reason" = raw_content ]; then
+      echo "DIRTY raw_content"
+    else
+      echo "DIRTY worktree_inventory"
+    fi
+  else
+    echo "PROBE_FAILED ${{_content_reason:-content_unknown}}"
+  fi
+  exit 0
+}}
+_rowless_inventory_safe "$_sd" {_sh_single_quote(host_tip)} {"mapped" if mapped_product else "rowless"} || {{ echo "DIRTY $_inventory_reason"; exit 0; }}
+_tree=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse 'HEAD^{{tree}}' 2>/dev/null) || {{ echo PROBE_FAILED; exit 0; }}
+_tip=$(git -C "$_sd" rev-parse HEAD) || {{ echo PROBE_FAILED; exit 0; }}
+_artifacts=$(_artifact_identity inventory) || {{ echo PROBE_FAILED artifact_inventory; exit 0; }}
+case "$_tree" in
+  ''|*[!0-9a-f]*) echo PROBE_FAILED; exit 0 ;;
+esac
+printf 'CLEAN\nTREE %s\nGENERATION %s\nKEY %s\nHEAD %s\nARTIFACTS %s\n' "$_tree" "$_generation" "$_sk" "$_tip" "$_artifacts"
+[ -z "$_translated_source_commit" ] || printf 'SOURCE_COMMIT %s\n' "$_translated_source_commit"
+git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" ls-tree -r --full-tree "$_tree"
+"""
+    return _bounded_native_script(payload, "PROBE_FAILED content_deadline")
+
+
+def _build_reap_script(
+    root: str,
+    keys: Sequence[str],
+    *,
+    rowless_proofs: Mapping[str, _RowlessProof] | None = None,
+    idle_seconds: int = DEFAULT_IDLE_SECONDS,
+) -> str:
+    helpers = _remote_helpers(root)
+    header = _HEADER_REAP_PREFIX + ",".join(keys)
+    calls_list: list[str] = []
+    for key in keys:
+        if not _LANE_KEY_RE.fullmatch(key):
+            raise ValueError("unsafe sandbox reap key")
+        proof = (rowless_proofs or {}).get(key)
+        args = [
+            key,
+            proof.tree if proof else "",
+            proof.generation if proof else "",
+            proof.host_tip if proof else "",
+            "mapped" if proof and proof.mapped_product else "rowless",
+            proof.key if proof else "",
+            proof.tip if proof else "",
+            proof.artifacts if proof else "",
+        ]
+        calls_list.append("_reap_one " + " ".join(_sh_single_quote(arg) for arg in args))
+    calls = "\n".join(calls_list)
+    payload = f"""{header}
+set -eu
+{helpers}
+[ ! -L "$ROOT/.reap.lock" ] && {{ [ ! -e "$ROOT/.reap.lock" ] || [ -f "$ROOT/.reap.lock" ]; }} || {{ echo LOCK_HELD; exit 0; }}
+exec 8>>"$ROOT/.reap.lock" || {{ echo LOCK_HELD; exit 0; }}
+if ! flock -n 8; then
+  echo LOCK_HELD
+  exit 0
+fi
+_reap_one() {{
+  _sk="$1"
+  _proven_tree="$2"
+  _proven_generation="$3"
+  _proven_host_tip="$4"
+  _proof_domain="$5"
+  _proven_key="$6"
+  _proven_tip="$7"
+  _proven_artifacts="$8"
+  _sd="$ROOT/$_sk"
+  _llf="$ROOT/.lane-lock-$_sk"
+  [ ! -L "$_llf" ] && {{ [ ! -e "$_llf" ] || [ -f "$_llf" ]; }} || {{ echo "SKIPPED_LOCK $_sk held_lock"; return; }}
+  (
+    flock -n 9 || {{ echo "SKIPPED_LOCK $_sk held_lock"; exit 0; }}
+    # The native lease-release writer takes this existing mutation lock rather
+    # than the dispatch lock. Preserve the lane -> lease acquisition order.
+    _lease_lock="$ROOT/.lane-lease-$_sk.lock"
+    [ ! -L "$_lease_lock" ] && {{ [ ! -e "$_lease_lock" ] || [ -f "$_lease_lock" ]; }} || {{ echo "SKIPPED_LOCK $_sk held_lock"; exit 0; }}
+    exec 7>>"$_lease_lock" || {{ echo "SKIPPED_LOCK $_sk held_lock"; exit 0; }}
+    flock -n 7 || {{ echo "SKIPPED_LOCK $_sk held_lock"; exit 0; }}
+    if [ ! -f "$_sd/.workbay-lane-sandbox" ]; then
+      echo "SKIPPED_UNMARKED $_sk"
+      exit 0
+    fi
+    if _lane_occupant_live "$_sk"; then
+      echo "SKIPPED_LIVE $_sk held_live_lease"
+      exit 0
+    fi
+    if [ -L "$ROOT/.lane-live-$_sk" ] || {{ [ -e "$ROOT/.lane-live-$_sk" ] && [ ! -f "$ROOT/.lane-live-$_sk" ]; }}; then
+      echo "SKIPPED_CHANGED $_sk unknown_lease_identity"; exit 0
+    fi
+    if [ -z "$_proven_tree" ] || [ "$_proven_key" != "$_sk" ] || [ -z "$_proven_tip" ] || [ -z "$_proven_artifacts" ]; then
+      echo "SKIPPED_CHANGED $_sk missing_source_proof"
+      exit 0
+    fi
+    if [ -n "$_proven_tree" ]; then
+      # CARD-15: retain the dispatch lock across proof revalidation and removal.
+      _rowless_worktree_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk $_worktree_reason"; exit 0; }}
+      _rowless_index_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk index_flags"; exit 0; }}
+      _content_reason=$(_rowless_content_safe "$_sd") || {{ echo "SKIPPED_CHANGED $_sk ${{_content_reason:-content_unknown}}"; exit 0; }}
+      _rowless_inventory_safe "$_sd" "$_proven_host_tip" "$_proof_domain" || {{ echo "SKIPPED_CHANGED $_sk $_inventory_reason"; exit 0; }}
+      _generation=$(_sandbox_generation "$_sd") || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      _tree=$(git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" rev-parse 'HEAD^{{tree}}' 2>/dev/null) || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      _tip=$(git -C "$_sd" rev-parse HEAD) || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      _artifacts=$(_artifact_identity inventory) || {{ echo "SKIPPED_CHANGED $_sk artifact_inventory"; exit 0; }}
+      _mtime=$(stat -c %Y "$_sd/.workbay-lane-sandbox" 2>/dev/null) || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      case "$_mtime" in ''|*[!0-9]*) echo "SKIPPED_CHANGED $_sk"; exit 0 ;; esac
+      _now=$(date +%s) || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      if [ "$_generation" != "$_proven_generation" ] || [ "$_tree" != "$_proven_tree" ] || \\
+         [ "$_tip" != "$_proven_tip" ] || [ "$_artifacts" != "$_proven_artifacts" ] || \\
+         {{ [ "$_proof_domain" != mapped ] && [ "$((_now - _mtime))" -lt {max(0, int(idle_seconds))} ]; }}; then
+        echo "SKIPPED_CHANGED $_sk"
+        exit 0
+      fi
+    fi
+    # No supported inventory proves the absence of foreign incoming references
+    # to shared caches/stamps without walking sibling keys. Retain custody.
+    for _shared in "$ROOT/.venv-lane-$_sk" "$ROOT/.venv-sync-stamp-$_sk"; do
+      if [ -e "$_shared" ] || [ -L "$_shared" ]; then
+        echo "SKIPPED_CHANGED $_sk unknown_cache_reference_census"
+        exit 0
+      fi
+    done
+    # _pid_in_sandbox's listing snapshot is advisory only. The fresh privileged
+    # CWD/FD/env/maps census below remains inside both deletion locks.
+    _census=$(_reference_census) || _census='UNKNOWN census_timeout'
+    case "$_census" in
+      IDLE) ;;
+      BUSY*) echo "SKIPPED_LIVE $_sk held_live_process"; exit 0 ;;
+      'UNKNOWN reader_acquisition_unfenced') echo "SKIPPED_CHANGED $_sk unknown_reader_acquisition_fence"; exit 0 ;;
+      *) echo "SKIPPED_CHANGED $_sk unknown_reference_census"; exit 0 ;;
+    esac
+    if _lane_occupant_live "$_sk"; then
+      echo "SKIPPED_LIVE $_sk held_live_lease"; exit 0
+    fi
+    _fresh=$(_artifact_identity inventory) || {{ echo "SKIPPED_CHANGED $_sk artifact_inventory"; exit 0; }}
+    [ "$_fresh" = "$_proven_artifacts" ] || {{ echo "SKIPPED_CHANGED $_sk artifact_changed"; exit 0; }}
+    # Even a genuinely dead-reader census cannot retire installed .pth/finder,
+    # donor or nested/symlink consumers. No existing authorized closed-domain
+    # incoming-source custody proof is available. Do not walk sibling keys or
+    # mint a trust sentinel to turn that unknown into absence.
+    echo "SKIPPED_CHANGED $_sk unknown_incoming_source_custody"
+    exit 0
+    _remaining=$(_guard_remaining) || {{ echo "SKIPPED_CHANGED $_sk deadline"; exit 0; }}
+    timeout "$_remaining" rm -rf -- "$_sd" 2>/dev/null || true
+    if [ ! -e "$_sd" ]; then
+      echo "REAPED $_sk"
+    else
+      echo "SKIPPED_GONE_FAILED $_sk"
+    fi
+  ) 9>>"$_llf" || echo "SKIPPED_LOCK $_sk held_lock"
+}}
+{calls}
+"""
+    failures = "\n".join(f"SKIPPED_CHANGED {key} content_deadline" for key in keys)
+    return _bounded_native_script(payload, failures)
+
+
+def _record_keyed_decision(
+    *,
+    task_ref: str,
+    lane_id: str,
+    tip_sha: str | None,
+    actor: Any,
+    sandbox_key: str,
+    reason: str,
+) -> None:
+    from workbay_handoff_mcp import record_decision  # noqa: PLC0415
+
+    sha = tip_sha or "unknown"
+    decision = f"remote_sandbox_reap:{task_ref}:{lane_id}:{sha}"
+    rationale = f"Reaped remote VM sandbox {sandbox_key} for lane {lane_id}: {reason}."
+    try:
+        record_decision(
+            session=f"remote-sandbox-reap:{task_ref}",
+            decision=decision,
+            rationale=rationale,
+            actor=actor,
+            task_ref=task_ref,
+            decision_origin="system",
+            refresh_rationale_on_conflict=True,
+        )
+    except Exception:  # noqa: BLE001 — ledger failure must not undo a completed reap
+        return
+
+
+def _validate_probe_process_identity(receipt, observed) -> bool:
+    """Principle 14: authority is the complete launch identity, never a directory."""
+    from collections.abc import Mapping
+
+    for identity in (receipt, observed):
+        if not isinstance(identity, Mapping):
+            return False
+        for key in ("pid", "uid"):
+            value = identity.get(key)
+            if type(value) is not int or value < (1 if key == "pid" else 0):
+                return False
+        for key in ("host", "start_time", "command", "owner_nonce"):
+            value = identity.get(key)
+            if not isinstance(value, str) or not value.strip() or "\0" in value:
+                return False
+    return all(receipt[key] == observed[key] for key in ("host", "pid", "uid", "start_time", "command", "owner_nonce"))
+
+
+def _owned_probe_remote_cleanup(receipt, budget, grace, attempt):
+    """Self-contained Linux payload; pidfds close the inspection/signal reuse race."""
+    import json
+    import math
+    import os
+    import secrets
+    import signal
+    import time
+    from pathlib import Path
+
+    deadline = time.monotonic() + budget
+    pid = receipt["pid"]
+    fd = None
+
+    def result(state, diagnostic):
+        return {"state": state, "diagnostic": diagnostic, "cleanup_receipt": receipt}
+
+    def expired(*args):
+        raise TimeoutError("remote cleanup deadline")
+
+    def read_identity():
+        root = Path("/proc") / str(pid)
+        stat = (root / "stat").read_text().rsplit(")", 1)[1].split()
+        start = stat[19]
+        status = (root / "status").read_text()
+        uids = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))
+        # Refuse setuid/partial UID observations rather than infer the launch owner.
+        uid = int(uids[0]) if len(uids) == 4 and len(set(uids)) == 1 else None
+        command = (root / "cmdline").read_bytes().rstrip(b"\0").replace(b"\0", b" ").decode()
+        nonces = [
+            entry.split(b"=", 1)[1].decode()
+            for entry in (root / "environ").read_bytes().split(b"\0")
+            if entry.startswith(b"WORKBAY_PROBE_OWNER_NONCE=")
+        ]
+        # Host is bound by the explicit authenticated transport destination.
+        observed = dict(
+            host=receipt["host"],
+            pid=pid,
+            uid=uid,
+            start_time=start,
+            command=command,
+            owner_nonce=nonces[0] if len(nonces) == 1 else None,
+        )
+        if not _validate_probe_process_identity(receipt, observed):
+            raise ValueError("process identity missing or changed")
+
+    def observe():
+        try:
+            read_identity()
+        except FileNotFoundError:
+            # Missing environ/status is unknown, not proof that the PID is gone.
+            (Path("/proc") / str(pid) / "stat").read_text()
+            raise ValueError("partial process observation") from None
+
+    def pause(until):
+        remaining = min(deadline, until) - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, budget)
+    try:
+        # The bootstrap watchdog is armed before READY, including a no-EOF partition.
+        started = time.monotonic()
+        challenge = secrets.token_hex(32)
+        print(json.dumps({"kind": "READY", "attempt": attempt, "challenge": challenge}), flush=True)
+        grant = json.loads(input())
+        if (
+            not isinstance(grant, dict)
+            or grant.get("kind") != "GRANT"
+            or grant.get("attempt") != attempt
+            or grant.get("challenge") != challenge
+            or type(grant.get("remaining")) not in (int, float)
+            or not math.isfinite(grant["remaining"])
+        ):
+            return result("blocked", "invalid cleanup grant")
+        lease = min(budget, grant["remaining"] - (time.monotonic() - started))
+        if lease <= 0:
+            return result("pending", "cleanup grant expired")
+        deadline = min(deadline, time.monotonic() + lease)
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic()))
+        if pid in {1, os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0)}:
+            return result("blocked", "caller identity excluded")
+        observe()
+        # No numeric-PID fallback: an unsupported kernel cannot safely authorize a signal.
+        fd = os.pidfd_open(pid, 0)
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            observe()  # Fresh full comparison immediately before EACH individual signal.
+            if time.monotonic() >= deadline:
+                return result("pending", "cleanup budget exhausted")
+            signal.pidfd_send_signal(fd, signum)
+            until = min(deadline, time.monotonic() + grace) if signum == signal.SIGTERM else deadline
+            while time.monotonic() < until:
+                observe()
+                pause(until)
+        return result("pending", "process still present after KILL")
+    except (FileNotFoundError, ProcessLookupError):
+        return result("complete", "process disappeared")
+    except TimeoutError:
+        return result("pending", "cleanup budget exhausted")
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError, EOFError) as exc:
+        return result("blocked", f"identity or signal unavailable: {type(exc).__name__}")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if fd is not None:
+            os.close(fd)
+
+
+def run_owned_probe_cleanup_ssh(script, *, host, timeout, on_ready, authorized_host):
+    """Authenticate the configured destination and reserve local SSH teardown time.
+
+    Script delivery uses argv; stdin carries exactly one invocation-scoped grant.
+    Completion remains conditional on timely scheduling and a healthy kernel.
+    """
+    import json
+    import selectors
+    import time
+
+    if not authorized_host or host != authorized_host or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", host):
+        raise ValueError("cleanup host differs from authorized destination")
+    if timeout <= 0.5:
+        raise TimeoutError("insufficient cleanup transport budget")
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(
+        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "--", host, script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    output = bytearray()
+    granted = False
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic() - 0.5
+            if remaining <= 0 or not selector.select(remaining):
+                raise TimeoutError("cleanup transport deadline")
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 65536:
+                raise ValueError("oversized cleanup response")
+            if not granted and b"\n" in output:
+                line, _, tail = output.partition(b"\n")
+                grant = on_ready(json.loads(line))
+                proc.stdin.write((json.dumps(grant) + "\n").encode())
+                proc.stdin.flush()
+                granted = True
+                output = bytearray(tail)
+        code = proc.wait(timeout=max(0.001, deadline - time.monotonic() - 0.5))
+        if not granted:
+            raise ValueError("cleanup transport closed before READY")
+        return subprocess.CompletedProcess([], code, output.decode(), "")
+    finally:
+        selector.close()
+        # Only the local SSH process is ours. Never signal its inherited group.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=max(0.001, min(0.25, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+        proc.stdin.close()
+        proc.stdout.close()
+
+
+def reap_owned_probe_process(
+    cleanup_receipt: Mapping[str, Any],
+    *,
+    ssh_runner: SshRunner,
+    timeout_s: float = 5.0,
+    grace_s: float = 0.5,
+) -> dict[str, Any]:
+    """Return complete/pending/blocked with the original retained receipt.
+
+    Runner contract: runner(script, host=receipt_host, timeout=remaining,
+    on_ready=callback) authenticates the host, separates control from final output,
+    parses one JSON READY line, and writes callback(ready) as one JSON GRANT line
+    to payload stdin. It must bound all I/O and terminate/reap local SSH resources
+    within timeout (reserving teardown time), including when callback raises.
+    Timeout-only runners fail closed. No other stdin or grants are permitted.
+    The callback is invocation-scoped and single-use; never cache a grant.
+    Remote READY-to-GRANT elapsed is subtracted from the host's remaining duration.
+    With compatible monotonic clock rates and bounded scheduling/signal latency,
+    this conservatively bounds remote authority by the original host deadline.
+    Unbounded partition/suspension cannot prove completion: retain pending/blocked.
+    The remote bootstrap timer bounds a partition without EOF and no subprocess
+    is spawned by this payload. Actual authenticated SSH integration is caller-owned.
+    Launch must export WORKBAY_PROBE_OWNER_NONCE; start_time is Linux stat field
+    22, command is the space-joined cmdline. Each child needs its own launch receipt.
+
+    Canon https://github.com/darce/heuristics-canon: Principle 14 limits authority;
+    RES-02 shares one deadline; TEST-15 is falsified by removing UID comparison.
+    A matching command or shared PGID is a countercase to ownership, not proof.
+    """
+    import inspect
+    import json
+    import math
+    import secrets
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    receipt = dict(cleanup_receipt)
+
+    def result(state, diagnostic):
+        return {"state": state, "diagnostic": diagnostic, "cleanup_receipt": receipt}
+
+    if not _validate_probe_process_identity(receipt, receipt):
+        return result("blocked", "incomplete launch receipt")
+    if not math.isfinite(timeout_s) or not math.isfinite(grace_s) or timeout_s <= 0 or grace_s < 0:
+        return result("blocked", "invalid cleanup budget")
+    attempt = secrets.token_hex(32)
+    granted = False
+
+    def on_ready(ready):
+        nonlocal granted
+        if (
+            granted
+            or not isinstance(ready, dict)
+            or ready.get("kind") != "READY"
+            or ready.get("attempt") != attempt
+            or not isinstance(ready.get("challenge"), str)
+            or len(ready["challenge"]) != 64
+        ):
+            raise ValueError("invalid or replayed cleanup READY")
+        granted = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("cleanup deadline before grant")
+        return dict(kind="GRANT", attempt=attempt, challenge=ready["challenge"], remaining=remaining)
+
+    payload = "import json\n" + inspect.getsource(_validate_probe_process_identity)
+    payload += "\n" + inspect.getsource(_owned_probe_remote_cleanup)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return result("pending", "cleanup budget exhausted")
+    payload += (
+        f"\nprint(json.dumps(_owned_probe_remote_cleanup({receipt!r}, {remaining!r}, {grace_s!r}, {attempt!r})))\n"
+    )
+    try:
+        raw = ssh_runner(
+            "python3 -c " + _sh_single_quote(payload), host=receipt["host"], timeout=remaining, on_ready=on_ready
+        )
+        if not granted or time.monotonic() >= deadline:
+            return result("pending", "cleanup grant or timely confirmation unavailable")
+        stdout, _, code = _coerce_ssh_result(raw)
+        if code != 0:
+            return result("blocked", "remote cleanup failed")
+        response = json.loads(stdout)
+        if (
+            not isinstance(response, dict)
+            or response.get("state") not in {"complete", "pending", "blocked"}
+            or response.get("cleanup_receipt") != receipt
+            or not isinstance(response.get("diagnostic"), str)
+        ):
+            return result("blocked", "invalid remote cleanup response")
+        return result(response["state"], response["diagnostic"])
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return result("pending", "remote cleanup timed out")
+    except (OSError, ValueError, TypeError):
+        return result("blocked", "remote cleanup unavailable")
