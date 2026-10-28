@@ -1,0 +1,12 @@
+[Unit]
+Description=WorkBay measured VM lane queue
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/lib/workbay/lane_queue.py --once
+Environment=WORKBAY_REMOTE_AGENT_ROOT=workbay-sandbox
+UMask=0077
+
+[Install]
+WantedBy=default.target
