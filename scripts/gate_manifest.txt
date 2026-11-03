@@ -1,0 +1,20 @@
+# gate_manifest.txt — ONE authored gate list (heuristics-canon v0.26.2
+# [REF-45] One authored token source). Every transport consumes this file;
+# adding a package gate = one line here, picked up by all three:
+#   local   scripts/ci_local.sh    (make ci-local; commit-stage + full local)
+#   remote  scripts/ci_report.sh   (make ci-report; OCI VM gate + statuses)
+#   hosted  .github/workflows/test.yml (workflow_dispatch only; clean-machine audit)
+# Format: <make-target> [stage ...]   stages: local remote hosted
+# A target with no stage list runs on every stage. [RLSE-21] every stage
+# gates the same committed HEAD / artifact definition, never a rebuild.
+brand-check local remote hosted
+format-check local remote hosted
+check-protocol local remote hosted
+check-bootstrap local remote hosted
+test-handoff local remote hosted
+test-orchestrator local remote hosted
+test-bridge local remote hosted
+check-system local remote hosted
+check-workbay local remote hosted
+test-contract local remote hosted
+check-system-integration remote
