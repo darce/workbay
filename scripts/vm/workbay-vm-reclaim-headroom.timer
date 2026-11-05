@@ -1,0 +1,11 @@
+[Unit]
+Description=Check WorkBay VM free-space headroom
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=workbay-vm-reclaim-headroom.service
+
+[Install]
+WantedBy=timers.target

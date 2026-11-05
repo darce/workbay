@@ -1,0 +1,9 @@
+{
+  "routes": {
+    "implement": {
+      "backend": "muse-remote",
+      "model": "muse-wonder-1.0",
+      "effort": "high"
+    }
+  }
+}

@@ -1,0 +1,1733 @@
+{
+  "$defs": {
+    "Allow": {
+      "additionalProperties": false,
+      "properties": {
+        "effects_authorized": {
+          "const": false,
+          "default": false,
+          "title": "Effects Authorized",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "allow",
+          "default": "allow",
+          "title": "Kind",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "execution",
+            "retention"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "title": "Allow",
+      "type": "object"
+    },
+    "ApplyRequest": {
+      "additionalProperties": false,
+      "description": "R4/R5 must hold a per-resource lock across re-probe and any effects.",
+      "properties": {
+        "dry_run": {
+          "default": true,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "expected_plan_digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Expected Plan Digest",
+          "type": "string"
+        },
+        "kind": {
+          "const": "apply",
+          "default": "apply",
+          "title": "Kind",
+          "type": "string"
+        },
+        "plan": {
+          "$ref": "#/$defs/RetentionPlan"
+        },
+        "probe": {
+          "$ref": "#/$defs/RetentionProbe"
+        }
+      },
+      "required": [
+        "plan",
+        "expected_plan_digest",
+        "probe"
+      ],
+      "title": "ApplyRequest",
+      "type": "object"
+    },
+    "ByteAccounting": {
+      "additionalProperties": false,
+      "properties": {
+        "estimated_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimated Bytes"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "measured_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Measured Bytes"
+        }
+      },
+      "title": "ByteAccounting",
+      "type": "object"
+    },
+    "Correlation": {
+      "additionalProperties": false,
+      "description": "IDs stay in their authority's namespace. Presence alone proves no join.",
+      "properties": {
+        "orca": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrcaIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "verified_join": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Proof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "workbay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkBayIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Correlation",
+      "type": "object"
+    },
+    "CustodyAcknowledgement": {
+      "additionalProperties": false,
+      "properties": {
+        "acknowledgement": {
+          "$ref": "#/$defs/Proof"
+        },
+        "archive": {
+          "$ref": "#/$defs/EvidenceRef"
+        },
+        "fidelity": {
+          "$ref": "#/$defs/Proof"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "restored_fsck": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Proof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "scope": {
+          "items": {
+            "enum": [
+              "full_bytes",
+              "types",
+              "links",
+              "refs",
+              "reflogs",
+              "ignored"
+            ],
+            "type": "string"
+          },
+          "title": "Scope",
+          "type": "array"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "docker": "#/$defs/DockerSource",
+              "git": "#/$defs/GitSource"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSource"
+            },
+            {
+              "$ref": "#/$defs/DockerSource"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "resource",
+        "source",
+        "scope",
+        "archive",
+        "acknowledgement",
+        "fidelity"
+      ],
+      "title": "CustodyAcknowledgement",
+      "type": "object"
+    },
+    "DependencyEdge": {
+      "additionalProperties": false,
+      "description": "Consumer -> required provider. R1 supplies reachability/SCC verdicts.",
+      "properties": {
+        "consumer": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "proof": {
+          "$ref": "#/$defs/Proof"
+        },
+        "provider": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "relation": {
+          "enum": [
+            "git",
+            "symlink",
+            "editable",
+            "process",
+            "mount",
+            "container",
+            "child_image",
+            "rollback",
+            "db_volume",
+            "other"
+          ],
+          "title": "Relation",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "required",
+            "released",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "consumer",
+        "provider",
+        "relation",
+        "state",
+        "proof"
+      ],
+      "title": "DependencyEdge",
+      "type": "object"
+    },
+    "DependencySnapshot": {
+      "additionalProperties": false,
+      "description": "No guessed order: retained consumers hold providers and whole SCCs.\n\nR1 must inventory incoming/reachable consumers and condense cycles before\nasserting no_live_consumers and scc_clear. This is a verdict interface, not\na graph algorithm. Unknown privileged inventory must remain unknown.",
+      "properties": {
+        "component_members": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceIdentity"
+          },
+          "title": "Component Members",
+          "type": "array"
+        },
+        "edges": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DependencyEdge"
+          },
+          "title": "Edges",
+          "type": "array"
+        },
+        "inventory_complete": {
+          "$ref": "#/$defs/Proof"
+        },
+        "no_live_consumers": {
+          "$ref": "#/$defs/Proof"
+        },
+        "scc_clear": {
+          "$ref": "#/$defs/Proof"
+        }
+      },
+      "required": [
+        "inventory_complete",
+        "no_live_consumers",
+        "scc_clear"
+      ],
+      "title": "DependencySnapshot",
+      "type": "object"
+    },
+    "DockerFacts": {
+      "additionalProperties": false,
+      "description": "R2 asserts absence with separate proofs, including stopped containers.\n\nDB/recovery volume clearance additionally requires explicit permission;\ndangling images, age and a failed privileged read grant no clearance.",
+      "properties": {
+        "db_volume_permission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Proof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "db_volume_released": {
+          "$ref": "#/$defs/Proof"
+        },
+        "inventory_complete": {
+          "$ref": "#/$defs/Proof"
+        },
+        "no_child_images": {
+          "$ref": "#/$defs/Proof"
+        },
+        "no_running_containers": {
+          "$ref": "#/$defs/Proof"
+        },
+        "no_stopped_containers": {
+          "$ref": "#/$defs/Proof"
+        },
+        "rollback_released": {
+          "$ref": "#/$defs/Proof"
+        }
+      },
+      "required": [
+        "inventory_complete",
+        "no_running_containers",
+        "no_stopped_containers",
+        "no_child_images",
+        "rollback_released",
+        "db_volume_released"
+      ],
+      "title": "DockerFacts",
+      "type": "object"
+    },
+    "DockerSource": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "kind": {
+          "const": "docker",
+          "default": "docker",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "digest"
+      ],
+      "title": "DockerSource",
+      "type": "object"
+    },
+    "EvidenceRef": {
+      "additionalProperties": false,
+      "description": "Immutable private evidence reference; never embed credentials or payloads.",
+      "properties": {
+        "digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "ref": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[a-z][a-z0-9+.-]*:[^\\s]+$",
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref",
+        "digest"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "ExecutionObservation": {
+      "additionalProperties": false,
+      "description": "Observed values, never copied from request/config as served-model proof.\n\nAccount/profile fields contain opaque nonsecret references only. Catalogue\nsupport and observed served execution are separate positive observations.\nMissing public handoff rows, wrong imported runtime or inaccessible users\nremain real unknown/denied observations, not fabricated running states.",
+      "properties": {
+        "account_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^opaque:[A-Za-z0-9._/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Account Ref"
+        },
+        "agent_binary": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent Binary"
+        },
+        "authenticated": {
+          "$ref": "#/$defs/Proof"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        },
+        "binary_executable": {
+          "$ref": "#/$defs/Proof"
+        },
+        "catalogue_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "cost_allowed": {
+          "$ref": "#/$defs/Proof"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "execution_user": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution User"
+        },
+        "handoff_available": {
+          "$ref": "#/$defs/Proof"
+        },
+        "identity_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "kind": {
+          "const": "execution_observation",
+          "default": "execution_observation",
+          "title": "Kind",
+          "type": "string"
+        },
+        "profile_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^opaque:[A-Za-z0-9._/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Profile Ref"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "remote_available": {
+          "$ref": "#/$defs/Proof"
+        },
+        "resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "runtime_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "served_execution_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "served_model": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Served Model"
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service Tier"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "supported_models": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "not": {
+                  "pattern": "[\\u0000-\\u001f]"
+                },
+                "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supported Models"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace"
+        },
+        "workspace_accessible": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Accessible"
+        },
+        "workspace_verified": {
+          "$ref": "#/$defs/Proof"
+        }
+      },
+      "title": "ExecutionObservation",
+      "type": "object"
+    },
+    "ExecutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "account_ref": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^opaque:[A-Za-z0-9._/-]+$",
+          "title": "Account Ref",
+          "type": "string"
+        },
+        "agent_binary": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Agent Binary",
+          "type": "string"
+        },
+        "backend": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Backend",
+          "type": "string"
+        },
+        "correlation": {
+          "$ref": "#/$defs/Correlation"
+        },
+        "effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "title": "Effort",
+          "type": "string"
+        },
+        "execution_user": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Execution User",
+          "type": "string"
+        },
+        "kind": {
+          "const": "execution_request",
+          "default": "execution_request",
+          "title": "Kind",
+          "type": "string"
+        },
+        "model": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Model",
+          "type": "string"
+        },
+        "profile_ref": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^opaque:[A-Za-z0-9._/-]+$",
+          "title": "Profile Ref",
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Provider",
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "service_tier": {
+          "enum": [
+            "standard",
+            "priority",
+            "flex"
+          ],
+          "title": "Service Tier",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/GitSource"
+        },
+        "workspace": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Workspace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource",
+        "source",
+        "execution_user",
+        "agent_binary",
+        "workspace",
+        "backend",
+        "provider",
+        "account_ref",
+        "profile_ref",
+        "model",
+        "effort",
+        "service_tier"
+      ],
+      "title": "ExecutionRequest",
+      "type": "object"
+    },
+    "GitSource": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "git",
+          "default": "git",
+          "title": "Kind",
+          "type": "string"
+        },
+        "revision": {
+          "maxLength": 40,
+          "minLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Revision",
+          "type": "string"
+        },
+        "tree": {
+          "maxLength": 40,
+          "minLength": 40,
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Tree",
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "tree"
+      ],
+      "title": "GitSource",
+      "type": "object"
+    },
+    "Held": {
+      "additionalProperties": false,
+      "properties": {
+        "effects_authorized": {
+          "const": false,
+          "default": false,
+          "title": "Effects Authorized",
+          "type": "boolean"
+        },
+        "holds": {
+          "items": {
+            "$ref": "#/$defs/Hold"
+          },
+          "minItems": 1,
+          "title": "Holds",
+          "type": "array"
+        },
+        "kind": {
+          "const": "held",
+          "default": "held",
+          "title": "Kind",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "execution",
+            "retention"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "holds"
+      ],
+      "title": "Held",
+      "type": "object"
+    },
+    "Hold": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "proof_unknown",
+            "proof_denied",
+            "proof_contradictory",
+            "proof_missing_evidence",
+            "proof_missing_freshness",
+            "proof_stale",
+            "proof_future",
+            "proof_invalid_window",
+            "execution_user_unknown",
+            "execution_user_mismatch",
+            "agent_binary_unknown",
+            "agent_binary_mismatch",
+            "agent_binary_not_absolute",
+            "workspace_unknown",
+            "workspace_mismatch",
+            "workspace_not_absolute",
+            "workspace_access_unknown",
+            "workspace_inaccessible",
+            "source_unknown",
+            "source_mismatch",
+            "resource_unknown",
+            "resource_mismatch",
+            "foreign_owner",
+            "backend_unknown",
+            "backend_mismatch",
+            "provider_unknown",
+            "provider_mismatch",
+            "account_ref_unknown",
+            "account_ref_mismatch",
+            "profile_ref_unknown",
+            "profile_ref_mismatch",
+            "served_model_unknown",
+            "served_model_mismatch",
+            "effort_unknown",
+            "effort_mismatch",
+            "service_tier_unknown",
+            "service_tier_mismatch",
+            "model_catalogue_unknown",
+            "model_unsupported",
+            "plan_changed",
+            "registration_changed",
+            "dependencies_changed",
+            "custody_changed",
+            "custody_scope_missing",
+            "custody_source_mismatch",
+            "custody_resource_mismatch",
+            "custody_fsck_missing",
+            "dependency_required",
+            "dependency_unknown",
+            "scc_held",
+            "docker_facts_missing",
+            "db_volume_permission_missing",
+            "stream_expectation_missing"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "subject": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "subject"
+      ],
+      "title": "Hold",
+      "type": "object"
+    },
+    "LifecycleEvent": {
+      "additionalProperties": false,
+      "description": "R3/R5 persist atomically with authority; replay retains original payload.\n\nEvent authority/history must live outside retired checkouts. transaction_ref\nis a durable authority reference, never an independently written second log.",
+      "properties": {
+        "accounting": {
+          "$ref": "#/$defs/ByteAccounting"
+        },
+        "correlation": {
+          "$ref": "#/$defs/Correlation"
+        },
+        "durable_committed_at": {
+          "format": "date-time",
+          "not": {
+            "pattern": "[\\r\\n]"
+          },
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "title": "Durable Committed At",
+          "type": "string"
+        },
+        "event_id": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "facts": {
+          "$ref": "#/$defs/LifecycleFacts"
+        },
+        "kind": {
+          "const": "event",
+          "default": "event",
+          "title": "Kind",
+          "type": "string"
+        },
+        "observations": {
+          "items": {
+            "$ref": "#/$defs/Proof"
+          },
+          "minItems": 1,
+          "title": "Observations",
+          "type": "array"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Allow"
+            },
+            {
+              "$ref": "#/$defs/Held"
+            }
+          ],
+          "title": "Outcome"
+        },
+        "phase": {
+          "enum": [
+            "registered",
+            "planned",
+            "probed",
+            "applied",
+            "failed",
+            "held"
+          ],
+          "title": "Phase",
+          "type": "string"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "docker": "#/$defs/DockerSource",
+              "git": "#/$defs/GitSource"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSource"
+            },
+            {
+              "$ref": "#/$defs/DockerSource"
+            }
+          ],
+          "title": "Source"
+        },
+        "synthetic_tag": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Synthetic Tag"
+        },
+        "transaction_ref": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[a-z][a-z0-9+.-]*:[^\\s]+$",
+          "title": "Transaction Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "operation_id",
+        "phase",
+        "resource",
+        "source",
+        "policy_version",
+        "evidence",
+        "outcome",
+        "observations",
+        "durable_committed_at",
+        "transaction_ref"
+      ],
+      "title": "LifecycleEvent",
+      "type": "object"
+    },
+    "LifecycleFacts": {
+      "additionalProperties": false,
+      "description": "Independent facts; terminal/age never implies review, release or custody.",
+      "properties": {
+        "activated": {
+          "$ref": "#/$defs/Proof"
+        },
+        "custody_acknowledged": {
+          "$ref": "#/$defs/Proof"
+        },
+        "execution_terminal": {
+          "$ref": "#/$defs/Proof"
+        },
+        "harvested": {
+          "$ref": "#/$defs/Proof"
+        },
+        "merged": {
+          "$ref": "#/$defs/Proof"
+        },
+        "published": {
+          "$ref": "#/$defs/Proof"
+        },
+        "retired": {
+          "$ref": "#/$defs/Proof"
+        },
+        "reviewed": {
+          "$ref": "#/$defs/Proof"
+        },
+        "verified": {
+          "$ref": "#/$defs/Proof"
+        }
+      },
+      "title": "LifecycleFacts",
+      "type": "object"
+    },
+    "OrcaIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "dispatch": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dispatch"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run"
+        },
+        "task": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task"
+        }
+      },
+      "title": "OrcaIdentity",
+      "type": "object"
+    },
+    "Owner": {
+      "additionalProperties": false,
+      "description": "Repository namespace, e.g. repo:github.com/darce/workbay; never a local ID.",
+      "properties": {
+        "repository": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^repo:[A-Za-z0-9][A-Za-z0-9._/-]*$",
+          "title": "Repository",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository"
+      ],
+      "title": "Owner",
+      "type": "object"
+    },
+    "Proof": {
+      "additionalProperties": false,
+      "description": "The named claim is true only with positive, fresh, immutable evidence.\n\nEmpty/unknown/denied inventories are representable and always hold admission.\nAn empty privileged result must not be converted into a verified claim.",
+      "properties": {
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "not": {
+                "pattern": "[\\r\\n]"
+              },
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observed At"
+        },
+        "state": {
+          "default": "unknown",
+          "enum": [
+            "verified",
+            "unknown",
+            "denied",
+            "contradictory"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "valid_until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "not": {
+                "pattern": "[\\r\\n]"
+              },
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Valid Until"
+        }
+      },
+      "title": "Proof",
+      "type": "object"
+    },
+    "Registration": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation": {
+          "$ref": "#/$defs/Correlation"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "kind": {
+          "const": "registration",
+          "default": "registration",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "archive",
+            "retire",
+            "withdraw_materialization"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceIdentity"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "docker": "#/$defs/DockerSource",
+              "git": "#/$defs/GitSource"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GitSource"
+            },
+            {
+              "$ref": "#/$defs/DockerSource"
+            }
+          ],
+          "title": "Source"
+        },
+        "stream": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StreamExpectation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "resource",
+        "source",
+        "operation",
+        "policy_version",
+        "evidence"
+      ],
+      "title": "Registration",
+      "type": "object"
+    },
+    "ResourceIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Identity",
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/Owner"
+        },
+        "resource_kind": {
+          "enum": [
+            "directory",
+            "artifact",
+            "git_repository",
+            "git_worktree",
+            "docker_image",
+            "docker_volume"
+          ],
+          "title": "Resource Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "resource_kind",
+        "identity"
+      ],
+      "title": "ResourceIdentity",
+      "type": "object"
+    },
+    "RetentionPlan": {
+      "additionalProperties": false,
+      "description": "Immutable dry-run intent, including dependency/custody observations.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "not": {
+            "pattern": "[\\r\\n]"
+          },
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "title": "Created At",
+          "type": "string"
+        },
+        "custody": {
+          "$ref": "#/$defs/CustodyAcknowledgement"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/DependencySnapshot"
+        },
+        "kind": {
+          "const": "plan",
+          "default": "plan",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "plan_id": {
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          },
+          "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+          "title": "Plan Id",
+          "type": "string"
+        },
+        "registration": {
+          "$ref": "#/$defs/Registration"
+        }
+      },
+      "required": [
+        "plan_id",
+        "operation_id",
+        "registration",
+        "dependencies",
+        "custody",
+        "created_at"
+      ],
+      "title": "RetentionPlan",
+      "type": "object"
+    },
+    "RetentionProbe": {
+      "additionalProperties": false,
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/Proof",
+          "description": "Operation-specific durable release/withdrawal receipt; terminal, age and merged markers are not substitutes."
+        },
+        "custody_digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Custody Digest",
+          "type": "string"
+        },
+        "custody_valid": {
+          "$ref": "#/$defs/Proof"
+        },
+        "dependencies_clear": {
+          "$ref": "#/$defs/Proof"
+        },
+        "dependencies_digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Dependencies Digest",
+          "type": "string"
+        },
+        "docker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DockerFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "kind": {
+          "const": "probe",
+          "default": "probe",
+          "title": "Kind",
+          "type": "string"
+        },
+        "no_live_use": {
+          "$ref": "#/$defs/Proof"
+        },
+        "owner_verified": {
+          "$ref": "#/$defs/Proof"
+        },
+        "plan_digest": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Plan Digest",
+          "type": "string"
+        },
+        "policy_allowed": {
+          "$ref": "#/$defs/Proof"
+        },
+        "registration": {
+          "$ref": "#/$defs/Registration"
+        },
+        "source_verified": {
+          "$ref": "#/$defs/Proof"
+        }
+      },
+      "required": [
+        "plan_digest",
+        "registration",
+        "dependencies_digest",
+        "custody_digest",
+        "owner_verified",
+        "source_verified",
+        "policy_allowed",
+        "completion",
+        "no_live_use",
+        "dependencies_clear",
+        "custody_valid"
+      ],
+      "title": "RetentionProbe",
+      "type": "object"
+    },
+    "StreamExpectation": {
+      "additionalProperties": false,
+      "description": "R3 evaluates cadence/deadline + registered grace, separately from age.\n\nActive streams require a cadence or deadline. Idle/dormant/completed history\nhas no age-based failure. The collector's original cadence is 60 seconds.",
+      "properties": {
+        "cadence_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cadence Seconds"
+        },
+        "connected_visibility_target_seconds": {
+          "const": 30,
+          "default": 30,
+          "title": "Connected Visibility Target Seconds",
+          "type": "integer"
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "not": {
+                "pattern": "[\\r\\n]"
+              },
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deadline"
+        },
+        "grace_seconds": {
+          "minimum": 0,
+          "title": "Grace Seconds",
+          "type": "integer"
+        },
+        "stale_after_missed_expectation_target_seconds": {
+          "const": 30,
+          "default": 30,
+          "title": "Stale After Missed Expectation Target Seconds",
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "idle",
+            "dormant",
+            "completed"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "grace_seconds"
+      ],
+      "title": "StreamExpectation",
+      "type": "object"
+    },
+    "WorkBayIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "job": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Job"
+        },
+        "lane": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lane"
+        },
+        "pass_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pass Id"
+        },
+        "task": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001f]"
+              },
+              "pattern": "^[^\\u0000-\\u001f]*[^\\s\\u0000-\\u001f][^\\u0000-\\u001f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task"
+        }
+      },
+      "title": "WorkBayIdentity",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated Draft 2020-12 discriminated packet schema, version 1.",
+  "discriminator": {
+    "mapping": {
+      "allow": "#/$defs/Allow",
+      "apply": "#/$defs/ApplyRequest",
+      "event": "#/$defs/LifecycleEvent",
+      "execution_observation": "#/$defs/ExecutionObservation",
+      "execution_request": "#/$defs/ExecutionRequest",
+      "held": "#/$defs/Held",
+      "plan": "#/$defs/RetentionPlan",
+      "probe": "#/$defs/RetentionProbe",
+      "registration": "#/$defs/Registration"
+    },
+    "propertyName": "kind"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Registration"
+    },
+    {
+      "$ref": "#/$defs/RetentionPlan"
+    },
+    {
+      "$ref": "#/$defs/RetentionProbe"
+    },
+    {
+      "$ref": "#/$defs/ApplyRequest"
+    },
+    {
+      "$ref": "#/$defs/ExecutionRequest"
+    },
+    {
+      "$ref": "#/$defs/ExecutionObservation"
+    },
+    {
+      "$ref": "#/$defs/Allow"
+    },
+    {
+      "$ref": "#/$defs/Held"
+    },
+    {
+      "$ref": "#/$defs/LifecycleEvent"
+    }
+  ],
+  "title": "ResourceLifecycleContract"
+}
