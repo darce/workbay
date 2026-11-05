@@ -1,0 +1,10 @@
+[Unit]
+Description=Reclaim owner-released WorkBay VM jobs below the headroom floor
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/workbay/workbay_vm_reclaim.py apply --max 20 --if-free-below 10737418240
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

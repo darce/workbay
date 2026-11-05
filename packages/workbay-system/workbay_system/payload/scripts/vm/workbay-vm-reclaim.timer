@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically reclaim owner-released WorkBay VM jobs
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=workbay-vm-reclaim.service
+
+[Install]
+WantedBy=timers.target
