@@ -1,0 +1,11 @@
+[Unit]
+Description=Safety-net resync for WorkBay VM lane queue
+
+[Timer]
+# Covers missed path events and rechecks pressure-deferred jobs after PSI falls.
+OnUnitInactiveSec=60s
+Persistent=false
+Unit=workbay-lane-queue.service
+
+[Install]
+WantedBy=timers.target

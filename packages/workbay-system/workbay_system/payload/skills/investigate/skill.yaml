@@ -1,0 +1,19 @@
+name: investigate
+description: Diagnose independent defect components before fixing them, and preserve
+  the decision/evidence trail; only confirmed defects become findings.
+mode: execution
+context_budget: 200
+makefile_target: null
+mcp_tools:
+- review_findings
+- record_event
+- search_handoff
+- find_related_prior_work
+- get_handoff_state
+- set_handoff_state
+- render_handoff
+tdd_gate: true
+scope: harness
+generator:
+  claude_overrides:
+    disable-model-invocation: false

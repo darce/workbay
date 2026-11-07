@@ -1,0 +1,864 @@
+{
+  "version": 2,
+  "global_instructions": [],
+  "commands": [
+    {
+      "command_id": "wb-scope",
+      "skill": "scope",
+      "mode": "guide",
+      "makefile_target": "(in-session intake; no standalone make target)",
+      "description": "Bound new feature or epic work by resolving missing material constraints before drafting planning artifacts.",
+      "execution_context": "Use when scope, success criteria, or constraints remain unclear. Reuse supplied answers and source evidence; ask only questions whose missing answers would change the plan, through the available harness question primitive.",
+      "argument_schema": [
+        {
+          "name": "request",
+          "required": false,
+          "description": "Optional feature or epic ask, including any already supplied constraints and acceptance criteria."
+        }
+      ],
+      "loop": [
+        "inspect the request and existing evidence; identify only missing material constraints",
+        "ask targeted questions where needed, without a fixed question count or repeating supplied answers",
+        "record answers, assumptions, scope boundaries, and success criteria as durable decisions; if MCP is unavailable, emit them in the worker report for coordinator recording",
+        "bound MVP scope and exclusions, then hand off to assessment or spec drafting",
+        "model downstream work as a dependency DAG; require real behavior RED evidence before dependent implementation while admitting independent groups concurrently"
+      ]
+    },
+    {
+      "command_id": "wb-refactor",
+      "skill": "refactor",
+      "mode": "guide",
+      "makefile_target": "(in-session advisory skill; no standalone make target)",
+      "description": "Structured refactoring evaluation: identify design smells, sequence behavior-preserving remediations.",
+      "execution_context": "Use when evaluating code health, smell audits, or tech-debt assessment for a module, package, or workflow — not for branch review or bug investigation.",
+      "argument_schema": [
+        {
+          "name": "scope-hint",
+          "required": false,
+          "description": "Optional file, module, or subsystem path that bounds the evaluation."
+        }
+      ],
+      "loop": [
+        "confirm task/worktree scope before cwd-resolving MCP reads",
+        "inspect the target area and classify findings by impact",
+        "tie each finding to a named smell or design pressure with evidence",
+        "sequence behavior-preserving refactorings into small testable steps",
+        "record findings and decisions through MCP when handoff durability matters"
+      ]
+    },
+    {
+      "command_id": "wb-auto-fix",
+      "skill": "auto-fix",
+      "mode": "write",
+      "makefile_target": "(in-session bounded-loop skill; no standalone make target)",
+      "description": "Bounded autonomous bug-fix loop: commit a candidate fix per iteration, exit on the first passing test tied to HEAD, finalize with a slice-complete decision and a single post-loop close integrity check.",
+      "execution_context": "Use when iterating on a specific failing test inside an active feature-branch task. The loop uses bounded handoff reads per iteration, commits each candidate fix before testing so verified_tests provenance matches HEAD, and reserves integrity_check(payload={\"kind\":\"close\",\"enforce\":true,\"require_fresh_tests\":true}) as the single post-loop pre-merge gate. Refuses to run on main/master/None target_branch.",
+      "argument_schema": [
+        {
+          "name": "failing-test-cmd",
+          "required": true,
+          "description": "Failing test command the loop should drive to passing (e.g. 'make test-handoff TEST=tests/test_foo.py')."
+        },
+        {
+          "name": "max-iterations",
+          "required": false,
+          "description": "Iteration cap before recording a blocker and exiting non-zero. Default 5."
+        },
+        {
+          "name": "scope-hint",
+          "required": false,
+          "description": "File path, module, or keyword that bounds the candidate-fix search space for each iteration."
+        }
+      ],
+      "loop": [
+        "confirm active task has a feature target_branch (abort on main/master/None with zero MCP writes)",
+        "record an auto_fix_open decision to anchor the investigation trail",
+        "per iteration: get_handoff_state(sections='identity'), read implicated files, propose smallest edit, commit the fix, run failing_test_cmd, record test_result",
+        "exit the loop on the first passed=true test_result tied to HEAD, or record a blocker and exit non-zero at max_iterations",
+        "finalize: record slice_complete decision, set_handoff_state(status='done', status_only=True), call integrity_check(payload={\"kind\":\"close\",\"enforce\":true,\"require_fresh_tests\":true,\"current_commit_sha\":<HEAD>}) exactly once",
+        "on Claude Code, gate inter-iteration waits to <270s warm-cache or >=1200s idle; Codex and Copilot iterate inline"
+      ]
+    },
+    {
+      "command_id": "wb-land",
+      "skill": "branch-lifecycle",
+      "mode": "write",
+      "makefile_target": "make task-start TASK=<task-ref> OBJECTIVE=\"...\"",
+      "secondary_targets": [
+        "make review-ready",
+        "make handoff-close-check",
+        "make task-finish TASK=<task-ref>"
+      ],
+      "description": "Task branch start, review gate, close-check, merge, and teardown for accepted-plan tasks or explicitly authorized maintenance with no task_plan_path.",
+      "execution_context": "Use when moving a plan-backed task from a reviewed, accepted plan baseline, or explicitly authorized maintenance with no task_plan_path, through branch start, review readiness, close-check, merge, and teardown; branch isolation and all verification, review, and close gates apply to both.",
+      "argument_schema": [
+        {
+          "name": "task-ref",
+          "required": true,
+          "description": "Active task reference being started or finished."
+        },
+        {
+          "name": "objective",
+          "required": false,
+          "description": "Task objective to pass to task-start when opening the branch."
+        }
+      ],
+      "loop": [
+        "for plan-backed tasks, establish the reviewed, accepted plan baseline with make plan-accept before task-start and pass PLAN=docs/plans/<NNNN>-*.md to task-start; explicitly authorized maintenance with no task_plan_path has no approved-plan prerequisite",
+        "create or enter the task branch/worktree",
+        "verify alignment with make context",
+        "advance slices through /wb-tdd and /wb-implement",
+        "clear review-ready blockers and pass handoff-close-check",
+        "finish with the invariant close sequence and task teardown"
+      ]
+    },
+    {
+      "command_id": "wb-review-code",
+      "skill": "branch-review",
+      "mode": "verify",
+      "makefile_target": "make review-run",
+      "description": "Implementation branch review workflow for lane or committed feature-branch diffs.",
+      "execution_context": "Use for implementation branch diffs, pre-merge review passes, and code audit requests.",
+      "argument_schema": [
+        {
+          "name": "scope",
+          "required": false,
+          "description": "Optional explicit diff scope such as main...HEAD when reviewing a committed feature branch."
+        }
+      ],
+      "loop": [
+        "decide whether the review scope is a lane/local working tree or a committed feature-branch diff",
+        "use make review-run only when reviewing lane/local working-tree scope",
+        "load the latest slice packet or branch diff",
+        "when the review is packet-backed, print the handoff decision string (`decision`) and numeric row id (`decision_id`)",
+        "pre-triage existing findings",
+        "run the branch-review checklist",
+        "record findings, verdict decision, and branch review run",
+        "refresh DASHBOARD.txt after state-changing handoff writes",
+        "confirm whether the branch is actually merge-ready"
+      ]
+    },
+    {
+      "command_id": "wb-handoff",
+      "skill": "handoff-lifecycle",
+      "mode": "guide",
+      "makefile_target": "make context",
+      "secondary_targets": [
+        "load_session",
+        "switch_task"
+      ],
+      "description": "Session start, task switching, and task-view regeneration workflow.",
+      "execution_context": "Use when starting or resuming a session, switching active tasks, or keeping generated task views aligned after MCP writes.",
+      "argument_schema": [
+        {
+          "name": "task-ref",
+          "required": false,
+          "description": "Optional target task to switch into during the session."
+        }
+      ],
+      "loop": [
+        "confirm branch/worktree context",
+        "load the current task state with bounded reads",
+        "externalize decisions, blockers, findings, and evidence at discovery through MCP; if unavailable, emit a structured worker report for coordinator durable recording without claiming successful writes",
+        "regenerate DASHBOARD.txt after non-atomic writes; use CURRENT_TASK.json only on demand",
+        "switch tasks safely and archive only after done"
+      ]
+    },
+    {
+      "command_id": "wb-investigate",
+      "skill": "investigate",
+      "mode": "write",
+      "makefile_target": "(in-session root-cause skill; no standalone make target)",
+      "description": "Evidence-driven root-cause investigation with falsifiable experiments and finding-scoped outcomes.",
+      "execution_context": "Use when a symptom is known but its cause is unproven. Reproduce and observe the actual boundary before editing; independent investigations may proceed concurrently when their inputs and side effects permit it. Nonreproduction is an unresolved evidence gap, not proof of a fix or a reason by itself for wontfix.",
+      "argument_schema": [
+        {
+          "name": "symptom",
+          "required": true,
+          "description": "Observed failure, error output, or unexpected behavior, with any reproduction evidence already available."
+        },
+        {
+          "name": "scope-hint",
+          "required": false,
+          "description": "Optional owned file, module, test command, task reference, or subsystem that bounds experiments and affected findings."
+        }
+      ],
+      "loop": [
+        "establish task/worktree scope before cwd-resolving reads",
+        "inspect actual producers, symptoms, reproduction steps, history, and relevant prior findings before mocks or mechanism claims",
+        "open a decision/evidence trail with symptoms, baseline, scope, and explicit affected ids; record only confirmed defects as review findings",
+        "for each hypothesis, predict a refuting observation and run a controlled experiment; serialize only experiments that share mutable state or dependent inputs",
+        "after refutations, reassess assumptions and seek independent evidence; escalate when a concrete missing input, scope, or environment blocker prevents progress",
+        "after confirming the cause, implement the smallest bounded fix and verify the original failing sequence and relevant regression checks",
+        "resolve only the explicit finding ids supported by commit-backed evidence; keep nonreproduced symptoms unresolved or defer them with the gap recorded",
+        "record the outcome and refresh the operator view; if MCP is unavailable, return evidence for coordinator durable recording"
+      ]
+    },
+    {
+      "command_id": "wb-implement",
+      "skill": "incremental-implementation",
+      "mode": "write",
+      "makefile_target": "make slice-start TASK=<task-ref> TEST_CMD=\"<command>\"",
+      "secondary_targets": [
+        "make slice-commit TASK=<task-ref> MSG=\"...\""
+      ],
+      "description": "Bounded vertical-slice implementation workflow.",
+      "execution_context": "Use when decomposing active task-plan work into bounded implementation slices instead of horizontal layer-by-layer waves.",
+      "argument_schema": [
+        {
+          "name": "task-ref",
+          "required": true,
+          "description": "Active task reference for the slice."
+        },
+        {
+          "name": "test-cmd",
+          "required": false,
+          "description": "Failing test command used to open the slice."
+        }
+      ],
+      "loop": [
+        "choose one end-to-end behavior path",
+        "advance the plan item cursor with a clean prior slice",
+        "open the slice through the tdd gate",
+        "keep the diff bounded to that one path",
+        "close with make slice-commit"
+      ]
+    },
+    {
+      "command_id": "wb-draft",
+      "skill": "plan-draft",
+      "mode": "verify",
+      "makefile_target": "make plan-analyze DOC=<path>",
+      "description": "Pre-review planning draft using the eight analysis passes (0148/0189 /wb-draft rail; replaces the interim /wb-analyze id).",
+      "execution_context": "Use for pre-review triage of a planning artifact before the formal planning-review pass. Registered as /wb-draft, not /wb-analyze.",
+      "argument_schema": [
+        {
+          "name": "doc",
+          "required": true,
+          "description": "Planning document path to analyze."
+        }
+      ],
+      "loop": [
+        "load the plan, constitution, and minimal adjacent anchors",
+        "run the eight analysis passes",
+        "record findings with review_mode=\"planning\"",
+        "record a planning review_run for this triage pass (no reserved session prefix)",
+        "recommend revise-first or proceed-to-planning-review"
+      ]
+    },
+    {
+      "command_id": "wb-review-plan",
+      "skill": "planning-review",
+      "mode": "verify",
+      "makefile_target": "make plan-review DOC=<path>",
+      "description": "Formal planning review workflow for task plans, epics, ADRs, and similar artifacts.",
+      "execution_context": "Use for task plans, epics, ADRs, and other planning artifacts that need formal review before implementation.",
+      "argument_schema": [
+        {
+          "name": "doc",
+          "required": true,
+          "description": "Planning document path to review."
+        }
+      ],
+      "loop": [
+        "load the planning doc and minimum code/contract anchors",
+        "run the planning-review checklist",
+        "record findings and verdict in MCP",
+        "print stable handoff gap ids (`finding_id`) when reporting findings",
+        "record the planning review run",
+        "refresh DASHBOARD.txt after state-changing handoff writes",
+        "block approval until open planning findings are resolved",
+        "after pass with zero open findings, direct the operator to make plan-accept before task-start"
+      ]
+    },
+    {
+      "command_id": "wb-review-slice",
+      "skill": "review-parallel",
+      "mode": "verify",
+      "makefile_target": "(in-session coordinator skill; no standalone make target)",
+      "description": "Coordinator skill that fans out branch review by completed slice packet (one reviewer per slice by default), merges findings under the coordinator task_ref via review_findings(operation=\"merge\"), and retires merged source rows. Falls back to whole-branch diff when no slice packets exist.",
+      "execution_context": "Use when a branch review benefits from independent reviewers partitioned by slice (default) or, when no slice packets exist, parallel whole-branch reviewers. The coordinator stays inside its harness and routes fan-out through the cheapest in-process subagent primitive.",
+      "argument_schema": [
+        {
+          "name": "reviewers-per-slice",
+          "required": false,
+          "description": "Reviewers to fan out per completed slice. Default 1. Legacy reviewers-count aliases here when slice mode is active."
+        },
+        {
+          "name": "reviewers-count",
+          "required": false,
+          "description": "Legacy alias for reviewers-per-slice in slice mode; whole-branch fallback still uses this as reviewer count (default 2)."
+        },
+        {
+          "name": "reviewer-prompt-template",
+          "required": false,
+          "description": "Optional prompt template id resolved under config/agent-workflows/prompts/wb-review-slice/ (harness-neutral)."
+        }
+      ],
+      "loop": [
+        "confirm coordinator has an active task_ref and feature branch",
+        "enumerate completed slices via search_handoff(slice_complete) and fetch each packet via get_latest_slice_review_packet(slice_decision_id=...); whole-branch fallback when zero slices",
+        "pick a round token and assign each reviewer a scoped task_ref using <task>-REV-<round>-S<n>-<letter> (fallback: <task>-REV-<round>-<letter>)",
+        "invoke reviewers via the harness routing table with per-slice git diff <commit>~1..<commit> restricted to packet changed_files",
+        "each reviewer records findings under its scoped task_ref via review_findings(operation='batch_record')",
+        "coordinator merges per slice with review_findings(operation='merge', retire_sources=true) under the coordinator task_ref",
+        "run one harmonization reviewer (<task>-REV-<round>-HARM-A) on integration lenses only, then merge under the coordinator",
+        "coordinator records exactly one branch-mode review_runs entry for the combined pass"
+      ]
+    },
+    {
+      "command_id": "wb-tdd",
+      "skill": "tdd",
+      "mode": "write",
+      "makefile_target": "make slice-start TASK=<task-ref> TEST_CMD=\"<command>\"",
+      "description": "Real-behavior RED to GREEN verification inside a bounded implementation slice.",
+      "execution_context": "Use before production edits for a behavior change. RED must exercise the actual behavior with representative real inputs and fail for the intended reason. Gate only implementation that consumes that evidence; unrelated slices may proceed independently. Documentation protocol corrections use existing materialization/contracts rather than fabricated failing tests.",
+      "argument_schema": [
+        {
+          "name": "task-ref",
+          "required": true,
+          "description": "Active task reference for the bounded behavior slice."
+        },
+        {
+          "name": "test-cmd",
+          "required": true,
+          "description": "Command demonstrating the intended behavioral RED on representative real inputs before implementation, then GREEN after the change."
+        }
+      ],
+      "loop": [
+        "define the observable behavior, real inputs, expected result, and falsifiable failure prediction",
+        "inspect the actual producer before introducing mocks; retain optional-dependency failure behavior",
+        "run a relevant existing or new behavior check and confirm intended RED rather than syntax, import, environment, or blanket assertion noise",
+        "record real RED evidence with make slice-start before the dependent production edit; do not require a separate dispatch when one lane can perform both steps",
+        "implement the smallest bounded change and re-run the same check to GREEN",
+        "refactor while GREEN; after any commit rewrite refresh verification against the final HEAD, then hand off to make slice-commit"
+      ]
+    },
+    {
+      "command_id": "wb-offload",
+      "skill": "offload",
+      "mode": "write",
+      "makefile_target": "(in-session cross-harness offload skill; no standalone make target)",
+      "description": "Bounded offload with an explicit agent, receipt-resolved routing, idempotent dispatch, typed outcomes, and coordinator review.",
+      "execution_context": "Use for a self-contained lane with explicit inputs, owned paths, and a structured end-state contract. Supported backend/model/effort choices and timeout bounds come from the live registry, capability/preflight receipt, and AgentSpec, not prose inventories. Require an explicit agent; refuse unavailable capabilities or dependencies with their typed failure and never silently substitute a backend.",
+      "argument_schema": [
+        {
+          "name": "objective",
+          "required": true,
+          "description": "Self-contained lane objective with explicit inputs, owned paths, acceptance criteria, and a structured output contract."
+        },
+        {
+          "name": "agent",
+          "required": true,
+          "description": "Explicit offload backend: grok-remote, grok-cli, cursor-cli, cursor-remote, codex-remote, codex-subagent, or openrouter-remote (normalized via validate_backend; no fallback, no implicit default). `grok-remote` is discontinued by the operator; never a default for dispatch. Under a remote_only ledger every REMOTE_OFFLOAD_BACKENDS member (codex-remote, cursor-remote, grok-remote, openrouter-remote) stays explicitly selectable, and an explicit local backend is refused with the typed remote_required outcome. Admission additionally requires live-registry validation and capability/preflight evidence."
+        },
+        {
+          "name": "effort",
+          "required": true,
+          "description": "Required requested reasoning effort supported by the selected backend; use registry capability/preflight evidence for valid choices and preserve the resolved AgentSpec value."
+        },
+        {
+          "name": "token-budget",
+          "required": true,
+          "description": "Required caller-owned per-lane token budget, checked by preflight and preserved across continuation cycles."
+        },
+        {
+          "name": "lane-id",
+          "required": false,
+          "description": "Optional lane identity for its worktree and isolated resources; default derived from the explicit agent."
+        },
+        {
+          "name": "task-ref",
+          "required": false,
+          "description": "Optional active task reference; defaults to the current handoff task after scope verification."
+        }
+      ],
+      "loop": [
+        "confirm active feature-branch task and a bounded lane contract with inputs, owned paths, scoped TEST_CMD, known-red evidence, and structured output",
+        "require an explicit agent and requested effort; use list_available_backends and capability evidence for supported backend/model/effort choices without an implicit default",
+        "run offload_preflight with requested routing, budget, and worktree; preserve optional-dependency refusals and use receipt-resolved model, effort, execution mode, and timeout bounds",
+        "manage_worktree_lane upsert and materialize_offload_lane_manifest with explicit backend and requested routing policy; preserve receipt/AgentSpec effective values without recomputing defaults",
+        "dispatch_lane_work with the bounded brief, dispatch_id idempotency key, admitted routing, and start_worker=false",
+        "run_offload_pass with caller-owned token_budget and receipt-supported timeout_seconds/turn_timeout_seconds; native remote execution uses the existing scripts/remote_agent.sh AgentSpec transport",
+        "branch only on the typed outcome; on still_running or client disconnect use bounded await_offload_pass continuation without polling or background monitors",
+        "present the committed diff, scoped verification, and remaining gaps for coordinator branch-complete /wb-review-slice over all landed product commits; /wb-review-code remains optional in-lane smoke; no fallback or automatic merge"
+      ]
+    },
+    {
+      "command_id": "wb-harness",
+      "skill": "workbay",
+      "mode": "guide",
+      "makefile_target": "(in-session harness control; no standalone make target)",
+      "description": "Post-install WorkBay controls from the harness (embeddings on/off/status).",
+      "execution_context": "Use when the operator wants to check or toggle semantic embeddings without editing `.workbay/embedding.env` by hand.",
+      "argument_schema": [
+        {
+          "name": "subcommand",
+          "required": false,
+          "description": "Optional tail after `/wb-harness`; today only `embeddings` is supported on positional harnesses."
+        },
+        {
+          "name": "embeddings-action",
+          "required": false,
+          "description": "With `embeddings`: `on`, `off`, or `status`. Claude Code uses AskUserQuestion instead of positional args."
+        }
+      ],
+      "loop": [
+        "resolve the consumer workspace root (bootstrap install target)",
+        "on Claude Code, AskUserQuestion menu for embeddings status/on/off",
+        "else parse `/wb-harness embeddings <on|off|status>`",
+        "delegate to `workbay embeddings --status|--enable|--disable` (cwd=workspace root; bootstrap alias is deprecated)",
+        "summarize enabled/disabled state and source for the operator"
+      ]
+    },
+    {
+      "command_id": "wb-ux-map",
+      "skill": "ux-map",
+      "mode": "guide",
+      "makefile_target": "(in-session advisory skill; no standalone make target)",
+      "description": "Text-first UX map: author/render/critique .uxmap.json inventory and optional FREEFORM flow projection.",
+      "execution_context": "Use when decomposing SPA/Workbench UI work from screens/zones/states/flows, editing .uxmap.json, or running heuristic critique before UI slices.",
+      "argument_schema": [
+        {
+          "name": "map-ref",
+          "required": false,
+          "description": "Optional map_ref under maps-dir (e.g. workbench-operator-loop, roster-people)."
+        },
+        {
+          "name": "path",
+          "required": false,
+          "description": "Optional explicit path to a .uxmap.json file."
+        },
+        {
+          "name": "action",
+          "required": false,
+          "description": "Optional focus: inventory | render | critique | project | dogfood."
+        }
+      ],
+      "loop": [
+        "locate map SSOT (package fixture or consumer docs/ux-maps via --workspace-root/--maps-dir)",
+        "load or upsert .uxmap.json; author jobs→screens→zones→states→actions→flows",
+        "render Markdown (ASCII+Mermaid) for PR/task-plan paste",
+        "run critique; fix high/medium before UI slice-start; optional emit to handoff when task_ref set",
+        "optional project_ux_flow for FREEFORM spatial review; never reverse-sync canvas→map"
+      ]
+    },
+    {
+      "command_id": "scope",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-scope",
+      "description": "Removed command id. Use /wb-scope.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-scope"
+    },
+    {
+      "command_id": "refactor",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-refactor",
+      "description": "Removed command id. Use /wb-refactor.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-refactor"
+    },
+    {
+      "command_id": "auto-fix",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-auto-fix",
+      "description": "Removed command id. Use /wb-auto-fix.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-auto-fix"
+    },
+    {
+      "command_id": "branch-lifecycle",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-land",
+      "description": "Removed command id. Use /wb-land.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-land"
+    },
+    {
+      "command_id": "branch-review",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-review-code",
+      "description": "Removed command id. Use /wb-review-code.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-review-code"
+    },
+    {
+      "command_id": "handoff-lifecycle",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-handoff",
+      "description": "Removed command id. Use /wb-handoff.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-handoff"
+    },
+    {
+      "command_id": "investigate",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-investigate",
+      "description": "Removed command id. Use /wb-investigate.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-investigate"
+    },
+    {
+      "command_id": "incremental-implementation",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-implement",
+      "description": "Removed command id. Use /wb-implement.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-implement"
+    },
+    {
+      "command_id": "plan-analyze",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-draft",
+      "description": "Removed command id. Use /wb-draft.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-draft"
+    },
+    {
+      "command_id": "planning-review",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-review-plan",
+      "description": "Removed command id. Use /wb-review-plan.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-review-plan"
+    },
+    {
+      "command_id": "review-parallel",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-review-slice",
+      "description": "Removed command id. Use /wb-review-slice.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-review-slice"
+    },
+    {
+      "command_id": "tdd",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-tdd",
+      "description": "Removed command id. Use /wb-tdd.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-tdd"
+    },
+    {
+      "command_id": "offload",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-offload",
+      "description": "Removed command id. Use /wb-offload.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-offload"
+    },
+    {
+      "command_id": "workbay",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-harness",
+      "description": "Removed command id. Use /wb-harness.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-harness"
+    },
+    {
+      "command_id": "ux-map",
+      "skill": "wb-tombstone",
+      "mode": "guide",
+      "makefile_target": "Use /wb-ux-map",
+      "description": "Removed command id. Use /wb-ux-map.",
+      "execution_context": "in-session",
+      "argument_schema": [],
+      "loop": [
+        "announce the replacement id and stop"
+      ],
+      "tombstone": true,
+      "replaces": "wb-ux-map"
+    }
+  ],
+  "hooks": [
+    {
+      "hook_id": "compact-session",
+      "description": "Managed stop-hook adapter declarations for compact-session wiring.",
+      "trigger": "stop",
+      "required_artifacts": [
+        {
+          "kind": "file",
+          "consumer_path": "scripts/hooks/compact-session.py"
+        }
+      ],
+      "profiles": [
+        "all"
+      ],
+      "adapters": [
+        {
+          "harness": "claude-code",
+          "target": ".claude/settings.local.json",
+          "write_kind": "user_owned_local",
+          "opt_in_flag": "--install-claude-stop-hook-local",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.Stop",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/compact-session.py\""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "harness": "codex",
+          "target": ".codex/hooks/stop.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-codex-stop-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.Stop",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "command": "{{consumer_root}}/scripts/hooks/compact-session.py"
+            }
+          }
+        },
+        {
+          "harness": "vscode",
+          "target": ".vscode/workbay-stop-hooks.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-vscode-stop-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.Stop",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "command": "{{consumer_root}}/scripts/hooks/compact-session.py"
+            }
+          }
+        },
+        {
+          "harness": "grok",
+          "target": ".grok/hooks/stop.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-grok-stop-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.Stop",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "python3 \"{{consumer_root}}/scripts/hooks/compact-session.py\"",
+                  "env": {
+                    "WORKBAY_HANDOFF_HARNESS": "grok"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook_id": "reinject-context",
+      "description": "Managed SessionStart adapter declarations for handoff.db context re-injection (internal / implementation note).",
+      "trigger": "session-start",
+      "supported_harnesses": [
+        "claude-code"
+      ],
+      "rationale": "Re-injection relies on SessionStart stdout being added to model context, which only Claude Code provides today; the internal generated session_start family for codex/vscode is always-on (no install-time opt-in) and its injection semantic is unverified there. Revisit when an opt-in surface or verified injection semantic exists.",
+      "required_artifacts": [
+        {
+          "kind": "file",
+          "consumer_path": "scripts/hooks/reinject-context.py"
+        }
+      ],
+      "profiles": [
+        "all"
+      ],
+      "adapters": [
+        {
+          "harness": "claude-code",
+          "target": ".claude/settings.local.json",
+          "write_kind": "user_owned_local",
+          "opt_in_flag": "--install-claude-reinject-hook-local",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/reinject-context.py\""
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook_id": "ensure-agent-surfaces",
+      "description": "Fresh-clone self-heal: regenerate gitignored agent surfaces (plugins-build + generate-agent-workflows) when missing.",
+      "trigger": "session-start",
+      "supported_harnesses": [
+        "codex",
+        "vscode",
+        "grok"
+      ],
+      "rationale": "Script body ships once under scripts/hooks/ (shared, already fenced). Claude base always-on registration is harness-protocol session_start / settings.hooks.json (wholesale write) — NO claude-code adapter here, which would double-register against that base. Non-claude adapters mirror compact-session multi-harness shape and are opt-in only so a harness with no selected adapter registers nothing (no crash).",
+      "required_artifacts": [
+        {
+          "kind": "file",
+          "consumer_path": "scripts/hooks/ensure-agent-surfaces.sh"
+        }
+      ],
+      "profiles": [
+        "all"
+      ],
+      "adapters": [
+        {
+          "harness": "codex",
+          "target": ".codex/hooks/session_start.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-codex-ensure-agent-surfaces-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "command": "bash {{consumer_root}}/scripts/hooks/ensure-agent-surfaces.sh"
+            }
+          }
+        },
+        {
+          "harness": "vscode",
+          "target": ".vscode/workbay-session-start-hooks.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-vscode-ensure-agent-surfaces-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "command": "bash {{consumer_root}}/scripts/hooks/ensure-agent-surfaces.sh"
+            }
+          }
+        },
+        {
+          "harness": "grok",
+          "target": ".grok/hooks/session_start.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-grok-ensure-agent-surfaces-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.hooks.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "bash \"{{consumer_root}}/scripts/hooks/ensure-agent-surfaces.sh\""
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

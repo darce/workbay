@@ -1,0 +1,12 @@
+name: scope
+scope: harness
+description: Use for new-feature intake with missing decision-changing constraints. Owns scope, success criteria, boundaries, and the decision trail.
+mode: advisory
+context_budget: 60
+makefile_target: null
+mcp_tools:
+- record_event
+tdd_gate: false
+generator:
+  claude_overrides:
+    disable-model-invocation: false

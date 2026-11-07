@@ -1,0 +1,14 @@
+name: tdd
+scope: harness
+description: Use for the per-behavior RED -> GREEN -> REFACTOR loop before production edits, reusing reproducible failing evidence and selecting economical checks.
+mode: execution
+context_budget: 90
+makefile_target: slice-start
+mcp_tools:
+- record_event
+- search_handoff
+- find_related_prior_work
+tdd_gate: true
+generator:
+  claude_overrides:
+    disable-model-invocation: false
