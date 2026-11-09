@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.33] — 2026-11-09
+
+### Changed
+- Scope retained pass history before authenticating protected records, so unrelated branches cannot block source-history import or review collection; preserve proof holds for applicable and ambiguous history.
+
+## [0.3.32] — 2026-11-09
+
+### Changed
+- Scope retained pass history before authenticating protected records, so unrelated branches cannot block source-history import or review collection; preserve proof holds for applicable and ambiguous history.
+
 ## [0.3.31] — 2026-11-09
 
 - Resume pending native plan reviews by observing and collecting the original job, with immutable intent, typed delivery, and no duplicate submission.

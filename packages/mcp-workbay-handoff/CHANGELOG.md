@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.27] — 2026-11-09
+
+### Changed
+- Align the optional orchestrator dependency floor with the coupled WorkBay v0.1.89 release.
+
+## [0.3.26] — 2026-11-09
+
+### Changed
+- Align the optional orchestrator dependency floor with the coupled WorkBay v0.1.89 release.
+
 ## [0.3.25] — 2026-11-09
 
 - Bind plan-review outcomes to immutable subject bytes and retain migration 51 compatibility; upgrade the WorkBay components together.

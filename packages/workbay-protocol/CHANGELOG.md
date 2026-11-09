@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.12] — 2026-11-09
+
+### Changed
+- Reissue the protocol member in the immutable WorkBay v0.1.89 snapshot; protocol behavior is unchanged.
+
+## [0.3.11] — 2026-11-09
+
+### Changed
+- Reissue the protocol member in the immutable WorkBay v0.1.89 public snapshot; protocol behavior is unchanged.
+
 ## [0.3.10] — 2026-11-09
 
 - Qualify the shared protocol with the assembled WorkBay v0.1.88 component set.

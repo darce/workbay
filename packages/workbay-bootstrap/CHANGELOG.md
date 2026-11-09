@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.29] — 2026-11-09
+
+### Changed
+- Align protocol and system floors in the atomic WorkBay v0.1.89 member tuple.
+
+## [0.4.28] — 2026-11-09
+
+### Changed
+- Align protocol and system dependency floors for the WorkBay v0.1.89 public snapshot.
+
 ## [0.4.27] — 2026-11-09
 
 - Align bootstrap dependency floors with the qualified WorkBay v0.1.88 component set.

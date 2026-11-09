@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.19] — 2026-11-09
+
+### Changed
+- Align handoff and orchestrator dependency floors with the WorkBay v0.1.89 release.
+
+## [0.1.18] — 2026-11-09
+
+### Changed
+- Align handoff and orchestrator dependency floors with the WorkBay v0.1.89 release.
+
 ## [0.1.17] — 2026-11-09
 
 - Qualify installed Studio, Lab, and Fleet surfaces with the WorkBay v0.1.88 component set.

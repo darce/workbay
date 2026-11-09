@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.83] — 2026-11-09
+
+### Changed
+- Pin the v0.1.89 member tuple, including the scoped source-history fix and preserved native execution accounting.
+
+## [0.3.82] — 2026-11-09
+
+### Changed
+- Pin the v0.1.89 member tuple, including the scoped source-history fix and preserved native execution accounting.
+
 ## [0.3.81] — 2026-11-09
 
 - Pin the assembled WorkBay components to the matching v0.1.88 package versions.

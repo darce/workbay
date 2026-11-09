@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.29] — 2026-11-09
+
+### Changed
+- Align protocol floors in the atomic WorkBay v0.1.89 member tuple.
+
+## [0.4.28] — 2026-11-09
+
+### Changed
+- Align the protocol dependency floor and reissue the system member in the WorkBay v0.1.89 public snapshot.
+
 ## [0.4.27] — 2026-11-09
 
 - Provision present standalone Canvas sources during remote bootstrap while preserving CLI workspace separation and isolated origin checks.

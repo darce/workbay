@@ -1237,6 +1237,26 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
         raise RatchetRefused(unavailable, str(exc)) from exc
 
 
+def _historical_pass_branch(state: dict) -> str | None:
+    """Scope a scan from retained identity, without granting history authority.
+
+    Constructors may retain the branch only in lane_cycle_binding. Neither a
+    missing identity nor a contradictory outer/bound branch proves that a
+    record is foreign. Applicable records still require their original proof.
+    """
+    branch = state.get("branch")
+    binding = state.get("lane_cycle_binding")
+    if binding is not None and not isinstance(binding, dict):
+        raise RatchetRefused("review_ratchet_pass_subject_unavailable")
+    bound = (binding or {}).get("branch")
+    if (
+        any(value is not None and (not isinstance(value, str) or not value) for value in (branch, bound))
+        or (branch is not None and bound is not None and branch != bound)
+    ):
+        raise RatchetRefused("review_ratchet_pass_subject_unavailable")
+    return branch if branch is not None else bound
+
+
 def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict]:
     """Authenticate original synchronous and detached sources, never a count.
 
@@ -1252,6 +1272,7 @@ def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict
     from workbay_handoff_mcp.shared_schema import _get_db_connection
 
     from .adapters.remote_exec import _source_provenance_from_json
+    from .invocation_disposition import _json
     from .offload_pass import _detached_artifact_paths
     from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError
     from .review_cycle_dispatch import authority, enforce_route, registered_lane, trusted_policy
@@ -1432,9 +1453,10 @@ def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict
             detached_states.add(state_path)
         for path in sorted(config.state_dir.glob("offload-pass-*.json")):
             raw = path.read_bytes()
-            state = json.loads(raw)
-            if not isinstance(state, dict):
-                raise RatchetRefused(unavailable)
+            state = _json(raw)
+            record_branch = _historical_pass_branch(state)
+            if record_branch is not None and record_branch != subject_branch:
+                continue
             from .nonexecution_history import authenticated_nonexecution
 
             # Exact-record host recovery authority, never an untrusted label,
@@ -1572,6 +1594,19 @@ def load_context(
     retained = []
     from .invocation_disposition import _json, regular_bytes
 
+    def nonexecution_pass(pass_id: str, raw: bytes) -> bool:
+        from .nonexecution_history import authenticated_nonexecution
+
+        try:
+            if authenticated_superseded_native_history(repo, state_dir, pass_id, raw):
+                return True  # charged native rows remain in their accounting authority
+            return authenticated_nonexecution(repo, state_dir, pass_id, raw)
+        except RatchetRefused:
+            raise
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RatchetRefused("review_ratchet_nonexecution_proof_unavailable") from exc
+
+    foreign_passes = []
     for path in state_dir.glob("offload-pass-*.json"):
         try:
             raw = regular_bytes(path)
@@ -1581,24 +1616,24 @@ def load_context(
             # task or omitted before its charged history is authenticated.
             raise RatchetRefused("review_ratchet_retained_pass_unreadable") from exc
         if isinstance(prior, dict) and prior.get("task_ref") == task_ref:
-            from .nonexecution_history import authenticated_nonexecution
-
+            record_branch = _historical_pass_branch(prior)
             prior_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
-            try:
-                if authenticated_superseded_native_history(repo, state_dir, prior_pass_id, raw):
-                    continue  # an authenticated implementation charge, never whole-pass nonexecution
-                if authenticated_nonexecution(repo, state_dir, prior_pass_id, raw):
+            if record_branch is None or record_branch == branch:
+                if nonexecution_pass(prior_pass_id, raw):
                     continue
-            except RatchetRefused:
-                raise
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise RatchetRefused("review_ratchet_nonexecution_proof_unavailable") from exc
-            record_branch = prior.get("branch")
+            else:
+                # A separate review branch can inherit this subject below.
+                # Keep its identity for binding; open protected proof only if
+                # binding makes it applicable to the requested review.
+                foreign_passes.append((record_branch, prior_pass_id, raw, prior))
             try:
                 # Decode exactly as the receipt join does, retaining the raw
                 # record if decoding itself refuses on a foreign branch.
                 prior = review_pass_view(prior)
-                if eligible(prior) and history_reader.classify(prior, source="pass") == NONREVIEW_HISTORY:
+                if (
+                    record_branch in (None, branch) and eligible(prior)
+                    and history_reader.classify(prior, source="pass") == NONREVIEW_HISTORY
+                ):
                     continue
             except RatchetRefused as exc:
                 if not isinstance(record_branch, str) or record_branch == branch:
@@ -1674,6 +1709,15 @@ def load_context(
     for name, refusal in deferred_refusals.items():
         if name in subject_branches:
             raise refusal
+    for name, pass_id, raw, prior in foreign_passes:
+        if name not in subject_branches:
+            continue
+        if nonexecution_pass(pass_id, raw):
+            retained = [item for item in retained if item.get("pass_id") != pass_id]
+            continue
+        prior = review_pass_view(prior)
+        if eligible(prior) and history_reader.classify(prior, source="pass") == NONREVIEW_HISTORY:
+            retained = [item for item in retained if item.get("pass_id") != pass_id]
     candidates = [item for item in receipts if item[2]["identity"]["branch"] in subject_branches]
 
     def empty_context() -> ReviewContext | None:
