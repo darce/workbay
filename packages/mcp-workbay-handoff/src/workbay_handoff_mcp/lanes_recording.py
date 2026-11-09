@@ -7,6 +7,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -20,12 +21,14 @@ _log = logging.getLogger(__name__)
 
 # closed_stale is the reaper terminal status (schema CHECK + reclaim scans);
 # operators open/update through LANE_STATUSES; close_lane stays closed|merged.
-LANE_STATUSES = frozenset({"planned", "active", "blocked", "review", "merged", "closed", "closed_stale"})
+LANE_STATUSES = frozenset(
+    {"planned", "active", "blocked", "review", "validated", "gated", "merged", "closed", "closed_stale"}
+)
 CLOSEABLE_LANE_STATUSES = frozenset({"closed", "merged"})
 # Non-close writes must not set closed|merged: only close_lane runs the
 # lane_messages reclaimer (pruned_lane_messages). closed_stale remains for the
 # reaper CAS path via update/open round-trip [cs0166-r12-16].
-OPENABLE_LANE_STATUSES = frozenset({"planned", "active", "blocked", "review", "closed_stale"})
+OPENABLE_LANE_STATUSES = frozenset({"planned", "active", "blocked", "review", "validated", "gated", "closed_stale"})
 # SQL IN-list text for the lane terminal set, in sorted (process-stable) order.
 _TERMINAL_LANE_STATUS_SQL = ", ".join(f"'{status}'" for status in sorted(TERMINAL_LANE_STATUSES))
 
@@ -330,6 +333,13 @@ def open_lane(
     A terminal row may be reopened only with ``reopen_reason``; the reason is
     appended to notes as part of the guarded upsert.
     """
+    if status in {"validated", "gated"}:
+        return _envelope(
+            ok=False,
+            tool="open_lane",
+            data={"error": "native milestone permit required", "error_kind": "native_validation_required"},
+            entity="lane",
+        )
     parsed_landing, parsed_tip, parsed_source, identity_error = _parse_lane_identity(
         landing_commit_sha, branch_tip_sha, branch_tip_source
     )
@@ -384,6 +394,11 @@ def open_lane(
             resolved_owner = owner_agent or ctx.agent
         prepared_row = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         prepared_row = dict(prepared_row) if prepared_row is not None else None
+        from .validation_lane import policy_source_current
+
+        validation_fresh = (
+            policy_source_current(conn, prepared_row) if status == "merged" and prepared_row is not None else False
+        )
     binding = prepare_lane_binding(normalized_path, normalized_branch)
     # Serialize the special same-terminal-status upsert case with its check.
     with _get_db_connection(begin_immediate=True) as conn:
@@ -426,6 +441,17 @@ def open_lane(
                             "Use close_lane for closed|merged (reclaims lane_messages)."
                         )
                     },
+                    entity="lane",
+                )
+        if existing_before_upsert is not None and status == "merged":
+            from .validation_lane import transition_error
+
+            error = transition_error(conn, existing_before_upsert, status, source_current=validation_fresh)
+            if error:
+                return _envelope(
+                    ok=False,
+                    tool="open_lane",
+                    data={"error": error, "error_kind": "native_validation_required"},
                     entity="lane",
                 )
         try:
@@ -609,6 +635,7 @@ def update_lane(
     expected_branch_tip_sha: object = _EXPECTED_TIP_UNSET,
     expected_branch_tip_source: object = _EXPECTED_SOURCE_UNSET,
     event_id: str | None = None,
+    _validation_permit: object = None,
 ) -> dict[str, Any]:
     """Patch an existing worktree lane row.
 
@@ -760,6 +787,16 @@ def update_lane(
             where += " AND branch_tip_source IS ?"
             params.append(parsed_expected_source)
         prepared_row = dict(existing)
+    from .validation_lane import NativeReviewGate, fresh_qualified
+
+    validation_result = (
+        _validation_permit.validation if isinstance(_validation_permit, NativeReviewGate) else _validation_permit
+    )
+    validation_fresh = (
+        fresh_qualified(validation_result, Path(prepared_row["worktree_path"]))
+        if status in {"validated", "gated"}
+        else False
+    )
     binding = prepare_lane_binding(
         str(patch.get("worktree_path") or existing["worktree_path"]),
         str(patch.get("branch") or existing["branch"]),
@@ -770,6 +807,21 @@ def update_lane(
         )
         if replay is not None:
             return replay
+        from .validation_lane import persist_milestone, transition_error
+
+        current = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
+        if current is None:
+            return _lane_status_conflict("update_lane")
+        error = transition_error(conn, current, status, _validation_permit, source_current=validation_fresh)
+        if error:
+            return _envelope(
+                ok=False,
+                tool="update_lane",
+                data={"error": error, "error_kind": "native_validation_required"},
+                entity="lane",
+            )
+        if status in {"validated", "gated"}:
+            conn.execute("SAVEPOINT native_validation_milestone")
         try:
             cursor, lifecycle_resource = execute_lane_change(
                 conn,
@@ -790,8 +842,24 @@ def update_lane(
             if "released_no_work_row_is_terminal" not in str(exc):
                 raise
             return _lane_status_conflict("update_lane")
+        if status in {"validated", "gated"} and lifecycle_resource.get("knowledge") != "observed":
+            conn.execute("ROLLBACK TO native_validation_milestone")
+            conn.execute("RELEASE native_validation_milestone")
+            return _envelope(
+                ok=False,
+                tool="update_lane",
+                data={
+                    "error": "native milestone source/custody observation is unknown",
+                    "error_kind": "native_validation_required",
+                    "lifecycle_resource": lifecycle_resource,
+                },
+                entity="lane",
+            )
         if (expected_status is not None or expected_tip_supplied or expected_source_supplied) and cursor.rowcount == 0:
             return cas_conflict(_get_lane_row(conn, resolved_task_ref, normalized_lane_id))
+        if status in {"validated", "gated"}:
+            persist_milestone(conn, current, status, _validation_permit)
+            conn.execute("RELEASE native_validation_milestone")
         row = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         lane_dict = _row_to_dict(row)
         if lifecycle_resource["knowledge"] == "unknown":
@@ -898,6 +966,9 @@ def close_lane(
                 data={"error": f"Lane '{normalized_lane_id}' not found for task '{resolved_task_ref}'."},
                 entity="lane",
             )
+        from .validation_lane import policy_source_current
+
+        validation_fresh = policy_source_current(conn, existing) if status == "merged" else False
         prepared_row = dict(existing)
     binding = prepare_lane_binding(existing["worktree_path"], existing["branch"])
     with _get_db_connection(begin_immediate=True) as conn:
@@ -906,6 +977,22 @@ def close_lane(
         )
         if replay is not None:
             return replay
+        from .validation_lane import transition_error
+
+        current = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
+        if current is None:
+            return _lane_status_conflict("close_lane")
+        error = transition_error(conn, current, status, source_current=validation_fresh)
+        if error:
+            return _envelope(
+                ok=False,
+                tool="close_lane",
+                data={"error": error, "error_kind": "native_validation_required"},
+                entity="lane",
+            )
+        native_merge = status == "merged" and current["status"] == "gated"
+        if native_merge:
+            conn.execute("SAVEPOINT native_validation_merge")
         try:
             _, lifecycle_resource = execute_lane_change(
                 conn,
@@ -946,6 +1033,21 @@ def close_lane(
             if "released_no_work_row_is_terminal" not in str(exc):
                 raise
             return _lane_status_conflict("close_lane")
+        if native_merge:
+            if lifecycle_resource.get("knowledge") != "observed":
+                conn.execute("ROLLBACK TO native_validation_merge")
+                conn.execute("RELEASE native_validation_merge")
+                return _envelope(
+                    ok=False,
+                    tool="close_lane",
+                    data={
+                        "error": "native merge source/custody observation is unknown",
+                        "error_kind": "native_validation_required",
+                        "lifecycle_resource": lifecycle_resource,
+                    },
+                    entity="lane",
+                )
+            conn.execute("RELEASE native_validation_merge")
         # Steady-state reclaimer (internal S1): brief/inbox rows have
         # no other deletion path, so a terminal lane status reclaims its inbox to
         # bound accumulation. S1-A-003: prune only already-terminal messages

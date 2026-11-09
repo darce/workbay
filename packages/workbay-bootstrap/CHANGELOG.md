@@ -3,6 +3,17 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.27] — 2026-11-09
+
+- Align bootstrap dependency floors with the qualified WorkBay v0.1.88 component set.
+
+### Changed
+- Require workbay-system 0.4.26 so linked consumers receive the matching shipped planning-review and deterministic anchor-lint surfaces with the v0.1.88 SDK family.
+
+### Added
+- Add `workbay-bootstrap provision-configured-hooks --target ABS [--check] [--json]`, lazily delegating to `workbay_bootstrap.configured_hooks.provision_configured_hooks(*, target: Path, check: bool = False)`.
+- Add `workbay-bootstrap provision-hook-helpers --target ABS --helper advise-worktree-cd [--check] [--json]` to provision only missing shipped helper files and their local Python dependencies from the installed `workbay-system` payload.
+
 ## [0.4.25] — 2026-11-07
 
 ### Changed

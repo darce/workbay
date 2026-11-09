@@ -1,6 +1,6 @@
 {
   "id": "orchestrator_lifecycle",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Hierarchical (Harel) lifecycle statechart: outer task machine with nested lane machine under the in-flight region. Static checker and phase-1 lane upsert edge guard; not a runtime interpreter.",
   "allowed_evidence_classes": [
     "commit_ancestry",
@@ -12,7 +12,9 @@
   "outer": {
     "id": "task_machine",
     "initial": "scoping",
-    "terminals": ["closed"],
+    "terminals": [
+      "closed"
+    ],
     "states": [
       "scoping",
       "planned",
@@ -35,7 +37,11 @@
     },
     "nested_region": {
       "id": "in_flight",
-      "parent_states": ["branch_open", "slice_open", "slice_review"],
+      "parent_states": [
+        "branch_open",
+        "slice_open",
+        "slice_review"
+      ],
       "child_machine": "lane_machine",
       "description": "In-flight region spans branch/slice work through slice_review until lanes are terminal; exits toward branch_review require child-terminal evidence."
     },
@@ -83,12 +89,19 @@
       {
         "id": "t_slice_review_exit",
         "from": "slice_review",
-        "to": ["slice_open", "branch_review"],
+        "to": [
+          "slice_open",
+          "branch_review"
+        ],
         "guard": {
           "predicate_id": "slice_gate_verdict",
           "evidence_class": "findings_count",
           "description": "Slice gate clean (require_clean_slice): open findings closed; either admit next slice or leave in-flight toward branch review. Leaving to branch_review consumes child-terminal evidence.",
-          "child_evidence_sources": ["merged", "closed", "closed_stale"]
+          "child_evidence_sources": [
+            "merged",
+            "closed",
+            "closed_stale"
+          ]
         }
       },
       {
@@ -99,7 +112,11 @@
           "predicate_id": "all_lanes_terminal",
           "evidence_class": "machine_terminal_outcome",
           "description": "Every lane has reached a child terminal (merged or closed); parent may leave in-flight.",
-          "child_evidence_sources": ["merged", "closed", "closed_stale"]
+          "child_evidence_sources": [
+            "merged",
+            "closed",
+            "closed_stale"
+          ]
         }
       },
       {
@@ -110,7 +127,9 @@
           "predicate_id": "close_check_clean",
           "evidence_class": "findings_count",
           "description": "make close-check reports readiness: findings closed, integrity clean.",
-          "child_evidence_sources": ["merged"]
+          "child_evidence_sources": [
+            "merged"
+          ]
         }
       },
       {
@@ -128,12 +147,18 @@
   "child": {
     "id": "lane_machine",
     "initial": "planned",
-    "terminals": ["merged", "closed", "closed_stale"],
+    "terminals": [
+      "merged",
+      "closed",
+      "closed_stale"
+    ],
     "states": [
       "planned",
       "active",
       "blocked",
       "review",
+      "validated",
+      "gated",
       "merged",
       "closed",
       "closed_stale"
@@ -304,6 +329,156 @@
           "predicate_id": "tip_moved_after_close",
           "evidence_class": "machine_observation",
           "description": "lane_reaping.py:_reopen_moved_closed_row uses lane_retire_sweep.py:_close_lane_cas(target_status=blocked) when a closed or closed_stale lane's authorized tip moves."
+        }
+      },
+      {
+        "id": "t_lane_active_to_validated",
+        "from": "active",
+        "to": "validated",
+        "guard": {
+          "predicate_id": "fresh_full_battery_qualified",
+          "evidence_class": "machine_observation",
+          "description": "Active policy only: fresh source-bound full40377 qualified PASS from production battery."
+        }
+      },
+      {
+        "id": "t_lane_review_to_validated",
+        "from": "review",
+        "to": "validated",
+        "guard": {
+          "predicate_id": "fresh_full_battery_qualified",
+          "evidence_class": "machine_observation",
+          "description": "Active policy only: fresh source-bound full40377 qualified PASS; legacy review is not qualification."
+        }
+      },
+      {
+        "id": "t_lane_blocked_to_validated",
+        "from": "blocked",
+        "to": "validated",
+        "guard": {
+          "predicate_id": "fresh_full_battery_qualified",
+          "evidence_class": "machine_observation",
+          "description": "Fresh battery evidence does not clear custody/recovery holds; gate remains separate."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_gated",
+        "from": "validated",
+        "to": "gated",
+        "guard": {
+          "predicate_id": "strict_review_and_holds_satisfied",
+          "evidence_class": "machine_observation",
+          "description": "Active policy only: exact validated source, applicable strict review, existing verification and custody/recovery holds satisfied."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_merged",
+        "from": "gated",
+        "to": "merged",
+        "guard": {
+          "predicate_id": "lane_merged_to_task_branch",
+          "evidence_class": "machine_observation",
+          "description": "Existing landing/ancestry and custody checks still apply after gating."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_active",
+        "from": "validated",
+        "to": "active",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_blocked",
+        "from": "validated",
+        "to": "blocked",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_review",
+        "from": "validated",
+        "to": "review",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_closed",
+        "from": "validated",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_validated_to_closed_stale",
+        "from": "validated",
+        "to": "closed_stale",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_active",
+        "from": "gated",
+        "to": "active",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_blocked",
+        "from": "gated",
+        "to": "blocked",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_review",
+        "from": "gated",
+        "to": "review",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_closed",
+        "from": "gated",
+        "to": "closed",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
+        }
+      },
+      {
+        "id": "t_lane_gated_to_closed_stale",
+        "from": "gated",
+        "to": "closed_stale",
+        "guard": {
+          "predicate_id": "validation_invalidated",
+          "evidence_class": "machine_observation",
+          "description": "Work/recovery/cancellation invalidates gating; existing holds remain."
         }
       }
     ]

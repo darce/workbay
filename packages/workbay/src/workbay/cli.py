@@ -118,6 +118,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             return plugin(argv[1:])
 
+    if argv and argv[0] in {"studio", "canvas"} and argv[0] not in bootstrap_names:
+        print(
+            f"workbay: '{argv[0]}' is not installed in this environment; from a checkout run: "
+            "bash scripts/install-workbay-studio.sh <checkout>",
+            file=sys.stderr,
+        )
+        return 2
+
     # Lazy import so ``import workbay.cli`` does not hard-require the bootstrap
     # distribution at module load (keeps the pure argv transform importable on
     # its own and testable without the full dependency tree).

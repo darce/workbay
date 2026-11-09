@@ -34,6 +34,7 @@ from pathlib import Path
 
 from workbay_bootstrap.activation import write_plugin_activation
 from workbay_bootstrap.adopt import _materialize_cursor_mcp_config
+from workbay_bootstrap.claude_settings import ClaudePermissionError, load_plugin_override_manifest
 from workbay_bootstrap.harnesses import (
     _file_has_bytes,
     materialize_cursor_plugin,
@@ -138,6 +139,10 @@ def bootstrap_surfaces(*, target: Path, primary: Path | None = None) -> dict[str
     # stays healable via doctor --apply / a later task-start) rather than
     # tracebacking out into the CLI or the task-start runner.
     try:
+        # The generator strips bootstrap-owned components. Validate before any
+        # emission so malformed declarations cannot become successful receipts.
+        load_plugin_override_manifest(_override_root(target))
+
         # Scope addendum (internal) — shared doc/hook surfaces.
         # The generated passes below emit plugins/prompts/cursor only; the
         # gitignored install.SHARED_SURFACES symlink set — docs/workbay/rules
@@ -195,7 +200,7 @@ def bootstrap_surfaces(*, target: Path, primary: Path | None = None) -> dict[str
                     configs.append(cursor_mcp)
             configs.append(write_plugin_activation("cursor", target, clone=payload_root))
             steps.append({"step": "cursor", "ok": True})
-    except (subprocess.SubprocessError, OSError) as exc:
+    except (subprocess.SubprocessError, OSError, ClaudePermissionError) as exc:
         steps.append({"step": "emit", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
         return {
             "ok": False,

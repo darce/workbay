@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,11 @@ from typing import Any
 import resolver
 
 from . import _common
+
+try:
+    from ..plan_review_freeze import plan_bytes
+except ImportError:  # direct lifecycle runner exposes handlers at top level
+    from plan_review_freeze import plan_bytes
 
 
 PLANNING_DIR_PREFIXES: tuple[str, ...] = (
@@ -48,6 +55,8 @@ class PlanBaselineStatus:
     # implementation note S1: open planning findings for other plan subjects under the
     # same task_ref. Informational only — does not block acceptance.
     open_planning_findings_other_subjects: int | None = None
+    reviewed_subject_sha256: str | None = None
+    review_run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -123,21 +132,27 @@ def _plan_untracked_on_main(repo: Path, plan_path: str) -> bool:
     return any(line == f"?? {plan_path}" for line in proc.stdout.splitlines())
 
 
-def query_latest_planning_verdict(
+def query_latest_planning_run(
     repo: Path,
     *,
     task_ref: str,
     subject_path: str,
-) -> tuple[str | None, bool]:
+) -> tuple[dict | None, bool]:
     argv = [
         _common.mcp_handoff_bin(),
-        "--workspace-root", str(_workspace(repo)),
+        "--workspace-root",
+        str(_workspace(repo)),
         "review-runs",
-        "--operation", "list",
-        "--task-ref", task_ref,
-        "--subject-path", subject_path,
-        "--review-mode", "planning",
-        "--limit", "1",
+        "--operation",
+        "list",
+        "--task-ref",
+        task_ref,
+        "--subject-path",
+        subject_path,
+        "--review-mode",
+        "planning",
+        "--limit",
+        "1",
     ]
     proc = _common.run_subprocess(argv)
     if proc.returncode != 0:
@@ -153,8 +168,13 @@ def query_latest_planning_verdict(
     if not isinstance(rows, list) or not rows:
         return None, True
     first = rows[0] if isinstance(rows[0], dict) else {}
-    verdict = first.get("verdict")
-    return (str(verdict) if verdict else None), True
+    return first, True
+
+
+def query_latest_planning_verdict(repo: Path, *, task_ref: str, subject_path: str) -> tuple[str | None, bool]:
+    row, ok = query_latest_planning_run(repo, task_ref=task_ref, subject_path=subject_path)
+    verdict = row.get("verdict") if row else None
+    return (str(verdict) if verdict else None), ok
 
 
 def query_open_planning_finding_count(
@@ -388,11 +408,7 @@ def evaluate_plan_baseline(
             # Fail closed when either probe fails despite cat-file presence:
             # treat as stale so we never report already_accepted on unknown
             # content equality.
-            if (
-                main_sha is None
-                or source_sha is None
-                or main_sha != source_sha
-            ):
+            if main_sha is None or source_sha is None or main_sha != source_sha:
                 baseline_stale_vs_source = True
         if not baseline_stale_vs_source:
             # Identical blobs, or plan absent on the source branch: keep the
@@ -468,9 +484,12 @@ def evaluate_plan_baseline(
 
     source_branch_state = "plan_present" if target_exists else "plan_untracked_on_main"
 
-    verdict, verdict_ok = query_latest_planning_verdict(
-        repo, task_ref=evidence_task_ref, subject_path=plan_path,
+    review_run, verdict_ok = query_latest_planning_run(
+        repo,
+        task_ref=evidence_task_ref,
+        subject_path=plan_path,
     )
+    verdict = review_run.get("verdict") if review_run else None
     if not verdict_ok:
         detail_reason = "baseline_query_failed"
         return PlanBaselineStatus(
@@ -532,42 +551,24 @@ def evaluate_plan_baseline(
         # operator can adopt it auditably; more than one is ambiguous and we
         # refuse to guess; candidates that never passed fall back to a bare
         # re-review instruction.
-        eligible = [
-            candidate
-            for candidate in candidate_review_task_refs
-            if candidate.get("verdict") == "pass"
-        ]
+        eligible = [candidate for candidate in candidate_review_task_refs if candidate.get("verdict") == "pass"]
         if len(eligible) == 1:
             detail_reason = "wrong_ref_review_run"
             next_command = build_acceptance_next_command(
                 task_ref,
                 plan_path=plan_path,
-                source_branch=(
-                    "main"
-                    if untracked_on_main and not target_exists
-                    else (branch or "main")
-                ),
+                source_branch=("main" if untracked_on_main and not target_exists else (branch or "main")),
                 local=untracked_on_main and not target_exists,
                 review_task_ref=str(eligible[0]["task_ref"]),
             )
-            safe_next_commands = [
-                {"command": next_command, "reason": "wrong_ref_review_run_recoverable"}
-            ]
+            safe_next_commands = [{"command": next_command, "reason": "wrong_ref_review_run_recoverable"}]
         elif len(eligible) > 1:
             detail_reason = "ambiguous_review_candidates"
             next_command = None
             safe_next_commands = []
         else:
-            detail_reason = (
-                "wrong_ref_review_run"
-                if candidate_review_task_refs
-                else "planning_verdict_not_pass"
-            )
-            next_command = (
-                build_planning_review_command(plan_path)
-                if candidate_review_task_refs
-                else None
-            )
+            detail_reason = "wrong_ref_review_run" if candidate_review_task_refs else "planning_verdict_not_pass"
+            next_command = build_planning_review_command(plan_path) if candidate_review_task_refs else None
             safe_next_commands = _safe_next_commands(
                 task_ref=task_ref,
                 plan_path=plan_path,
@@ -618,8 +619,56 @@ def evaluate_plan_baseline(
             ),
         )
 
+    # A final insert or caller-supplied hash cannot establish what the reviewer
+    # received. Only the authoritative pre-review freeze completed by CAS can.
+    binding_reason = "review_subject_unbound"
+    reviewed_digest = None
+    try:
+        pin = json.loads(review_run.get("judge_pin_json") or "{}")
+        subject = pin.get("plan_review_subject") if isinstance(pin, dict) else None
+        if (
+            isinstance(subject, dict)
+            and subject.get("schema") == "workbay/plan-review-subject@1"
+            and pin.get("plan_review_completed") is True
+            and subject.get("review_run_id") == review_run.get("review_run_id")
+            and subject.get("freeze_id") == review_run.get("review_run_id")
+            and subject.get("task_ref") == evidence_task_ref
+            and subject.get("subject_path") == plan_path
+            and subject.get("subject_sha256") == review_run.get("subject_sha")
+            and isinstance(review_run.get("subject_sha"), str)
+            and len(review_run["subject_sha"]) == 64
+            and all(c in "0123456789abcdef" for c in review_run["subject_sha"])
+        ):
+            reviewed_digest = review_run["subject_sha"]
+            actual = plan_bytes(repo, plan_path, branch if target_exists else None)
+            binding_reason = (
+                None if hashlib.sha256(actual).hexdigest() == reviewed_digest else "review_subject_bytes_changed"
+            )
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        binding_reason = "review_subject_unavailable"
+    if binding_reason:
+        return PlanBaselineStatus(
+            task_ref=task_ref,
+            task_plan_path=plan_path,
+            baseline_exists_on_main=baseline_exists,
+            plan_exists_on_target_branch=target_exists,
+            plan_untracked_on_main=untracked_on_main,
+            latest_planning_verdict=verdict,
+            open_planning_findings=None,
+            acceptance_ready=False,
+            mcp_available=True,
+            baseline_status="stale" if baseline_stale_vs_source else "missing",
+            reason=binding_reason,
+            detail_reason=binding_reason,
+            next_command=build_planning_review_command(plan_path),
+            source_branch_state=source_branch_state,
+            review_task_ref=review_ref,
+        )
+
     findings_result = query_open_planning_finding_count(
-        repo, task_ref=evidence_task_ref, plan_path=plan_path,
+        repo,
+        task_ref=evidence_task_ref,
+        plan_path=plan_path,
     )
     # plan_path is always non-empty here, so the subject-scoped triple is returned.
     findings_count, other_subjects_count, findings_ok = findings_result  # type: ignore[misc]
@@ -681,9 +730,7 @@ def evaluate_plan_baseline(
         # routes through the normal readiness/apply path rather than the
         # already_accepted no-op success.
         detail_reason = "baseline_stale_vs_source"
-        next_command = build_acceptance_next_command(
-            task_ref, review_task_ref=review_ref
-        )
+        next_command = build_acceptance_next_command(task_ref, review_task_ref=review_ref)
         return PlanBaselineStatus(
             task_ref=task_ref,
             task_plan_path=plan_path,
@@ -693,6 +740,8 @@ def evaluate_plan_baseline(
             latest_planning_verdict=verdict,
             open_planning_findings=findings_count,
             acceptance_ready=True,
+            reviewed_subject_sha256=reviewed_digest,
+            review_run_id=review_run["review_run_id"],
             mcp_available=True,
             baseline_status="stale",
             reason="baseline_stale_vs_source",
@@ -710,9 +759,7 @@ def evaluate_plan_baseline(
         )
 
     detail_reason = (
-        "untracked_draft_on_main"
-        if untracked_on_main and not target_exists
-        else "accepted_baseline_missing"
+        "untracked_draft_on_main" if untracked_on_main and not target_exists else "accepted_baseline_missing"
     )
     next_command = (
         build_acceptance_next_command(
@@ -734,6 +781,8 @@ def evaluate_plan_baseline(
         latest_planning_verdict=verdict,
         open_planning_findings=findings_count,
         acceptance_ready=True,
+        reviewed_subject_sha256=reviewed_digest,
+        review_run_id=review_run["review_run_id"],
         mcp_available=True,
         baseline_status="missing",
         reason="plan_baseline_missing",

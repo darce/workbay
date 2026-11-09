@@ -82,6 +82,13 @@ from workbay_bootstrap.worktree import (
 _GENERATOR_INPUT_SURFACES = frozenset(surfaces_for_kind("generator_input"))
 
 
+def validate_overrides(*, override_root: Path) -> None:
+    """Validate plugin overrides, including bootstrap-owned Claude components."""
+    from workbay_bootstrap.claude_settings import load_plugin_override_manifest
+
+    load_plugin_override_manifest(override_root)
+
+
 def _is_under(surface: str, child: str) -> bool:
     return child == surface or child.startswith(surface + "/")
 

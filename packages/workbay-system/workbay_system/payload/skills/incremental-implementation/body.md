@@ -22,6 +22,7 @@ Advance one bounded plan item with a complete end-to-end slice that starts with 
 
 ## Canonical Policy
 
+- [Frozen acceptance qualification](../../docs/workbay/rules/frozen-acceptance-qualification.md) owns independent original-case qualification and the packet carried into review or repair.
 - [../../../docs/workbay/rules/development-workflow.md](../../../docs/workbay/rules/development-workflow.md)
 - [../../../docs/workbay/lifecycle-map.md](../../../docs/workbay/lifecycle-map.md)
 
@@ -29,7 +30,7 @@ This skill owns slice sizing, vertical-path discipline, and plan-item advancemen
 
 ## Core Process
 
-1. Load the active task plan and identify the next slice worth shipping. If prior slices are unclear, use `search_handoff` to find the latest slice summaries first (tokens/IDs only). When mining prior art by paraphrase / like-this, call `find_related_prior_work` — do not invent FTS synonyms — and read `status` / `embeddings_mode` / `semantic_degrade_reason` before treating empty `results` as "nothing similar."
+1. Load the active task plan and identify the next slice worth shipping. Before authoring, apply [frozen acceptance qualification steps 1–2](../../docs/workbay/rules/frozen-acceptance-qualification.md#required-order): the independent coordinator holds the original criteria/cases and the observer computes the baseline where possible; name prose-only and runtime gaps. If prior slices are unclear, use `search_handoff` to find the latest slice summaries first (tokens/IDs only). When mining prior art by paraphrase / like-this, call `find_related_prior_work` — do not invent FTS synonyms — and read `status` / `embeddings_mode` / `semantic_degrade_reason` before treating empty `results` as "nothing similar."
 2. Advance the slice cursor with `plan_cursor(operation="upsert", task_ref=..., plan_item_id=..., require_clean_slice=true)`. The `require_clean_slice` guard means the next slice does not start while open findings still exist on the prior one.
 3. Define the smallest end-to-end path that delivers user value. Prefer one behavior path such as one field, one endpoint, one UI state, or one docs workflow step. When writing the slice's checklist items, include explicit evidence anchors in each item's body — a backtick-quoted file path, a `make <target>` reference, a `Slice N` reference, or a recorded decision id — so the post-slice `sync-task-plan-checklist` recipe can resolve the item to its proof. When a codebase-graph MCP is connected, use the [Codebase-graph capability](#codebase-graph-capability-optional) block during sizing (`get_architecture` / `trace_path` / `detect_changes`).
 4. Open the slice with the `tdd` skill: write the failing test first, run `make slice-start TASK=<task-ref> TEST_CMD="<command>"`, then make the smallest change that turns the check green.
@@ -37,7 +38,7 @@ This skill owns slice sizing, vertical-path discipline, and plan-item advancemen
 6. Implement the minimum to make the path work end to end. Keep each layer thin enough that the test still explains the whole diff. When the slice touches a shared contract, payload shape, status code, envelope, or enum, follow [contract-change-checklist.md](../../../docs/workbay/rules/contract-change-checklist.md) and update the owning contract in the same slice.
 7. Re-run the targeted checks and record passing evidence with `record_event(event={"event_kind": "test_result", "passed": true, ...})`.
 8. Check the diff boundary and the **Produce-first shape gate** above. If the change now spans multiple independent user paths or grows a second responsibility, split it before commit. Before `make slice-commit`, run `detect_changes` (codebase-graph MCP when connected) to confirm the diff footprint matches the intended slice and there is no accidental blast radius.
-9. Close the slice with `make slice-commit TASK=<task-ref> MSG="..."`, then refresh task context if more slices remain.
+9. Close the slice with `make slice-commit TASK=<task-ref> MSG="..."`. Before model merge review or repair dispatch, the independent owner computes original evaluations on that exact candidate and supplies the [minimum packet](../../docs/workbay/rules/frozen-acceptance-qualification.md#minimum-independent-packet); author tests are supporting evidence only. Apply the rule's classification and repetition checks before advancing, then refresh task context if more slices remain.
 
 **Refactoring cadence & scale cues** (each cue names the canon row it maps to, or says `workbay practice (no canon row)`; release pin and apply procedure live in the [heuristics canon pointer](../../../docs/workbay/rules/heuristics-canon.md); cite only the rows whose trigger fires in the slice):
 

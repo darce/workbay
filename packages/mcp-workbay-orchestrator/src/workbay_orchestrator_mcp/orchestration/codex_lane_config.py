@@ -394,3 +394,18 @@ PREFLIGHT_OVERRIDE_FILE = ".task-state/remote-preflight-override.json"
 PREFLIGHT_PROBE_MODEL_ENV = "WORKBAY_PREFLIGHT_PROBE_MODEL"
 PREFLIGHT_PROBE_MAX_LIVE_ENV = "WORKBAY_PREFLIGHT_MAX_LIVE_PROBES"
 PREFLIGHT_PROBE_MAX_LIVE = 2
+
+
+# Executable provisioning is a non-model handshake, never a paid Codex turn.
+# The remote process boundary observes these imports in the lane interpreter.
+EXECUTION_PREFLIGHT_IMPORTS = (
+    "workbay_protocol",
+    "workbay_handoff_mcp",
+    "workbay_orchestrator_mcp",
+)
+EXECUTION_PREFLIGHT_TIMEOUT_S = 20.0
+
+# Remote roots exist only after materialization. The model boundary replaces
+# this exact template with absolute roots before either native probe or exec.
+EXECUTION_PERMISSION_PROFILE = "workbay_execution"
+EXECUTION_PERMISSION_TEMPLATE = 'permissions.workbay_execution.extends=":workspace"'

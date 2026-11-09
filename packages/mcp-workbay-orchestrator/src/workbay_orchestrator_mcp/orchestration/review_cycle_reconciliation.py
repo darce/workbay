@@ -780,7 +780,7 @@ def bootstrap_holder_report(repo: Path, primary: Path, runtime, proof: dict, dat
 def reconcile(request: dict, *, repo: Path | None = None) -> LedgerDecision:
     """Typed public seam; preview is read-only and apply reauthenticates under CAS."""
     try:
-        if isinstance(request, dict) and request.get("operation") in {"terminal_preview", "terminal_apply"}:
+        if isinstance(request, dict) and request.get("operation") in {"terminal_preview", "terminal_apply", "source_preview", "source_apply"}:
             from .review_cycle_terminal_recovery import recover
 
             return recover(request, repo=Path(repo or Path.cwd()).resolve())

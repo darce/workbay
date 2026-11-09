@@ -1,0 +1,455 @@
+{
+  "$defs": {
+    "Action": {
+      "additionalProperties": false,
+      "description": "Action row.\n\n``costly`` / ``irreversible`` without ``preview_required`` is **allowed** here;\n[INT-07] is enforced by the S3 critique pack, not this model.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "verb": {
+          "title": "Verb",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "hierarchy": {
+          "$ref": "#/$defs/ActionHierarchy"
+        },
+        "costly": {
+          "default": false,
+          "title": "Costly",
+          "type": "boolean"
+        },
+        "irreversible": {
+          "default": false,
+          "title": "Irreversible",
+          "type": "boolean"
+        },
+        "preview_required": {
+          "default": false,
+          "title": "Preview Required",
+          "type": "boolean"
+        },
+        "screen_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Screen Id"
+        },
+        "code_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code Ref"
+        }
+      },
+      "required": [
+        "id",
+        "verb",
+        "target",
+        "hierarchy"
+      ],
+      "title": "Action",
+      "type": "object"
+    },
+    "ActionHierarchy": {
+      "enum": [
+        "primary",
+        "secondary",
+        "tertiary",
+        "destructive"
+      ],
+      "title": "ActionHierarchy",
+      "type": "string"
+    },
+    "Flow": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "job": {
+          "title": "Job",
+          "type": "string"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/FlowStep"
+          },
+          "title": "Steps",
+          "type": "array"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        }
+      },
+      "required": [
+        "id",
+        "job"
+      ],
+      "title": "Flow",
+      "type": "object"
+    },
+    "FlowStep": {
+      "additionalProperties": false,
+      "properties": {
+        "screen_id": {
+          "title": "Screen Id",
+          "type": "string"
+        },
+        "branch_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Branch Label"
+        }
+      },
+      "required": [
+        "screen_id"
+      ],
+      "title": "FlowStep",
+      "type": "object"
+    },
+    "Job": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "title": "Job",
+      "type": "object"
+    },
+    "MapState": {
+      "description": "Per-screen/zone states aligned to engineering [RLSE-04].",
+      "enum": [
+        "default",
+        "loading",
+        "empty",
+        "error",
+        "offline",
+        "first_time",
+        "edge_input",
+        "degraded"
+      ],
+      "title": "MapState",
+      "type": "string"
+    },
+    "Screen": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ScreenKind"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "purpose": {
+          "title": "Purpose",
+          "type": "string"
+        },
+        "route": {
+          "title": "Route",
+          "type": "string"
+        },
+        "wp_page": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wp Page"
+        },
+        "job_entry": {
+          "default": false,
+          "title": "Job Entry",
+          "type": "boolean"
+        },
+        "deep_link": {
+          "default": true,
+          "title": "Deep Link",
+          "type": "boolean"
+        },
+        "url_params": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Url Params",
+          "type": "array"
+        },
+        "zones": {
+          "items": {
+            "$ref": "#/$defs/Zone"
+          },
+          "title": "Zones",
+          "type": "array"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/MapState"
+          },
+          "title": "States",
+          "type": "array"
+        },
+        "primary_action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Primary Action Id"
+        },
+        "code_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code Ref"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "purpose",
+        "route"
+      ],
+      "title": "Screen",
+      "type": "object"
+    },
+    "ScreenKind": {
+      "enum": [
+        "screen",
+        "overlay",
+        "exit"
+      ],
+      "title": "ScreenKind",
+      "type": "string"
+    },
+    "Zone": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ZoneRole"
+        },
+        "code_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code Ref"
+        },
+        "evidence_linked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Linked"
+        },
+        "max_candidates": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Candidates"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/MapState"
+          },
+          "title": "States",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "role"
+      ],
+      "title": "Zone",
+      "type": "object"
+    },
+    "ZoneRole": {
+      "enum": [
+        "content",
+        "nav",
+        "status",
+        "queue",
+        "job",
+        "ai_review",
+        "forced_choice",
+        "form",
+        "other"
+      ],
+      "title": "ZoneRole",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Structured UX map \u2014 jobs, screens, zones, states, flows, actions.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "map_ref": {
+      "title": "Map Ref",
+      "type": "string"
+    },
+    "product": {
+      "title": "Product",
+      "type": "string"
+    },
+    "source_fixture": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Fixture"
+    },
+    "goals": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Goals",
+      "type": "array"
+    },
+    "jobs": {
+      "items": {
+        "$ref": "#/$defs/Job"
+      },
+      "title": "Jobs",
+      "type": "array"
+    },
+    "screens": {
+      "items": {
+        "$ref": "#/$defs/Screen"
+      },
+      "title": "Screens",
+      "type": "array"
+    },
+    "flows": {
+      "items": {
+        "$ref": "#/$defs/Flow"
+      },
+      "title": "Flows",
+      "type": "array"
+    },
+    "actions": {
+      "items": {
+        "$ref": "#/$defs/Action"
+      },
+      "title": "Actions",
+      "type": "array"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "not_doing": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Not Doing",
+      "type": "array"
+    }
+  },
+  "required": [
+    "map_ref",
+    "product"
+  ],
+  "title": "UxMap",
+  "type": "object"
+}

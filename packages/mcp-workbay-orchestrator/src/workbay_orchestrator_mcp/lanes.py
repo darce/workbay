@@ -63,14 +63,24 @@ from .plan_cursors import (  # noqa: F401 -- re-exported for the daemon and api.
 # loads the MCP API. Raw review-cycle admission imports the lane constants;
 # defer these exact re-exports until used so reserve and EXIT settlement do
 # not each start that unrelated API stack.
-_REAPING_EXPORTS = frozenset({
-    "_ARCHIVED_ORPHAN_TERMINAL_STATUSES", "_DEFAULT_BUNDLE_RETENTION_COUNT",
-    "_close_authority_row_refusal", "_close_blocked_lane_cas", "_parse_close_authority",
-    "_probe_branch_dead", "_probe_worktree_gone", "_reopen_moved_closed_row",
-    "collect_blocked_lane_aging_entries", "format_blocked_lane_aging_line",
-    "format_lane_age_label", "reap_blocked_lanes", "reap_task_archived_orphan_lanes",
-    "unreap_lane_branch",
-})
+_REAPING_EXPORTS = frozenset(
+    {
+        "_ARCHIVED_ORPHAN_TERMINAL_STATUSES",
+        "_DEFAULT_BUNDLE_RETENTION_COUNT",
+        "_close_authority_row_refusal",
+        "_close_blocked_lane_cas",
+        "_parse_close_authority",
+        "_probe_branch_dead",
+        "_probe_worktree_gone",
+        "_reopen_moved_closed_row",
+        "collect_blocked_lane_aging_entries",
+        "format_blocked_lane_aging_line",
+        "format_lane_age_label",
+        "reap_blocked_lanes",
+        "reap_task_archived_orphan_lanes",
+        "unreap_lane_branch",
+    }
+)
 
 
 def __getattr__(name: str):
@@ -91,7 +101,9 @@ _logger = logging.getLogger(__name__)
 
 LANE_MESSAGE_DIRECTIONS = frozenset({"orchestrator_to_worker", "worker_to_orchestrator"})
 # closed_stale: schema v27 terminal for blocked-lane reclaimer (internal).
-LANE_STATUSES = frozenset({"planned", "active", "blocked", "review", "merged", "closed", "closed_stale"})
+LANE_STATUSES = frozenset(
+    {"planned", "active", "blocked", "review", "validated", "gated", "merged", "closed", "closed_stale"}
+)
 MESSAGE_STATUSES = frozenset({"open", "acknowledged", "closed"})
 # Success terminals that may CAS-acknowledge an open orchestrator_to_worker brief.
 # Failure / residual outcomes leave the brief open so a later turn can resume.
@@ -2596,7 +2608,7 @@ def _lane_status_transition_receipt(
     source: str,
     target: str,
 ) -> dict[str, Any] | None:
-    """Phase 1: enforce unlisted merged exits; observe other unknown edges."""
+    """Phase1 observes legacy edges; new milestone edges and merged exits enforce."""
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from workbay_handoff_mcp.runtime import get_runtime_config  # noqa: PLC0415
@@ -2626,7 +2638,7 @@ def _lane_status_transition_receipt(
         "to": target,
         "chart_id": chart.get("id") if chart is not None else None,
         "chart_version": chart.get("version") if chart is not None else None,
-        "enforced": source == "merged",
+        "enforced": source == "merged" or source in {"validated", "gated"} or target in {"validated", "gated"},
         "caller": "upsert_worktree_lane",
         "at": datetime.now(UTC).isoformat(),
     }
@@ -2946,10 +2958,16 @@ def rebind_worktree_lane(
     source_lane = _normalize_optional_text(lane_id)
     target_task = _normalize_optional_text(to_task_ref)
     target_lane = _normalize_optional_text(to_lane_id) or source_lane
-    if (source_task is None or source_lane is None or target_task is None or source_task == target_task
-            or _normalize_optional_text(reason) is None or type(expected_row_id) is not int
-            or type(expected_task_revision) is not int
-            or not (expected_identity_seq is None or type(expected_identity_seq) is int)):
+    if (
+        source_task is None
+        or source_lane is None
+        or target_task is None
+        or source_task == target_task
+        or _normalize_optional_text(reason) is None
+        or type(expected_row_id) is not int
+        or type(expected_task_revision) is not int
+        or not (expected_identity_seq is None or type(expected_identity_seq) is int)
+    ):
         return _json_response(
             {"ok": False, "error_kind": "lane_rebind_invalid", "error": "from_task_ref, lane_id, to_task_ref required."}
         )
@@ -2977,9 +2995,12 @@ def rebind_worktree_lane(
         return _json_response({"ok": False, "error_kind": "lane_rebind_stale", "error": "fenced identity changed"})
     worktree_path, branch = str(old["worktree_path"]), str(old["branch"])
     source_owner = task_record(source_task)
-    if source_owner and str(source_owner.get("target_branch") or "").removeprefix("refs/heads/") == branch.removeprefix("refs/heads/"):
-        return _json_response({"ok": False, "error_kind": "lane_rebind_source_owns_branch",
-                               "error": "source task still owns this branch"})
+    if source_owner and str(source_owner.get("target_branch") or "").removeprefix("refs/heads/") == branch.removeprefix(
+        "refs/heads/"
+    ):
+        return _json_response(
+            {"ok": False, "error_kind": "lane_rebind_source_owns_branch", "error": "source task still owns this branch"}
+        )
     repo = _lane_git_repo(worktree_path)
     try:
         proof = (
@@ -3148,9 +3169,7 @@ def _routing_upsert_rejection(*, values: dict[str, object], row: dict[str, objec
                 "error_kind": "lane_status_conflict",
             }
         )
-    if status_changed and (
-        row["status"] in TERMINAL_LANE_STATUSES or row.get("landing_commit_sha") is not None
-    ):
+    if status_changed and (row["status"] in TERMINAL_LANE_STATUSES or row.get("landing_commit_sha") is not None):
         return _json_response(
             {
                 "ok": False,
@@ -4731,15 +4750,24 @@ def close_worktree_lane(
         repo = _merged_close_workspace_root()
         if status == "merged":
             result["vm_marker"] = _write_close_vm_merged_marker(
-                result, lane_id=normalized_lane_id, repo=repo, task_ref=task_ref,
+                result,
+                lane_id=normalized_lane_id,
+                repo=repo,
+                task_ref=task_ref,
             )
         lane = result.get("lane")
         branch = lane.get("branch") if isinstance(lane, dict) else None
         marker = result.get("vm_marker", {})
         if marker.get("reason") == "inventory_failed":
             # An untrusted inventory aborts the whole close's marker delivery.
-            backfill = {"ok": False, "reason": "inventory_failed", "marked": 0,
-                        "already_marked": 0, "failed": 1, "retained": {}}
+            backfill = {
+                "ok": False,
+                "reason": "inventory_failed",
+                "marked": 0,
+                "already_marked": 0,
+                "failed": 1,
+                "retained": {},
+            }
         else:
             backfill = _backfill_close_vm_merged_markers(repo=repo, focus_branch=branch)
         result["vm_marker_backfill"] = backfill
@@ -4758,22 +4786,33 @@ def _backfill_close_vm_merged_markers(*, repo: Path | None, focus_branch: str | 
         if repo is None:
             raise RuntimeError("workspace root unavailable")
         return backfill_vm_merged_markers(
-            repo=repo, state_dir=Path(get_runtime_config().state_dir), focus_branch=focus_branch,
+            repo=repo,
+            state_dir=Path(get_runtime_config().state_dir),
+            focus_branch=focus_branch,
         )
     except Exception as exc:  # noqa: BLE001 — closure has already committed
         error = f"{type(exc).__name__}: {exc}"
         _logger.warning("VM merged marker backfill failed: %s", error)
         return {
-            "marked": 0, "already_marked": 0, "failed": 1, "error": error,
+            "marked": 0,
+            "already_marked": 0,
+            "failed": 1,
+            "error": error,
             "retained": {
-                "retained_not_on_main": 0, "retained_open_row": 0,
-                "retained_no_row": 0, "retained_review_lane": 0,
+                "retained_not_on_main": 0,
+                "retained_open_row": 0,
+                "retained_no_row": 0,
+                "retained_review_lane": 0,
             },
         }
 
 
 def _write_close_vm_merged_marker(
-    result: dict[str, object], *, lane_id: str, repo: Path | None, task_ref: str | None = None,
+    result: dict[str, object],
+    *,
+    lane_id: str,
+    repo: Path | None,
+    task_ref: str | None = None,
 ) -> dict[str, object]:
     """Keep the base immediate writer only for an explicitly merged close."""
     lane = result.get("lane")
@@ -4806,7 +4845,11 @@ def _write_close_vm_merged_marker(
             return {"ok": False, "reason": veto}
         main_sha, ancestors, first_parent = _main_history(repo)
         proof, reason = _marker_eligibility(
-            [lane], ancestors=ancestors, first_parent=first_parent, repo=repo, main_sha=main_sha,
+            [lane],
+            ancestors=ancestors,
+            first_parent=first_parent,
+            repo=repo,
+            main_sha=main_sha,
         )
         if proof is None:
             return {"ok": False, "reason": reason}
@@ -4820,8 +4863,12 @@ def _write_close_vm_merged_marker(
             _logger.warning("VM merged marker inventory failed for branch %s: %s: %s", branch, type(exc).__name__, exc)
             return {"ok": False, "reason": "inventory_failed", "error": f"{type(exc).__name__}: {exc}"}
         proof, reason = _marker_eligibility(
-            [lane], ancestors=ancestors, first_parent=first_parent, repo=repo,
-            main_sha=main_sha, sandbox=inventory.get(key),
+            [lane],
+            ancestors=ancestors,
+            first_parent=first_parent,
+            repo=repo,
+            main_sha=main_sha,
+            sandbox=inventory.get(key),
         )
         if proof is None:
             return {"ok": False, "reason": reason}
@@ -4834,11 +4881,16 @@ def _write_close_vm_merged_marker(
         )
 
         return _write_vm_merged_marker(
-            branch, proof[1], repo=repo, state_dir=state_dir,
+            branch,
+            proof[1],
+            repo=repo,
+            state_dir=state_dir,
             task_ref=(
                 lane["task_ref"]
                 if isinstance(lane.get("task_ref"), str) and lane["task_ref"].strip()
-                else task_ref if isinstance(task_ref, str) and task_ref.strip() else ""
+                else task_ref
+                if isinstance(task_ref, str) and task_ref.strip()
+                else ""
             ),
         )
     except Exception as exc:  # noqa: BLE001 — the lane close has already committed

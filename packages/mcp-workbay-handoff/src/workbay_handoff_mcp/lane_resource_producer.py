@@ -132,6 +132,13 @@ def execute_lane_change(
     conn.execute(f"SAVEPOINT {name}")
     try:
         cursor = conn.execute(sql, parameters)
+        if cursor.rowcount != 0:
+            # Recovery/upsert/close may invalidate an old imported native label.
+            # Retain its qualification obligation on the same row, including
+            # UNKNOWN producer observations. Never manufacture milestone proof.
+            from .validation_lane import retain_native_exit_hold
+
+            retain_native_exit_hold(conn, current)
         if cursor.rowcount == 0:
             receipt = {"knowledge": "unknown", "reason": "lane_mutation_not_applied"}
         elif reason or binding.resource is None or binding.source is None:

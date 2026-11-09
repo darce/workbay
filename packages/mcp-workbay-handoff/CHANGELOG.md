@@ -3,6 +3,19 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.25] — 2026-11-09
+
+- Bind plan-review outcomes to immutable subject bytes and retain migration 51 compatibility; upgrade the WorkBay components together.
+
+### Added
+- Bind planning reviews to a frozen byte subject and complete pending runs through a typed compare-and-swap operation, preserving the subject digest and recorded findings.
+
+### Migration
+- Handoff schema 51 adds native lane states and per-lane native automation policy, with minimum compatible reader 51 so older writers fail closed.
+
+### Changed
+- Raise the optional lifecycle dependency floor to orchestrator 0.3.30 for the matching planning-review driver.
+
 ## [0.3.23] — 2026-11-07
 
 ### Changed

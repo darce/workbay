@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from workbay_handoff_mcp.validation_lane import NativeValidationResult
+
     from workbay_orchestrator_mcp.orchestration.lane_routing import RoutingQuad
     from workbay_orchestrator_mcp.orchestration.merge_classification_doc_only import DocOnlyClassification
 
@@ -2928,6 +2930,8 @@ class WorkerConfig:
     # Managed passes resolve once before reservation and capability preflight.
     # Daemon sessions keep their existing per-cycle row routing when absent.
     resolved_routing: RoutingQuad | None = None
+    native_validation_config: Path | None = None
+    native_validation_digest: str | None = None
 
 
 @dataclass
@@ -3045,6 +3049,11 @@ class WorkerRunContext:
     # by an ordinary daemon cycle (persist_verified_lane_gate). An off-box
     # _verify_phase consumes it and never re-runs lane-check on the host.
     verified_gate_evidence: dict[str, Any] | None = None
+    native_validation_result: "NativeValidationResult | None" = None
+    native_validation_milestone: str | None = None
+    native_validation_attempt_id: str | None = None
+    native_validation_prepared: bool = False
+    native_validation_error: str | None = None
 
     def __setattr__(self, name: str, value: object) -> None:
         # Couple post-init handoff_exit writes to attempted-ness so a recorded
@@ -4915,7 +4924,9 @@ def _review_phase(ctx: WorkerRunContext) -> "dict[str, Any]":
         repo=config.worktree_path,
         orchestrator_root=config.orchestrator_root,
     )
-    if ctx.lane_kind == "review" or self_review is False:
+    if ctx.lane_kind == "review" or (
+        self_review is False and getattr(config, "native_validation_config", None) is None
+    ):
         scope_reason = "lane_kind_review" if ctx.lane_kind == "review" else "manifest_self_review_false"
         review_output = {
             "converged": True,
@@ -5330,6 +5341,9 @@ def _verify_phase(ctx: WorkerRunContext, review_output: "dict[str, Any]") -> boo
             lane_id=config.lane_id,
             worktree_path=config.worktree_path,
         )
+    from workbay_orchestrator_mcp.orchestration.native_validation import finish_native
+
+    check = finish_native(ctx, review_output, check)
     log_kw: dict[str, Any] = {"passed": bool(check) if not isinstance(check, dict) else bool(check.get("passed"))}
     if isinstance(check, dict):
         log_kw["command"] = check.get("command")
@@ -5410,6 +5424,25 @@ def _handoff_phase(ctx: WorkerRunContext, check_ok: bool | dict[str, Any]) -> No
     from workbay_handoff_mcp.enums import WorkerEventName  # noqa: PLC0415
 
     config = ctx.config
+    if getattr(config, "native_validation_config", None) is not None and ctx.lane_kind != "review":
+        from workbay_handoff_mcp.validation_lane import NativeValidationResult, fresh_qualified
+
+        native_result = getattr(ctx, "native_validation_result", None)
+        claims_pass = check_ok is True or (
+            isinstance(check_ok, dict) and (check_ok.get("passed") is True or check_ok.get("status") == "passed")
+        )
+        if claims_pass and not (
+            isinstance(native_result, NativeValidationResult)
+            and ctx.native_validation_milestone == "gated"
+            and fresh_qualified(native_result, config.worktree_path)
+        ):
+            check_ok = LaneGateResult(
+                dict(check_ok) if isinstance(check_ok, dict) else {},
+                passed=False,
+                status="system_error",
+                skipped=False,
+                reason="native_validation_not_gated",
+            )
     final_result_path = _require_result_path(ctx.final_result_path)
     handoff_result_path = final_result_path
     current_result = _load_result(final_result_path)
@@ -5466,6 +5499,12 @@ def _handoff_phase(ctx: WorkerRunContext, check_ok: bool | dict[str, Any]) -> No
     _patch_result(
         handoff_result_path,
         {
+            "native_validation": (
+                ctx.native_validation_result.as_dict()
+                | {"milestone": ctx.native_validation_milestone, "milestone_error": ctx.native_validation_error}
+                if ctx.native_validation_result is not None
+                else None
+            ),
             "style_debt": style_debt,
             "style_advisories": style_advisories,
             "style_debt_reported": style_debt is not None,
@@ -5573,7 +5612,7 @@ def _handoff_phase(ctx: WorkerRunContext, check_ok: bool | dict[str, Any]) -> No
                 submitted_result = _load_result(handoff_result_path)
             except (OSError, json.JSONDecodeError, RuntimeError, TypeError, ValueError):
                 submitted_result = {}
-            for key in ("handoff_action", "blockers"):
+            for key in ("handoff_action", "blockers", "native_validation"):
                 if key in submitted_result:
                     ctx.final_result_snapshot[key] = submitted_result[key]
         _cleanup_result_file(final_result_path)
@@ -6409,11 +6448,16 @@ def _run_worker_cycles_without_checkpoint(run_ctx: WorkerRunContext, single_pass
     from workbay_orchestrator_mcp.orchestration.backend_registry import (  # noqa: PLC0415
         backend_supports_token_telemetry,
     )
+    from workbay_orchestrator_mcp.orchestration.native_validation import begin_native, configure, prepare_native
 
+    run_ctx.config = configure(run_ctx.config)
+    config = run_ctx.config
     review_output: dict[str, Any] = {}
     consecutive_repeats = 0
     # A dispatch starts with no VM proof, and a zero-cycle run must not reuse one.
     run_ctx.verified_gate_evidence = None
+    run_ctx.native_validation_result = None
+    run_ctx.native_validation_milestone = None
     for cycle in range(config.max_review_cycles):
         run_ctx.cycle = cycle
         run_ctx.execute_stop_reason = None
@@ -6436,11 +6480,15 @@ def _run_worker_cycles_without_checkpoint(run_ctx: WorkerRunContext, single_pass
         ):
             _handle_token_budget_exceeded(run_ctx)
             return run_ctx.handoff_exit if single_pass else None
+        prepare_native(run_ctx)
         exec_ok = _execute_phase(run_ctx)
         if not exec_ok:
             break
         # Durable exact-tip proof before review; the normal and terminal verify callers both read it.
         _persist_off_box_vm_gate(run_ctx)
+        begin_native(run_ctx)
+        if getattr(run_ctx.native_validation_result, "reason", None) == "battery_cancelled":
+            return 1
         prev_finding_ids = set(run_ctx.prev_finding_ids)
         try:
             review_output = _review_phase(run_ctx)
@@ -6569,6 +6617,9 @@ def _setup_worker_run(config: WorkerConfig) -> "tuple[WorkerRunContext, str | No
 
     Returns (run_ctx, initial_dormant_state).
     """
+    from workbay_orchestrator_mcp.orchestration.native_validation import configure
+
+    config = configure(config)
     from workbay_handoff_mcp.enums import WorkerEventName  # noqa: PLC0415
 
     log_dir = config.orchestrator_root / "logs" / "worker-daemon"
@@ -7950,6 +8001,15 @@ def worker_loop(config: WorkerConfig, lock: WorkerLock | None = None) -> int:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Worker daemon: poll, implement, review, verify, handoff.")
+    parser.add_argument(
+        "--native-validation-config",
+        type=Path,
+        default=None,
+        help="Coordinator-held full40377 config@1 outside candidate roots.",
+    )
+    parser.add_argument(
+        "--native-validation-digest", default=None, help="Independently held SHA-256 of native config bytes."
+    )
     parser.add_argument("--orchestrator-root", required=True, help="Absolute path to the monorepo root.")
     parser.add_argument("--task-ref", required=True, help="MCP task reference (e.g. example-multi-lane-task).")
     parser.add_argument("--lane-id", required=True, help="Lane identifier (e.g. domain).")
@@ -8141,6 +8201,8 @@ def main() -> int:
             capability_config_digest=args.capability_config_digest,
             pass_id=args.pass_id,
             dispatch_id=args.dispatch_id,
+            native_validation_config=args.native_validation_config,
+            native_validation_digest=args.native_validation_digest,
         )
         config = _resolve_grok_cycle_bounds(config)
         return worker_loop(config, lock)

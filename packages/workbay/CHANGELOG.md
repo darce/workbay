@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.81] — 2026-11-09
+
+- Pin the assembled WorkBay components to the matching v0.1.88 package versions.
+
+### Changed
+- Pin protocol 0.3.9, handoff 0.3.24, orchestrator 0.3.30, bootstrap 0.4.26 and system 0.4.26 as the exact core stack for v0.1.88.
+- Carry the integrated publication path that requires explicit approval of the exact retained remote-main subject, supports qualified HTTPS and SSH receivers, and checks destination alias closure.
+- These release notes and author-side fixture checks do not establish independent installed-runtime qualification.
+
 ## [0.3.79] — 2026-11-07
 
 ### Changed

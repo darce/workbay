@@ -1,0 +1,261 @@
+{
+  "$defs": {
+    "Attribution": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "license": {
+          "title": "License",
+          "type": "string"
+        },
+        "credit": {
+          "title": "Credit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "license",
+        "credit"
+      ],
+      "title": "Attribution",
+      "type": "object"
+    },
+    "CompiledCssInput": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "title": "Output",
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/CompiledCssProvenance"
+        }
+      },
+      "required": [
+        "output",
+        "provenance"
+      ],
+      "title": "CompiledCssInput",
+      "type": "object"
+    },
+    "CompiledCssProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/ProvenanceInput"
+          },
+          "title": "Inputs",
+          "type": "array"
+        },
+        "output_digest": {
+          "title": "Output Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "inputs",
+        "output_digest"
+      ],
+      "title": "CompiledCssProvenance",
+      "type": "object"
+    },
+    "DeclaredComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "export_name": {
+          "title": "Export Name",
+          "type": "string"
+        },
+        "module_path": {
+          "title": "Module Path",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "slots": {
+          "items": {
+            "$ref": "#/$defs/SlotSpec"
+          },
+          "title": "Slots",
+          "type": "array"
+        },
+        "example_props": {
+          "additionalProperties": true,
+          "title": "Example Props",
+          "type": "object"
+        },
+        "token_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Token Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "export_name",
+        "module_path",
+        "description",
+        "slots",
+        "example_props"
+      ],
+      "title": "DeclaredComponent",
+      "type": "object"
+    },
+    "ExampleRef": {
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "title": "Component Id",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component_id",
+        "path"
+      ],
+      "title": "ExampleRef",
+      "type": "object"
+    },
+    "ProvenanceInput": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ProvenanceInput",
+      "type": "object"
+    },
+    "SlotSpec": {
+      "description": "A named insertion point within a component.\n\n``allowed_component_ids`` lists the component ids that may fill the\nslot (Pencil's \"suggested components\" idea \u2014 guidance for both human\nand AI designers); an empty list means \"unconstrained\". ``guidance``\nis optional free text shown alongside the slot.",
+      "properties": {
+        "slot_id": {
+          "title": "Slot Id",
+          "type": "string"
+        },
+        "allowed_component_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Component Ids",
+          "type": "array"
+        },
+        "guidance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Guidance"
+        }
+      },
+      "required": [
+        "slot_id"
+      ],
+      "title": "SlotSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "config_version": {
+      "const": 1,
+      "title": "Config Version",
+      "type": "integer"
+    },
+    "maps": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Maps",
+      "type": "array"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/DeclaredComponent"
+      },
+      "title": "Components",
+      "type": "array"
+    },
+    "css_inputs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Css Inputs",
+      "type": "array"
+    },
+    "asset_roots": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Asset Roots",
+      "type": "array"
+    },
+    "compiled_css": {
+      "items": {
+        "$ref": "#/$defs/CompiledCssInput"
+      },
+      "title": "Compiled Css",
+      "type": "array"
+    },
+    "examples": {
+      "items": {
+        "$ref": "#/$defs/ExampleRef"
+      },
+      "title": "Examples",
+      "type": "array"
+    },
+    "attributions": {
+      "items": {
+        "$ref": "#/$defs/Attribution"
+      },
+      "title": "Attributions",
+      "type": "array"
+    },
+    "generated_dir": {
+      "default": "docs/design/generated",
+      "title": "Generated Dir",
+      "type": "string"
+    }
+  },
+  "required": [
+    "config_version",
+    "maps",
+    "components",
+    "css_inputs",
+    "asset_roots"
+  ],
+  "title": "DesignSources",
+  "type": "object"
+}

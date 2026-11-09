@@ -147,6 +147,8 @@ class LaneStatus(StrEnum):
     ACTIVE = "active"
     BLOCKED = "blocked"
     REVIEW = "review"
+    VALIDATED = "validated"
+    GATED = "gated"
     MERGED = "merged"
     CLOSED = "closed"
     # Reaper terminal status; schema CHECK stores it. close_lane stays
@@ -158,6 +160,7 @@ class LaneStatus(StrEnum):
 # Pinned by test to LaneStatus and to the orchestrator's lanes_support literal.
 _TERMINAL_LANE_STATUS_MEMBERS = (LaneStatus.MERGED, LaneStatus.CLOSED, LaneStatus.CLOSED_STALE)
 TERMINAL_LANE_STATUSES: frozenset[str] = frozenset(status.value for status in _TERMINAL_LANE_STATUS_MEMBERS)
+LIVE_LANE_STATUSES: frozenset[str] = frozenset(status.value for status in LaneStatus) - TERMINAL_LANE_STATUSES
 
 
 class ReportStatus(StrEnum):

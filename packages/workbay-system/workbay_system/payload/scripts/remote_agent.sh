@@ -19,6 +19,9 @@
 #       --agent-spec <file.json> [--out <patch>] \
 #       [--result-out <json>] [--debug-out <log>] [--stream-out <jsonl>] [--timeout <seconds>]
 #       [--uncommitted-out <patch>]
+#   scripts/remote_agent.sh inventory --json [--deadline-seconds N] [--limit N]
+#                      read-only VM snapshot; default 20 s (max 60), 200 sandboxes.
+#                      Exit 3 retains partial rows with truncated=true.
 #   scripts/remote_agent.sh doctor          # grok readiness on the host
 #   scripts/remote_agent.sh reap [--idle-seconds N] [--dry-run] [--authorized-only] [--eligible-keys-stdin] [--eligible-key K]...
 #   scripts/remote_agent.sh status [--sweep] --job-id <j+20hex> [--job-id ...]
@@ -319,6 +322,26 @@ _review_cycle_bridge() {
 # A missing or malformed timer leaves freshness unknown and therefore stale.
 _queue_timer_file="$(dirname "${BASH_SOURCE[0]}")/vm/workbay-lane-queue.timer"
 _host_reservation_file="$(dirname "${BASH_SOURCE[0]}")/vm/host_reservation.py"
+
+_remote_agent_check_companions() {
+    # These local files are part of the installed transport contract. A broken
+    # install cannot recover through retryable VM admission (exit 75).
+    local _companion _companion_rc=0
+    for _companion in "$_host_reservation_file" "$_queue_timer_file"; do
+        if [ ! -f "$_companion" ] || [ ! -r "$_companion" ] || [ ! -s "$_companion" ]; then
+            printf 'remote_agent: config_missing scripts/vm/%s\n' "${_companion##*/}" >&2
+            _companion_rc=78
+        fi
+    done
+    return "$_companion_rc"
+}
+
+# Validate before any dispatch rendering or transport. Other commands can still
+# inspect or clean up remote jobs when a local install needs repair.
+case "${1:-}" in
+    build|submit) _remote_agent_check_companions || exit "$?" ;;
+esac
+
 QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
 case "$QUEUE_TICK_INTERVAL_S" in ''|*[!0-9]*|0) QUEUE_TICK_INTERVAL_S="" ;; esac
 
@@ -762,10 +785,21 @@ for key, names in {
     "uncommitted-out": "uncommitted-remainder.patch",
     "phases-out": (".agent-phases.json", ".grok-phases.json"),
     "provenance-out": ".workbay-source-provenance.json",
+    "preflight-effect-out": "__protected_preflight_effect__",
 }.items():
     if isinstance(names, str):
         names = (names,)
     candidates = (outbox_path / name for name in names) if outbox_path else ()
+    if key == "preflight-effect-out" and outbox_path:
+        import stat
+        suffix = outbox_path.name.removeprefix(".lane-out-")
+        protected = outbox_path.parent / (".preflight-effect-" + suffix + ".json")
+        if protected.is_symlink() or not protected.is_file():
+            continue
+        st = protected.stat()
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            continue
+        candidates = (protected,)
     source = next((candidate for candidate in candidates if candidate.exists() or candidate.is_symlink()), None)
     if source is None:
         continue
@@ -2132,9 +2166,325 @@ _agent_spec_resolve_argv() {
     done
 }
 
+# BEGIN REMOTE_INVENTORY
+_remote_inventory() {
+    # Python only reads local kernel/filesystem metadata. GNU timeout bounds
+    # subprocesses; its escalation applies solely to these inventory probes.
+    PYTHONDONTWRITEBYTECODE=1 python3 - <<'INVENTORY_PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import time
+
+started = time.monotonic()
+deadline_seconds = int(os.environ["INVENTORY_DEADLINE_SECONDS"])
+limit = int(os.environ["INVENTORY_LIMIT"])
+deadline = started + deadline_seconds
+root = Path(os.environ["AGENT_ROOT"])
+if not root.is_absolute():
+    root = Path.home() / root
+root = Path(os.path.abspath(root))
+proc = Path(os.environ.get("WORKBAY_REMOTE_AGENT_PROC_ROOT", "/proc"))
+unknowns = set()
+truncation_reason = None
+
+
+def remaining():
+    return deadline - time.monotonic()
+
+
+def truncate(reason):
+    global truncation_reason
+    if truncation_reason is None:
+        truncation_reason = reason
+
+
+def read(path):
+    # A malformed lock/fixture must not turn a metadata read into a FIFO wait.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("metadata is not a regular file")
+        return stream.read(65536)
+
+
+def probe(args, *, git=False):
+    # Rows reserve five seconds before either of their two two-second probes.
+    # Snapshots also share the absolute budget, including very short requests.
+    budget = min(2.0, remaining() - 0.25)
+    if budget <= 0:
+        truncate("deadline")
+        return None
+    env = dict(os.environ, LC_ALL="C")
+    if git:
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        result = subprocess.run(["timeout", "-k", "0.1", str(budget), *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def pressure(axis):
+    try:
+        result = {}
+        for line in read(proc / "pressure" / axis).splitlines():
+            kind, *fields = line.split()
+            result[kind] = {key: int(value) if key == "total" else float(value)
+                            for key, value in (field.split("=", 1) for field in fields)}
+        if "some" not in result or not {"avg10", "avg60", "avg300", "total"} <= result["some"].keys():
+            raise ValueError("invalid pressure")
+        return result
+    except (OSError, ValueError):
+        unknowns.add("psi_" + axis)
+        return None
+
+
+def holder_alive(pid):
+    if pid is None:
+        return "unknown"
+    directory = proc / str(pid)
+    try:
+        # A missing stat is not proof of death if the process directory exists.
+        state = read(directory / "stat").rsplit(")", 1)[1].split()[0]
+        return "no" if state in ("Z", "X") else "yes"
+    except (OSError, IndexError):
+        # hidepid can make a live PID appear absent in proc. A contradictory
+        # exact ps observation is uncertainty, never evidence of death.
+        if pid in process_ids:
+            return "unknown"
+        try:
+            # Failure to inspect proc itself is missing capability, not death.
+            proc.stat()
+            with os.scandir(proc):
+                pass
+        except OSError:
+            return "unknown"
+        try:
+            directory.stat()
+        except FileNotFoundError:
+            return "no"
+        except OSError:
+            pass
+        return "unknown"
+
+
+doc = {"schema_version": 1,
+       "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+       "deadline_seconds": deadline_seconds, "limit": limit,
+       "df": None, "mem_available_bytes": None, "load": None,
+       "psi": {axis: pressure(axis) for axis in ("cpu", "memory", "io")},
+       "processes": [], "processes_state": "known", "sandboxes": [],
+       "sandboxes_state": "known"}
+try:
+    match = re.search(r"^MemAvailable:\s+(\d+) kB$", read(proc / "meminfo"), re.M)
+    if not match:
+        raise ValueError("missing MemAvailable")
+    doc["mem_available_bytes"] = int(match[1]) * 1024
+except (OSError, ValueError):
+    unknowns.add("mem_available_bytes")
+try:
+    doc["load"] = [float(value) for value in read(proc / "loadavg").split()[:3]]
+    if len(doc["load"]) != 3:
+        raise ValueError("invalid load")
+except (OSError, ValueError):
+    doc["load"] = None
+    unknowns.add("load")
+
+df = probe(["df", "-P", "-B1"])
+try:
+    if df is None:
+        raise ValueError("df unavailable")
+    mounts = []
+    for line in df.splitlines()[1:]:
+        device, size, used, available, percent, mount = line.split(None, 5)
+        mounts.append({"filesystem": device, "mount": mount, "bytes": int(size),
+                       "used_bytes": int(used), "available_bytes": int(available)})
+    if not mounts:
+        raise ValueError("empty df")
+    doc["df"] = mounts
+except ValueError:
+    unknowns.add("df")
+
+# Stream directory discovery; do not sort/materialize an unbounded root, follow
+# directory symlinks, or count missing/unreadable roots as healthy empty roots.
+paths = []
+try:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if remaining() < 5:
+                truncate("deadline")
+                break
+            if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                continue
+            path = Path(entry.path)
+            try:
+                (path / ".workbay-lane-sandbox").stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unknowns.add("sandboxes")
+                doc["sandboxes_state"] = "unknown"
+                continue
+            if len(paths) >= limit:
+                truncate("limit")
+                break
+            paths.append(path)
+except OSError:
+    unknowns.add("sandboxes")
+    doc["sandboxes_state"] = "unknown"
+    truncate("sandbox_scan")
+
+# One exact-PID metadata snapshot. Membership is by cwd boundary or the PGID
+# of a directly attributed process; command text is never used for selection.
+processes = []
+ps = probe(["ps", "-eo", "pid,ppid,pgid,lstart,rss,comm"])
+if ps is None:
+    doc["processes_state"] = "unknown"
+else:
+    for line in ps.splitlines():
+        if remaining() < 5:
+            truncate("deadline")
+            doc["processes_state"] = "unknown"
+            break
+        fields = line.split(None, 9)
+        if fields and fields[0] == "PID":
+            continue
+        try:
+            pid, ppid, pgid = map(int, fields[:3])
+            item = {"pid": pid, "ppid": ppid, "pgid": pgid,
+                    "lstart": " ".join(fields[3:8]), "rss_kib": int(fields[8]), "comm": fields[9],
+                    "cwd": None, "cwd_state": "unknown"}
+        except (ValueError, IndexError):
+            doc["processes_state"] = "unknown"
+            continue
+        try:
+            item["cwd"] = os.readlink(proc / str(pid) / "cwd")
+            item["cwd_state"] = "known"
+        except OSError:
+            doc["processes_state"] = "unknown"
+        processes.append(item)
+
+process_ids = {item["pid"] for item in processes}
+for path in paths:
+    if remaining() < 5:
+        truncate("deadline")
+        break
+    row = {"path": str(path), "bytes": None, "bytes_state": "unknown",
+           "marker_age_seconds": None, "lock_holder_pid": None,
+           "lock_holder_alive": "unknown", "git_dirty": "unknown"}
+    try:
+        row["marker_age_seconds"] = max(0, time.time() - (path / ".workbay-lane-sandbox").stat().st_mtime)
+    except OSError:
+        pass
+    try:
+        lock = read(root / (".lane-lock-" + path.name))
+        match = re.fullmatch(r"pid=([1-9][0-9]*)\s*", lock)
+        if match:
+            row["lock_holder_pid"] = int(match[1])
+    except (OSError, ValueError):
+        pass
+    row["lock_holder_alive"] = holder_alive(row["lock_holder_pid"])
+    size = probe(["du", "-sb", "--", str(path)])
+    if size is not None:
+        try:
+            measured = int(size.split()[0])
+            if measured >= 0:
+                row["bytes"], row["bytes_state"] = measured, "known"
+        except (ValueError, IndexError):
+            pass
+    status = probe(["git", "-C", str(path), "status", "--porcelain"], git=True)
+    if status is not None:
+        row["git_dirty"] = "yes" if status.strip() else "no"
+    doc["sandboxes"].append(row)
+
+pgids = {}
+for row in doc["sandboxes"]:
+    if remaining() < 0.25:
+        truncate("deadline")
+        doc["processes_state"] = "unknown"
+        break
+    path = row["path"]
+    for item in processes:
+        if remaining() < 0.25:
+            truncate("deadline")
+            doc["processes_state"] = "unknown"
+            break
+        cwd = (item["cwd"] or "").removesuffix(" (deleted)")
+        if cwd == path or cwd.startswith(path + "/") or item["pid"] == row["lock_holder_pid"]:
+            pgids.setdefault(item["pgid"], set()).add(path)
+for item in processes:
+    if remaining() < 0.25:
+        truncate("deadline")
+        doc["processes_state"] = "unknown"
+        break
+    members = sorted(pgids.get(item["pgid"], ()))
+    if members:
+        item["sandboxes"] = members
+        doc["processes"].append(item)
+if doc["processes_state"] == "unknown":
+    unknowns.add("processes")
+doc.update(truncated=truncation_reason is not None, truncation_reason=truncation_reason,
+           rows_emitted=len(doc["sandboxes"]), unknowns=sorted(unknowns),
+           elapsed_seconds=time.monotonic() - started)
+print(json.dumps(doc, allow_nan=False))
+raise SystemExit(3 if doc["truncated"] else 0)
+INVENTORY_PY
+}
+# END REMOTE_INVENTORY
+
 cmd="${1:-}"; [ "$#" -gt 0 ] && shift
 
 case "$cmd" in
+inventory)
+    # B1 is an observer: no dispatch, reap, flock, cache, or remote file writes.
+    exec </dev/null
+    _inventory_json=0
+    _inventory_deadline=20
+    _inventory_limit=200
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --json) _inventory_json=1; shift ;;
+            --deadline-seconds|--limit)
+                _inventory_option="$1"
+                [ "$#" -ge 2 ] || die "missing value for $_inventory_option"
+                [[ "$2" =~ ^[1-9][0-9]{0,8}$ ]] || die "invalid $_inventory_option: need a positive integer"
+                if [ "$_inventory_option" = --deadline-seconds ]; then
+                    [ "$2" -le 60 ] || die "--deadline-seconds maximum is 60"
+                    _inventory_deadline="$2"
+                else
+                    _inventory_limit="$2"
+                fi
+                shift 2
+                ;;
+            *) die "unknown inventory arg: $1" ;;
+        esac
+    done
+    [ "$_inventory_json" = 1 ] || die "inventory requires --json"
+    # Quote exports on stdin: SSH joins argv for a remote shell, so paths and
+    # bounds must not become command text there. One SSH, including all probes.
+    _inventory_exports="$(printf 'export %q\n' \
+        "AGENT_ROOT=$AGENT_ROOT" \
+        "INVENTORY_DEADLINE_SECONDS=$_inventory_deadline" \
+        "INVENTORY_LIMIT=$_inventory_limit" \
+        "WORKBAY_REMOTE_AGENT_PROC_ROOT=${WORKBAY_REMOTE_AGENT_PROC_ROOT:-/proc}")"
+    _inventory_src="$(declare -f _remote_inventory)"
+    _inventory_rc=0
+    "${SSH[@]}" bash -s <<INVENTORY_EOF || _inventory_rc=$?
+set -euo pipefail
+${_inventory_exports}
+${_inventory_src}
+_remote_inventory
+INVENTORY_EOF
+    exit "$_inventory_rc"
+    ;;
 writable-roots-probe|workspace-write-probe)
     # These arms execute on the VM, where the sandbox actually exists. They
     # deliberately return one complete typed receipt on every path; an SSH or
@@ -2615,32 +2965,12 @@ else
     sandbox_flags='workspace-write'
     sandbox_extra=''
 fi
-codex_out="$probe_root/codex.out"
-codex_err="$probe_root/codex.err"
-if [ -n "$sandbox_extra" ]; then
-    if "$codex" exec --ignore-user-config -C . -m "$model" -c "model_reasoning_effort=$effort" -s workspace-write -c "$sandbox_extra" "$prompt" >"$codex_out" 2>"$codex_err" </dev/null; then _rc=0; else _rc=$?; fi
-else
-    if "$codex" exec --ignore-user-config -C . -m "$model" -c "model_reasoning_effort=$effort" -s workspace-write "$prompt" >"$codex_out" 2>"$codex_err" </dev/null; then _rc=0; else _rc=$?; fi
-fi
-if [ "$_rc" -eq 124 ] || [ "$_rc" -eq 137 ]; then
-    emit false unknown timeout
-    exit 0
-fi
-if [ "$_rc" -ne 0 ]; then
-    if grep -Eqi 'permission denied|not permitted|sandbox|writable.roots' "$codex_err" 2>/dev/null; then
-        emit false negative sandbox_denied
-    else
-        emit false unknown executor_failed
-    fi
-    exit 0
-fi
-if [ "$kind" = "writable-roots-probe" ]; then
-    _head="$(git -C "$probe_root" rev-parse --verify HEAD 2>/dev/null || true)"
-    if [ -n "$_head" ]; then emit true positive committed "$_head"; else emit false unknown commit_absent; fi
-else
-    if [ -f "$probe_root/.workbay-workspace-write-probe" ]; then emit true positive committed; else emit false unknown commit_absent; fi
-fi
+# These historical probes have no exact future lane env/cwd or native policy
+# handle. A paid turn cannot repair that missing capability. Never infer PASS
+# from ordinary host writability or synthesize an unconfigured profile.
+emit false unknown sandbox_policy_unavailable
 exit 0
+
 REMOTE_PREFLIGHT_BODY_EOF
     }
     if _probe_output=$(_run_preflight_transport)
@@ -2659,6 +2989,7 @@ REMOTE_PREFLIGHT_BODY_EOF
     exit 0
     ;;
 doctor)
+    _remote_agent_check_companions || true
     "${SSH[@]}" 'g="$HOME/.grok/bin/grok"
         [ -x "$g" ] && echo "grok    : $("$g" --version)" || echo "grok    : MISSING (install per runbook)"
         # implementation note: per-backend binary/env paths are AgentSpec data, not doctor
@@ -2736,6 +3067,7 @@ try:
     unmarked = data["unmarked"]
     unmarked_bytes = unmarked["bytes"]
     unmarked_count = unmarked["count"]
+    unmarked_reason = unmarked.get("reason", "unknown")
     integer(unmarked_count, "unmarked.count")
     if unmarked_bytes is not None:
         integer(unmarked_bytes, "unmarked.bytes")
@@ -2750,6 +3082,8 @@ try:
     counts = {clean(key): value for key, value in counts.items()}
     summary = (f"reclaim : free={free:.2f} GiB floor={floor:.2f} GiB last_run={last_text} "
                f"counts={json.dumps(counts, sort_keys=True)} unmarked={unmarked_count} size={size}")
+    if unmarked_bytes is None:
+        summary += f" reason={clean(unmarked_reason)}"
 except (KeyError, TypeError, ValueError, OverflowError) as error:
     failed("invalid_status", error)
     sys.exit(0)
@@ -2760,8 +3094,25 @@ actions = {
     "last_run_error": "inspect journalctl --user -u workbay-vm-reclaim.service and fix the reported error",
     "free_below_floor": "restore disk headroom; inspect retained jobs and the headroom timer",
     "unmarked_present": "adopt or release the unmarked dirs after checking ownership and retained evidence",
-    "unmarked_size_unmeasured": "check du errors and permissions on the unmarked dirs; rerun doctor",
+    "unmarked_size_unmeasured": (
+        "the measure budget was spent; rerun later or raise --measure-budget-seconds for status"
+        if unmarked_reason == "budget"
+        else "check du errors and permissions on the unmarked dirs; rerun doctor"
+    ),
+    "scan_incomplete": "status hit its deadline before classifying every dir (counts.unclassified); "
+    "check systemctl --user is-system-running for a hung user bus, then rerun doctor",
 }
+stuck = last.get("recover_failed") if isinstance(last, dict) else None
+if isinstance(stuck, list) and stuck and all(isinstance(name, str) for name in stuck):
+    listed = ", ".join(clean(name) for name in stuck[:3]) + (" ..." if len(stuck) > 3 else "")
+else:
+    listed = "the .reclaiming-* tombstones in last_run.recover_failed"
+actions["recover_failed"] = (
+    f"check the owner and mode of {listed} (and everything under it) in the VM job root, fix them, "
+    "then rerun recover: ~/.local/lib/workbay/workbay_vm_reclaim.py apply --retry-recover-failed "
+    "(a reclaimer installed before that flag rejects it with exit 2: run plain apply there, which retries "
+    "every tombstone, or reinstall the reclaimer first with scripts/vm/install_vm_reclaim.sh)"
+)
 print(summary)
 for alarm in alarms:
     action = actions.get(alarm, "inspect the VM reclaim status and service logs for this alarm")
@@ -6114,7 +6465,7 @@ import sys
 import tarfile
 from pathlib import Path
 allowed = {"done.json", "stdout", "stderr", "artifacts.json"}
-keys = {"result-out", "debug-out", "stream-out", "selfverify-out", "uncommitted-out", "phases-out", "provenance-out"}
+keys = {"result-out", "debug-out", "stream-out", "selfverify-out", "uncommitted-out", "phases-out", "provenance-out", "preflight-effect-out"}
 allowed.update("artifacts/" + key for key in keys)
 with tarfile.open(sys.argv[1]) as bundle:
     seen = set()
@@ -6233,7 +6584,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 try:
     files = {}
-    artifact_keys = {"result-out", "debug-out", "stream-out", "selfverify-out", "uncommitted-out", "phases-out", "provenance-out"}
+    artifact_keys = {"result-out", "debug-out", "stream-out", "selfverify-out", "uncommitted-out", "phases-out", "provenance-out", "preflight-effect-out"}
     has_manifest = (root / "artifacts.json").exists()
     if has_manifest:
         manifest = json.loads((root / "artifacts.json").read_text())
@@ -6280,6 +6631,19 @@ try:
                 stream.write(files[key])
                 stream.flush()
                 os.fsync(stream.fileno())
+        # The protected native effect follows an existing provenance output;
+        # no new public CLI flag or unowned runner artifact map is needed.
+        for flag, destination in zip(sys.argv[3::2], sys.argv[4::2]):
+            if flag != "--provenance-out":
+                continue
+            target = Path(destination + ".effect")
+            if "preflight-effect-out" not in files:
+                skipped.append(("preflight-effect-out", target))
+                continue
+            fd, temporary = tempfile.mkstemp(prefix=".wb-effect-", dir=target.parent)
+            staged.append((temporary, target))
+            with os.fdopen(fd,"wb") as stream:
+                stream.write(files["preflight-effect-out"]); stream.flush(); os.fsync(stream.fileno())
         # Defer stale-destination removal until validation and staging succeed.
         # An artifact this job did not produce must not leave an earlier job's bytes.
         for key, target in skipped:
@@ -6871,29 +7235,38 @@ elif backend == "claude-remote" and model.startswith("claude-"):
     except ValueError:
         reason = "analysis_requires_read_only_tools"
 elif backend == "codex-remote" and model.startswith("gpt-"):
+    import re, tomllib
+
     try:
         if argv[:1] != ["exec"] or argv[-1:] != ["-"]:
             raise ValueError("unexpected Codex command or prompt")
         opts = options(argv[1:-1], {"--json", "--ignore-user-config"},
-                       {"--cd", "--model", "--config", "--sandbox", "--output-schema",
-                        "--output-last-message"})
-        if (opts.get("--sandbox") != ["read-only"] or "--ignore-user-config" not in opts
-                or opts.get("--cd") != ["."] or opts.get("--output-schema") != ["{schema_file}"]
+                       {"--cd", "--model", "--config", "--output-schema", "--output-last-message"})
+        if ("--ignore-user-config" not in opts or opts.get("--cd") != ["."]
+                or opts.get("--output-schema") != ["{schema_file}"]
                 or opts.get("--output-last-message") != ["{result_file}"]):
-            raise ValueError("analysis sandbox or output widening")
-        keys = set()
-        for config in opts.get("--config", []):
-            key, equals, value = config.partition("=")
-            key = key.strip()
-            # Only the builder route and inert workspace-root settings are
-            # admitted. Quoted/dotted sandbox keys, MCP and plugin configs fail
-            # closed rather than trying to replicate the TOML config merger.
-            if (not equals or key in keys or key not in {
-                    "model_reasoning_effort", "service_tier", "sandbox_workspace_write.writable_roots"}):
-                raise ValueError("unvalidated config override")
-            keys.add(key)
-            if key == "sandbox_workspace_write.writable_roots" and json.loads(value) != [".git"]:
-                raise ValueError("analysis writable-root widening")
+            raise ValueError("analysis output widening")
+        keys = [config.partition("=")[0] for config in opts.get("--config", [])]
+        if len(set(keys)) != len(keys):
+            raise ValueError("repeated analysis config")
+        # Host admission precedes worker/runtime provisioning: stdlib only.
+        # Mirror the closed analysis contract; the provisioned native probe
+        # and its fresh, source-bound receipt remain execution authority.
+        profile = 'default_permissions="workbay_analysis_read_only"'
+        template = 'permissions.workbay_analysis_read_only.extends=":read-only"'
+        permissions = 'permissions={workbay_analysis_read_only={extends=":read-only"}}'
+        configs = [permissions if value == template else value for value in opts.get("--config", [])]
+        policy = [value for value in configs if value.partition("=")[0] in {"permissions", "default_permissions"}]
+        if sorted(policy) != sorted([profile, permissions]):
+            raise ValueError("analysis permission profile widening")
+        for value in configs:
+            key, _, raw = value.partition("=")
+            if key not in {"permissions", "default_permissions", "model_reasoning_effort", "service_tier"}:
+                raise ValueError("unvalidated analysis config")
+            # Match Codex's bare routing literals and the native TOML check.
+            if key in {"model_reasoning_effort", "service_tier"} and re.fullmatch(r"[a-z][a-z0-9_-]*", raw):
+                continue
+            tomllib.loads(value)
     except ValueError:
         reason = "analysis_requires_read_only_tools"
 else:
@@ -6957,6 +7330,10 @@ PY
         # name guard can match both mint paths [REF-10][RES-07].
         [ -n "${DISPATCH_NONCE#*-}" ] || DISPATCH_NONCE="${$}-$(printf '%08x%08x' "$(date +%s)" "${RANDOM:-0}")"
     fi
+    # Retain the host-generated request before any remote process. Late
+    # preflight evidence must join this nonce/ref, never supply its own scope.
+    _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
+        "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" || exit 76
     # Named systemd scope unit: workbay-lane-<LANE_KEY>.scope so active lanes are
     # countable + debuggable ([RES-14] concurrency ceiling; implementation note S5).
     # Suffix is part of the name: is-active/reset-failed resolve bare names to
@@ -7788,6 +8165,8 @@ except Exception as exc:
 PRODUCTION_CONTEXT_PY
 )"
     # END REMOTE_PRODUCTION_CONTEXT
+    _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
+        "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" "$_production_context_b64" || exit 76
 
     # 1) push the pinned commit to the remote clone (only committed state is built).
     # Push target is LANE_KEY + per-dispatch nonce: LANE_KEY alone is shared by
@@ -11871,6 +12250,9 @@ _uv_sync_with_cache_fallback() {
     if [ -n "\${_UV_PROJECT_DIR:-}" ]; then
         _uv_project_args=(--project "\$_UV_PROJECT_DIR")
     fi
+    local -a _uv_sync_command=("\$UV_BIN" sync "\${_uv_project_args[@]+"\${_uv_project_args[@]}"}")
+    # Standalone editable installs share the same bounded cache fallback.
+    if [ "\$#" -gt 0 ]; then _uv_sync_command=("\$UV_BIN" "\$@"); fi
     _UV_SYNC_FAILURE_RC=1
     _uv_sync_capture() {
         local _uv_log _uv_rc
@@ -11891,13 +12273,13 @@ _uv_sync_with_cache_fallback() {
         rm -f "\$_uv_log" 2>/dev/null || true
         return "\$_uv_rc"
     }
-    if _uv_sync_capture "\$UV_BIN" sync "\${_uv_project_args[@]+"\${_uv_project_args[@]}"}" --offline -q; then
+    if _uv_sync_capture "\${_uv_sync_command[@]}" --offline -q; then
         return 0
     fi
     echo 'remote_agent: offline uv cache incomplete — trying bounded network sync' >&2
     if command -v timeout >/dev/null 2>&1 && \
         UV_HTTP_TIMEOUT=10 UV_HTTP_RETRIES=1 _uv_sync_capture timeout -k 5 "\${UV_SYNC_NETWORK_TIMEOUT_SEC}" \
-            "\$UV_BIN" sync "\${_uv_project_args[@]+"\${_uv_project_args[@]}"}" -q; then
+            "\${_uv_sync_command[@]}" -q; then
         return 0
     fi
     printf 'remote_agent: uv sync failed (uv_sync_failed) uv_rc=%s\n' "\$_UV_SYNC_FAILURE_RC" >&2
@@ -12329,6 +12711,52 @@ print(sys.argv[2] + ":" + ("verified_roots" if names else "skipped_no_guarded_ro
         *) _origin_guard_refuse invalid_attestation; return 1 ;;
     esac
 }
+# Root sync deliberately excludes independently released source projects. Add
+# only declared, present guarded projects to this lane, without resolving their
+# release-tag dependency sources or changing the CLI workspace/lock contract.
+_provision_lane_standalones() {
+    local _projects _project
+    local -a _editable_args=()
+    [ -f "\$SBX/pyproject.toml" ] || return 0
+    _projects=\$(timeout -k 5 30 python3 -I -c '
+import sys
+import tomllib
+from pathlib import Path
+
+root = Path(sys.argv[1])
+config = tomllib.loads((root / "pyproject.toml").read_text())
+patterns = config.get("tool", {}).get("uv", {}).get("workspace", {}).get("exclude", [])
+projects = set()
+for pattern in patterns:
+    for project in root.glob(pattern):
+        sources = [p for glob in ("src/workbay_*/__init__.py", "workbay_*/__init__.py",
+                                  "src/workbay_*.py", "workbay_*.py")
+                   for p in project.glob(glob) if p.is_file()]
+        if not sources:
+            continue
+        manifest = project / "pyproject.toml"
+        paths = [project, manifest, *sources]
+        if any(p.resolve() != p.absolute() or not p.is_relative_to(root) for p in paths):
+            raise ValueError("redirected standalone project")
+        if not manifest.is_file() or "\n" in str(project):
+            raise ValueError("invalid standalone manifest")
+        projects.add(str(project))
+for project in sorted(projects):
+    print(project)
+' "\$SBX" </dev/null 9>&-) || {
+        echo 'remote_agent: uv sync failed (uv_sync_failed) reason=standalone_manifest' >&2
+        return 1
+    }
+    [ -n "\$_projects" ] || return 0
+    while IFS= read -r _project; do
+        _editable_args+=(--editable "\$_project")
+    done <<< "\$_projects"
+    # Root sync already supplied the dependency closure. Never fetch standalone
+    # git pins for unreleased local dependencies or replace those root installs.
+    _uv_sync_with_cache_fallback pip install --python "\$LANE_VENV/bin/python" \
+        --no-deps --no-sources "\${_editable_args[@]}"
+}
+_provision_lane_standalones || { rm -f "\$SYNC_STAMP"; exit 1; }
 if ! _assert_lane_venv_origin; then
     echo 'remote_agent: lane import origin invalid — rebuilding fresh once' >&2
     rm -rf "\$LANE_VENV" "\$SYNC_STAMP"
@@ -12345,6 +12773,7 @@ if ! _assert_lane_venv_origin; then
         printf 'remote_agent: uv sync failed (uv_sync_failed) uv_rc=%s\n' "\$_UV_SYNC_FAILURE_RC" >&2
         exit 1
     fi
+    _provision_lane_standalones || exit 1
     _assert_lane_venv_origin || { echo 'remote_agent: uv sync failed to repair lane import origin' >&2; exit 1; }
     [ -n "\$_dep_hash" ] && printf '%s\n' "\$_dep_hash" > "\$SYNC_STAMP" 2>/dev/null || true
 fi
@@ -14131,6 +14560,7 @@ if [ '${AGENT_SPEC_ENABLED}' = 1 ]; then
     # before exec, and retracts that stamp if exec itself is refused.
     _model_start_boundary="\$OUT_DIR/.workbay-model-process-boundary.py"
     cat > "\$_model_start_boundary" <<'PYMODELSTART'
+import hashlib
 import json
 import os
 import shutil
@@ -14144,19 +14574,144 @@ def write_receipt(path, payload):
     os.replace(tmp, path)
 
 
+def effect_path(proof=None):
+    # Supplied by the trusted launcher AFTER AgentSpec.env. The model's exact
+    # R/O/TMP profile cannot write this sibling in ROOT. No key is minted.
+    raw = os.environ.get("WORKBAY_EXECUTION_EFFECT_PATH")
+    if not raw:
+        raise ValueError("native effect channel unavailable")
+    path = Path(raw)
+    if (not path.is_absolute() or path.parent.resolve() != Path.cwd().resolve().parent
+            or not path.name.startswith(".preflight-effect-") or path.suffix != ".json"
+            or path.parent.stat().st_uid != os.getuid()):
+        raise ValueError("native effect channel scope invalid")
+    roots = [Path.cwd(), receipt_path.parent, Path(os.environ.get("TMPDIR", "/nonexistent"))]
+    if isinstance(proof, dict):
+        roots += [Path(row["path"]) for row in proof.get("roots", [])]
+    for root in roots:
+        if path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("native effect channel is model writable")
+    return path
+
+
+def write_refusal_effect(proof):
+    path = effect_path(proof)
+    encode = lambda value: json.dumps(value,sort_keys=True,separators=(",", ":")).encode()
+    effect = {"schema":"workbay/native-execution-effect@1","effect":"pre_model_refusal","rc":7,
+              "proof_sha256":hashlib.sha256(encode(proof)).hexdigest(),"binding":proof.get("binding",{})}
+    fd = os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,"wb") as stream:
+        stream.write(encode(effect)); stream.flush(); os.fsync(stream.fileno())
+    parent = os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try: os.fsync(parent)
+    finally: os.close(parent)
+
+
 receipt_path = Path(sys.argv[1])
-agent = sys.argv[2]
-agent_argv = sys.argv[2:]
+native_spec = None
+agent = sys.argv[3]
+agent_argv = sys.argv[3:]
 try:
     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    native_spec = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+    if not isinstance(native_spec, dict) or not native_spec.get("backend_id"):
+        raise ValueError("native backend identity unavailable")
+    binding = {"boundary_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "source": {k: payload.get(k) for k in (
+            "dispatch_nonce", "requested_branch", "agent_spec_head_sha",
+            "remote_source_commit", "remote_source_tree", "sandbox_base_commit", "sandbox_base_tree")},
+            "routing_requested": native_spec.get("routing_requested"),
+            "routing_effective": native_spec.get("routing_effective")}
     resolved_agent = shutil.which(agent)
     if not isinstance(payload, dict) or not resolved_agent:
         raise ValueError("agent binary unavailable after environment setup")
+    # BEGIN EXECUTABLE_PROVISIONING_PREFLIGHT
+    # Runs after the final env/PATH/cwd setup, before any paid binary or start
+    # stamp. No cached host/operator grant can bypass this handshake.
+    if native_spec.get("backend_id") == "codex-remote":
+        if effect_path().exists() or effect_path().is_symlink():
+            raise ValueError("native effect channel already exists")
+        from workbay_orchestrator_mcp.orchestration.execution_preflight import (
+            ANALYSIS_CAPABILITY, WRITE_CAPABILITY, Refused, check_execution_context, materialize_execution_argv,
+            refusal_marker, refusal_receipt, run_execution_preflight,
+        )
+
+        # Set by the generated launcher AFTER the author environment fragment.
+        # Receipt consumers also require this exact capability, never infer it
+        # from a caller-supplied PASS or merely from the requested argv.
+        capability = (ANALYSIS_CAPABILITY if os.environ.get("WORKBAY_NATIVE_REVIEW_KIND") == "analysis"
+                      else WRITE_CAPABILITY)
+        binding["execution_capability"] = capability
+        try:
+            agent_argv[1:] = materialize_execution_argv(agent_argv[1:], cwd=Path.cwd(),
+                output_dir=receipt_path.parent, env=os.environ)
+        except Refused as exc:
+            proof = refusal_receipt(exc.reason, binding=binding)
+        else:
+            proof = run_execution_preflight(resolved_agent, agent_argv[1:],
+                                        cwd=Path.cwd(), output_dir=receipt_path.parent,
+                                        binding=binding, capability=capability)
+        payload["execution_preflight"] = proof
+        write_receipt(receipt_path, payload)
+        from workbay_orchestrator_mcp.orchestration.preflight_attestation import validate_execution_preflight
+        validation = validate_execution_preflight(proof, capability=capability)
+        if not validation["ok"]:
+            if proof.get("status") == "PASS":
+                observed = proof
+                proof = refusal_receipt(validation["reason"], binding=binding)
+                proof["native_observation"] = observed
+                proof.pop("evidence_digest", None)
+                proof["evidence_digest"] = hashlib.sha256(json.dumps(proof,sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+                payload["execution_preflight"] = proof
+            payload["execution_preflight_refusal"] = refusal_marker(proof)
+            write_receipt(receipt_path, payload)
+            write_refusal_effect(proof)
+            print("remote_agent: execution_preflight=" + validation["reason"], file=sys.stderr)
+            raise SystemExit(7)
+        if (payload.get("sandbox_base_tree") and proof.get("source", {}).get("tree") != payload["sandbox_base_tree"]):
+            raise ValueError("execution preflight source tree mismatch")
+        if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != binding["boundary_sha256"]:
+            raise ValueError("model boundary source changed after native probe")
+        if not check_execution_context(proof, resolved_agent, agent_argv[1:], cwd=Path.cwd(),
+                                       output_dir=receipt_path.parent, env=os.environ):
+            raise ValueError("execution context changed after native probe")
+        if not validate_execution_preflight(proof, capability=capability)["ok"]:
+            raise ValueError("execution preflight expired during context recheck")
+        effect_path(proof)
+    # END EXECUTABLE_PROVISIONING_PREFLIGHT
     payload["model_process_started"] = True
     write_receipt(receipt_path, payload)
-except (OSError, ValueError, json.JSONDecodeError) as exc:
-    print(f"remote_agent: model process boundary refused: {exc}", file=sys.stderr)
-    raise SystemExit(127) from exc
+except (ImportError, OSError, ValueError, json.JSONDecodeError) as exc:
+    # Preserve typed UNKNOWN even if the provisioned runtime cannot import
+    # the handshake module. Do not turn missing installation into model spend.
+    if isinstance(locals().get("payload"), dict):
+        observed_preflight = payload.get("execution_preflight")
+        payload["execution_preflight"] = {
+            "schema": "workbay/execution-preflight@1", "status": "UNKNOWN",
+            "reason": "runtime_handshake_failed", "error_type": type(exc).__name__,
+            "retryable": False, "repair_hint": "Reprovision the exact lane runtime and companions before model start."}
+        # Even import failure is a typed pre-boundary effect. Hashes bind bytes,
+        # never authenticate an author or grant permissions.
+        import hashlib
+        import time
+        proof = payload["execution_preflight"]
+        if isinstance(observed_preflight, dict):
+            proof["native_observation"] = observed_preflight
+        proof.update(binding=locals().get("binding", {}), cache_reused=False,
+                     started_at=time.time(), finished_at=time.time(), expires_at=time.time()+20,
+                     deadline_seconds=20)
+        encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        proof["evidence_digest"] = hashlib.sha256(encoded(proof)).hexdigest()
+        payload["execution_preflight_refusal"] = {
+            "schema": "workbay/execution-preflight-refusal@1", "phase": "execution_preflight",
+            "exit_code": 7, "model_boundary_reached": False, "reason": proof["reason"],
+            "evidence_digest": hashlib.sha256(encoded(proof)).hexdigest()}
+        write_receipt(receipt_path, payload)
+        try:
+            write_refusal_effect(proof)
+        except (OSError, ValueError):
+            pass  # missing protected observation never qualifies for a refund
+    print("remote_agent: model process boundary refused: runtime_handshake_failed", file=sys.stderr)
+    raise SystemExit(7) from exc
 
 try:
     os.execv(resolved_agent, agent_argv)
@@ -14170,6 +14725,10 @@ except OSError as exc:
     raise SystemExit(127) from exc
 PYMODELSTART
     # END MODEL_PROCESS_START_BOUNDARY
+    # Classifier and harvest run in this parent, not the background child.
+    # Bind the declared role here too; child authorenv still needs the final
+    # trusted export below because it may contain an untrusted role value.
+    export WORKBAY_NATIVE_REVIEW_KIND='${REVIEW_KIND}'
     _agent_rc=0
     # Background + wait, never a foreground child: the agent runs in its own
     # --scope cgroup, so a job-unit stop signals only this shell, and bash runs
@@ -14198,9 +14757,12 @@ ${AGENT_SPEC_ENV_FILE}
             export TEMP="\$_lane_scratch_root"
         fi
         # END AGENT_SPEC_ENV_LAUNCH
+        export WORKBAY_NATIVE_REVIEW_KIND='${REVIEW_KIND}'
+        export WORKBAY_EXECUTION_EFFECT_PATH="\$ROOT/.preflight-effect-${LANE_KEY}-${DISPATCH_NONCE}.json"
         # fd 4 (the root's .lock) stays with this body shell; the agent never inherits it.
         exec \$RUNNER \$TW python3 "\$_model_start_boundary" \
                 "\$OUT_DIR/.workbay-source-provenance.json" \
+                "\$ROOT/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json" \
                 '${AGENT_SPEC_BIN}' "\${AGENT_ARGV[@]}" \
                 >"\$_spec_stdout" 2>"\$_spec_stderr" <"\$_spec_stdin" 4>&- 9>&-
     ) &
@@ -14210,6 +14772,39 @@ ${AGENT_SPEC_ENV_FILE}
         _agent_rc=\$?
     fi
     _AGENT_END_TS=\$(date +%s)
+    # Classify the actual pre-model effect before turn/port-back/selfverify.
+    # Generic exit7 never enters this arm. The collector rebinds this evidence
+    # to the protected host request before any reservation is released.
+    if [ "\$_agent_rc" -eq 7 ] && python3 -I -S - "\$OUT_DIR/.workbay-source-provenance.json" "\$ROOT/.preflight-effect-${LANE_KEY}-${DISPATCH_NONCE}.json" <<'PYPREFLIGHTEFFECT'
+import hashlib,json,sys
+try:
+    p=json.load(open(sys.argv[1]))
+    e=p["execution_preflight"]
+    encode=lambda v: json.dumps(v,sort_keys=True,separators=(",", ":")).encode()
+    expected={"schema":"workbay/execution-preflight-refusal@1","phase":"execution_preflight",
+              "exit_code":7,"model_boundary_reached":False,"reason":e["reason"],
+              "evidence_digest":hashlib.sha256(encode(e)).hexdigest()}
+    import os,stat
+    fd=os.open(sys.argv[2],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd) as f:
+        st=os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o077:
+            raise ValueError("unprotected effect")
+        effect=json.load(f)
+    wanted={"schema":"workbay/native-execution-effect@1","effect":"pre_model_refusal","rc":7,
+            "proof_sha256":hashlib.sha256(encode(e)).hexdigest(),"binding":e.get("binding",{})}
+    ok=("model_process_started" not in p and e["status"] in ("UNKNOWN","FAIL")
+        and p["execution_preflight_refusal"]==expected and effect==wanted)
+except (OSError,KeyError,TypeError,ValueError):
+    ok=False
+sys.exit(0 if ok else 1)
+PYPREFLIGHTEFFECT
+    then
+        _phase_record execution_preflight "\$_AGENT_START_TS" "\$_AGENT_END_TS"
+        unset _AGENT_START_TS _AGENT_END_TS
+        _PHASES_PARTIAL=1
+        exit 7
+    fi
     _phase_record agent_turn "\$_AGENT_START_TS" "\$_AGENT_END_TS"
     # Best effort [RES-13][OBS-05]: name leftover scope members. Never changes
     # the agent exit code. timeout 5 bounds the probe.
@@ -14704,6 +15299,18 @@ if result_source == "output_last_message":
     result_path = os.environ.get("AGENT_SPEC_RESULT_FILE") or ""
 else:
     result_path = stdout_path
+if os.environ.get("WORKBAY_NATIVE_REVIEW_KIND") == "analysis":
+    # Analysis has its own requested schema; edit/review shape heuristics are
+    # not its outcome contract. The trusted role is exported after authorenv.
+    try:
+        from workbay_orchestrator_mcp.orchestration.plan_review_driver import _read_analysis_result
+        _read_analysis_result(Path(result_path), Path(os.environ["AGENT_SPEC_SCHEMA_FILE"]))
+    except Exception as exc:
+        print("remote_agent: analysis result invalid: " + str(exc), file=sys.stderr)
+        print("result_degraded")
+        raise SystemExit(0)
+    print("ok")
+    raise SystemExit(0)
 if not result_path:
     print("ok")
     raise SystemExit(0)
@@ -14852,6 +15459,44 @@ PY
         _SALVAGE_DONE=1
         echo 'remote_agent: source_identity_failure=source_history_not_descendant refusing success harvest outside sandbox base lineage' >&2
         exit 17
+    fi
+    if [ "\${WORKBAY_NATIVE_REVIEW_KIND:-}" = analysis ]; then
+        # A successful read-only task produces a typed result, not a commit.
+        # Check every source observation with the existing bounded Git reader;
+        # a failed/empty observation must never masquerade as a clean tree.
+        _analysis_head=\$(_harvest_git rev-parse --verify HEAD) || exit 17
+        _analysis_tree=\$(_harvest_git rev-parse --verify HEAD^{tree}) || exit 17
+        _analysis_dirty=\$(_harvest_git status --porcelain=v1 --untracked-files=all) || exit 17
+        if [ "\$_analysis_head" != "\$BASE" ] || [ "\$_analysis_tree" != "\$SOURCE_TREE" ] || [ -n "\$_analysis_dirty" ]; then
+            echo 'remote_agent: analysis source changed or dirty (exit 17)' >&2
+            exit 17
+        fi
+        if ! python3 - "\$OUT_DIR/.workbay-source-provenance.json" "\$_spec_json" "\$SOURCE_COMMIT" "\$SOURCE_TREE" "\$BASE" "\$_spec_stdout" <<'ANALYSIS_RESULT_PY'
+import json
+import os
+import sys
+from pathlib import Path
+from workbay_orchestrator_mcp.orchestration.adapters.remote_exec import _source_provenance_from_json
+from workbay_orchestrator_mcp.orchestration.plan_review_driver import _read_analysis_result, _validate_analysis_completion
+
+try:
+    path, spec_path, head, tree, base, stdout = sys.argv[1:]
+    spec = json.loads(Path(spec_path).read_text())
+    proof, error = _source_provenance_from_json(Path(path), branch=spec["branch"], head_sha=head, head_tree=tree)
+    if error or not proof or proof["sandbox_base_commit"] != base:
+        raise ValueError("analysis source provenance: " + str(error or "base mismatch"))
+    _validate_analysis_completion(proof, Path(os.environ["AGENT_SPEC_STREAM_FILE"]), spec["routing_effective"])
+    result = os.environ["AGENT_SPEC_RESULT_FILE"] if spec.get("result_source") == "output_last_message" else stdout
+    _read_analysis_result(Path(result), Path(os.environ["AGENT_SPEC_SCHEMA_FILE"]))
+except Exception as exc:
+    print("remote_agent: analysis completion refused: " + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+ANALYSIS_RESULT_PY
+        then
+            exit 5
+        fi
+        _SALVAGE_DONE=1
+        exit 0
     fi
     if _harvest_git diff --quiet --no-textconv --no-ext-diff "\$BASE"..HEAD; then
         echo 'remote_agent: agent produced no committed changes' >&2
@@ -15091,6 +15736,12 @@ SUBMIT_EOF
     }
 
     fetch_provenance() {
+        _effect_tmp="${PROVENANCE_OUT}.effect.fetch.$$"
+        if _scp_with_deadline "${REMOTE_HOST}:${AGENT_ROOT}/.preflight-effect-${LANE_KEY}-${DISPATCH_NONCE}.json" "$_effect_tmp" 2>/dev/null; then
+            mv -f "$_effect_tmp" "${PROVENANCE_OUT}.effect"
+        else
+            rm -f "$_effect_tmp" "${PROVENANCE_OUT}.effect"
+        fi
         [ -n "$PROVENANCE_OUT" ] || return 0
         _provenance_fetch_tmp="${PROVENANCE_OUT}.fetch.$$"
         if _scp_with_deadline \

@@ -24,11 +24,11 @@ from .lanes_recording import update_lane as _update_lane
 # closed_stale is the reaper terminal status the schema stores; include it so
 # the typed port can round-trip every CHECK-legal value. CloseLaneStatus stays
 # closed|merged: close_lane is an operator action, not the reaper CAS path.
-LaneStatus = Literal["planned", "active", "blocked", "review", "merged", "closed", "closed_stale"]
+LaneStatus = Literal["planned", "active", "blocked", "review", "validated", "gated", "merged", "closed", "closed_stale"]
 # Open/update must not accept closed|merged: those terminals reclaim
 # lane_messages only on close_lane. closed_stale stays for reaper CAS
 # round-trip via update/open [cs0166-r12-16].
-OpenUpdateLaneStatus = Literal["planned", "active", "blocked", "review", "closed_stale"]
+OpenUpdateLaneStatus = Literal["planned", "active", "blocked", "review", "validated", "gated", "closed_stale"]
 CloseLaneStatus = Literal["closed", "merged"]
 
 

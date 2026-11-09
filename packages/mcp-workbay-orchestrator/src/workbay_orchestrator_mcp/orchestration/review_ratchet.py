@@ -510,16 +510,37 @@ def _short_branch(value: object) -> str | None:
 
 
 def task_record(task_ref: str) -> dict | None:
-    """The canonical durable task record (status, target branch/worktree, revision)."""
+    """The canonical durable task record (status, target branch/worktree, revision).
+
+    A live ``handoff_state`` row wins (``source: "live"``). Archiving moves the
+    row, not the facts it records, so without one the newest ``task_archives``
+    snapshot reports the task's final record (``source: "archive"``). ``None``
+    means neither store knows the task: unknown, never "unfinished".
+    """
     from workbay_handoff_mcp.shared_schema import _get_db_connection
 
+    fields = ("status", "target_branch", "target_worktree_path", "revision")
     with _get_db_connection() as conn:
         row = conn.execute(
             "SELECT task_ref, status, target_branch, target_worktree_path, revision FROM handoff_state "
             "WHERE task_ref = ?",
             (task_ref,),
         ).fetchone()
-    return dict(row) if row is not None else None
+        if row is not None:
+            return {**dict(row), "source": "live"}
+        archived = conn.execute(
+            "SELECT snapshot_json FROM task_archives WHERE task_ref = ? ORDER BY archived_at DESC LIMIT 1",
+            (task_ref,),
+        ).fetchone()
+    if archived is None:
+        return None
+    try:
+        snapshot = json.loads(archived["snapshot_json"])
+    except (TypeError, ValueError):
+        snapshot = None
+    active = snapshot.get("active") if isinstance(snapshot, dict) else None
+    active = active if isinstance(active, dict) else {}
+    return {"task_ref": task_ref, **{key: active.get(key) for key in fields}, "source": "archive"}
 
 
 def _manifest_lane(orchestrator_root: Path, task_ref: str, lane_id: str) -> tuple[dict, dict] | None:
@@ -558,7 +579,8 @@ def _task_source(
     """
     task = task_record(task_ref)
     located = _manifest_lane(orchestrator_root, task_ref, lane_id)
-    if task is None or task["status"] == "done" or located is None:
+    # An archived snapshot reports a final status; it never authorizes a source.
+    if task is None or task.get("source") == "archive" or task["status"] == "done" or located is None:
         return None
     manifest, lane = located
     parent = _main_parent(task, manifest)
@@ -750,6 +772,147 @@ def derive_task_subject(
     )
 
 
+TASK_SUBJECT_CORRECTION_SCHEMA = "workbay/task-subject-correction@1"
+REANCHOR_REASON = "empty_delta_first_parent_reanchor"
+
+
+def _first_parent_descendant(repo: Path, older: str, newer: str) -> bool:
+    """``older`` lies on ``newer``'s first-parent chain, not only on a merged side branch."""
+    if not _subject_is_ancestor(repo, older, newer):
+        return False
+    chain = _git(repo, "rev-list", "--first-parent", "--parents", f"{older}..{newer}").splitlines()
+    return bool(chain) and chain[-1].split()[1:2] == [older]
+
+
+def _binding_dispatched(repo: Path, binding: dict) -> bool:
+    """Any dispatch receipt for the binding or its subject branch; unreadable ones cannot prove absence."""
+    from .review_cycle_dispatch import authority
+
+    branch = binding.get("subject_branch")
+    try:
+        paths = list((authority(repo) / "review_cycle_dispatch").iterdir())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for path in paths:
+        if path.suffix != ".json":
+            continue
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return True
+        identity = receipt.get("identity") if isinstance(receipt, dict) else None
+        if (not isinstance(identity, dict) or receipt.get("source_task_subject") == binding
+                or branch in (identity.get("subject_branch"), receipt.get("source_branch"))):
+            return True
+    return False
+
+
+def task_subject_reanchor_blocker(
+    repo: Path, orchestrator_root: Path, *, pinned: dict, fresh: dict | None, worktree_path: str
+) -> str | None:
+    """The first unmet empty-delta re-anchor condition, or ``None`` when every one holds.
+
+    A binding that never produced code (tip == base, no changed files) has no
+    work a forward re-anchor could misattribute. It moves only to the
+    integration branch's current tip, reached from the pinned base along that
+    branch's first parent, with the lane branch and manifest base at exactly
+    that commit, the producer's fresh source otherwise identical (task, lane,
+    branch, integration, authorized scope, worktree) and no dispatch receipt
+    for the old binding.
+    """
+    base = pinned.get("base_sha")
+    if (not isinstance(base, str) or not re.fullmatch("[0-9a-f]{40}", base) or pinned.get("tip_sha") != base
+            or pinned.get("changed_files") != []):
+        return "pinned_delta_not_empty"
+    landed = _commit(repo, f"refs/heads/{_short_branch(pinned.get('integration_branch')) or 'main'}")
+    if landed is None:
+        return "integration_branch_unresolved"
+    if landed == base:
+        return "integration_not_moved"
+    if _commit(repo, base) != base or not _first_parent_descendant(repo, base, landed):
+        return "new_base_not_first_parent_descendant"
+    if _commit(repo, f"refs/heads/{pinned.get('subject_branch')}") != landed:
+        return "branch_tip_not_new_base"
+    located = _manifest_lane(orchestrator_root, str(pinned.get("task_ref") or ""), str(pinned.get("lane_id") or ""))
+    if located is None or located[1].get("base_sha") != landed:
+        return "manifest_base_not_new_base"
+    if fresh is None:
+        return "fresh_source_unproven"
+    record = _scope_record(repo, pinned)
+    if record is None:
+        return "scope_record_unverified"
+    authorized = record["authorized_scopes"][-1]
+    if fresh != {**pinned, "base_sha": landed, "tip_sha": landed, "owned_paths": authorized}:
+        return "identity_or_scope_changed"
+    if record is not None and not _same_worktree(record["worktree_path"], worktree_path):
+        return "worktree_changed"
+    if _binding_dispatched(repo, pinned):
+        return "dispatch_receipt_exists"
+    return None
+
+
+def _correction_path(repo: Path, binding: dict) -> Path:
+    from .review_cycle_dispatch import authority
+
+    digest = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+    return authority(repo) / "task_subject_corrections" / (digest + ".json")
+
+
+def task_subject_correction(repo: Path, binding: dict) -> dict | None:
+    """The audited correction that re-anchored to ``binding``, if the producer recorded one."""
+    path = _correction_path(repo, binding)
+    try:
+        if path.resolve() != path or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+            return None
+        record = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("schema") != TASK_SUBJECT_CORRECTION_SCHEMA:
+        return None
+    return record if record.get("binding") == binding else None
+
+
+def _record_task_subject_correction(repo: Path, pinned: dict, binding: dict) -> None:
+    """Producer-private audit of a re-anchor, shaped like the registry's ``registry_correction``.
+
+    Reuse rebind_lane's supersedes, reason, actor and corrected_at audit
+    convention. Its writer requires different tasks, so this same-task
+    correction uses the existing private atomic _save writer. Written before the
+    new binding is published. Replaying the identical correction is a no-op.
+    """
+    from datetime import UTC, datetime
+
+    from .review_cycle_dispatch import _save
+
+    path = _correction_path(repo, binding)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if path.exists():
+                existing = task_subject_correction(repo, binding)
+                if existing is None or existing.get("supersedes") != pinned:
+                    raise RatchetRefused("review_ratchet_task_subject_correction_conflict")
+                return
+            _save(path, {
+                "schema": TASK_SUBJECT_CORRECTION_SCHEMA,
+                "task_ref": binding["task_ref"],
+                "lane_id": binding["lane_id"],
+                "supersedes": pinned,
+                "binding": binding,
+                "reason": REANCHOR_REASON,
+                "actor": "registry_producer",
+                "corrected_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            })
+            path.chmod(0o600)
+    except RatchetRefused:
+        raise
+    except (OSError, ValueError):
+        raise RatchetRefused("review_ratchet_task_subject_correction_unavailable")
+
+
 def pin_task_subject(
     repo: Path, orchestrator_root: Path, *, task_ref: str, lane_id: str, branch: str, worktree_path: str, pinned: object
 ) -> dict | None:
@@ -788,7 +951,13 @@ def pin_task_subject(
             _publish_scope(repo, pinned, worktree_path, current["owned_paths"])
         return pinned
     # Do not turn mutation of base/branch/worktree/history into a fresh source.
-    # Explicit registry correction is a separate audited producer operation.
+    # The one exception is an empty-delta binding whose integration moved: it is
+    # re-anchored only under every audited condition, with a recorded correction.
+    if task_subject_reanchor_blocker(repo, orchestrator_root, pinned=pinned, fresh=fresh,
+                                     worktree_path=worktree_path) is None:
+        _record_task_subject_correction(repo, pinned, fresh)
+        _publish_scope(repo, fresh, worktree_path, fresh["owned_paths"])
+        return fresh
     return pinned
 
 
@@ -944,6 +1113,128 @@ def source_task_subject_scope(repo: Path, orchestrator_root: Path, snapshot: dic
 
 def source_task_subject_holds(repo: Path, orchestrator_root: Path, snapshot: dict) -> bool:
     return source_task_subject_scope(repo, orchestrator_root, snapshot) is not None
+
+
+def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id: str, raw: bytes) -> list[dict]:
+    """Read charged implementation history sealed by a current refusal.
+
+    The current producer seals the old token/config sequence, not an old
+    terminal result. Independently join each request to exactly one protected
+    native reservation/source and the still-charged settled ledger row. No
+    execution conclusion, source-scope release or current permission follows.
+    Canon v0.26.2 DATA-14 (lexicons/engineering.md:232, DDIA ch. 11).
+    """
+    import hashlib
+
+    from .invocation_disposition import _json, regular_bytes
+    from .nonexecution_history import authenticated_current_invocation
+    from .offload_pass_recovery import EvidenceHold, regular_file_bytes
+    from .review_cycle_dispatch import _model_or_unknown_evidence, authority, trusted_policy
+    from .review_cycle_ledger import ReviewCycleLedger, _Hold, effective_outcome_class, subject_accounting
+
+    unavailable = "review_ratchet_superseded_native_history_unavailable"
+    ambiguous = "review_ratchet_superseded_native_history_ambiguous"
+    try:
+        state = _json(raw)
+        if "superseded_invocations" not in state:
+            return []
+        if not authenticated_current_invocation(repo, state_dir, pass_id, raw):
+            raise ValueError("current_invocation_unproven")
+        prior = state["superseded_invocations"]
+        if not prior or (state_dir / f"review-receipt-{pass_id}.json").exists():
+            raise ValueError("superseded_history_unproven")
+        binding = state["lane_cycle_binding"]
+        managed = dict(task_ref=state["task_ref"], lane_id=state["lane_id"], pass_id=pass_id,
+                       worktree_path=binding["worktree_path"])
+        policy = trusted_policy()
+        ledger_path = authority(repo) / "review_cycle_ledger.json"
+        ledger_raw = regular_bytes(ledger_path)
+        data = ReviewCycleLedger(ledger_path, policy)._decode(ledger_raw)
+        candidates = []
+        directory = authority(repo) / "review_cycle_dispatch"
+        for path in sorted(directory.glob("*.json")):
+            # Native prepare uses its existing producer-owned custody contract,
+            # not the separate owner-only nonexecution receipt namespace.
+            content = regular_file_bytes(path, root=directory)
+            if regular_bytes(path) != content:
+                raise ValueError("native_history_changed")
+            receipt = _json(content)
+            if receipt.get("managed_identity") == managed:
+                candidates.append((path, receipt, content))
+        used, records, previous_sequence = set(), [], 0
+        for invocation in prior:
+            request = invocation["completion_config"]
+            head = request.get("start_head_ref")
+            if (request.get("dry_run") is not False or _model_or_unknown_evidence(request) is not None
+                    or not isinstance(head, str)
+                    or not re.fullmatch("[0-9a-f]{40}", head)):
+                raise ValueError("superseded_request_unproven")
+            matches = [(p, r, b) for p, r, b in candidates
+                       if r.get("managed_source", {}).get("head_sha") == head]
+            if len(matches) > 1:
+                raise RatchetRefused(ambiguous)
+            if not matches:
+                raise ValueError("native_source_missing")
+            path, protected, content = matches[0]
+            identity, decision = protected["identity"], protected["decision"]
+            dispatch_id = identity["dispatch_id"]
+            row = data["rows"][dispatch_id]
+            reserved = decision["row"]
+            # A prepared producer is evidence of reserved source, not evidence
+            # that execution did or did not occur. Other native producer shapes
+            # retain their existing recovery protocol rather than being skipped.
+            if (set(protected) != {"identity", "decision", "token", "state", "settlement_owner",
+                                   "managed_identity", "managed_source"}
+                    or protected["state"] != "prepared" or protected["settlement_owner"] != "engine"
+                    or not isinstance(protected["token"], str)
+                    or not re.fullmatch("[0-9a-f]{48}", protected["token"])
+                    or path.name != hashlib.sha256(dispatch_id.encode()).hexdigest() + ".json"
+                    or identity != dict(dispatch_id=dispatch_id, subject_branch=binding["branch"], kind="implement")
+                    or protected["managed_source"] != dict(branch=binding["branch"], head_sha=head,
+                        head_tree=_git(repo, "--no-replace-objects", "rev-parse", head + "^{tree}"))
+                    or decision["status"] != "reserved" or reserved["decision"] != "reserved"
+                    or reserved["outcome_class"] != "pending" or reserved["completion"] is not None
+                    or reserved["dispatch_id"] != dispatch_id or reserved["kind"] != "implement"
+                    or reserved["subject_branch"] != binding["branch"]
+                    or row != {**reserved, "completion": row.get("completion"),
+                               "outcome_class": "verdict", "settled_sequence": row.get("settled_sequence"),
+                               "settlement_status": "settled"}
+                    or not isinstance(row["completion"], dict) or row["completion"].get("outcome") != "error"
+                    or effective_outcome_class(data, row) != "verdict"
+                    or type(row.get("settled_sequence")) is not int or row["settled_sequence"] <= 0
+                    or type(row.get("issued_sequence")) is not int or row["issued_sequence"] <= previous_sequence
+                    or dispatch_id in used):
+                raise ValueError("native_reservation_source_mismatch")
+            route = reserved.get("required_route")
+            if route is not None and route != dict(backend=request.get("backend"), model=request.get("model"),
+                                                   effort=request.get("reasoning_effort")):
+                raise ValueError("native_route_mismatch")
+            if _commit(repo, head) != head:
+                raise ValueError("native_source_missing")
+            _git(repo, "--no-replace-objects", "merge-base", "--is-ancestor", binding["source_base_sha"], head)
+            account = subject_accounting(data, binding["branch"], policy)
+            if data["subjects"][binding["branch"]]["fixes"] != account["fixes"] or account["fixes"] < 1:
+                raise ValueError("native_accounting_mismatch")
+            previous_sequence = row["issued_sequence"]
+            used.add(dispatch_id)
+            records.append(dict(dispatch_id=dispatch_id, invocation_token=invocation["invocation_token"],
+                                completion_config=request, source_head=head,
+                                source_tree=protected["managed_source"]["head_tree"], charged=True,
+                                execution="UNKNOWN", reservation=row,
+                                producer=dict(path=str(path), sha256=hashlib.sha256(content).hexdigest())))
+        if len(used) != len(candidates):
+            raise RatchetRefused(ambiguous)
+        if (regular_bytes(state_dir / f"offload-pass-{pass_id}.json") != raw
+                or regular_bytes(ledger_path) != ledger_raw
+                or any(regular_file_bytes(path, root=directory) != content or regular_bytes(path) != content
+                       for path, _, content in candidates)):
+            raise ValueError("native_history_changed")
+        return records
+    except RatchetRefused:
+        raise
+    except (EvidenceHold, _Hold, OSError, ValueError, KeyError, TypeError, AttributeError,
+            subprocess.SubprocessError) as exc:
+        raise RatchetRefused(unavailable, str(exc)) from exc
 
 
 def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict]:
@@ -1140,9 +1431,23 @@ def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict
                 provenance_path=paths["provenance"], started_at=state.get("started_at") or spec["created_at"], job_path=path))
             detached_states.add(state_path)
         for path in sorted(config.state_dir.glob("offload-pass-*.json")):
-            state, _ = read(path)
+            raw = path.read_bytes()
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                raise RatchetRefused(unavailable)
+            from .nonexecution_history import authenticated_nonexecution
+
+            # Exact-record host recovery authority, never an untrusted label,
+            # absent dispatch or inferred outcome. Invalid custody holds.
+            recovered_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
+            if authenticated_superseded_native_history(repo, config.state_dir, recovered_pass_id, raw):
+                continue  # charged native rows remain in their accounting authority
+            if authenticated_nonexecution(repo, config.state_dir, recovered_pass_id, raw):
+                continue
             if state.get("branch") != subject_branch:
                 continue
+            if (state.get("completion_config") or {}).get("dry_run") is True:
+                raise RatchetRefused(mismatch)  # a label never erases execution or proves a preview
             kind = (state.get("lane_spec") or {}).get("lane_kind")
             if kind not in {None, "implement"}:
                 continue
@@ -1265,12 +1570,29 @@ def load_context(
             # Keep unprovable foreign history available for subject binding.
             receipts.append((str(identity.get("started_at") or ""), path, receipt))
     retained = []
+    from .invocation_disposition import _json, regular_bytes
+
     for path in state_dir.glob("offload-pass-*.json"):
         try:
-            prior = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
+            raw = regular_bytes(path)
+            prior = _json(raw)
+        except (OSError, ValueError) as exc:
+            # An unreadable identity cannot be safely assigned to another
+            # task or omitted before its charged history is authenticated.
+            raise RatchetRefused("review_ratchet_retained_pass_unreadable") from exc
         if isinstance(prior, dict) and prior.get("task_ref") == task_ref:
+            from .nonexecution_history import authenticated_nonexecution
+
+            prior_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
+            try:
+                if authenticated_superseded_native_history(repo, state_dir, prior_pass_id, raw):
+                    continue  # an authenticated implementation charge, never whole-pass nonexecution
+                if authenticated_nonexecution(repo, state_dir, prior_pass_id, raw):
+                    continue
+            except RatchetRefused:
+                raise
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RatchetRefused("review_ratchet_nonexecution_proof_unavailable") from exc
             record_branch = prior.get("branch")
             try:
                 # Decode exactly as the receipt join does, retaining the raw

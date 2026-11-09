@@ -38,6 +38,7 @@ from workbay_bootstrap.subcommands import (
     repair,
     status,
     update,
+    validate_overrides,
 )
 
 # implementation note: CLI default flips to ``minimal``. The library
@@ -1170,6 +1171,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit the bootstrap receipt as JSON.",
     )
 
+    p_validate_overrides = sub.add_parser(
+        "validate-overrides",
+        help="Validate plugin overrides, including bootstrap-owned Claude settings.",
+    )
+    p_validate_overrides.add_argument("--override-root", type=Path, required=True)
+
     p_overrides = sub.add_parser(
         "overrides",
         help="Inspect and maintain consumer plugin overrides (internal).",
@@ -1784,6 +1791,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"skipped {f['kind']}: {f['path']}{suffix}", file=sys.stdout)
         if not report["repaired"] and not report["skipped"]:
             print("repair: no drift detected.", file=sys.stdout)
+        return 0
+
+    if args.command == "validate-overrides":
+        import yaml
+
+        try:
+            validate_overrides(override_root=args.override_root)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         return 0
 
     if args.command == "overrides":

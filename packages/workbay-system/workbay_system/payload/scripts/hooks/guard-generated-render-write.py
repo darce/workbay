@@ -89,6 +89,12 @@ EXIT_BLOCK = 2
 CONTRACT_RELATIVE = Path("docs/workbay/contracts/harness-protocol.yaml")
 SOURCE_HINT = "docs/workbay/contracts/harness-protocol.yaml"
 
+# Standalone hooks cannot import bootstrap. Pinned to its validator-table keys
+# by test_guard_render_consumer_home.py; keep both shipped guard copies equal.
+SHARED_CONSUMER_TOP_LEVEL_KEYS = frozenset(
+    {"attribution", "enableAllProjectMcpServers", "disabledMcpjsonServers"}
+)
+
 # Payload twin of every monorepo-root render lives under the shipped payload
 # tree (DATA-14). Arm B must cover both anchors (SECD-03 / WEB-33).
 _PAYLOAD_TWIN_PREFIX = "packages/workbay-system/workbay_system/payload/"
@@ -760,6 +766,12 @@ def format_refusal(rel_path: str, *, reason: str) -> str:
         f"  {SOURCE_HINT}\n"
         f"\n"
     )
+    if _norm_path(rel_path).removeprefix(_PAYLOAD_TWIN_PREFIX) == ".claude/settings.json":
+        header += (
+            "For consumer-owned Claude settings, edit components.claude_settings_shared\n"
+            "  in workbay-overrides/workbay-system/overrides.yaml.\n"
+            f"Allowed keys: {', '.join(sorted(SHARED_CONSUMER_TOP_LEVEL_KEYS))}.\n\n"
+        )
     if regen:
         return header + f"Then regenerate with:\n  {regen}\n"
     # Honest no-writer text. Mentions check-harness-sync only as verify-only

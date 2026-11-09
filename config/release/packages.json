@@ -55,6 +55,15 @@
       "git_mirror": true
     },
     {
+      "name": "mcp-workbay-canvas",
+      "path": "packages/mcp-workbay-canvas",
+      "distribution": "mcp-workbay-canvas",
+      "artifact_prefix": "mcp_workbay_canvas",
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/mcp-workbay-canvas/CHANGELOG.md",
+      "git_mirror": true
+    },
+    {
       "name": "workbay",
       "path": "packages/workbay",
       "distribution": "workbay",

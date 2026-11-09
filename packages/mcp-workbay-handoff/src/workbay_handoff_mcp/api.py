@@ -91,6 +91,7 @@ from .review_findings_api import (
     review_findings as _review_findings_api,
 )
 from .review_findings_queries import cap_review_findings_response
+from .review_findings_queries import complete_review_run as _core_complete_review_run
 from .review_findings_updates import _attach_opportunistic_integrate_signal
 from .runtime import configure_runtime as _configure_runtime
 from .runtime import get_runtime_config, reset_runtime_config
@@ -251,7 +252,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "record_event": "Record a decision, verification result, blocker, or error through one typed event surface. Set event.event_kind to 'decision', 'test_result', 'blocker', or 'error' (error_class + summary) to select the required fields.",
     "next_actions": "List or mutate next-action items through one typed domain surface. Set action.operation to 'list', 'add', 'update', 'complete', or 'skip'.",
     "review_findings": "Record, batch record, update, resolve, repair provenance, merge, integrate, disposition, reanchor, or list review findings through one typed domain surface. Set review.operation to 'record', 'batch_record', 'update', 'resolve', 'repair_provenance', 'merge', 'integrate', 'disposition', 'reanchor', or 'list'. The 'resolve' operation is the commit-backed reconciliation path that classifies open findings against the current workspace commit, marks eligible findings fixed, and reports pending-uncommitted outcomes without dummy writes. The 'repair_provenance' operation is the bounded admin path for fixing a finding row whose source branch/commit_sha was attributed to the wrong commit (e.g. the reviewer's workspace HEAD instead of the actual buggy code's commit) — see ReviewFindingsRepairProvenanceOp. The 'merge' operation (coordinator-centric) re-records findings from one or more source task_refs under a target coordinator task_ref with merged_from provenance. By default retire_sources=true retires merged source rows to status='superseded' in the same transaction while preserving audit content; retire_sources=false keeps legacy additive source rows — see ReviewFindingsMergeOp. The 'disposition' operation is the admin path for terminal status on findings whose task_ref has no live handoff row or is already status=done (orphan/stale refs); optional disposition_evidence is folded into resolution_notes (implementation note) — see ReviewFindingsDispositionOp. The 'reanchor' operation is the open-preserving file_path rewrite (status stays open) for remappable rename-map findings — see ReviewFindingsReanchorOp.",
-    "review_runs": "Record, list, or summarize review-run coverage through one typed domain surface. Set review.operation to 'record', 'list', or 'coverage'.",
+    "review_runs": "Record, list, or summarize review-run coverage through one typed domain surface. Set review.operation to 'record', 'complete', 'list', or 'coverage'.",
     "terminal_guard_telemetry": "Record, list, or replay durable terminal-guard telemetry through one typed domain surface. Set telemetry.operation to 'record', 'list', or 'replay'. Record writes a bounded redacted command preview plus repo-instance identity; list returns persisted rows with optional task/decision/harness filters; replay ingests fallback JSONL rows into the durable ledger with event-key dedupe.",
     "integrity_check": "Run a working-tree, post-merge, or close-readiness integrity check through one typed surface. Set kind to 'working_tree' (compares dirty paths to .task-state/dirty-allowlist), 'post_merge' (diffs working tree against merged_sha), or 'close' (full close-readiness gate: blockers, pending actions, findings, optional fresh-test gate).",
     "audit_decision_ids": "Audit the task's decision IDs (newest first, limit up to 500) for grammar conformance. Each row is classified canonical (<author_tag>_<decision_kind>_<work_ref>_<slug>), legacy_slice (grandfathered slice_complete_*), malformed_slice, or freeform. include_categories selects which categories appear in the per-row violations list (default malformed_slice and freeform).",
@@ -666,6 +667,15 @@ class ReviewRunsRecordOp(BaseModel):
     ] = None
     task_ref: TaskRefParam = None
     actor: ActorParam = None
+    subject_sha: Annotated[
+        str | None,
+        Field(
+            description="File SHA256 or existing branch commit identity; a caller hash alone is not review provenance."
+        ),
+    ] = None
+    source_ref: Annotated[
+        str | None, Field(description="Pin code source and require an authoritative pending planning-file freeze.")
+    ] = None
     max_review_rounds: Annotated[
         int,
         Field(
@@ -676,6 +686,17 @@ class ReviewRunsRecordOp(BaseModel):
             ),
         ),
     ] = 5
+
+
+class ReviewRunsCompleteOp(BaseModel):
+    operation: Literal["complete"]
+    review_run_id: str
+    session: str
+    expected_subject_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    verdict: Literal["pass", "pass_with_findings", "fail", "conditional_pass"]
+    verdict_decision: str | None = None
+    actor: ActorParam = None
+    max_review_rounds: int = 5
 
 
 class ReviewRunsListOp(BaseModel):
@@ -701,13 +722,13 @@ class ReviewRunsCoverageOp(BaseModel):
 
 
 ReviewRunsParam = Annotated[
-    ReviewRunsRecordOp | ReviewRunsListOp | ReviewRunsCoverageOp,
+    ReviewRunsRecordOp | ReviewRunsCompleteOp | ReviewRunsListOp | ReviewRunsCoverageOp,
     Field(discriminator="operation"),
 ]
 
-_REVIEW_RUNS_ADAPTER: TypeAdapter[ReviewRunsRecordOp | ReviewRunsListOp | ReviewRunsCoverageOp] = TypeAdapter(
-    ReviewRunsParam
-)
+_REVIEW_RUNS_ADAPTER: TypeAdapter[
+    ReviewRunsRecordOp | ReviewRunsCompleteOp | ReviewRunsListOp | ReviewRunsCoverageOp
+] = TypeAdapter(ReviewRunsParam)
 
 
 class TerminalGuardTelemetryRecordOp(BaseModel):
@@ -1514,7 +1535,9 @@ def _validate_validate(payload: ValidateParam) -> DecisionIdValidate | WriteVali
     return _VALIDATE_ADAPTER.validate_python(payload)
 
 
-def _validate_review_runs(review: ReviewRunsParam) -> ReviewRunsRecordOp | ReviewRunsListOp | ReviewRunsCoverageOp:
+def _validate_review_runs(
+    review: ReviewRunsParam,
+) -> ReviewRunsRecordOp | ReviewRunsCompleteOp | ReviewRunsListOp | ReviewRunsCoverageOp:
     return _REVIEW_RUNS_ADAPTER.validate_python(review)
 
 
@@ -2653,6 +2676,9 @@ def record_review_run(
             ),
         ),
     ] = 5,
+    *,
+    subject_sha: str | None = None,
+    source_ref: str | None = None,
 ) -> dict:
     return _core_record_review_run(
         review_run_id=review_run_id,
@@ -2665,6 +2691,8 @@ def record_review_run(
         task_ref=task_ref,
         actor=_dump_actor(actor),
         max_review_rounds=max_review_rounds,
+        subject_sha=subject_sha,
+        source_ref=source_ref,
     )
 
 
@@ -2672,7 +2700,7 @@ def review_runs(
     review: Annotated[
         ReviewRunsParam,
         Field(
-            description="Typed review-runs payload. operation selects one of the record, list, or coverage variants."
+            description="Typed review-runs payload. operation selects one of the record, complete, list, or coverage variants."
         ),
     ],
 ) -> dict:
@@ -2689,6 +2717,12 @@ def review_runs(
             task_ref=review_payload.task_ref,
             actor=_dump_actor(review_payload.actor),
             max_review_rounds=review_payload.max_review_rounds,
+            subject_sha=review_payload.subject_sha,
+            source_ref=review_payload.source_ref,
+        )
+    if isinstance(review_payload, ReviewRunsCompleteOp):
+        return _core_complete_review_run(
+            **review_payload.model_dump(exclude={"operation", "actor"}), actor=_dump_actor(review_payload.actor)
         )
     if isinstance(review_payload, ReviewRunsListOp):
         return list_review_runs(

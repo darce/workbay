@@ -227,6 +227,8 @@ _REVIEW_RUNS_RECORD_VARIANT = WriteContract(
         "task_ref",
         "actor",
         "max_review_rounds",
+        "subject_sha",
+        "source_ref",
     ],
     field_grammars={
         "verdict": r"^(pass|pass_with_findings|conditional_pass|fail)$",
@@ -240,6 +242,15 @@ _REVIEW_RUNS_LIST_VARIANT = WriteContract(
     optional=["task_ref", "subject_path", "limit", "offset", "review_mode", "verdict"],
     field_grammars={
         "review_mode": r"^(branch|release_audit|planning)$",
+        "verdict": r"^(pass|pass_with_findings|conditional_pass|fail)$",
+    },
+)
+_REVIEW_RUNS_COMPLETE_VARIANT = WriteContract(
+    tool_name="review_runs.operation=complete",
+    required=["review_run_id", "session", "expected_subject_sha256", "verdict"],
+    optional=["verdict_decision", "actor", "max_review_rounds"],
+    field_grammars={
+        "expected_subject_sha256": r"^[0-9a-f]{64}$",
         "verdict": r"^(pass|pass_with_findings|conditional_pass|fail)$",
     },
 )
@@ -446,6 +457,7 @@ REGISTRY: dict[str, WriteContract] = {
         selector_field="operation",
         variants={
             "record": _REVIEW_RUNS_RECORD_VARIANT,
+            "complete": _REVIEW_RUNS_COMPLETE_VARIANT,
             "list": _REVIEW_RUNS_LIST_VARIANT,
             "coverage": _REVIEW_RUNS_COVERAGE_VARIANT,
         },

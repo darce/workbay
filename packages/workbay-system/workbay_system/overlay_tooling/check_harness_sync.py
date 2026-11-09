@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import importlib.util
 import json
 import os
 import re
@@ -73,6 +74,9 @@ CLAUDE_MANAGED_BY = "workbay-bootstrap"
 CLAUDE_PLUGIN_SELECTOR = "workbay-system@workbay-marketplace"
 CLAUDE_PLUGIN_MARKETPLACE_NAME = "workbay-marketplace"
 CLAUDE_OVERRIDE_ROOT_REL = Path("workbay-overrides") / "workbay-system"
+# Bootstrap validates these independently; keep parity with its loader and the
+# standalone generator without requiring a newer workbay_protocol at runtime.
+BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS = frozenset({"claude_permissions", "claude_settings_shared"})
 FIXTURE_COPY_FILES = (
     Path(".vscode/settings.json"),
     Path(".github/hooks/guard-main-branch.py"),
@@ -424,10 +428,13 @@ def _expected_managed_claude_hooks(contract: dict, *, repo_root: Path = REPO_ROO
     manifest_payload = yaml.safe_load((override_root / "overrides.yaml").read_text()) or {}
     if isinstance(manifest_payload, dict) and isinstance(manifest_payload.get("components"), dict):
         components = manifest_payload["components"]
-        if "claude_permissions" in components:
+        if any(key in components for key in BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS):
             manifest_payload = dict(manifest_payload)
             manifest_payload["components"] = dict(components)
-            manifest_payload["components"].pop("claude_permissions", None)
+            # Bootstrap validates these extensions separately from the plugin
+            # protocol model. Neither changes the composed hooks subtree.
+            for key in BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS:
+                manifest_payload["components"].pop(key, None)
     manifest = PluginOverrideManifest.model_validate(manifest_payload)
     return generator.render_composed_claude_settings_hooks(
         hooks_spec,
@@ -1038,6 +1045,11 @@ def _fixture_env(repo: Path) -> dict[str, str]:
 
 
 def _fixture_python_command(*, packages_root: Path = PACKAGES_ROOT) -> list[str]:
+    # The overlay CLI may run in a bootstrap/tool environment without handoff
+    # dependencies. Preserve the caller only when it can run fixture children.
+    fixture_dependencies = ("fastmcp", "packaging", "pydantic", "tiktoken")
+    if sys.executable and all(importlib.util.find_spec(name) is not None for name in fixture_dependencies):
+        return [sys.executable]
     uv_bin = shutil.which("uv")
     if uv_bin:
         return [

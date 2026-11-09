@@ -15,7 +15,6 @@ a ``--write`` I/O failure (each file is replaced atomically, so it is old or new
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
@@ -30,6 +29,7 @@ from typing import Any, Mapping, Sequence
 from .statechart_conformance import (
     CHART_FILENAME,
     MACHINE_KEYS,
+    ConformanceError,
     _iter_guards,
     _machine_edges,
     _targets,
@@ -104,8 +104,6 @@ def _gates_by_transition(chart: Mapping[str, Any]) -> dict[str, list[str]]:
 def _transition_rows(machine: Mapping[str, Any], gates: Mapping[str, list[str]]) -> list[list[str]]:
     keyed: list[tuple[tuple[str, tuple[str, ...], str], list[str]]] = []
     for transition in machine["transitions"]:
-        if not _machine_edges([transition]):
-            continue
         tid, src = transition["id"], transition["from"]
         targets = tuple(sorted(_targets(transition)))
         guards = _iter_guards(transition)
@@ -175,7 +173,10 @@ def render_mermaid_overview(chart: Mapping[str, Any]) -> str:
 
     Edges and aliases match ``render_mermaid(chart, machines=("outer",))``. An edge with both ends in the
     region is drawn inside the composite; every other edge, including ``[*]`` ones, is drawn at top level.
+
+    Raises ``ConformanceError`` with the validation report's errors if any part of the chart is invalid.
     """
+    validate_chart(chart).raise_if_failed()
     machine = chart["outer"]
     prefix = machine["id"]
     grouped = _region_states(machine)
@@ -204,8 +205,11 @@ def render_mermaid_overview(chart: Mapping[str, Any]) -> str:
 
 
 def render_markdown(chart: Mapping[str, Any], *, chart_sha256: str) -> str:
-    """Render the human-readable statechart doc; pure and input-order independent."""
-    report = validate_chart(chart)
+    """Render the human-readable statechart doc; pure and input-order independent.
+
+    Raises ``ConformanceError`` with the validation report's errors if any part of the chart is invalid.
+    """
+    validate_chart(chart).raise_if_failed()
     lines = [
         f"<!-- GENERATED from {CHART_FILENAME} by {GENERATOR_COMMAND}; do not edit -->",
         "# Orchestrator lifecycle statechart",
@@ -224,12 +228,7 @@ def render_markdown(chart: Mapping[str, Any], *, chart_sha256: str) -> str:
         "## Conformance",
         "",
     ]
-    if report.ok:
-        lines.append("`validate_chart`: `ok`")
-    else:
-        lines.append("`validate_chart` errors:")
-        lines.append("")
-        lines += [f"- {_cell(error)}" for error in sorted(report.errors)]
+    lines.append("`validate_chart`: `ok`")
     lines.append("")
     if _region_states(chart["outer"]) is not None:
         lines += ["## Overview", "", "```mermaid", render_mermaid_overview(chart).rstrip("\n"), "```", ""]
@@ -269,9 +268,9 @@ def _sweep_stale_temps(path: Path) -> None:
     hex; a match is unlinked when its mtime is that far in the past or in the future (a clock stepped back, or a
     skewed network FS). Symlinks are judged by their own mtime and unlinked, never followed. A match that is not a
     regular file or a symlink (a directory, FIFO, socket or device) is no temp of ours and is left alone, never
-    recursed into or removed. Residual risk: after a clock step or skew over the limit a live run's temp can be
-    swept. Temp names are per run, so that cannot make two runs share a file; the live run's ``os.replace`` fails,
-    it exits 2, and its target keeps the old bytes.
+    recursed into or removed; so is one that became a directory between the stat and the unlink. Residual risk:
+    after a clock step or skew over the limit a live run's temp can be swept. Temp names are per run, so that cannot
+    make two runs share a file; the live run's ``os.replace`` fails, it exits 2, and its target keeps the old bytes.
     """
     pattern = re.compile(rf"\.{re.escape(path.name)}\.[0-9]+(?:\.[0-9a-f]{{{2 * _TEMP_TOKEN_BYTES}}})?\.tmp")
     now = time.time()
@@ -287,29 +286,30 @@ def _sweep_stale_temps(path: Path) -> None:
                     continue
                 if abs(now - info.st_mtime) > _STALE_TEMP_SECONDS:
                     os.unlink(entry.path)
-            except FileNotFoundError:
-                pass  # Another run reclaimed it first.
+            except (FileNotFoundError, IsADirectoryError):
+                pass  # Another run reclaimed it first, or it is a directory since the stat (Linux EISDIR).
+            except PermissionError:
+                # macOS reports unlink of a directory as EPERM; a real permission failure on a file still raises.
+                try:
+                    now_dir = stat.S_ISDIR(os.lstat(entry.path).st_mode)
+                except FileNotFoundError:
+                    continue  # Gone since the unlink failed: another run reclaimed it.
+                if not now_dir:
+                    raise
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
     """Write a sibling temp file, then ``os.replace``; on failure the target is untouched and the temp removed.
 
-    The temp name carries this run's pid and a random token, so ``O_EXCL`` fails only if another run holds the
-    name; that ``FileExistsError`` propagates without touching the file (``--write`` exits 2). Until ``os.fdopen``
-    returns, the fd is ours to close. Residual risk: an interrupt after ``os.open`` returns but before ``fd`` is
-    bound leaks the fd and the temp; no Python statement can close that, and the next run's sweep reclaims it.
+    The temp name carries this run's pid and a random token, so ``O_EXCL`` (mode ``"xb"``) fails only if another
+    run holds the name; that ``FileExistsError`` propagates without touching the file (``--write`` exits 2). The
+    temp's fd is owned by its file object from creation, so no bare fd number is ever closed here. Residual risk: an
+    interrupt inside ``open`` after it creates the file, or before ``handle`` is bound, leaks the temp (the file
+    object closes its own fd); the next run's sweep reclaims it.
     """
     _sweep_stale_temps(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    try:
-        handle = os.fdopen(fd, "wb")
-    except BaseException:
-        # EBADF when a file object took the fd and closed it before the error surfaced.
-        with contextlib.suppress(OSError):
-            os.close(fd)
-        tmp.unlink(missing_ok=True)
-        raise
+    handle = open(tmp, "xb")  # O_WRONLY | O_CREAT | O_EXCL, mode 0o666 under the umask.
     try:
         with handle:
             handle.write(data)
@@ -334,7 +334,7 @@ def _render_outputs(chart_file: Path, out_dir: Path) -> dict[Path, bytes]:
     try:
         markdown = render_markdown(chart, chart_sha256=hashlib.sha256(raw).hexdigest())
         mermaid = render_mermaid(chart)
-    except (KeyError, TypeError, AttributeError) as exc:
+    except (KeyError, TypeError, AttributeError, ConformanceError) as exc:
         raise ValueError(f"chart {chart_file} cannot be rendered: missing or malformed {exc}") from exc
     return {
         out_dir / MARKDOWN_FILENAME: markdown.encode("utf-8"),

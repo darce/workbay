@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-system"
-version = "0.4.25"
+version = "0.4.27"
 description = "Canonical workbay-system overlay payload (skills, hooks, contracts, generator) shipped as package data for workbay-bootstrap."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,7 @@ dev = [
     "pyyaml>=6",
     "hatchling>=1.27",
     "radon>=6.0.0",
-    "workbay-protocol>=0.3.8,<0.4.0",
+    "workbay-protocol>=0.3.10,<0.4.0",
 ]
 
 # uv-only dev provisioning: sibling test deps resolve via path-editable sources.
@@ -47,7 +47,7 @@ dev = [
     "hatchling>=1.27",
     "radon>=6.0.0",
     "mcp-workbay-handoff[test] ; python_version >= '3.12'",
-    "workbay-protocol>=0.3.8,<0.4.0",
+    "workbay-protocol>=0.3.10,<0.4.0",
 ]
 
 

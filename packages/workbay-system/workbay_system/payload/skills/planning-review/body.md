@@ -38,14 +38,32 @@ This skill owns planning-review execution order. The guide owns the detailed che
    - **Pre-worktree implementation row:** if the implementation task's `target_branch` has no linked worktree yet, do not write MCP review state against that implementation row. Those writes can fail with `WorktreeNotFoundError`. Use a `target_branch=main` `MAINT-*` row for the planning pass, run `make task-start` once the accepted baseline exists, or wait until the feature worktree exists.
    - **`Ambiguous active task` error:** pass `task_ref` explicitly; if stale rows cause the ambiguity, run `make task-reap` (dry-run) to see closeable vs active rows; `make task-reap REAP_ARGS=--apply` closes only closeable rows, then re-run `make context`. `make context` exits `2` on this ambiguity.
 
-1. Load the planning artifact, the minimum prerequisite packet, and the relevant code or contract anchors.
+1. **Execute one bounded remote round through the normal gateway.** From the target worktree run:
+
+   ```sh
+   make plan-review DOC=<path> LIFECYCLE_ARGS="--task-ref <task-ref> --base-sha <full-commit> --round 1 --scope-decision <decision-id> --review-run-id <stable-id> --session <session> --json"
+   ```
+
+   The installed `workbay_orchestrator_mcp.orchestration.plan_review_driver` owns execution. Root and payload gateways use that same package API. Defaults are `codex-remote`, `gpt-6.1-sol`, `high`, `standard`; explicit `--model` and `--effort` are validated through the remote catalogue. All reviewers execute remotely; unavailable routes fail without local fallback. One invocation is one round, with no automatic rereview. Round 2 requires `--prior-adjudication <json-path>`; rounds above 2 also require `--round-justification <reason>`. Prior JSON names `task_ref`, the preceding `round`, and its `review_run_id`; its exact byte digest travels with the review. `--timeout` bounds native transport to 1..1800 seconds (default 900).
+
+   - The gateway freezes once through NWI02's authoritative pending DTO, then runs NWI01 lint against the snapshot and immutable source tree before intent or model input. `invalid` exits 1; `unknown` exits 2. Unsupported evidence is unknown. No mutable plan path substitutes for the frozen bytes.
+   - `--preflight-only` produces the pending DTO without execution. To continue it, pass its **same** `--review-run-id` and base to the normal gateway. Completed retries read the canonical row and return the same review identity without resubmission. Changed immutable parameters conflict; old unbound rows cannot become new proof.
+   - The driver packages the exact base64 snapshot, digest, immutable source, round, prior adjudication and scope, builds a read-only AgentSpec, and executes existing native submit/status/collect. `COPYFILE_DISABLE=1` and `COPYINGFILE_DISABLE=1` are set for archive transport. A packet, intent, or spool is not a completed review.
+   - Every real defect must be in `findings[]`, including confirmed out-of-scope defects as `follow_up` with origin and rationale. Notes are bounded non-defect observations; notes-only output is not qualified authority. Schema validation cannot prove semantic completeness. Independent qualification remains required and must check for defects hidden in prose.
+   - Canonical finding batches are capped at 100 per write, retain committed event receipts, reconcile linked prior findings, and never replay a terminal upsert. Partial recording exits nonzero without completion and resumes through canonical receipts. A stable verdict event precedes the explicit digest CAS of the same pending row.
+   - The machine receipt names the job/run, source/tree, subject and packet digests, round, prior digest, scope, requested route, all canonical finding IDs, verdict and CAS. `review_completed` and `plan_accepted` are distinct; this driver never accepts or publishes a plan.
+   - Failure codes: 20 parameters, 21 identity conflict, 22 route/catalogue, 23 native transport/provenance, 24 result/schema, 25 incomplete recording, 26 completion CAS, 27 dashboard outcome unknown, 28 busy run, 29 subject unavailable. Native return code and partial progress remain in the receipt. Exit 0 means all recording and one dashboard refresh completed, not that the verdict was a pass.
+   - Delivery artifacts and the existing native-job ledger are resumable transport state, not another review database. A dashboard attempt whose acknowledgment was lost reports unknown and requires reconciliation; retry never silently renders twice.
+
+   Steps 2–10 below describe the checks and canonical effects owned by this driver. Inspect its receipt; do not launch another reviewer or repeat its writes in-session. Resume a failed operation with the same immutable parameters and stable run ID. Steps 11–12 retain the existing separate operator workflow.
+
 2. Check prior planning review history with `review_runs(review={"operation": "list", "review_mode": "planning", ...})`.
 3. Execute the planning-review checklist: current-state accuracy, internal consistency, architecture ownership, contract realism, interface realism, **junior-agent implementability**, naming compliance, pipeline readiness, and testability. The *Junior-Agent Implementability* subsection of `planning-review-guide.md` is mandatory: verify the plan names files **and** functions (`path:symbol`), grounds every code claim against the actual codebase (no invented APIs/fields/files), and is implementable from the text alone — spot-check cited anchors exist.
 4. If the artifact is a task plan under `docs/tasks/`, verify it still conforms to `docs/workbay/templates/TASK_PLAN.template.md`, including the `## Consolidated Checklist` structure, the required supporting sections, and the *Implementation Readiness — Junior-Agent Standard*.
 5. Record every finding in MCP with `review_findings`.
 6. Decide the planning verdict.
 7. Record the verdict decision with `record_event(event={"event_kind": "decision", ...})`.
-8. Record the planning review run with `review_runs(review={"operation": "record", "review_mode": "planning", ...})`.
+8. Complete the **same authoritative pending review** through the freeze producer's bound completion protocol, preserving `review_run_id` and the exact reviewed digest. Do not insert a new unbound verdict or capture a digest after judging. Completion and plan acceptance must recheck the reviewed bytes at effect; if the NWI02 completion/acceptance integration is unavailable, report that dependency and stop without declaring acceptance.
 9. Refresh `DASHBOARD.txt` with `render_handoff(kind='dashboard')` after the state-changing writes land.
 10. Confirm whether open findings remain before declaring the artifact ready, and cite the stable handoff gap ids (`finding_id`) when reporting them.
 11. **Post-`pass`**: when the verdict is exactly `pass` and zero open planning findings remain for the subject, instruct the operator to run `make plan-accept TASK=<ref>` from the root `main` checkout before `make task-start`. This lands the plan on `main` as a docs-only commit so the accepted baseline becomes durable and coordinators can read it locally. If the reviewed plan is a brand-new untracked draft on root `main`, use the receipt's explicit `LIFECYCLE_ARGS="--json --local --plan <path> --source-branch main"` form so `plan-accept` commits only that plan file. `task-start`, `review-ready`, and `handoff-close-check` report `plan_baseline_missing` until that baseline exists. `pass_with_findings`, `conditional_pass`, `fail`, and absent runs do **not** unlock acceptance.
@@ -69,6 +87,7 @@ This skill owns planning-review execution order. The guide owns the detailed che
 
 ## Recovery
 
+- Use the same normal gateway to resume a pending run. Direct model reasoning outside this gateway cannot claim its freeze, native execution, or completion proof. A protocol fixture is author support only; independent actual remote qualification owns production capability claims.
 - If the planning packet is incomplete, record the missing dependency as a finding instead of guessing.
 - If MCP is unavailable, stop and record a blocker when access returns.
 
@@ -89,3 +108,15 @@ If a codebase-graph MCP is connected (exposes `get_architecture`, `trace_path`, 
 
 - [../../../docs/workbay/rules/planning-review-guide.md](../../../docs/workbay/rules/planning-review-guide.md)
 - [../plan-draft/SKILL.md](../plan-draft/SKILL.md)
+
+## Contract basis
+
+Pinned canon 0.26.2 (`meta/release-manifest.json`): OPS-76, `lexicons/planning.md:109`
+(Site Reliability Engineering ch. 5), removes repeated round ceremony without
+claiming measured savings. AGT-07, `lexicons/engineering.md:81` (The Programmer's
+Brain ch. 11; CARD-05/P7), keeps decisions durable. GRPH-33,
+`lexicons/graph-theory.md:190` (practice label), requires explicit packet/result
+contracts. AGT-21, `lexicons/engineering.md:94` (The UNIX Programming Environment
+ch. 5; CARD-01/P18), requires named nonzero outcomes. DATA-14 (`lexicons/engineering.md:232`, Designing Data-Intensive Applications ch. 11; CARD-02/P12) keeps
+canonical byte authority. OBS-09 (`lexicons/engineering.md:615`, Thinking in Systems ch. 6; CARD-11/P15) retains independent qualification.
+CON-11 (`lexicons/engineering.md:185`, Operating Systems: Three Easy Pieces ch. 32) leaves completion enforcement at the existing CAS effect.

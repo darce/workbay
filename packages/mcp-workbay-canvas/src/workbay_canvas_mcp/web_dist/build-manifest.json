@@ -1,0 +1,14 @@
+{
+  "collector_sha256": "97cc6110efedc8147d7685c48d0787b8c863407dfc9cb75b2f6124778de43edf",
+  "files": {
+    "assets/App-Be32luKM.js": "sha256:d1741e1ccda1eedec23ba3191461ab2a2a6c11b1085b99f89ac2a6de41d7c4cf",
+    "assets/FleetShell-BIi0VRd9.css": "sha256:609c1d09d5288e432045e4f55e166b474e97fd9f90202e2ab74b51d7c9a059c6",
+    "assets/FleetShell-CknnEKz3.js": "sha256:55e00051c15e51690c089af1c589fd3d4db6620d4fe8a729fa4d2932f71cd427",
+    "assets/index-CDxnNT9a.css": "sha256:4384f97c3bfa8a5664662e5b9be7458e0b63c7e775dffd43126ea33019ffcac8",
+    "assets/index-Dzzx99fS.js": "sha256:9e2194d8b0819627d6d5451d9f90f538c6375b7f027737c617978462b7cb7224",
+    "assets/local-review-source-BAh_lCyI.js": "sha256:e6b3219bd55a4c9a7fad4653e490ab171733d29828098b5700ee4141ab7d7a76",
+    "index.html": "sha256:6e1e2694d08f4b599a11e3d0d1d3de34e2e596308192a8dfde3c4acabb4b5f52"
+  },
+  "manifest_version": 1,
+  "source_digest": "sha256:b8b987eefe83d9a4f5baeca23c4d81d1a1242fe6344bc1b20503b5f8bfd30425"
+}

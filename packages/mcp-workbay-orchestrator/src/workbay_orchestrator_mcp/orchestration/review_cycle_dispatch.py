@@ -8,17 +8,20 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
+import time
 from contextvars import ContextVar
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
 
-from .review_cycle_ledger import LedgerDecision, ReviewCycleLedger, ReviewCycleRoutesError, TrustedPolicy, _Hold
+from .review_cycle_ledger import KINDS, LedgerDecision, ReviewCycleLedger, ReviewCycleRoutesError, TrustedPolicy, _Hold
 
 # Operator-supplied immutable release, overriding the older repository consumer
 # pin for this integration. This is a release digest, never proposal-derived.
@@ -37,6 +40,7 @@ _EXECUTION_FACTS = frozenset({"process_ran", "served_model", "observed_model", "
 # refusal reason. Only these positive proofs may classify an infra stop.
 NATIVE_PRE_MODEL_SCHEMA = "workbay/native-pre-model-refusal@1"
 _NATIVE_PRE_MODEL_REASONS = {
+    "execution_preflight": "native_execution_preflight_refused",
     "history": "native_history_incomplete",  # persisted pass history incomplete: no turn starts
     "attestation": "native_attestation_refused",  # capability mint refused before worker setup
     # The shell bridge refused the engine's one-use transfer before any
@@ -102,14 +106,7 @@ def _ancestries(repo: Path, heads: list[str], target: str) -> list[Literal["ance
                 answers.append("absent")  # returned only after the batch proves absence
         if not unresolved:
             return answers
-        shallow = probe("rev-parse", "--is-shallow-repository")
-        partial = probe("config", "--get", "extensions.partialClone")
-        promisors = probe("config", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$")
-        if (shallow.returncode != 0 or shallow.stdout.strip() != "false"
-                or partial.returncode != 1 or promisors.returncode not in {0, 1}
-                or shallow.stderr or partial.stderr or promisors.stderr
-                or any(line.rsplit(" ", 1)[-1] == "true" for line in promisors.stdout.splitlines())):
-            raise ValueError("review_cycle_subject_unresolvable")
+        _require_complete_storage(probe)
         # Raw storage distinguishes missing names from blobs and corruption.
         # One stdin line per unresolved head; no per-head cat-file subprocess.
         raw = probe("cat-file", "--batch-check=%(objecttype)", input="\n".join(unresolved) + "\n")
@@ -126,6 +123,206 @@ def _ancestries(repo: Path, heads: list[str], target: str) -> list[Literal["ance
         raise ValueError("review_cycle_subject_unresolvable") from exc
 
 
+def _require_complete_storage(probe) -> None:
+    """Absence is provable only in a complete, non-promisor repository."""
+    shallow = probe("rev-parse", "--is-shallow-repository")
+    partial = probe("config", "--get", "extensions.partialClone")
+    promisors = probe("config", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$")
+    if (shallow.returncode != 0 or shallow.stdout.strip() != "false"
+            or partial.returncode != 1 or promisors.returncode not in {0, 1}
+            or shallow.stderr or partial.stderr or promisors.stderr
+            or any(line.rsplit(" ", 1)[-1] == "true" for line in promisors.stdout.splitlines())):
+        raise ValueError("review_cycle_subject_unresolvable")
+
+
+ABSENT_SOURCE_CACHE_SCHEMA = "workbay/review-cycle-absent-sources@1"
+# A write this close to a directory's recorded mtime may leave that mtime
+# unchanged on coarse-timestamp filesystems, so such a stat proves nothing.
+_RACY_MTIME_NS = 2_000_000_000
+_HEX_OID = re.compile(r"[0-9a-f]{40}")
+
+
+def _dir_stat(path: Path) -> list[int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return [stat.st_dev, stat.st_ino, stat.st_mtime_ns]
+
+
+def _file_digest(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def _object_stores(objects: Path, depth: int = 0) -> list[Path] | None:
+    """The object directory and its alternates closure; None when not statically known."""
+    stores = [objects]
+    try:
+        lines = (objects / "info" / "alternates").read_text().splitlines()
+    except FileNotFoundError:
+        return stores
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        nested = None if line.startswith('"') or depth >= 5 else _object_stores(objects / line, depth + 1)
+        if nested is None:
+            return None
+        stores.extend(nested)
+    return stores
+
+
+class _AbsentSourceCache:
+    """Proven receipt-head absence, reused across dispatches only while its store is unchanged.
+
+    Lanes dispatch from separate processes, so the cache is a file in the
+    primary task-state directory, replaced atomically. An entry is keyed by
+    receipt digest and ``source_head``; the file by object-store identity
+    (each store's inode, pack directory and alternates) and the shallow file;
+    each entry also by the head's loose fan-out directory in every store, so
+    an unrelated commit does not reclassify every receipt. Only probed
+    absence is stored, never a present answer. Canon v0.26.2: CAL-02, Unknown
+    is a valid result (Designing Machine Learning Systems): an unreadable
+    fact, a missing state directory or a racy stat disables reuse and the
+    check probes instead.
+    """
+
+    def __init__(self, path: Path, stores: list[Path], identity: list, started: int, entries: dict) -> None:
+        self.path, self.stores, self.identity, self.started, self.entries = path, stores, identity, started, entries
+
+    @classmethod
+    def open(cls, probe) -> _AbsentSourceCache | None:
+        if os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+            return None
+        try:
+            paths = probe("rev-parse", "--path-format=absolute", "--git-common-dir",
+                          "--git-path", "objects", "--git-path", "shallow")
+        except ValueError:
+            return None  # the check's own probes report the fault
+        lines = paths.stdout.splitlines()
+        if paths.returncode != 0 or paths.stderr or len(lines) != 3:
+            return None
+        common, objects, shallow = (Path(line) for line in lines)
+        configured = os.environ.get("WORKBAY_HANDOFF_STATE_DIR", "").strip()
+        state_dir = Path(configured).expanduser() if configured else common.parent / ".task-state"
+        started = time.time_ns()
+        try:
+            stores = _object_stores(objects)
+            if stores is None or not state_dir.is_dir():
+                return None
+            packs = [_dir_stat(store / "pack") for store in stores]
+            if any(stat is not None and stat[2] > started - _RACY_MTIME_NS for stat in packs):
+                return None
+            identity = [str(objects), _file_digest(shallow),
+                        [[str(store), (_dir_stat(store) or [None, None])[:2], pack,
+                          _file_digest(store / "info" / "alternates")] for store, pack in zip(stores, packs)]]
+            store_key = hashlib.sha256(str(objects).encode()).hexdigest()[:16]
+            path = state_dir / f"review-cycle-absent-sources-{store_key}.json"
+            try:
+                data = json.loads(path.read_bytes())
+            except (FileNotFoundError, ValueError):
+                data = None
+        except OSError:
+            return None
+        valid = (isinstance(data, dict) and data.get("schema") == ABSENT_SOURCE_CACHE_SCHEMA
+                 and data.get("store") == identity and isinstance(data.get("absent"), dict))
+        return cls(path, stores, identity, started, data["absent"] if valid else {})
+
+    def fanout(self, head: str) -> list | None:
+        try:
+            stats = [_dir_stat(store / head[:2]) for store in self.stores]
+        except OSError:
+            return None
+        return None if any(stat is not None and stat[2] > self.started - _RACY_MTIME_NS for stat in stats) else stats
+
+    def hit(self, digest: str, head: str, fanout: list | None) -> bool:
+        return fanout is not None and self.entries.get(digest) == dict(source_head=head, fanout=fanout)
+
+    def store(self, proven: list[tuple[str, str, list | None]]) -> None:
+        fresh = {digest: dict(source_head=head, fanout=fanout) for digest, head, fanout in proven
+                 if fanout is not None and self.entries.get(digest) != dict(source_head=head, fanout=fanout)}
+        if not fresh:
+            return
+        from .pass_rescue import _atomic_write
+        try:
+            _atomic_write(self.path, json.dumps(dict(schema=ABSENT_SOURCE_CACHE_SCHEMA, store=self.identity,
+                                                     absent={**self.entries, **fresh}), sort_keys=True))
+        except OSError:
+            pass  # an unwritable cache only costs the next check its probes
+
+
+def _receipt_ancestries(repo: Path, receipts: list[tuple[str, str]], target: str,
+                        ) -> tuple[list[Literal["ancestor", "not_ancestor", "absent"]], int]:
+    """Classify receipt heads with per-check batched probes, reusing proven absence.
+
+    ``receipts`` pairs each receipt file digest with its ``source_head``. One
+    ``cat-file --batch-check`` types every uncached head and one ``rev-list``
+    of the target answers every present commit; only non-hex names and tag
+    objects keep the per-head ``_ancestries`` probe. A replace ref can make
+    an absent name resolve, so any replace ref bypasses the cache. Cached
+    and fresh absence both still need this check's complete-storage and
+    target proof. Returns the answers and how many the absent cache
+    supplied. Canon v0.26.2: PERF-10, Join independent waits (Latency:
+    Reduce Delay in Software Systems, ch. 9).
+    """
+    heads = [head for _, head in receipts]
+    if not isinstance(target, str) or any(not isinstance(head, str) for head in heads):
+        raise ValueError("review_cycle_subject_unresolvable")
+    if not heads:
+        return [], 0
+
+    def probe(*args: str, input: str | None = None):
+        return _subject_probe(repo, *args, input=input)
+
+    try:
+        replaced = probe("for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/")
+        unreplaced = not (replaced.returncode or replaced.stderr or replaced.stdout
+                          or os.environ.get("GIT_REPLACE_REF_BASE"))
+        cache = _AbsentSourceCache.open(probe) if unreplaced else None
+        hexed = [index for index, head in enumerate(heads) if _HEX_OID.fullmatch(head)]
+        fanouts = {index: cache.fanout(heads[index]) for index in hexed} if cache else {}
+        answers: dict[int, Literal["ancestor", "not_ancestor", "absent"]] = {
+            index: "absent" for index, fanout in fanouts.items() if cache.hit(receipts[index][0], heads[index], fanout)}
+        cached = len(answers)
+        named = [index for index in range(len(heads)) if index not in answers and index not in hexed]
+        missing, commits = [], []
+        if unanswered := [index for index in hexed if index not in answers]:
+            raw = probe("cat-file", "--batch-check=%(objectname) %(objecttype)",
+                        input="".join(f"{heads[index]}\n" for index in unanswered))
+            lines = raw.stdout.splitlines()
+            if raw.returncode != 0 or raw.stderr or len(lines) != len(unanswered):
+                raise ValueError("review_cycle_subject_unresolvable")
+            kinds = {"missing": missing, "commit": commits, "tag": named}  # merge-base peels tags
+            for index, line in zip(unanswered, lines):
+                name, _, kind = line.partition(" ")
+                if name != heads[index] or kind not in kinds:
+                    raise ValueError("review_cycle_subject_unresolvable")  # blob, tree or unreadable storage
+                kinds[kind].append(index)
+        if commits:
+            walk = probe("rev-list", "--end-of-options", target, "--")
+            if walk.returncode != 0 or walk.stderr:
+                raise ValueError("review_cycle_subject_unresolvable")
+            reachable = set(walk.stdout.split())
+            answers.update((index, "ancestor" if heads[index] in reachable else "not_ancestor") for index in commits)
+        if named:
+            answers.update(zip(named, _ancestries(repo, [heads[index] for index in named], target)))
+        if missing or cached:
+            _require_complete_storage(probe)
+            valid_target = probe("cat-file", "-e", f"{target}^{{commit}}")
+            if valid_target.returncode != 0 or valid_target.stderr:
+                raise ValueError("review_cycle_subject_unresolvable")
+            answers.update(dict.fromkeys(missing, "absent"))
+            if cache:
+                cache.store([(receipts[index][0], heads[index], fanouts[index]) for index in missing])
+        return [answers[index] for index in range(len(heads))], cached
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(SUBJECT_PROBE_TIMEOUT) from exc
+    except subprocess.SubprocessError as exc:
+        raise ValueError("review_cycle_subject_unresolvable") from exc
+
+
 def authority(repo: Path) -> Path:
     return Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "workbay"
 
@@ -134,12 +331,14 @@ def absent_source_report(repo: Path) -> dict:
     """Read-only inventory of receipt heads provably absent from complete Git storage."""
     candidates, receipts = [], []
     for path in (authority(repo) / "review_cycle_dispatch").glob("*.json"):
-        receipt = json.loads(path.read_text())
+        raw = path.read_bytes()
+        receipt = json.loads(raw)
         head = receipt.get("source_head")
         if receipt.get("source_branch") and head:
-            candidates.append((path, receipt))
-    answers = _ancestries(repo, [receipt["source_head"] for _, receipt in candidates], "HEAD")
-    for (path, receipt), ancestry in zip(candidates, answers):
+            candidates.append((path, receipt, hashlib.sha256(raw).hexdigest()))
+    answers, _ = _receipt_ancestries(repo, [(digest, receipt["source_head"]) for _, receipt, digest in candidates],
+                                     "HEAD")
+    for (path, receipt, _), ancestry in zip(candidates, answers):
         if ancestry == "absent":
             receipts.append(dict(receipt=path.name, subject=receipt["identity"]["subject_branch"],
                                  source_branch=receipt["source_branch"], source_head=receipt["source_head"]))
@@ -259,10 +458,16 @@ def dispatch(request: dict, *, repo: Path | None = None) -> LedgerDecision | dic
             return LedgerDecision("ledger_hold", "invalid_protocol")
         ledger = runtime_ledger(repo or Path.cwd())
         identity = {key: request[key] for key in ("dispatch_id", "subject_branch", "kind")}
-        if not all(isinstance(value, str) and value for value in identity.values()):
+        if (not all(isinstance(value, str) and value for value in identity.values())
+                or identity["kind"] not in KINDS):
             return LedgerDecision("ledger_hold", "invalid_identity")
         if operation == "reserve":
-            _import_legacy_sources(repo or Path.cwd(), ledger, identity["subject_branch"])
+            # Analysis charges only its own row; source fix/gate history cannot
+            # affect it, and must not make a read-only reservation unavailable.
+            if identity["kind"] != "analysis":
+                held = _import_legacy_sources(repo or Path.cwd(), ledger, identity["subject_branch"])
+                if held is not None:
+                    return held
             proposal = request.get("canon_proposal_path")
             return ledger.reserve(**identity, canon_proposal_path=Path(proposal) if proposal else None)
         return ledger.settle(**identity, **{key: value for key, value in request.items()
@@ -271,8 +476,8 @@ def dispatch(request: dict, *, repo: Path | None = None) -> LedgerDecision | dic
         return LedgerDecision("ledger_hold", str(exc))
 
 
-def _import_legacy_sources(repo: Path, ledger: ReviewCycleLedger, subject: str) -> None:
-    """Join B18's canonical migration before reserving any fresh model call.
+def _import_legacy_sources(repo: Path, ledger: ReviewCycleLedger, subject: str) -> LedgerDecision | None:
+    """Join B18's canonical migration before reserving a source or gate call.
 
     An unjoined checkout may run new-work component tests, but cannot start a
     known legacy work unit without its migration adapter and producer evidence.
@@ -284,11 +489,12 @@ def _import_legacy_sources(repo: Path, ledger: ReviewCycleLedger, subject: str) 
     if adapter is not None:
         result = adapter(repo, ledger, subject)
         if isinstance(result, LedgerDecision) and result.status == "ledger_hold":
-            raise ValueError(result.reason)
+            return result
         if isinstance(result, dict) and (result.get("ok") is False or result.get("status") in {"ledger_hold", "unavailable", "held"}):
             raise ValueError(result.get("reason") or "review_cycle_legacy_import_unavailable")
         return
-    if any(row["subject_branch"] == subject for row in ledger._read()["rows"].values()):
+    # As in the adapter, an analysis row is not native source/gate history.
+    if any(row["subject_branch"] == subject and row["kind"] != "analysis" for row in ledger._read()["rows"].values()):
         return
     from .review_ratchet import verified_legacy_source_history
 
@@ -445,8 +651,170 @@ def _record_adapter_refusal(repo: Path, result_path: Path, managed_identity: dic
         _save(path, receipt)
 
 
+def _pre_model_source_journal(receipt: dict, provenance: dict) -> bool:
+    """A production journal may accompany refusal, never grant N coverage.
+
+    Require the host's retained admission context and the exact unchanged
+    prepare/exit7 interval. Any publication, new ref/commit, unknown artifact,
+    coverage claim or context mismatch keeps the original source charge.
+    """
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    try:
+        journal = provenance["source_journal"]
+        context = receipt["native_production_context"]
+        keys = {"schema_version", "producer_version", "recorder", "coverage", "reason", "state",
+                "binding", "admission_id", "mapping", "start", "end", "entries"}
+        if (set(journal) != keys or type(journal["schema_version"]) is not int or journal["schema_version"] != 1
+                or journal["producer_version"] != "1" or journal["recorder"] != "worker_writable"
+                or journal["coverage"] != "unavailable" or journal["reason"] != "route_not_n_capable"
+                or journal["state"] != "settled" or journal["binding"] != context["binding"]
+                or journal["admission_id"] != context["admission_id"]):
+            return False
+        mapping = {k: provenance[k] for k in ("remote_source_commit", "remote_source_tree", "sandbox_base_commit", "sandbox_base_tree")}
+        mapping.update({k:context[k] for k in ("host_admission_base", "host_admission_tree")})
+        store_id = "remote-source:" + provenance["dispatch_nonce"] + ":" + provenance["sandbox_base_commit"]
+        previous = dict(store_id=store_id, sequence=0, digest=digest(mapping))
+        if (journal["mapping"] != mapping or journal["start"] != previous
+                or not isinstance(journal["entries"], list) or len(journal["entries"]) != 2):
+            return False
+        initial = None
+        for index, row in enumerate(journal["entries"]):
+            fields = {"sequence", "previous_digest", "kind", "refs", "digest"}
+            if index:
+                fields |= {"commits", "exit_code", "ref_updates", "artifacts"}
+            if (set(row) != fields or type(row["sequence"]) is not int or row["sequence"] != index + 1
+                    or row["previous_digest"] != previous["digest"]
+                    or row["digest"] != digest({k:v for k,v in row.items() if k != "digest"})
+                    or row["kind"] != ("source_prepare" if index == 0 else "source_settle")
+                    or not isinstance(row["refs"], dict) or not row["refs"]
+                    or row["refs"].get("HEAD") != provenance["sandbox_base_commit"]
+                    or any(value != provenance["sandbox_base_commit"] for value in row["refs"].values())):
+                return False
+            if index == 0:
+                initial = row["refs"]
+            elif (row["refs"] != initial or type(row["exit_code"]) is not int or row["exit_code"] != 7
+                    or row["ref_updates"] != [dict(ref=ref, old_oid=initial[ref], new_oid=initial[ref]) for ref in sorted(initial)]
+                    or not isinstance(row["commits"], list) or len(row["commits"]) != 1
+                    or set(row["commits"][0]) != {"oid", "sha256"}
+                    or row["commits"][0]["oid"] != provenance["sandbox_base_commit"]
+                    or re.fullmatch(r"[0-9a-f]{64}", row["commits"][0]["sha256"]) is None):
+                return False
+            if index:
+                if (not isinstance(row["artifacts"], list)
+                        or len({item["path"] for item in row["artifacts"]}) != len(row["artifacts"])):
+                    return False
+                for artifact in row["artifacts"]:
+                    name = artifact["path"]
+                    if (set(artifact) != {"path", "sha256", "size_bytes"}
+                            or type(artifact["size_bytes"]) is not int or artifact["size_bytes"] < 0
+                            or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None
+                            or not (re.fullmatch(r"native-preflight-[A-Za-z0-9_-]+\.(stdout|stderr)", name)
+                                    or name == ".workbay-model-process-boundary.py"
+                                    or (name == ".agent-stream.jsonl" and artifact["size_bytes"] == 0))):
+                        return False
+            previous = dict(store_id=store_id, sequence=row["sequence"], digest=row["digest"])
+        return journal["end"] == previous
+    except (KeyError, ValueError, TypeError, AttributeError, IndexError):
+        return False
+
+
+def read_execution_effect(path: Path) -> dict | None:
+    import stat
+    try:
+        fd = os.open(path, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,"rb") as stream:
+            st = os.fstat(stream.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+                return None
+            result = json.load(stream)
+        return result if isinstance(result,dict) else None
+    except (OSError,ValueError):
+        return None
+
+
+def execution_refusal_reason(receipt: dict, provenance: object, rc: object, *, effect: object = None) -> str | None:
+    """Consume only native producer bytes joined to the protected host request.
+
+    Digests are integrity, not authentication against same-UID writers. This
+    internal consumer is never called on a model result or public JSON claim.
+    Artifact/usage absence is checked by the transport caller, not inferred
+    from exit 7. Unknown or contradictory effects keep the original charge.
+    """
+    from .execution_preflight import SCHEMA, _digest, refusal_effect, refusal_marker
+    try:
+        if (str(rc) != "7" or receipt["state"] != "transport_started" or not isinstance(provenance, dict)
+                or (receipt.get("executed_route") or {}).get("backend") != "codex-remote"):
+            return None
+        fields = {"schema_version", "dispatch_nonce", "requested_branch", "requested_ref", "agent_spec_head_sha",
+                  "dispatch_ref", "remote_source_commit", "remote_source_tree", "sandbox_base_commit",
+                  "sandbox_base_tree", "history_stripped", "execution_preflight", "execution_preflight_refusal"}
+        if "source_journal" in provenance:
+            if not _pre_model_source_journal(receipt, provenance):
+                return None
+            fields.add("source_journal")
+        elif receipt.get("native_production_context") is not None:
+            return None
+        if set(provenance) != fields or type(provenance["schema_version"]) is not int or provenance["schema_version"] != 1:
+            return None
+        if (provenance["history_stripped"] is not True
+                or provenance["requested_branch"] != receipt["source_branch"]
+                or provenance["requested_ref"] != "refs/heads/" + receipt["source_branch"]
+                or any(provenance[k] != receipt["source_head"] for k in ("agent_spec_head_sha", "remote_source_commit"))
+                or any(provenance[k] != receipt["source_tree"] for k in ("remote_source_tree", "sandbox_base_tree"))
+                or any(provenance[k] != receipt["native_dispatch"][k] for k in ("dispatch_nonce", "dispatch_ref"))
+                or re.fullmatch(r"[0-9]+-[0-9a-f]{16}", provenance["dispatch_nonce"]) is None
+                or not provenance["dispatch_ref"].endswith("-" + provenance["dispatch_nonce"])
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", provenance["sandbox_base_commit"]) is None):
+            return None
+        proof = provenance["execution_preflight"]
+        if effect != refusal_effect(proof):
+            return None
+        marker = provenance["execution_preflight_refusal"]
+        if (not isinstance(marker, dict) or type(marker.get("exit_code")) is not int
+                or marker.get("model_boundary_reached") is not False):
+            return None
+        reasons = {"tmpdir_missing", "tmpdir_not_absolute", "cwd_mismatch", "git_root_unavailable",
+                   "runtime_schema_unsupported", "companion_missing", "runtime_origin_mismatch",
+                   "source_identity_unavailable", "source_identity_changed", "executable_missing",
+                   "executable_version_mismatch", "capacity_disk_low", "host_write_denied",
+                   "sandbox_policy_unavailable", "sandbox_policy_ambiguous", "sandbox_config_unmirrored",
+                   "sandbox_backend_unsupported", "sandbox_probe_failed", "sandbox_probe_malformed",
+                   "sandbox_outside_control_unavailable", "sandbox_outside_write_allowed", "sandbox_roots_overbroad",
+                   "execution_context_changed", "execution_owner_unavailable", "stale_capability_receipt",
+                   "receipt_integrity_mismatch", "capability_incomplete", "probe_exception", "deadline_expired", "probe_output_overflow",
+                   "descendant_cleanup_unknown", "descendant_supervision_unavailable", "runtime_handshake_failed"}
+        if (proof["schema"] != SCHEMA or proof["status"] not in {"UNKNOWN", "FAIL"}
+                or proof["reason"] not in reasons or type(proof["retryable"]) is not bool
+                or proof["cache_reused"] is not False
+                or proof.get("evidence_digest") != _digest({k:v for k,v in proof.items() if k != "evidence_digest"})
+                or provenance["execution_preflight_refusal"] != refusal_marker(proof)):
+            return None
+        stamps = [proof[k] for k in ("started_at", "finished_at", "expires_at", "deadline_seconds")]
+        if (not all(type(v) in (int, float) and math.isfinite(v) for v in stamps)
+                or not 0 < proof["deadline_seconds"] <= 60
+                or not proof["started_at"] <= proof["finished_at"]
+                or not proof["started_at"] < proof["expires_at"] <= proof["started_at"] + 60):
+            return None
+        binding = proof["binding"]
+        if binding["source"] != {k:provenance[k] for k in (
+                "dispatch_nonce", "requested_branch", "agent_spec_head_sha", "remote_source_commit",
+                "remote_source_tree", "sandbox_base_commit", "sandbox_base_tree")}:
+            return None
+        if proof.get("source") and proof["source"] != {"commit": provenance["sandbox_base_commit"], "tree": provenance["sandbox_base_tree"]}:
+            return None
+        route = binding.get("routing_effective")
+        expected = receipt.get("executed_route")
+        if expected and (not isinstance(route, dict) or any(route.get(k) != v for k,v in expected.items())):
+            return None
+        return proof["reason"]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def _native_pre_model_proof(
-    receipt: dict, phase: str, detail: str | None = None, constructor: dict | None = None
+    receipt: dict, phase: str, detail: str | None = None, constructor: dict | None = None,
+    execution: dict | None = None,
 ) -> dict:
     """The exact proof a host-native pre-model exit binds to its reservation.
 
@@ -455,10 +823,17 @@ def _native_pre_model_proof(
     """
     proof = dict(schema=NATIVE_PRE_MODEL_SCHEMA, phase=phase, reason=_NATIVE_PRE_MODEL_REASONS[phase],
                  model_boundary_reached=False, identity=receipt["identity"], reservation=receipt["decision"],
-                 managed_identity=(receipt.get("managed_identity") if (phase == "shell_transfer_unconsumed"
-                                   and receipt["settlement_owner"] == "adapter")
+                 managed_identity=(receipt.get("managed_identity") if (phase in {"shell_transfer_unconsumed", "execution_preflight"}
+                                   and receipt["settlement_owner"] in {"adapter", "shell"})
                                    else receipt["managed_identity"]),
                  token_sha256=hashlib.sha256(receipt["token"].encode()).hexdigest())
+    if phase == "execution_preflight":
+        if (not isinstance(execution, dict) or set(execution) != {"provenance", "rc", "effect"}
+                or execution_refusal_reason(receipt, execution["provenance"], execution["rc"], effect=execution["effect"]) is None):
+            raise ValueError("native_execution_refusal_invalid")
+        proof["execution"] = execution
+    elif execution is not None:
+        raise ValueError("native_execution_refusal_invalid")
     if phase in _DETAIL_PHASES:
         if not isinstance(detail, str) or not detail or len(detail) > _DETAIL_LIMIT:
             raise ValueError("native_pre_model_refusal_detail_invalid")
@@ -528,13 +903,24 @@ def shell_transfer_unconsumed(receipt: dict, active: dict) -> bool:
 def _native_pre_model_reason(receipt: dict, proof: object) -> str | None:
     """Validate a positive native pre-model proof against its own receipt.
 
-    Only a still-``prepared`` reservation (no transport, native dispatch,
-    completion or adapter observation) qualifies. Existing phases require an
-    engine-owned managed reservation; the host's unconsumed-transfer phase
-    also admits an adapter-owned receipt. Every proof binds its own receipt.
+    Existing pre-transfer phases require a still-prepared reservation without
+    transport/completion facts. The execution-preflight phase instead requires
+    the native request/source-bound effect after transport and before model
+    execution. Every proof binds its own original reservation and token.
     """
     try:
         phase = proof["phase"]
+        if phase == "execution_preflight":
+            if (proof != _native_pre_model_proof(receipt, phase, execution=proof.get("execution"))
+                    or receipt["settlement_owner"] not in {"engine", "adapter", "shell"}
+                    or receipt["decision"]["status"] != "reserved"
+                    or _model_or_unknown_evidence(receipt) is not None
+                    or "adapter_pre_dispatch_refusal" in receipt):
+                return None
+            completion = receipt.get("native_completion")
+            if completion is not None and completion != {"rc": "7", "outcome": "dispatch_refused"}:
+                return None
+            return proof["reason"]
         if (
             phase not in _NATIVE_PRE_MODEL_REASONS
             or proof != _native_pre_model_proof(receipt, phase, proof.get("detail"), proof.get("constructor"))
@@ -908,13 +1294,15 @@ def _record_shell_reserve_refusal(repo: Path, *, dispatch_id: str, subject_branc
 
 def record_native_pre_model_refusal(
     repo: Path, *, phase: str, detail: str | None = None, constructor: dict | None = None,
-    active: dict | None = None,
+    active: dict | None = None, execution: dict | None = None,
 ) -> dict:
     """Write-ahead positive proof that a host-native phase exits before the model.
 
     Recorded BEFORE settlement under the dispatch receipt lock (CON-11), and
     only for the ACTIVE_DISPATCH managed reservation (or the adapter owner's
-    explicit unconsumed transfer) whose receipt is still exactly prepared.
+    explicit unconsumed transfer). Pre-transfer receipts must remain prepared;
+    late preflight requires the completed, bound native effect and an unfinalized
+    original ledger row (or an identical already-refused replay).
     An existing different proof is never
     replaced (DATA-14). Any failure raises; the caller must not settle as a
     refusal without this proof (SECD-05).
@@ -922,7 +1310,7 @@ def record_native_pre_model_refusal(
     active = ACTIVE_DISPATCH.get() if active is None else active
     if (phase not in _NATIVE_PRE_MODEL_REASONS or not isinstance(active, dict)
             or (not isinstance(active.get("managed_identity"), dict) and not (
-                phase == "shell_transfer_unconsumed" and active.get("settlement_owner") == "adapter"))
+                phase in {"shell_transfer_unconsumed", "execution_preflight"} and active.get("settlement_owner") in {"adapter", "shell"}))
             or not isinstance(active.get("token"), str)):
         raise ValueError("native_pre_model_refusal_unbound")
     path = _receipt_path(repo, active["identity"]["dispatch_id"])
@@ -931,7 +1319,15 @@ def record_native_pre_model_refusal(
         receipt = json.loads(path.read_bytes())
         prior = receipt.get("native_pre_model_refusal")
         base = {key: value for key, value in receipt.items() if key != "native_pre_model_refusal"}
-        if base != active:
+        if phase == "execution_preflight":
+            row = reserved_row(repo, receipt["identity"])
+            if row.get("completion") is not None and (prior is None or row["completion"].get("outcome") != "dispatch_refused"):
+                raise ValueError("native_pre_model_refusal_already_finalized")
+            if (any(base.get(k) != active.get(k) for k in ("identity", "token", "decision", "managed_identity", "managed_source", "settlement_owner"))
+                    or base.get("state") != "transport_started"
+                    or base.get("native_completion") not in (None, {"rc": "7", "outcome": "dispatch_refused"})):
+                raise ValueError("native_pre_model_refusal_dispatch_changed")
+        elif base != active:
             raise ValueError("native_pre_model_refusal_dispatch_changed")
         if phase == "shell_transfer_unconsumed" and not shell_transfer_unconsumed(receipt, active):
             raise ValueError("native_pre_model_refusal_transfer_consumed")
@@ -941,7 +1337,7 @@ def record_native_pre_model_refusal(
             head_tree=_git(repo, "rev-parse", "HEAD^{tree}"),
         ):
             raise ValueError("native_constructor_source_changed")
-        proof = _native_pre_model_proof(receipt, phase, detail, constructor)
+        proof = _native_pre_model_proof(receipt, phase, detail, constructor, execution)
         if prior is not None:
             if prior != proof:
                 raise ValueError("native_pre_model_refusal_changed")
@@ -980,7 +1376,7 @@ def managed_refusal_evidence(repo: Path, active: dict) -> dict | None:
                 "managed_identity",
                 "managed_source",
                 "decision",
-                "state",
+                *(() if isinstance(native, dict) and native.get("phase") == "execution_preflight" else ("state",)),
                 "settlement_owner",
             )
         ):
@@ -1069,7 +1465,7 @@ def shell_reserve(repo: Path, spec_path: Path, *, dispatch_id: str, subject_bran
     """
     try:
         spec = json.loads(spec_path.read_text())
-        source_proof = validate_shell_subject(repo, spec, subject_branch, dispatch_id)
+        source_proof = validate_shell_subject(repo, spec, subject_branch, dispatch_id) if kind != "analysis" else None
         if kind == "gate" and not token:
             source_review_scope(repo, spec, subject_branch)  # refuse a mismatched spec before charging
         if token:
@@ -1116,7 +1512,7 @@ def shell_reserve(repo: Path, spec_path: Path, *, dispatch_id: str, subject_bran
                                source_tree=_git(repo, "rev-parse", spec["head_sha"] + "^{tree}"))
                 if source_proof is not None:
                     receipt["source_task_subject"] = source_proof
-                else:
+                elif kind != "analysis":
                     unproven = _source_task_subject_unproven(repo, spec, subject_branch)
                     if unproven is not None:
                         receipt["source_task_subject_unproven"] = unproven
@@ -1216,7 +1612,7 @@ def scope_harvest(repo: Path, identity: dict, harvest: dict) -> dict:
                                                                   if str(item["finding_id"]) not in named)}}
 
 
-def _pre_model_phases(path: Path) -> bool:
+def _pre_model_phases(path: Path, *, execution: bool = False) -> bool:
     """Validate the native VM phase schema; later or unknown phases charge."""
     phases = json.loads(path.read_bytes())
     if (not isinstance(phases, dict) or type(phases.get("schema_version")) is not int
@@ -1228,6 +1624,10 @@ def _pre_model_phases(path: Path) -> bool:
             or not isinstance(phases["phases"], dict)):
         return False
     before_model = {"remote_preamble", "archive_extract", "git_init", "sync", "uv_sync", "uv_cache", "agent_launch"}
+    if execution:
+        if "execution_preflight" not in phases["phases"] or phases["partial"] is not True:
+            return False
+        before_model.add("execution_preflight")
     for name, phase in phases["phases"].items():
         if (name not in before_model or not isinstance(phase, dict)
                 or not {"side", "start_ts", "end_ts", "duration_s"} <= set(phase)
@@ -1268,8 +1668,10 @@ def native_collect_outcome(bundle: Path, dispatch_id: str, recorded_rc: str | No
                      and isinstance(files, dict) and present == set(files)
                      and all(hashlib.sha256((bundle / "artifacts" / key).read_bytes()).hexdigest() == digest
                              for key, digest in files.items()))
-        if (not authentic or done["rc"] != _RC_ADMISSION_DEFERRED or stdout
-                or not present <= _PRE_MODEL_ARTIFACTS or "provenance-out" not in present):
+        allowed = _PRE_MODEL_ARTIFACTS | ({"stream-out", "preflight-effect-out"} if done["rc"] == 7 else set())
+        if (not authentic or done["rc"] not in {_RC_ADMISSION_DEFERRED, 7} or stdout
+                or not present <= allowed or "provenance-out" not in present
+                or ("stream-out" in present and (bundle / "artifacts/stream-out").read_bytes())):
             return error
         if receipt["identity"]["dispatch_id"] != dispatch_id or receipt["state"] != "transport_started":
             return error
@@ -1279,6 +1681,11 @@ def native_collect_outcome(bundle: Path, dispatch_id: str, recorded_rc: str | No
         fields = {"schema_version", "dispatch_nonce", "requested_branch", "requested_ref", "agent_spec_head_sha",
                   "dispatch_ref", "remote_source_commit", "remote_source_tree", "sandbox_base_commit",
                   "sandbox_base_tree", "history_stripped"}
+        if done["rc"] == 7:
+            if (reason or execution_refusal_reason(receipt, proof, done["rc"], effect=json.loads((bundle / "artifacts/preflight-effect-out").read_bytes())) is None
+                    or "phases-out" not in present or not _pre_model_phases(bundle / "artifacts/phases-out", execution=True)):
+                return error
+            return OffloadOutcome.DISPATCH_REFUSED.value
         if (reason or proof is None or set(proof) != fields or type(proof["schema_version"]) is not int
                 or re.fullmatch(r"[0-9]+-[0-9a-f]{16}", native["dispatch_nonce"]) is None
                 or proof["dispatch_nonce"] != native["dispatch_nonce"]
@@ -1460,6 +1867,27 @@ def shell_entry() -> None:
     """Private shell bridge; the public module stdin protocol stays reserve/settle."""
     mode, dispatch_id, subject, kind, spec, proposal = sys.argv[1:7]
     repo = Path.cwd()
+    if mode == "bind":
+        path = _receipt_path(repo, dispatch_id)
+        nonce, ref = sys.argv[7:9]
+        if re.fullmatch(r"[0-9]+-[0-9a-f]{16}", nonce) is None or not ref.endswith("-" + nonce):
+            raise ValueError("native_dispatch_identity_invalid")
+        with path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            receipt = json.loads(path.read_bytes())
+            native = dict(dispatch_nonce=nonce, dispatch_ref=ref)
+            if receipt["state"] != "transport_started" or receipt.get("native_dispatch", native) != native:
+                raise ValueError("native_dispatch_identity_changed")
+            receipt["native_dispatch"] = native
+            if len(sys.argv) == 10 and sys.argv[9]:
+                import base64
+                context = json.loads(base64.b64decode(sys.argv[9], validate=True))
+                if (not isinstance(context, dict) or set(context) != {"binding", "admission_id", "host_admission_base", "host_admission_tree"}
+                        or receipt.get("native_production_context", context) != context):
+                    raise ValueError("native_production_context_invalid")
+                receipt["native_production_context"] = context
+            _save(path, receipt)
+        return
     if mode == "reserve":
         token = os.environ.get("WORKBAY_REVIEW_CYCLE_TOKEN")
         receipt = shell_reserve(repo, Path(spec), dispatch_id=dispatch_id, subject_branch=subject, kind=kind,
@@ -1488,6 +1916,13 @@ def shell_entry() -> None:
             "transport_failure" if mode == "premodel" and not started and not result and not patch else "error")
         path = _receipt_path(repo, dispatch_id)
         if mode == "settle":  # only a completed synchronous run has a native rc
+            # This call owns the transport exit and retained producer files.
+            # Never infer no-work from generic exit7 or from result JSON.
+            if (not started and not result and not patch
+                    and execution_refusal_reason(receipt, provenance, rc, effect=read_execution_effect(Path(provenance_path + ".effect"))) is not None):
+                outcome = "dispatch_refused"
+                record_native_pre_model_refusal(repo, phase="execution_preflight", active=receipt,
+                    execution={"provenance": provenance, "rc": rc, "effect": read_execution_effect(Path(provenance_path + ".effect"))})
             receipt = _publish_native_completion(path, rc, outcome)
         settlement = settle_actual(repo, receipt["identity"], outcome=outcome, model_started=started,
                                    judgment=bool(result), commit_landed=patch,
@@ -1537,6 +1972,14 @@ def canonical_subject(repo: Path, state_dir: Path, *, task_ref: str, branch: str
     return identity.get("review_cycle_subject_branch") or identity["branch"]
 
 
+class RegistryAmbiguous(ValueError):
+    """Keep the refusal string stable while naming every conflicting lane."""
+
+    def __init__(self, lane_ids: list[str]) -> None:
+        super().__init__("review_cycle_registry_ambiguous")
+        self.lane_ids = sorted(lane_ids)
+
+
 def registered_lane(repo: Path, branch: str) -> tuple[object, dict] | None:
     """Read the existing primary-worktree runtime registry when deployed.
 
@@ -1555,7 +1998,9 @@ def registered_lane(repo: Path, branch: str) -> tuple[object, dict] | None:
         raise ValueError("review_cycle_registry_unavailable")
     lanes = (response.get("data") or {}).get("current")
     if not isinstance(lanes, list) or len(lanes) > 1:
-        raise ValueError("review_cycle_registry_ambiguous")
+        raise RegistryAmbiguous([lane["lane_id"] for lane in lanes
+                                 if isinstance(lane, dict) and isinstance(lane.get("lane_id"), str)]
+                                if isinstance(lanes, list) else [])
     return (config, lanes[0]) if lanes else None
 
 
@@ -2156,11 +2601,28 @@ class SubjectAmbiguous(ValueError):
 class SubjectScopeUnauthenticated(ValueError):
     """An authenticated caller must not be charged to an unverified foreign scope."""
 
+    reason = "review_cycle_subject_scope_unauthenticated"
+
     def __init__(self, row: dict) -> None:
-        super().__init__("review_cycle_subject_scope_unauthenticated")
+        super().__init__(self.reason)
         self.receipt = row["receipt"]
         self.subject = row["subject"]
         self.source_branch = row["source_branch"]
+
+
+class SubjectHolderTaskUnknown(SubjectScopeUnauthenticated):
+    """The holder's task is in neither ``handoff_state`` nor ``task_archives``.
+
+    Unknown is reported as unknown, naming the task to restore, not as a
+    foreign-scope refusal. Canon v0.26.2: CAL-02, Unknown is a valid result
+    (lexicons/ml-systems.md#cal-02; Designing Machine Learning Systems).
+    """
+
+    reason = "review_cycle_holder_task_unknown"
+
+    def __init__(self, row: dict, task_ref: str) -> None:
+        super().__init__(row)
+        self.task_ref = task_ref
 
 
 def _holder_scope_binds(repo: Path, proof: dict, receipt: dict, row: dict, orchestrator_root: Path) -> bool:
@@ -2183,34 +2645,67 @@ def _holder_scope_binds(repo: Path, proof: dict, receipt: dict, row: dict, orche
         return True
     older = _authorized_roots(repo, orchestrator_root, original)
     if older is None:
+        from .review_ratchet import task_record
+        try:
+            holder_task = task_record(original["task_ref"])
+        except (OSError, sqlite3.Error) as exc:
+            raise SubjectScopeUnauthenticated(row) from exc
+        if holder_task is None:
+            raise SubjectHolderTaskUnknown(row, original["task_ref"])
         raise SubjectScopeUnauthenticated(row)
     return not _disjoint_roots(older, incoming)
 
 
 def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None, *,
-                             orchestrator_root: Path | None = None) -> dict:
+                             orchestrator_root: Path | None = None, metrics: bool = False) -> dict:
     """One decision table for retained subjects and their holding receipts.
 
-    Preserve the historical first direct-branch match, which bypasses ancestry
-    and release checks and ends the walk. Otherwise report only ancestor
-    receipts that every applicable release predicate left holding. A stamp's
-    presence is diagnostic here; only the existing predicates authenticate it.
+    Preserve the first unreleased direct-branch match. An authenticated native
+    source-authority recovery may discharge it; the walk then still considers
+    later holders. Otherwise report only ancestor receipts that every applicable
+    release predicate left holding. A stamp's presence is diagnostic here; the
+    release predicates authenticate it.
+
+    ``metrics`` adds the phase cost: ``subject_hold_ms``, ``receipts_scanned``
+    (receipts the walk classified) and ``receipts_skipped_cached`` (absent
+    heads answered by the absent-source cache without a per-receipt probe).
+    Canon v0.26.2: PERF-06, Measure, don't guess (A Philosophy of Software
+    Design, ch. 20).
     """
+    started = time.perf_counter()
     directory = authority(repo) / "review_cycle_dispatch"
     holding, recorded, absent, scope_refusals = [], {}, [], []
     report = dict(holding=holding, source_head_absent=absent)
-    candidates = []
+    candidates, released_direct = [], set()
     for path in directory.glob("*.json"):
-        receipt = json.loads(path.read_text())
+        raw = path.read_bytes()
+        receipt = json.loads(raw)
         source_branch, head = receipt.get("source_branch"), receipt.get("source_head")
-        if not source_branch or not head:
+        # A read-only analysis is never a source pass, so its receipt holds no subject.
+        if not source_branch or not head or (receipt.get("identity") or {}).get("kind") == "analysis":
             continue
-        candidates.append((path, receipt))
+        candidates.append((path, receipt, hashlib.sha256(raw).hexdigest()))
         if source_branch == branch:
-            break  # never inspect or probe receipts beyond the first direct match
-    answers = iter(_ancestries(repo, [receipt["source_head"] for _, receipt in candidates
-                                     if receipt["source_branch"] != branch], "HEAD"))
-    for path, receipt in candidates:
+            from .review_cycle_terminal_recovery import _recovery_path, releases
+            recovery = _recovery_path(repo, receipt["identity"]["dispatch_id"])
+            if (proof is not None and (recovery.exists() or recovery.is_symlink())
+                    and releases(repo, proof, receipt, orchestrator_root or repo)):
+                released_direct.add(path)
+                continue  # authenticated correction cannot hide later holders
+            break  # retain legacy precedence for every unauthenticated direct match
+    answers, cached = _receipt_ancestries(repo, [(digest, receipt["source_head"]) for _, receipt, digest in candidates
+                                                 if receipt["source_branch"] != branch], "HEAD")
+    answers = iter(answers)
+
+    def measured() -> dict:
+        if metrics:
+            report.update(subject_hold_ms=round((time.perf_counter() - started) * 1000, 3),
+                          receipts_scanned=len(candidates), receipts_skipped_cached=cached)
+        return report
+
+    for path, receipt, _ in candidates:
+        if path in released_direct:
+            continue
         source_branch, head = receipt["source_branch"], receipt["source_head"]
         subject = receipt["identity"]["subject_branch"]
         row = dict(receipt=path.name, subject=subject, source_branch=source_branch, source_head=head,
@@ -2219,7 +2714,7 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
         if source_branch == branch:
             row["predicates_tried"] = ["direct_match"]
             holding.append(row)
-            return report
+            return measured()
         ancestry = next(answers)
         if ancestry == "absent":
             absent.append({key: row[key] for key in ("receipt", "subject", "source_branch", "source_head")})
@@ -2259,7 +2754,7 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
         if len({row["subject"] for row in holding}) > 1:
             raise SubjectAmbiguous(holding)
         raise scope_refusals[0]
-    return report
+    return measured()
 
 
 def subject_hold_report(repo: Path, branch: str, proof: dict | None = None, *,
@@ -2305,8 +2800,45 @@ def _source_task_subject_unproven(repo: Path, spec: dict, subject: str) -> dict 
     located = _manifest_lane(config.workspace_root, lane["task_ref"], lane["lane_id"])
     integration = (_short_branch(located[0].get("integration_branch")) if located else None) or "main"
     landed = _commit(repo, f"refs/heads/{integration}")
-    return dict(reason=reason, head_on_integration=landed is not None and _subject_is_ancestor(repo, spec["head_sha"], landed),
-                integration_sha=landed)
+    record = dict(reason=reason, head_on_integration=landed is not None and _subject_is_ancestor(repo, spec["head_sha"], landed),
+                  integration_sha=landed)
+    if reason == "no_producer_proof":
+        record.update(_reanchor_diagnosis(repo, config.workspace_root, lane, integration, landed))
+    return record
+
+
+def _reanchor_diagnosis(repo: Path, orchestrator_root: Path, lane: dict, integration: str, landed: str | None) -> dict:
+    """Name why a pinned subject left behind by its integration branch did not re-anchor.
+
+    Only a pinned binding whose base the integration has moved past is
+    diagnosed; otherwise the record is unchanged. Diagnosis never refuses the
+    mint: an unverifiable condition is reported under its refusal reason.
+    """
+    from .review_ratchet import (
+        RatchetRefused,
+        _short_branch,
+        derive_task_subject,
+        task_subject_binding,
+        task_subject_reanchor_blocker,
+    )
+
+    pinned = task_subject_binding(lane)
+    if pinned is None or landed is None or not isinstance(pinned.get("base_sha"), str) or pinned["base_sha"] == landed:
+        return {}
+    try:
+        fresh = derive_task_subject(repo, orchestrator_root, task_ref=lane["task_ref"], lane_id=lane["lane_id"],
+                                    branch=_short_branch(lane.get("branch")) or "", worktree_path=lane["worktree_path"])
+        blocker = task_subject_reanchor_blocker(repo, orchestrator_root, pinned=pinned, fresh=fresh,
+                                                worktree_path=lane["worktree_path"])
+    except RatchetRefused as exc:
+        blocker = str(exc)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        blocker = f"reanchor_condition_unverified:{type(exc).__name__}"
+    moved = f"task subject pinned at {pinned['base_sha']}; {integration} moved to {landed}"
+    if blocker is None:
+        return dict(reanchor_blocker=None, detail=f"{moved}; every re-anchor condition holds: re-upsert the lane")
+    return dict(reanchor_blocker=blocker,
+                detail=f"{moved}; re-anchor refused: {blocker}; re-provision the lane at {landed}")
 
 
 def validate_shell_subject(repo: Path, spec: dict, subject: str, dispatch_id: str) -> dict | None:
@@ -2385,7 +2917,8 @@ def shell_collect() -> None:
     if not path.exists():
         return  # observation of a legacy job
     receipt = json.loads(path.read_text())
-    if receipt.get("settlement_owner") != "shell":
+    engine_preflight = receipt.get("settlement_owner") == "engine" and recorded_rc == "7"
+    if receipt.get("settlement_owner") != "shell" and not engine_preflight:
         return  # engine completion must harvest before settling its gate
     def read(name):
         try:
@@ -2396,6 +2929,18 @@ def shell_collect() -> None:
     result, provenance = read("result-out"), read("provenance-out")
     patch = (bundle / "stdout").stat().st_size > 0
     outcome = native_collect_outcome(bundle, dispatch_id, recorded_rc, receipt=receipt)
+    if outcome == "dispatch_refused":
+        record_native_pre_model_refusal(repo, phase="execution_preflight", active=receipt,
+            execution={"provenance": provenance, "rc": recorded_rc,
+                       "effect": read_execution_effect(bundle / "artifacts/preflight-effect-out")})
+    if engine_preflight:
+        # The collector owns authenticated wrapper/artifact bytes, including the
+        # ROOT-only effect. Retain its positive proof before deleting the bundle;
+        # the late engine consumer owns settlement of this original reservation.
+        # Unknown/contradictory bytes create no refund authority or completion.
+        if outcome == "dispatch_refused":
+            _publish_native_completion(path, recorded_rc, outcome)
+        return
     receipt = _publish_native_completion(path, recorded_rc, outcome)
     # Like shell_entry, only a collected result is a review product to harvest.
     harvest = harvest_shell_gate(repo, receipt, result) if receipt["identity"]["kind"] == "gate" and result else None

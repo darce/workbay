@@ -16,7 +16,7 @@ from typing import cast
 
 from . import shared_write_context as _shared_write_context
 from .concept_embed_hook import embed_finding_from_envelope
-from .enums import FindingStatus
+from .enums import LIVE_LANE_STATUSES, FindingStatus
 from .git_merge import AncestryFatal
 from .git_merge import is_ancestor_in_repo as _is_ancestor_in_repo
 from .git_merge import is_ancestor_of_ref as _is_ancestor_of_ref
@@ -568,13 +568,13 @@ def _derive_resolve_worktree_path(
         registered_paths.append(registered_task_path)
 
     live_lanes = conn.execute(
-        """
+        f"""
         SELECT worktree_path, branch
         FROM worktree_lanes
-        WHERE task_ref = ? AND status IN ('planned', 'active', 'blocked', 'review')
+        WHERE task_ref = ? AND status IN ({",".join("?" for _ in LIVE_LANE_STATUSES)})
         ORDER BY updated_at DESC, id DESC
         """,
-        (task_ref,),
+        (task_ref, *sorted(LIVE_LANE_STATUSES)),
     ).fetchall()
     lane_paths = [
         _normalize_optional_text(lane["worktree_path"])
@@ -1656,13 +1656,26 @@ def _apply_finding_update(update_ctx: FindingUpdateContext, update_input: Findin
             task_ref=update_ctx.task_ref,
             entity="finding",
         )
-    if any(value is not None for value in (update_input.impact, update_input.origin,
-                                                 update_input.failure_scenario, update_input.impact_reason)):
+    if any(
+        value is not None
+        for value in (
+            update_input.impact,
+            update_input.origin,
+            update_input.failure_scenario,
+            update_input.impact_reason,
+        )
+    ):
         # v45: an omitted impact/origin keeps the stored classification.
         update_ctx.conn.execute(
             "UPDATE review_findings SET impact = COALESCE(?, impact), origin = COALESCE(?, origin), "
             "failure_scenario = COALESCE(?, failure_scenario), impact_reason = COALESCE(?, impact_reason) WHERE id = ?",
-            (update_input.impact, update_input.origin, update_input.failure_scenario, update_input.impact_reason, target_db_id),
+            (
+                update_input.impact,
+                update_input.origin,
+                update_input.failure_scenario,
+                update_input.impact_reason,
+                target_db_id,
+            ),
         )
     row = update_ctx.conn.execute("SELECT * FROM review_findings WHERE id = ?", (target_db_id,)).fetchone()
     _write_current_task_md_for_active_context(update_ctx.conn, update_ctx.task_ref)
@@ -2316,8 +2329,8 @@ def _update_review_finding_impl(
                 is_reopen_transition=is_reopen_transition,
                 impact=impact,
                 origin=origin,
-        failure_scenario=failure_scenario,
-        impact_reason=impact_reason,
+                failure_scenario=failure_scenario,
+                impact_reason=impact_reason,
             ),
         )
 

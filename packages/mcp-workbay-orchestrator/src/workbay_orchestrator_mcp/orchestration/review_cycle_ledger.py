@@ -25,8 +25,9 @@ replay returns the stored row, so historical ``required_route`` is immutable.
 
 Pre-activation sources enter only through ``import_legacy_source_history``,
 which consumes the A17 verified lineage producer's ``list[dict]`` and keeps
-original IDs, routes and charges. Once a subject has rows, this ledger is its
-system of record: it is never rescanned, merged or reset (DATA-14).
+original IDs, routes and charges. Once a subject has source or gate rows, this
+ledger is its system of record: it is never rescanned, merged or reset
+(DATA-14). An analysis row never joins that migration, so it never proves it.
 
 Historical outcome corrections never rewrite a row. A trusted host producer
 appends one idempotent event per dispatch to the append-only ``corrections``
@@ -949,13 +950,14 @@ class ReviewCycleLedger:
                 if [row["legacy_source"]["record"] for row in prior] == records:
                     return LedgerDecision("imported", "replay", imported)
                 raise _Hold("legacy_source_history_conflict")
-            # Native history for the subject, or an original ID or provenance
-            # nonce already held elsewhere, means another authority owns it.
+            # Native source/gate history for the subject, or an original ID or
+            # provenance nonce already held elsewhere, means another authority
+            # owns it. Analysis rows do not prove a legacy source migration.
             held = {
                 row["legacy_source"]["record"]["producer"]["dispatch_nonce"] for row in rows if row.get("legacy_source")
             }
             if (
-                any(row["subject_branch"] == subject_branch for row in rows)
+                any(row["subject_branch"] == subject_branch and row["kind"] != "analysis" for row in rows)
                 or any(record["dispatch_id"] in data["rows"] for record in records)
                 or held & nonces
             ):
@@ -996,14 +998,15 @@ class ReviewCycleLedger:
 def import_legacy_source_history(repo: Path, ledger: ReviewCycleLedger, subject_branch: str) -> LedgerDecision:
     """Named B18 migration adapter over the A17 verified lineage producer.
 
-    A subject that already has rows is answered from this ledger without a
-    legacy scan: a native subject is ``not_applicable`` and an imported prefix
-    replays, however many native calls followed it. Only a subject without
-    rows reads the producer, which is late-bound and never replaced by a local
-    guess; its absence or refusal is a typed hold, never a fresh bucket.
+    A subject that already has source/gate rows is answered from this ledger
+    without a legacy scan: a native subject is ``not_applicable`` and an imported
+    prefix replays, however many native calls followed it. Analysis-only rows
+    do not establish migration, so those subjects still read the late-bound
+    producer; its absence or refusal is a typed hold, never a fresh bucket.
     """
     try:
-        rows = [row for row in ledger._read()["rows"].values() if row["subject_branch"] == subject_branch]
+        rows = [row for row in ledger._read()["rows"].values()
+                if row["subject_branch"] == subject_branch and row["kind"] != "analysis"]
     except _Hold as exc:
         return LedgerDecision("ledger_hold", str(exc))
     except (KeyError, TypeError, AttributeError):
@@ -1024,9 +1027,12 @@ def import_legacy_source_history(repo: Path, ledger: ReviewCycleLedger, subject_
     try:
         history = verified_legacy_source_history(Path(repo), subject_branch)
     except Exception as exc:  # any producer failure holds known work; it never proves new work
+        detail: dict = {"subject_branch": subject_branch, "producer_reason": str(exc) or type(exc).__name__}
+        if hasattr(exc, "lane_ids"):
+            detail["lanes"] = sorted(exc.lane_ids)
         return LedgerDecision(
             "ledger_hold",
             "legacy_source_history_unavailable",
-            {"subject_branch": subject_branch, "producer_reason": str(exc) or type(exc).__name__},
+            detail,
         )
     return ledger.import_legacy_sources(subject_branch, history)

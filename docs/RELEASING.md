@@ -2,7 +2,8 @@
 
 This document describes how to cut a **git-only** release. It is the
 operator playbook for exporting the public subset to `darce/workbay`,
-syncing the consumer tags, and verifying the smoke install. There is
+preparing an exact publication subject, approving it, and verifying the smoke
+install. There is
 **one delivery channel: the public git mirror.** A release is an export
 + push + tag-sync; nothing is uploaded to a package index. Consumers
 install with `workbay-bootstrap install --remote-ref vX.Y.Z` from
@@ -36,7 +37,7 @@ make help                            # list every distribution target
 make preflight                       # pre-release checklist only
 make release-status                  # show package/tag state + suggested next consumer tag
 make release-public                  # PRIMARY path (dry-run): export + install-check, plan the rest
-make release-public FLAGS=--execute  # export -> install-check -> push darce/workbay -> force-sync tags
+make release-public FLAGS=--json     # prepare a retained exact subject; no remote mutation
 make smoke                           # git-install the latest consumer tag into /tmp
 ```
 
@@ -75,13 +76,13 @@ Rule: **every monorepo `vX.Y.Z` is preceded by all the per-package tags
 it contains, in the same commit chain**, in dependency order:
 
 ```text
-workbay-protocol -> mcp-workbay-handoff -> mcp-workbay-orchestrator -> workbay-bootstrap -> workbay-codex-bridge -> vX.Y.Z (monorepo)
+workbay-protocol -> mcp-workbay-handoff -> mcp-workbay-orchestrator -> workbay-bootstrap -> workbay-codex-bridge -> workbay-system -> Canvas -> workbay -> vX.Y.Z (monorepo)
 ```
 
 The dependency order still matters: each downstream package's
 `pyproject.toml` pins an upstream version *range*, and the export ships
 the whole family on a single fresh-history commit so every pin resolves
-against the same mirror snapshot. `release-public` emits all the
+against the same mirror snapshot. The approved publication emits all the
 `<pkg>-vX.Y.Z` tags plus the monorepo `vX.Y.Z` tag on that one commit
 (see the release flow below).
 
@@ -91,38 +92,56 @@ Dist-1 made the public git mirror the **only** consumer channel. A
 release is five steps, orchestrated by `make release-public`
 (`scripts/release_public.py`):
 
-1. **Export** the operational subset to a throwaway fresh-history tree
-   (`scripts/export_public.py --out <tmp> --force`) — a single scrubbed
-   commit, with plans/assessments/reviews stripped.
-2. **Install-check** — non-mutating pre-push gate
-   (`scripts/check_consumer_install.py`): replay the documented consumer
-   install recipe against the export tree in a scratch uv venv (every
-   exported member as a local-path requirement, **without**
-   `--no-sources`). A red gate aborts before any remote mutation.
-3. **Push** that commit force to the public `main` on
-   `git@github.com:darce/workbay.git`. The export rewrites history every
-   run, so a force replacement is the intended, convergent behavior.
-4. **Tag-sync** the per-package `<pkg>-vX.Y.Z` family plus the
-   consumer-facing `vX.Y.Z` monorepo tag onto the exported commit, and
-   force-push them.
-5. **Status** — read-only; confirm the tags and print the suggested next
-   consumer bump.
+1. **Build Canvas package data** from the current frontend with its locked
+   dependencies. Run `npm ci` in the private frontend directory, return to the
+   repository root, then build and verify:
+
+   ```bash
+   python scripts/build_canvas_web_package_data.py
+   python scripts/build_canvas_web_package_data.py --check
+   ```
+
+   The producer runs the TypeScript/Vite build and stages `web_dist` and
+   `collector_dist` under the Canvas Python source package.
+   The manifest binds the frontend source digest, compiled assets and collector.
+   These generated assets need not be committed in the private checkout; export
+   verifies and Git-tracks them in the public tree. Never commit `node_modules`,
+   build environments or caches. See [Canvas delivery](contracts/canvas-public-release-v1.md).
+2. **Prepare** with `make release-public FLAGS=--json`. Export copies the
+   Git-tracked operational subset plus the checked generated Canvas package
+   data. The consumer gate installs **ALL8** local-path members: protocol,
+   handoff, orchestrator, bootstrap, codex-bridge, system, Canvas (exactly once),
+   and workbay. Preparation retains the checked objects, exact source identity,
+   remote preimage, final commit/tree and version-tag update set.
+3. **Inspect and explicitly approve** that exact retained subject externally.
+   For an existing remote main, its tip becomes the prepared commit's parent;
+   its checked tree is preserved without replacing public ancestry. Release
+   intent, local landing, `--execute`, `--assume-yes` and the old `release`
+   confirmation grant no remote-main authority.
+4. **Publish the retained subject** using its exact plan ID. No re-export or
+   re-plan follows approval. Main is updated with its frozen expected-old SHA;
+   existing version tags cannot be clobbered. Tag and origin-tag failures remain
+   explicit in the report and may require a retained-plan retry.
+5. **Verify** the reported remote refs and smoke-install the consumer tag.
+
+The operator performs setup/approval on a real terminal after reviewing the
+concrete plan; implementation workers do not provision production authority:
 
 ```bash
-make release-public                  # dry-run: real export + install-check, no remote mutation
-make release-public FLAGS=--execute  # maintainer-run: export + install-check + push + tag-sync
+python scripts/release_public.py --json
+# One-time operator setup:
+python scripts/release_public.py publication-setup
+# Review the exact retained subject and type its complete plan ID:
+python scripts/release_public.py approve-publication --prepared <plan-id>
+python scripts/release_public.py --execute --prepared <plan-id> --json
 ```
 
-`release-public` is **dry-run by default**; it mutates remote state only
-under `--execute`, and even then it prompts for confirmation — type
-`release` to proceed (operator automation can pass `--assume-yes`). The
-two mutating steps are `push` and `tag-sync`; `export`, `install-check`,
-and `status` never touch the remote. Dry-run is not plan-only, though: it
-performs a real export to a temp tree and runs the install-check gate
-against it (so it needs `uv` on PATH and index access for dependency
-resolution), and it exits non-zero when the gate fails. Pass
-`FLAGS=--json` for a machine-readable plan/report; the install-check step
-carries a `verdict` (and a resolver-output excerpt on failure).
+Default dry-run performs a real export and consumer install gate, then retains
+its subject without remote mutation. An unapproved execute attempt returns exit
+3 with `publication_held`; it does not open an approval prompt. A preparation
+failure is nonzero. The install gate needs `uv` and dependency index/cache access.
+See [Remote-main publication](contracts/remote-main-publication-v1.md) for source
+safety, destination binding, approval custody and exact retry rules.
 
 Consumers then install from the synced tag (git-only closure — the
 `--with` deps supply the sibling members that live on no index. Exported
@@ -186,14 +205,15 @@ pipeline defends it in three places:
 
 ### Agent / permission note
 
-An AI coding agent **cannot** run `release-public --execute`: the harness
-blocks the private-monorepo -> public-repo push as a data-exfiltration class
-action. The maintainer runs the push step directly. Everything up to the push
-(bump, CHANGELOG, local tests, committing + pushing `main`) is agent-safe.
+Implementation, tests and local commits do not authorize publication. The
+maintainer reviews and approves the exact remote-main subject on a real terminal
+before consuming it. Do not create production approval keys or grants as part of
+implementation. Source-only integration runs do not push, tag, deploy or mutate
+managed release state.
 
 ## Pre-release checklist
 
-Before `make release-public FLAGS=--execute` (or run `make preflight`,
+Before preparing a publication subject (or run `make preflight`,
 which automates the gate-able subset):
 
 1. **Working tree is clean and on `main`.**
@@ -280,15 +300,13 @@ different bytes.
    re-pushed at the corrected commit.
 2. **Bump the patch version**, fix the issue, add a CHANGELOG entry, and
    commit to `main`.
-3. **Re-run the release flow** (`make release-public FLAGS=--execute`) to
-   re-export, re-push, and re-sync the tag family at the corrected commit.
-   Because the export rewrites history and `release-public` force-syncs
-   tags, the corrected `vX.Y.Z` lands cleanly.
-4. **Smoke-test** the re-cut tag (`make smoke`).
+3. **Prepare a new release**, inspect and approve its exact plan, then consume
+   it with `--execute --prepared <plan-id>`. The new public commit preserves the
+   previous main ancestry and the new version tags identify the corrected bytes.
+4. **Smoke-test** the new tag (`make smoke`).
 
-A same-version re-push at a corrected commit is technically possible
-(tag-sync force-pushes), but prefer bump-and-fix so consumers always see
-a monotonic version rather than a moved tag.
+Existing version tags cannot be silently moved to corrected bytes. Use a new
+version; deletion of a bad tag is a separate explicit maintainer operation.
 
 If the backout discovers a contract drift caught only by the smoke test,
 add a regression test in
@@ -341,8 +359,10 @@ $EDITOR packages/<pkg>/pyproject.toml packages/<pkg>/CHANGELOG.md
 git commit -am "<pkg>: <one-line summary>"
 git push origin main
 
-# 3. Re-export, push the mirror, and sync the tag family.
-make release-public FLAGS=--execute
+# 3. Prepare, then inspect/approve externally and consume the exact plan.
+make release-public FLAGS=--json
+python scripts/release_public.py approve-publication --prepared <plan-id>
+python scripts/release_public.py --execute --prepared <plan-id> --json
 
 # 4. Smoke-test from a fresh shell against the new monorepo tag.
 make smoke
@@ -359,15 +379,16 @@ handoff version, bootstrap pins the new orchestrator):
 #    pin's lower bound to the new upstream version; leave the upper bound
 #    at the next major (e.g. <0.6.0).
 # 2. One commit per package, in dependency order, then push main.
-# 3. Release the whole family atomically:
-make release-public FLAGS=--execute
+# 3. Prepare and approve the exact family update set:
+make release-public FLAGS=--json
+python scripts/release_public.py approve-publication --prepared <plan-id>
+python scripts/release_public.py --execute --prepared <plan-id> --json
 make smoke
 ```
 
-Because the export ships every package on a single fresh-history commit
-and tag-sync emits the entire `<pkg>-vX.Y.Z` family plus the monorepo
-`vX.Y.Z` together, there is no half-released state to resume from — the
-release is all-or-nothing per `--execute` run.
+The checked export contains the whole family. The approved plan binds the final
+public commit, its tree and every tag update. If a later step fails, inspect the
+report and retry the retained plan; do not assume every step completed atomically.
 
 ### Task: preview a release without taking action
 
@@ -395,7 +416,7 @@ produce.
 
 See [Backing out a bad release](#backing-out-a-bad-release). In short:
 delete the bad tag on `darce/workbay`, bump-and-fix, and re-run
-`make release-public FLAGS=--execute`.
+a newly prepared, explicitly approved plan with `--execute --prepared <plan-id>`.
 
 ## Who runs the release
 

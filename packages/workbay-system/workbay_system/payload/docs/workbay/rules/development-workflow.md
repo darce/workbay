@@ -5,6 +5,17 @@ workbay-system git hooks. Hook scripts cite this file by path and anchor
 when they block a commit, push, or PreToolUse so operators have a
 single place to find the protocol that fired.
 
+## Frozen acceptance qualification
+
+Apply [frozen-acceptance-qualification.md](frozen-acceptance-qualification.md)
+throughout the normal loop: independent original criteria and baseline before
+authoring, exact-candidate original evaluations before model merge review or
+repair dispatch, and one owner for assembled-train qualification. Carry its
+minimum packet through implementation, offload, branch review, and parallel
+review. Missing coverage is a PROCESS gap to repair and recompute before more
+product authors; author receipts alone cannot qualify completion. This is the
+coordinator procedure; lifecycle runtime enforcement remains separate work.
+
 ## Canonical Workflow Loop
 
 The default workflow for both operators and agents is a six-step loop.

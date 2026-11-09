@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Run once per VM by the operator or VM bootstrap. This installer is not wired
 # into remote_agent.sh because it manages per-VM user systemd services.
+#
+# Rollback: before installing an OLDER reclaimer, finish every pending intent.
+# Recovery runs at the start of each `workbay_vm_reclaim.py apply`; repeat apply
+# until ~/.local/state/workbay/vm-reclaim holds no pending-*.json. Older versions
+# cannot read a pending intent with "bytes_freed": null and fail every pass. An
+# intent kept by a recover_failed tombstone needs its permissions fixed first.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

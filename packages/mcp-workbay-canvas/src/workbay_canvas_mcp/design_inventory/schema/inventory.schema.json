@@ -1,0 +1,764 @@
+{
+  "$defs": {
+    "CompiledCssFreshness": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "title": "Output",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "stale",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "no_provenance",
+                "input_changed",
+                "output_changed",
+                "input_missing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "stale_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Stale Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "output",
+        "status",
+        "reason",
+        "stale_paths"
+      ],
+      "title": "CompiledCssFreshness",
+      "type": "object"
+    },
+    "Coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "registered_components": {
+          "title": "Registered Components",
+          "type": "integer"
+        },
+        "verified_exports": {
+          "title": "Verified Exports",
+          "type": "integer"
+        },
+        "unresolved_exports": {
+          "title": "Unresolved Exports",
+          "type": "integer"
+        },
+        "css_inputs": {
+          "title": "Css Inputs",
+          "type": "integer"
+        },
+        "tokens": {
+          "title": "Tokens",
+          "type": "integer"
+        },
+        "unsupported_tokens": {
+          "title": "Unsupported Tokens",
+          "type": "integer"
+        },
+        "assets": {
+          "title": "Assets",
+          "type": "integer"
+        },
+        "missing_assets": {
+          "title": "Missing Assets",
+          "type": "integer"
+        },
+        "oversized_assets": {
+          "title": "Oversized Assets",
+          "type": "integer"
+        },
+        "skipped_asset_files": {
+          "title": "Skipped Asset Files",
+          "type": "integer"
+        },
+        "limitations": {
+          "items": {
+            "enum": [
+              "registered_components_only",
+              "css_custom_properties_only",
+              "no_usage_inference",
+              "compiled_css_requires_provenance"
+            ],
+            "type": "string"
+          },
+          "title": "Limitations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "registered_components",
+        "verified_exports",
+        "unresolved_exports",
+        "css_inputs",
+        "tokens",
+        "unsupported_tokens",
+        "assets",
+        "missing_assets",
+        "oversized_assets",
+        "skipped_asset_files",
+        "limitations"
+      ],
+      "title": "Coverage",
+      "type": "object"
+    },
+    "ExportRef": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "export_name": {
+          "title": "Export Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "export_name",
+        "status"
+      ],
+      "title": "ExportRef",
+      "type": "object"
+    },
+    "FontSource": {
+      "additionalProperties": false,
+      "properties": {
+        "asset_path": {
+          "title": "Asset Path",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        }
+      },
+      "required": [
+        "asset_path",
+        "digest"
+      ],
+      "title": "FontSource",
+      "type": "object"
+    },
+    "FontWeight": {
+      "additionalProperties": false,
+      "properties": {
+        "min": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Min",
+          "type": "number"
+        },
+        "max": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max",
+          "type": "number"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "title": "FontWeight",
+      "type": "object"
+    },
+    "InventoryAsset": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "mime": {
+          "title": "Mime",
+          "type": "string"
+        },
+        "width": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Width"
+        },
+        "height": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Height"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Digest"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Bytes"
+        },
+        "license": {
+          "title": "License",
+          "type": "string"
+        },
+        "references": {
+          "items": {
+            "type": "string"
+          },
+          "title": "References",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "present",
+            "missing",
+            "oversized"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mime",
+        "width",
+        "height",
+        "digest",
+        "bytes",
+        "license",
+        "references",
+        "status"
+      ],
+      "title": "InventoryAsset",
+      "type": "object"
+    },
+    "InventoryComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "export_ref": {
+          "$ref": "#/$defs/ExportRef"
+        },
+        "declared_props": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Declared Props",
+          "type": "object"
+        },
+        "slots": {
+          "items": {
+            "$ref": "#/$defs/SlotSpec"
+          },
+          "title": "Slots",
+          "type": "array"
+        },
+        "token_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Token Refs",
+          "type": "array"
+        },
+        "unresolved_token_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved Token Refs",
+          "type": "array"
+        },
+        "example_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Example Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "description",
+        "export_ref",
+        "declared_props",
+        "slots",
+        "token_refs",
+        "unresolved_token_refs",
+        "example_refs"
+      ],
+      "title": "InventoryComponent",
+      "type": "object"
+    },
+    "InventoryFontFace": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "minLength": 1,
+          "title": "Family",
+          "type": "string"
+        },
+        "weight": {
+          "$ref": "#/$defs/FontWeight"
+        },
+        "style": {
+          "title": "Style",
+          "type": "string"
+        },
+        "unicode_range": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unicode Range"
+        },
+        "display": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display"
+        },
+        "src": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/FontSource"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Src"
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "family",
+        "weight",
+        "style",
+        "src",
+        "status"
+      ],
+      "title": "InventoryFontFace",
+      "type": "object"
+    },
+    "InventoryToken": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "expression": {
+          "title": "Expression",
+          "type": "string"
+        },
+        "context": {
+          "title": "Context",
+          "type": "string"
+        },
+        "source_ref": {
+          "title": "Source Ref",
+          "type": "string"
+        },
+        "resolved": {
+          "discriminator": {
+            "mapping": {
+              "color": "#/$defs/TokenResolvedValue",
+              "font_family": "#/$defs/TokenResolvedFontFamily",
+              "length": "#/$defs/TokenResolvedValue",
+              "number": "#/$defs/TokenResolvedValue",
+              "unsupported": "#/$defs/TokenResolvedUnsupported"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/TokenResolvedValue"
+            },
+            {
+              "$ref": "#/$defs/TokenResolvedFontFamily"
+            },
+            {
+              "$ref": "#/$defs/TokenResolvedUnsupported"
+            }
+          ],
+          "title": "Resolved"
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "expression",
+        "context",
+        "source_ref",
+        "resolved",
+        "status"
+      ],
+      "title": "InventoryToken",
+      "type": "object"
+    },
+    "SlotSpec": {
+      "description": "A named insertion point within a component.\n\n``allowed_component_ids`` lists the component ids that may fill the\nslot (Pencil's \"suggested components\" idea \u2014 guidance for both human\nand AI designers); an empty list means \"unconstrained\". ``guidance``\nis optional free text shown alongside the slot.",
+      "properties": {
+        "slot_id": {
+          "title": "Slot Id",
+          "type": "string"
+        },
+        "allowed_component_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Component Ids",
+          "type": "array"
+        },
+        "guidance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Guidance"
+        }
+      },
+      "required": [
+        "slot_id"
+      ],
+      "title": "SlotSpec",
+      "type": "object"
+    },
+    "SourceDigest": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "digest": {
+          "title": "Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "digest"
+      ],
+      "title": "SourceDigest",
+      "type": "object"
+    },
+    "TokenResolvedFontFamily": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "font_family",
+          "title": "Kind",
+          "type": "string"
+        },
+        "families": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Families",
+          "type": "array"
+        },
+        "generic": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Generic"
+        }
+      },
+      "required": [
+        "kind",
+        "families"
+      ],
+      "title": "TokenResolvedFontFamily",
+      "type": "object"
+    },
+    "TokenResolvedUnsupported": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "unsupported",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "alias_cycle",
+            "runtime_expression",
+            "url_expression",
+            "unresolved_alias",
+            "not_scalar",
+            "font_shorthand"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reason"
+      ],
+      "title": "TokenResolvedUnsupported",
+      "type": "object"
+    },
+    "TokenResolvedValue": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "color",
+            "length",
+            "number"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "title": "TokenResolvedValue",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "not": {
+        "required": [
+          "font_faces"
+        ]
+      },
+      "properties": {
+        "inventory_version": {
+          "const": 1
+        }
+      }
+    },
+    {
+      "properties": {
+        "inventory_version": {
+          "const": 2
+        }
+      },
+      "required": [
+        "font_faces"
+      ]
+    }
+  ],
+  "properties": {
+    "inventory_version": {
+      "enum": [
+        1,
+        2
+      ],
+      "title": "Inventory Version",
+      "type": "integer"
+    },
+    "product": {
+      "title": "Product",
+      "type": "string"
+    },
+    "source_digest": {
+      "title": "Source Digest",
+      "type": "string"
+    },
+    "coverage": {
+      "$ref": "#/$defs/Coverage"
+    },
+    "source_digests": {
+      "items": {
+        "$ref": "#/$defs/SourceDigest"
+      },
+      "title": "Source Digests",
+      "type": "array"
+    },
+    "compiled_css_freshness": {
+      "items": {
+        "$ref": "#/$defs/CompiledCssFreshness"
+      },
+      "title": "Compiled Css Freshness",
+      "type": "array"
+    },
+    "tokens": {
+      "items": {
+        "$ref": "#/$defs/InventoryToken"
+      },
+      "title": "Tokens",
+      "type": "array"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/InventoryComponent"
+      },
+      "title": "Components",
+      "type": "array"
+    },
+    "assets": {
+      "items": {
+        "$ref": "#/$defs/InventoryAsset"
+      },
+      "title": "Assets",
+      "type": "array"
+    },
+    "font_faces": {
+      "items": {
+        "$ref": "#/$defs/InventoryFontFace"
+      },
+      "title": "Font Faces",
+      "type": "array"
+    }
+  },
+  "required": [
+    "inventory_version",
+    "product",
+    "source_digest",
+    "coverage",
+    "source_digests",
+    "compiled_css_freshness",
+    "tokens",
+    "components",
+    "assets"
+  ],
+  "title": "InventoryDocument",
+  "type": "object"
+}

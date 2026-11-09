@@ -30,7 +30,7 @@ from .current_task_rendering import (
     _render_current_task_md,
     _write_workspace_current_task_json,
 )
-from .enums import TERMINAL_LANE_STATUSES, HandoffStatus
+from .enums import LIVE_LANE_STATUSES, TERMINAL_LANE_STATUSES, HandoffStatus
 from .git_merge import branch_is_merged
 from .lifecycle_resource_producer import ProducerBinding, _git, prepare_binding, stage_change
 from .review_findings_support import _validate_impact_origin
@@ -1093,6 +1093,37 @@ def _settle_report_imports(prepared: dict[int, _ReportImport]) -> bool:
     return pending
 
 
+class _NativeImportRefusal(ValueError):
+    """Snapshot labels cannot supply or discard live native authority."""
+
+
+def _check_native_import(
+    snapshot: dict, conn: sqlite3.Connection | None = None, task_ref: str = "", mode: str = "merge"
+) -> None:
+    if any(row.get("status") in {"validated", "gated"} for row in snapshot.get("worktree_lanes", [])):
+        raise _NativeImportRefusal("Imported native milestones require fresh source-bound qualification.")
+    if conn is not None and mode == "replace_task":
+        # Destructive import is not a native-policy reset. Preserve the original
+        # lane row, generation, policy, audit and custody until revalidation.
+        held = conn.execute(
+            "SELECT 1 FROM worktree_lanes AS lane WHERE lane.task_ref=? AND "
+            "(lane.status IN ('validated','gated') OR EXISTS "
+            "(SELECT 1 FROM lane_validation_state AS policy WHERE policy.lane_row_id=lane.id)) LIMIT 1",
+            (task_ref,),
+        ).fetchone()
+        if held is not None:
+            raise _NativeImportRefusal("replace_task cannot discard an existing native validation hold.")
+
+
+def _native_import_refusal(task_ref: str, exc: _NativeImportRefusal) -> dict:
+    return _envelope(
+        ok=False,
+        tool="import_handoff_state",
+        task_ref=task_ref,
+        data={"error": str(exc), "error_kind": "native_validation_required"},
+    )
+
+
 def _import_snapshot(
     conn: sqlite3.Connection,
     task_ref: str,
@@ -1101,6 +1132,7 @@ def _import_snapshot(
     set_active: bool,
     production_imports: dict[int, _ReportImport] | None = None,
 ) -> dict[str, int]:
+    _check_native_import(snapshot)
     data = _parse_import_snapshot(snapshot)
     blockers = data.blockers
     actions = data.actions
@@ -1137,6 +1169,9 @@ def _import_snapshot(
                 if retained is not None:
                     prepared.report_id = retained["id"]
     if mode == "replace_task":
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        _check_native_import(snapshot, conn, task_ref, mode)
         for table in (
             "blockers",
             "next_actions",
@@ -1525,6 +1560,11 @@ def import_handoff_state(
             tool="import_handoff_state",
             data={"error": "Invalid import payload: snapshot.active must be an object."},
         )
+    try:
+        with _get_db_connection() as conn:
+            _check_native_import(snapshot, conn, task_ref, mode)
+    except _NativeImportRefusal as exc:
+        return _native_import_refusal(task_ref, exc)
     with _get_db_connection() as conn:
         if mode == "replace_task" and not allow_destructive_clear:
             existing_counts = _count_task_rows(conn, task_ref)
@@ -1578,6 +1618,8 @@ def import_handoff_state(
                 set_active=set_active,
                 production_imports=production_imports,
             )
+    except _NativeImportRefusal as exc:
+        return _native_import_refusal(task_ref, exc)
     except Exception:
         if not production_imports:
             raise
@@ -2382,7 +2424,10 @@ def task_completion_hold_reason(
             # Qualified cleanup after a deleted branch still uses the existing
             # task/receipt/time-bound proof. Missing path alone is never proof.
             if not explicit_completion and _branch_ref_resolves(branch) is False:
-                if _deleted_branch_merge_proof(branch, task_ref, integration_ref, task_created_at=task_updated_at) is True:
+                if (
+                    _deleted_branch_merge_proof(branch, task_ref, integration_ref, task_created_at=task_updated_at)
+                    is True
+                ):
                     return None
             return "target worktree unknown"
 
@@ -2768,7 +2813,7 @@ DEFAULT_PLAN_CURSOR_REAP_BATCH = 50
 _PLAN_CURSOR_EXPIRED = "expired"
 _PLAN_CURSOR_DISPATCHED = "dispatched"
 # Lane statuses that still imply possible live work — never auto-expire.
-_LANE_LIVE_STATUSES = frozenset({"planned", "active", "blocked", "review"})
+_LANE_LIVE_STATUSES = LIVE_LANE_STATUSES
 
 
 def _plan_cursor_entry(row: sqlite3.Row | Mapping[str, object], *, reason: str) -> dict[str, object]:

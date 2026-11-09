@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.10] — 2026-11-09
+
+- Qualify the shared protocol with the assembled WorkBay v0.1.88 component set.
+
+### Changed
+- Metadata-only revision aligning the protocol package with the new v0.1.88 family tags; the protocol runtime and schemas are unchanged.
+
 ## [0.3.8] — 2026-11-07
 
 ### Added

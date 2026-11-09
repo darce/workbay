@@ -133,6 +133,10 @@ _PLUGIN_DESCRIPTION = (
     "Cross-harness agentic skills, slash commands, and MCP server registration."
 )
 _PLUGIN_OVERRIDE_MANIFEST = "overrides.yaml"
+# Bootstrap owns validation/rendering of these settings extensions. Keep this
+# literal in parity with bootstrap and harness sync: the overlay generator may
+# run with an older installed workbay_protocol.
+BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS = frozenset({"claude_permissions", "claude_settings_shared"})
 _PLUGIN_EFFECTIVE_LOCK = "plugin-lock.json"
 _PLUGIN_HARNESSES: tuple[tuple[str, str], ...] = (
     ("claude", ".claude-plugin"),
@@ -1425,9 +1429,12 @@ def _prune_legacy_portable_emissions(
         after the SKILL.md deletion, so user-added siblings are
         preserved.
       - A slug directory that is a symlink is never walked, since its
-        target need not be in the target repo; the link itself is
-        unlinked only when ``_is_stale_slug_link`` says it is the
-        generator's (the legacy sibling link, or a dangling one).
+        target need not be in the target repo. The link itself is
+        unlinked only when it dangles, checked after both roots' real
+        slug dirs are pruned: the legacy sibling link
+        (``.codex/skills/<slug>`` -> ``.claude/skills/<slug>``) goes once
+        that legacy emission does, and stays while the slot holds a
+        consumer's own skill.
     """
     removed: list[Path] = []
     for command in manifest["commands"]:
@@ -1442,20 +1449,13 @@ def _prune_legacy_portable_emissions(
                         removed.append(legacy_command)
                 except OSError:
                     pass
-        for skills_root, sibling_root in (
-            (claude_skills_out, codex_skills_out),
-            (codex_skills_out, claude_skills_out),
-        ):
-            if skills_root is None:
-                continue
+        skills_roots = [
+            root for root in (claude_skills_out, codex_skills_out) if root is not None
+        ]
+        for skills_root in skills_roots:
             skill_dir = skills_root / slug
-            if skill_dir.is_symlink():
-                # Never walk through a slug link: its target is not ours.
-                if _is_stale_slug_link(skill_dir, sibling_root):
-                    skill_dir.unlink()
-                    removed.append(skill_dir)
-                continue
-            if not skill_dir.exists():
+            # Never walk through a slug link: its target is not ours.
+            if skill_dir.is_symlink() or not skill_dir.exists():
                 continue
             for name in ("SKILL.md", "skill.md"):
                 candidate = skill_dir / name
@@ -1469,6 +1469,11 @@ def _prune_legacy_portable_emissions(
                     removed.append(skill_dir)
             except OSError:
                 pass
+        for skills_root in skills_roots:
+            skill_dir = skills_root / slug
+            if skill_dir.is_symlink() and _is_stale_slug_link(skill_dir, None):
+                skill_dir.unlink()
+                removed.append(skill_dir)
     return removed
 
 
@@ -2246,6 +2251,12 @@ def _load_plugin_override_manifest(override_root: Path) -> PluginOverrideManifes
         payload = yaml.safe_load(path.read_text()) or {}
     except FileNotFoundError as exc:
         raise SystemExit(f"plugin override manifest not found: {path}") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("components"), dict):
+        payload["components"] = {
+            key: value
+            for key, value in payload["components"].items()
+            if key not in BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS
+        }
     try:
         return PluginOverrideManifest.model_validate(payload)
     except ValidationError as exc:
@@ -2274,7 +2285,11 @@ def _compose_plugin_skill_overrides(
 ) -> tuple[dict[str, str], list[str], list[dict[str, str]]]:
     compose = _import_plugin_override_compose()
     return compose.compose_plugin_skill_overrides(
-        rendered_skills, override_root, payload, link_space=link_space
+        rendered_skills,
+        override_root,
+        payload,
+        link_space=link_space,
+        has_relative_link=_has_retargetable_link,
     )
 
 
@@ -2380,15 +2395,16 @@ def _refuse_contradictory_command_overrides(
 def _recognize_projected_upstream_digests(
     payload: PluginOverrideManifest,
     rendered_skills: dict[str, str],
-    skills_source_root: Path,
+    base_projection: dict[str, str],
 ) -> PluginOverrideManifest:
     """Accept a replace digest recorded against the emitted base SKILL.md.
 
     Overrides compose on the unprojected rendering, but consumer tooling
     (``overrides accept-upstream`` / ``relock``) hashes the emitted base tree,
-    whose links are projected. Both digests name the same upstream, so a
-    replace digest matching the base projection is mapped to the composer's.
-    Patch digests pin the stored fork copy and need no mapping.
+    whose links are projected (``base_projection``). Both digests name the
+    same upstream, so a replace digest matching the base projection is mapped
+    to the composer's. Patch digests pin the stored fork copy and need no
+    mapping.
     """
     replaces = {
         slug
@@ -2399,9 +2415,6 @@ def _recognize_projected_upstream_digests(
     }
     if not replaces:
         return payload
-    base_projection, _ = _project_plugin_links(
-        rendered_skills, skills_source_root, frozenset()
-    )
     payload = payload.model_copy(deep=True)
     for slug in replaces:
         override = payload.components.skills[slug]
@@ -2455,7 +2468,7 @@ def _effective_composition(
         _refuse_contradictory_command_overrides(override_root, payload, disabled)
         # Every workspace resource the base tree bundles is a valid kept link
         # for an override copied from it (replace and add included).
-        _project_plugin_links(
+        base_projection, _ = _project_plugin_links(
             rendered, skills_source_root, frozenset(), resources=link_resources
         )
 
@@ -2480,9 +2493,16 @@ def _effective_composition(
         composed, skill_order, skill_components = _compose_plugin_skill_overrides(
             rendered,
             override_root,
-            _recognize_projected_upstream_digests(payload, rendered, skills_source_root),
+            _recognize_projected_upstream_digests(payload, rendered, base_projection),
             link_space=link_space,
         )
+        # Relock / accept-upstream hash the emitted BASE tree, whose sibling
+        # links do not see this root's disables: record that projection.
+        for component in skill_components:
+            if "current_base_projected_digest" in component:
+                component["current_base_projected_digest"] = _sha256_digest(
+                    base_projection[component["name"]]
+                )
         rendered = {slug: composed[slug] for slug in skill_order}
         if payload.components.portable_commands:
             manifest, command_components = _compose_plugin_portable_command_overrides(
@@ -2537,6 +2557,20 @@ _SKILL_LINK_RES = (
 )
 _SOURCE_SKILL_REFS = PurePosixPath("references/source-skills")
 _WORKSPACE_REFS = PurePosixPath("references/workspace")
+
+
+def _is_retargetable_link(value: str) -> bool:
+    """Whether the projection may retarget link ``value``: neither a
+    ``#fragment``-only link nor a URL scheme."""
+    return not (value.startswith("#") or _URL_SCHEME_RE.match(value))
+
+
+def _has_retargetable_link(text: str) -> bool:
+    """Whether ``text`` has a link the projection may retarget, found by the
+    projection's own scan (the composer classes a fork's link space by it)."""
+    return any(
+        _is_retargetable_link(match.group(1)) for match in _MARKDOWN_LINK_RE.finditer(text)
+    )
 
 
 def _source_skill_reference_text(slug: str, *, disabled: bool) -> str:
@@ -2667,7 +2701,7 @@ def _project_plugin_links(
 
         def replace(match: re.Match[str]) -> str:
             value = match.group(1)
-            if value.startswith("#") or _URL_SCHEME_RE.match(value):
+            if not _is_retargetable_link(value):
                 return match.group(0)
             link_path, separator, anchor = value.partition("#")
             fragment = separator + anchor
@@ -2745,8 +2779,8 @@ def _render_plugin_effective_lock_json(
     ).model_dump(mode="json")
     for entry in payload["components"]:
         for key in _PROJECTED_LOCK_KEYS:
-            if entry[key] is None:
-                del entry[key]
+            if entry.get(key) is None:
+                entry.pop(key, None)
     return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
 

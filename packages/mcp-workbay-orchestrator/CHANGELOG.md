@@ -3,6 +3,18 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.31] — 2026-11-09
+
+- Resume pending native plan reviews by observing and collecting the original job, with immutable intent, typed delivery, and no duplicate submission.
+
+### Changed
+- Resume a pending native plan review by observing and collecting the original job; reconnects preserve its intent and never submit a duplicate job or cancel it after an observation timeout.
+
+### Changed
+- Authenticate the current native refusal separately from superseded charged UNKNOWN history, while accepting genuine historical v1 evidence with its original provenance and accounting.
+- Add a bounded planning-review round driver over the frozen subject and typed handoff findings/completion APIs.
+- The B4 advisor remains unimplemented and unqualified: its original UNKNOWN hold and two source charges are retained.
+
 ## [0.3.29] — 2026-11-07
 
 ### Changed

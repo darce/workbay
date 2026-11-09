@@ -29,6 +29,8 @@ SURFACE_PROVENANCE: dict[str, SurfaceKind] = {
     "scripts/workbay": "shared",
     ".codex/hooks.json": "shared",
     "scripts/remote_agent.sh": "shared",
+    "scripts/vm/host_reservation.py": "shared",
+    "scripts/vm/workbay-lane-queue.timer": "shared",
     "scripts/review_pipeline.py": "shared",
     "scripts/assert_gate_interpreter.sh": "shared",
     # generated — real dirs the generator writes into the target

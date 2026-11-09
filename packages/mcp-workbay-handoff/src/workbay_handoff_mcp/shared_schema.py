@@ -349,7 +349,10 @@ _REVIEW_FINDINGS_FINDING_ID_INDEX = "idx_review_findings_finding_id"
 #         semantics are unchanged; reader floor stays 37.
 #   v50 — package version 0.3.21: additive append-only lane production evidence;
 #         old readers may ignore the table; reader floor stays 37.
-HANDOFF_SCHEMA_VERSION = 50
+#   v51 — introducing package version 0.3.24 (coordinator-owned pyproject seam):
+#         native validation milestones and per-lane authority. Breaking reader
+#         floor: older writers do not enforce active-policy gating.
+HANDOFF_SCHEMA_VERSION = 51
 
 # Minimum compatible reader version stamped into ``PRAGMA user_version``.
 #
@@ -366,7 +369,7 @@ HANDOFF_SCHEMA_VERSION = 50
 # Schema 37 is breaking even though its storage change is additive: readers
 # predating delivery claims write NULL ids and silently degrade exactly-once
 # report delivery to at-least-once behavior.
-MIN_COMPATIBLE_READER_VERSION = 37
+MIN_COMPATIBLE_READER_VERSION = 51
 
 # Couples the schema constant to the distribution version so a stale-schema build
 # cannot silently wear a fresh version label — the copy-editable / uv-cache skew
@@ -408,6 +411,7 @@ SCHEMA_VERSION_PACKAGE_INTRODUCED: tuple[tuple[int, str], ...] = (
     (48, "0.3.19"),
     (49, "0.3.20"),
     (50, "0.3.21"),
+    (51, "0.3.24"),
 )
 
 # Allocated schema numbers deliberately retired by a written migration decision,
@@ -876,7 +880,7 @@ CREATE TABLE IF NOT EXISTS worktree_lanes (
     speed         TEXT,
     tier          TEXT,
     status        TEXT NOT NULL DEFAULT 'planned'
-                  CHECK (status IN ('planned', 'active', 'blocked', 'review', 'merged', 'closed', 'closed_stale')),
+                  CHECK (status IN ('planned', 'active', 'blocked', 'review', 'validated', 'gated', 'merged', 'closed', 'closed_stale')),
     lane_kind     TEXT NOT NULL DEFAULT 'implement'
                   CHECK (lane_kind IN ('implement', 'review')),
     -- v38 branch identity. A branch *name* is not an identity: once the ref is
@@ -1811,7 +1815,7 @@ def _handoff_schema_bootstrapped(conn: sqlite3.Connection) -> bool:
         return False
     if not _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES):
         return False
-    return _required_columns_present(conn)
+    return _required_columns_present(conn) and _native_validation_schema_present(conn)
 
 
 def _handoff_fts_bootstrapped(conn: sqlite3.Connection) -> bool:
@@ -3371,6 +3375,65 @@ def _migrate_lane_completion_evidence_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "lane_completion_evidence", column, "INTEGER" if column in integers else "TEXT")
 
 
+def _native_validation_schema_present(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='worktree_lanes'").fetchone()
+    return bool(
+        row
+        and "'validated'" in row[0]
+        and "'gated'" in row[0]
+        and _sqlite_objects_exist(
+            conn,
+            "table",
+            frozenset({"lane_validation_state", "lane_validation_events"}),
+        )
+        and _sqlite_objects_exist(
+            conn,
+            "trigger",
+            frozenset({"lane_validation_events_no_update", "lane_validation_events_no_delete"}),
+        )
+    )
+
+
+def _migrate_native_validation(conn: sqlite3.Connection) -> None:
+    """v51: additive states and per-lane policy; preserve every column/index/trigger.
+
+    No foreign keys reference worktree_lanes. Copy/swap without renaming the old
+    table avoids rewriting trigger bodies to a temporary table name. All of this
+    runs in the bootstrap transaction; any failure rolls back the entire swap.
+    """
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='worktree_lanes'").fetchone()
+    if row is not None and "'validated'" not in row[0]:
+        ddl = row[0]
+        expanded = ddl.replace("'review',", "'review', 'validated', 'gated',", 1)
+        if expanded == ddl:
+            raise sqlite3.OperationalError("unrecognized worktree_lanes status CHECK; refusing lossy rebuild")
+        dependents = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='worktree_lanes' AND sql IS NOT NULL "
+            "AND type IN ('index','trigger')"
+        ).fetchall()
+        conn.execute(expanded.replace("worktree_lanes", "worktree_lanes_native_v51", 1))
+        columns = ",".join(
+            '"' + r[1].replace('"', '""') + '"' for r in conn.execute("PRAGMA table_info(worktree_lanes)")
+        )
+        conn.execute(f"INSERT INTO worktree_lanes_native_v51 ({columns}) SELECT {columns} FROM worktree_lanes")
+        conn.execute("DROP TABLE worktree_lanes")
+        conn.execute("ALTER TABLE worktree_lanes_native_v51 RENAME TO worktree_lanes")
+        for dependent in dependents:
+            conn.execute(dependent[0])
+    conn.execute("""CREATE TABLE IF NOT EXISTS lane_validation_state (
+        lane_row_id INTEGER PRIMARY KEY, task_ref TEXT NOT NULL, lane_id TEXT NOT NULL, policy_digest TEXT NOT NULL, attempt_id TEXT NOT NULL,
+        milestone TEXT CHECK(milestone IN ('validated','gated')), result_json TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS lane_validation_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task_ref TEXT NOT NULL,
+        lane_id TEXT NOT NULL, lane_row_id INTEGER NOT NULL,
+        milestone TEXT NOT NULL CHECK(milestone IN ('validated','gated')),
+        result_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+    for operation in ("UPDATE", "DELETE"):
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS lane_validation_events_no_{operation.lower()}
+            BEFORE {operation} ON lane_validation_events
+            BEGIN SELECT RAISE(ABORT, 'native_validation_audit_is_immutable'); END""")
+
+
 def _apply_handoff_migrations(conn: sqlite3.Connection) -> None:
     _migrate_lane_completion_evidence_columns(conn)
     _migrate_add_audit_tables(conn)
@@ -3417,6 +3480,7 @@ def _apply_handoff_migrations(conn: sqlite3.Connection) -> None:
     _migrate_add_task_tool_roster(conn)
     _migrate_add_worker_report_delivery_claim(conn)
     _migrate_add_blockers_task_lane_status_index(conn)
+    _migrate_native_validation(conn)
 
 
 def _migrate_add_blockers_task_lane_status_index(conn: sqlite3.Connection) -> None:

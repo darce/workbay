@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 import uuid
 from contextlib import contextmanager
 from copy import deepcopy
@@ -41,6 +42,25 @@ MANAGED_TOP_LEVEL_KEYS = frozenset(
         "_managed_by",
     }
 )
+# Consumer-owned repository policy stays shared, unlike personal residual
+# settings. Declare already-migrated policy in overrides.yaml, for example:
+# components: {claude_settings_shared: {attribution: {commit: "", pr: ""}}}
+# Never infer shared policy from the gitignored settings.local.json.
+_SHARED_CONSUMER_VALUE_VALIDATORS = {
+    "attribution": (lambda value: isinstance(value, dict), "a JSON object"),
+    "enableAllProjectMcpServers": (lambda value: isinstance(value, bool), "a bool"),
+    "disabledMcpjsonServers": (
+        lambda value: isinstance(value, list)
+        and all(isinstance(item, str) and item.strip() for item in value)
+        and len(value) == len(set(value)),
+        "a list of non-empty strings with no duplicates",
+    ),
+}
+SHARED_CONSUMER_TOP_LEVEL_KEYS = frozenset(_SHARED_CONSUMER_VALUE_VALIDATORS)
+# Bootstrap validates/renders these independently of the strict plugin model.
+# Keep literal copies in the standalone generator and harness checker: the
+# overlay clone can run with an older installed workbay_protocol.
+BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS = frozenset({"claude_permissions", "claude_settings_shared"})
 GENERATOR_SCRIPT = "scripts/generate_agent_workflows.py"
 PLUGIN_OVERRIDE_MANIFEST = "overrides.yaml"
 
@@ -228,12 +248,29 @@ def load_plugin_override_manifest(
         separated_components["claude_permissions"] = _validate_claude_permission_overrides(
             components["claude_permissions"], manifest_path=manifest_path
         )
+    if "claude_settings_shared" in components:
+        shared = components["claude_settings_shared"]
+        context = f"{manifest_path} components.claude_settings_shared"
+        if not isinstance(shared, dict):
+            raise ClaudePermissionError(f"{context} must be an object")
+        for key, value in shared.items():
+            if key not in SHARED_CONSUMER_TOP_LEVEL_KEYS:
+                raise ClaudePermissionError(f"{context} has unknown key {key!r}")
+            validate, expected = _SHARED_CONSUMER_VALUE_VALIDATORS[key]
+            if not validate(value):
+                raise ClaudePermissionError(f"{context}.{key} must be {expected}")
+            try:
+                json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ClaudePermissionError(f"{context}.{key} must be {expected}: {exc}") from exc
+        separated_components["claude_settings_shared"] = deepcopy(shared)
 
     # The protocol model remains strict for every established component.
     from workbay_protocol.bootstrap import PluginOverrideManifest
 
     manifest_payload = deepcopy(payload)
-    manifest_payload.get("components", {}).pop("claude_permissions", None)
+    for component in BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS:
+        manifest_payload.get("components", {}).pop(component, None)
     manifest = PluginOverrideManifest.model_validate(manifest_payload)
     return LoadedPluginOverrideManifest(manifest, separated_components)
 
@@ -409,6 +446,7 @@ def build_managed_claude_settings(
     *,
     preserve_enabled_plugins: dict[str, Any] | None = None,
     preserve_marketplaces: dict[str, Any] | None = None,
+    preserve_shared_settings: dict[str, Any] | None = None,
     permissions: dict[str, list[str]] | None = None,
     permission_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -438,6 +476,10 @@ def build_managed_claude_settings(
         settings["permissions"] = deepcopy(permissions)
     if permission_overrides is not None:
         settings["_permission_overrides"] = deepcopy(permission_overrides)
+    if isinstance(preserve_shared_settings, dict):
+        for key in sorted(SHARED_CONSUMER_TOP_LEVEL_KEYS):
+            if key in preserve_shared_settings:
+                settings[key] = deepcopy(preserve_shared_settings[key])
     return settings
 
 
@@ -449,31 +491,37 @@ def managed_claude_settings_document(
 ) -> dict[str, Any]:
     hooks = render_managed_hooks(clone, override_root=override_root)
     permission_policy = _load_claude_permission_policy(clone)
-    permission_overrides = _load_claude_permission_overrides(override_root)
+    overrides = load_plugin_override_manifest(override_root)
+    permission_overrides = overrides.claude_permissions
     existing_permissions = existing.get("permissions") if isinstance(existing, dict) else None
     permissions, permission_audit = _render_claude_permissions(
         permission_policy, existing_permissions, permission_overrides
     )
     preserve_enabled = None
     preserve_marketplaces = None
+    shared_settings = {}
     if isinstance(existing, dict):
+        shared_settings = {key: existing[key] for key in SHARED_CONSUMER_TOP_LEVEL_KEYS if key in existing}
         enabled = existing.get("enabledPlugins")
         if isinstance(enabled, dict):
             preserve_enabled = dict(enabled)
         marketplaces = existing.get("extraKnownMarketplaces")
         if isinstance(marketplaces, dict):
             preserve_marketplaces = dict(marketplaces)
+    # An explicit tracked declaration restores policy and wins over carry-through.
+    shared_settings.update(overrides.separated_components.get("claude_settings_shared", {}))
     return build_managed_claude_settings(
         hooks,
         preserve_enabled_plugins=preserve_enabled,
         preserve_marketplaces=preserve_marketplaces,
+        preserve_shared_settings=shared_settings,
         permissions=permissions,
         permission_overrides=permission_audit,
     )
 
 
 def _extract_non_managed_top_level(
-    existing: dict[str, Any], *, managed_keys: frozenset[str] = MANAGED_TOP_LEVEL_KEYS
+    existing: dict[str, Any], *, managed_keys: frozenset[str] = MANAGED_TOP_LEVEL_KEYS | SHARED_CONSUMER_TOP_LEVEL_KEYS
 ) -> dict[str, Any]:
     residual: dict[str, Any] = {}
     for key, value in existing.items():
@@ -698,12 +746,12 @@ def migrate_residual_claude_settings(
     if not isinstance(existing_project, dict):
         return None
     pruned_local = _prune_local_hooks_against_managed(existing_local, managed)
-    managed_keys = MANAGED_TOP_LEVEL_KEYS
+    managed_keys = MANAGED_TOP_LEVEL_KEYS | SHARED_CONSUMER_TOP_LEVEL_KEYS
     if "permissions" not in managed:
         # The lower-level builder remains usable by older callers that only
         # manage hooks/plugin pins; they do not own the permissions subtree.
         managed_keys = frozenset(
-            key for key in MANAGED_TOP_LEVEL_KEYS if key not in {"permissions", "_permission_overrides"}
+            key for key in managed_keys if key not in {"permissions", "_permission_overrides"}
         )
     residual_top = _extract_non_managed_top_level(existing_project, managed_keys=managed_keys)
     migrated_hooks = _migrate_residual_hooks(existing_project, managed, existing_local=pruned_local)
@@ -970,7 +1018,7 @@ def write_wholesale_claude_settings(
     *,
     override_root: Path | None,
     write_json: Any,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     # Retain the callback API, but all settings IO uses the pinned directory.
     with _claude_directory(target) as directory:
 
@@ -987,10 +1035,23 @@ def write_wholesale_claude_settings(
         existing_local = read_document(CLAUDE_SETTINGS_LOCAL_PATH.name)
         managed = managed_claude_settings_document(clone, existing_project, override_root=override_root)
         local_doc = migrate_residual_claude_settings(existing_project, managed, existing_local)
-        entries = [_write_claude_file(directory, CLAUDE_SETTINGS_PATH.name, managed)]
+        entries: list[dict[str, Any]] = [_write_claude_file(directory, CLAUDE_SETTINGS_PATH.name, managed)]
         if local_doc is not None:
-            entries.append(_write_claude_file(directory, CLAUDE_SETTINGS_LOCAL_PATH.name, local_doc))
+            moved_keys = set(_extract_non_managed_top_level(existing_project or {}))
+            # Report partial hook moves too, including entries already in local:
+            # the shared file still loses those registrations on this pass.
+            if _migrate_residual_hooks(existing_project or {}, managed):
+                moved_keys.add("hooks")
+            local_entry: dict[str, Any] = _write_claude_file(directory, CLAUDE_SETTINGS_LOCAL_PATH.name, local_doc)
+            local_entry["migrated_top_level_keys"] = sorted(moved_keys)
+            entries.append(local_entry)
             entries.append(ensure_claude_settings_local_gitignore(target))
+            if moved_keys:
+                print(
+                    f"Claude settings: migrated top-level keys from {CLAUDE_SETTINGS_PATH.as_posix()} "
+                    f"to {CLAUDE_SETTINGS_LOCAL_PATH.as_posix()}: {', '.join(sorted(moved_keys))}",
+                    file=sys.stderr,
+                )
         try:
             source = _resolve_existing_in_clone(clone, CLAUDE_SETTINGS_HOOKS_PATH.as_posix())
         except FileNotFoundError:

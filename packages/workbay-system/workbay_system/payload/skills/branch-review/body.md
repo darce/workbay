@@ -20,6 +20,7 @@ Produce a branch-review verdict with MCP-recorded findings, a recorded review ru
 
 ## Canonical Policy
 
+- [Frozen acceptance qualification](../../docs/workbay/rules/frozen-acceptance-qualification.md) governs original evaluations before model merge review and any repair dispatch.
 - [../../../docs/workbay/instructions.md](../../../docs/workbay/instructions.md)
 - [../../../docs/workbay/rules/development-workflow.md](../../../docs/workbay/rules/development-workflow.md)
 - [../../../docs/workbay/rules/branch-review-guide.md](../../../docs/workbay/rules/branch-review-guide.md)
@@ -29,13 +30,20 @@ This skill owns branch-review execution order. The guide owns the detailed check
 
 ## Review contract and parallel frontiers
 
-Every reviewer receives the same exact base and candidate SHAs, diff/slice scope, touched contracts, test commands and receipts, prior findings and review verdicts, codemap anchors with index freshness, semantic prior-work context with retrieval status, and applicable canon rows with their IDs and sources. Pass this packet to slice, whole-branch, and integration reviewers alike. Missing graph or semantic capability is an explicit context limitation; similarity and unavailable retrieval are not correctness evidence. Use actual source to confirm or refute each claim, and reject unsupported conclusions rather than promoting uncertainty to a finding. Preserve the complete branch-mode checklist, verdict, and recording authority even when work is partitioned.
+Every reviewer receives the same exact base and candidate SHAs, diff/slice scope, touched contracts, test commands and receipts, prior findings and review verdicts, codemap anchors with index freshness, semantic prior-work context with retrieval status, and applicable canon rows with their IDs and sources. Include the independently computed [original-case packet](../../docs/workbay/rules/frozen-acceptance-qualification.md#minimum-independent-packet), not only author receipts. Pass this packet to slice, whole-branch, and integration reviewers alike. Missing graph or semantic capability is an explicit context limitation; similarity and unavailable retrieval are not correctness evidence. Use actual source to confirm or refute each claim, and reject unsupported conclusions rather than promoting uncertainty to a finding. Preserve the complete branch-mode checklist, verdict, and recording authority even when work is partitioned.
 
 Use [GRPH-01] **Model the work as a DAG, then topological-sort** (Source: The Algorithm Design Manual, ch. 7) and [GRPH-33] **A node without a contract cannot be parallelised** (Source: practice label bootstrap): each review lane names its input commit, scope, output schema, and provenance. Independent read-only review frontiers may run concurrently with isolated finding writes. Order shared target/ref mutations and git integration explicitly; unrelated branches need no ordering edge. Merge and adjudicate results deterministically, preserving reviewer lineage under [GRPH-14] **Record provenance as a walkable lineage graph** (Source: Building Knowledge Graphs, ch. 8 + Mental Models, ch. 8). Runtime canon guidance: [heuristics canon pointer](../../../docs/workbay/rules/heuristics-canon.md).
 
 Remote execution and payload authorization come from the selected installed capability/preflight receipts and the shared native adapter (`scripts/remote_agent.sh` and its payload twin). Preserve resolved invocation values from those receipts; do not invent backend/model defaults or substitute another backend or local execution after selection. Surface a typed refusal when the selected execution cannot proceed.
 
 ## Core Process
+
+Before step 1 starts a model merge review, require independent original evaluations
+for the exact candidate under [the qualification order](../../docs/workbay/rules/frozen-acceptance-qualification.md#required-order).
+Classify each finding before repair dispatch against an original case or a causal
+base/candidate demonstration of an introduced regression. Missing original coverage
+goes to harness/workflow repair and recomputation. Apply the rule's third-dispatch
+and review-repetition checks; another label or tip does not reset history.
 
 0. **Ensure task scope before any cwd-resolving MCP read.** Every other step calls `load_session`, `search_handoff`, `review_findings`, etc. — these resolve the active task from cwd unless `task_ref` is passed explicitly. On cold start:
    - Run `make status LIFECYCLE_ARGS=--json` from the target worktree first so branch/worktree alignment and the active task surface are confirmed through the public facade.

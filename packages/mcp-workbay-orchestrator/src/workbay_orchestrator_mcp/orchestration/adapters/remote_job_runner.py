@@ -1030,6 +1030,7 @@ class _TimeoutContext:
     env: dict[str, str] | None
     work_deadline: float  # submit, poll and collect stop here, leaving the cancel reserve
     total_deadline: float  # the authorized total; a cancel may not run past it
+    resume_only: bool = False  # recovery never owns cancellation of the existing VM job
 
 
 @dataclass(frozen=True)
@@ -1038,9 +1039,19 @@ class _JobStatus:
     payload: dict[str, Any]
 
 
-def _status_payload(completed: subprocess.CompletedProcess[str], identity: RemoteJobIdentity) -> dict[str, Any] | None:
+def _status_payload(
+    completed: subprocess.CompletedProcess[str], identity: RemoteJobIdentity, *, strict: bool = False
+) -> dict[str, Any] | None:
+    def fields(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("ambiguous native status")
+            value[key] = item
+        return value
+
     try:
-        payload: Any = json.loads(completed.stdout)
+        payload: Any = json.loads(completed.stdout, object_pairs_hook=fields if strict else None)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -1048,6 +1059,9 @@ def _status_payload(completed: subprocess.CompletedProcess[str], identity: Remot
     if payload.get("job_id") != identity.job_id:
         return None
     if not isinstance(payload.get("state"), str):
+        return None
+    if strict and (type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
+                   or "observer_error" not in payload):
         return None
     return payload
 
@@ -1060,6 +1074,15 @@ def _timed_out(
     cause: subprocess.TimeoutExpired | None = None,
     include_cause_output: bool = False,
 ) -> None:
+    if context.resume_only:
+        # A consumer's observation budget cannot rebudget/retire the original
+        # native execution. Its existing VM deadline remains authoritative.
+        detail = "\n".join([*stderr_parts, "remote_job_resume_hold reason=deadline"])
+        if cause is not None and cause.stderr:
+            detail += "\n" + (_as_text(cause.stderr) or "")
+        if cause is not None and include_cause_output:
+            stdout = _as_text(cause.output) or stdout
+        raise subprocess.TimeoutExpired(context.cmd, context.timeout, output=stdout, stderr=detail) from None
     cancel_cmd = _operation_command(context.cmd, "cancel", context.identity)
     cancel_timeout = max(0.0, context.total_deadline - time.monotonic())
     if cancel_timeout <= 0:
@@ -1154,7 +1177,7 @@ def _read_status(
             "",
             f"remote_job_status_failed rc={status.returncode}{suffix}",
         )
-    payload = _status_payload(status, context.identity)
+    payload = _status_payload(status, context.identity, strict=context.resume_only)
     if payload is None:
         return _refusal(context.cmd, f"remote_job_status_invalid job_id={context.identity.job_id}")
     return _JobStatus(status, payload)
@@ -1172,6 +1195,13 @@ def _poll_job(
             return status
         payload = status.payload
         state = payload["state"]
+        if context.resume_only and (
+            payload.get("observer_error") is not None
+            or state not in {"claiming", "submitted", "queued", "running", "done"}
+        ):
+            return _refusal(
+                context.cmd, f"state={state} observer_error={payload.get('observer_error')}"
+            )
         if state == "lost":
             return subprocess.CompletedProcess(context.cmd, 1, "", f"remote_job_lost job_id={context.identity.job_id}")
         if state == "done":
@@ -1253,6 +1283,43 @@ def run_detached(
     poll_result = _poll_job(context, stderr_parts)
     if poll_result is not None:
         return poll_result
+    return _collect_job(context, stderr_parts)
+
+
+def resume_pending(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str] | None,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    """Observe, poll and collect an existing identity; never submit or cancel.
+
+    The caller must authenticate the retained full spec before entering this
+    path and validate collected source provenance before accepting a result.
+    Intent alone is not evidence that a native job exists. Missing, lost,
+    conflicting or unavailable observations retain the original intent.
+    """
+    identity, refusal = _identity_refusal(cmd, env)
+    if refusal is not None:
+        return refusal
+    assert identity is not None
+    if _build_command(cmd, identity) is None:
+        return _refusal(cmd, "remote_job_invalid_command expected=build")
+    job_flags = [i for i, arg in enumerate(cmd) if arg == "--job-id"]
+    if job_flags and (len(job_flags) != 1 or cmd[job_flags[0] + 1 : job_flags[0] + 2] != [identity.job_id]):
+        return _refusal(cmd, "remote_job_resume_hold reason=identity_conflict")
+    deadline = time.monotonic() + timeout
+    if isinstance(cmd, _AuthenticatedTransportCommand) and cmd.deadline is not None:
+        deadline = min(deadline, cmd.deadline)
+    context = _TimeoutContext(cmd, timeout, identity, cwd, env, deadline, deadline, resume_only=True)
+    stderr_parts: list[str] = []
+    if _remaining(context) <= 0:
+        _timed_out(context, stderr_parts)
+    polled = _poll_job(context, stderr_parts)
+    if polled is not None:
+        polled.stderr = "remote_job_resume_hold " + (polled.stderr or "")
+        return polled
     return _collect_job(context, stderr_parts)
 
 

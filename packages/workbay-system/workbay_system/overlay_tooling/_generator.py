@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+import shutil
+import subprocess
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 
@@ -19,6 +22,31 @@ def _generator_script():
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Bootstrap depends on system; keep validation across that boundary in a
+    # subprocess rather than introducing the reverse package dependency.
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--plugin-overrides")
+    options, _ = parser.parse_known_args(argv or [])
+    if options.plugin_overrides is not None:
+        validator = shutil.which("workbay-bootstrap")
+        if validator is None:
+            print(
+                "generate-agent-workflows: override validation skipped (workbay-bootstrap executable not found).",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                result = subprocess.run(
+                    [validator, "validate-overrides", "--override-root", options.plugin_overrides],
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"generate-agent-workflows: override validation failed: {exc}", file=sys.stderr)
+                return 1
+            if result.returncode != 0:
+                return result.returncode
+
     path = _generator_script()
     if not path.is_file():
         print(f"generate-agent-workflows: missing script at {path}", file=sys.stderr)

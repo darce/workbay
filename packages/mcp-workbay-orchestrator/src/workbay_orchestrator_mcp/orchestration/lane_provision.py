@@ -359,6 +359,24 @@ def _expand_worktree_path(raw: str, *, root: Path) -> str:
     return str(path.resolve())
 
 
+def _declared_lineage(lane_spec: Mapping[str, Any], task_ref: str, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    lineage = []
+    lanes = manifest.get("lanes", {})
+    for relation in ("reviews", "fixes"):
+        targets = lane_spec.get(relation, [])
+        if not isinstance(targets, list):
+            raise ProvisionRefused(reason="invalid_lane_spec", detail=f"{relation} must be a list of lane IDs")
+        for target in targets:
+            if not isinstance(target, str) or not target or not isinstance(lanes, Mapping) or target not in lanes:
+                raise ProvisionRefused(
+                    reason="invalid_lane_spec", detail=f"{relation} target {target!r} is absent from task {task_ref}"
+                )
+            edge = {"relation": relation, "target": {"kind": "lane", "task_ref": task_ref, "lane_id": target}}
+            if edge not in lineage:
+                lineage.append(edge)
+    return lineage
+
+
 def _prepare_entry(
     *,
     lane_spec: Mapping[str, Any],
@@ -369,8 +387,10 @@ def _prepare_entry(
     base_sha: str,
     review_of: str | None,
     review_subject: dict[str, str] | None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     entry = copy.deepcopy(dict(lane_spec))
+    entry["lineage"] = _declared_lineage(entry, task_ref, manifest or {})
     entry["branch"] = str(entry.get("branch") or f"codex/{task_ref}-{lane_id}").strip()
     if not entry["branch"]:
         raise ProvisionRefused(reason="invalid_branch", detail="lane spec branch must be non-empty")
@@ -548,6 +568,8 @@ def _insert_lane(
         raise ProvisionRefused(reason="manifest_invalid", detail="lane manifest lanes must be an object")
     if lane_id in lanes:
         raise ProvisionRefused(reason="lane_id_reused", detail=f"lane id {lane_id!r} already exists in manifest")
+    # Recheck under the manifest's atomic update, before any materialization.
+    _declared_lineage(entry, str(manifest.get("task_ref") or ""), manifest)
     if supersedes is not None:
         previous = lanes.get(supersedes)
         if not isinstance(previous, dict):
@@ -956,6 +978,7 @@ def _build_plan(
         base_sha=base_sha,
         review_of=review_of,
         review_subject=review_subject,
+        manifest=manifest_before,
     )
     actions = [
         "register_manifest_lane",

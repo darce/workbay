@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-workbay-canvas"
+version = "0.1.17"
+description = "Portable MCP server for a shared visual/spatial planning surface."
+requires-python = ">=3.12"
+# README carries internal ticket refs that hatchling would otherwise bake verbatim
+# into the wheel METADATA / sdist PKG-INFO long-description, OUTSIDE the build hook's
+# scrub. Declare readme dynamic so ScrubMetadataHook supplies the scrubbed
+# long-description (see [tool.hatch.metadata.hooks.custom] below).
+dynamic = ["readme"]
+dependencies = [
+    "fastmcp>=3.4,<4",
+    "pydantic>=2.6.0,<3.0.0",
+    "mcp-workbay-handoff>=0.3.25,<0.4.0",
+    "mcp-workbay-orchestrator>=0.3.31,<0.4.0",
+]
+
+[project.scripts]
+workbay-canvas-mcp = "workbay_canvas_mcp.cli:main"
+ux-map = "workbay_canvas_mcp.cli:ux_map_main"
+
+[project.entry-points."workbay.commands"]
+canvas = "workbay_canvas_mcp.cli:workbay_front_door"
+studio = "workbay_canvas_mcp.cli:workbay_studio_front_door"
+# TODO(internal): Add the missing-renderer blocker wording to the canonical
+# payload skills/ux-map/body.md when that actual source path is admitted to the lane write-set.
+
+[project.urls]
+Homepage = "https://github.com/darce/workbay"
+Source = "https://github.com/darce/workbay/tree/main/packages/mcp-workbay-canvas"
+Changelog = "https://github.com/darce/workbay/blob/main/packages/mcp-workbay-canvas/CHANGELOG.md"
+Issues = "https://github.com/darce/workbay/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0", "pytest-timeout>=2.3.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.3.0",
+    "ruff==0.15.17",
+    "mypy>=1.13.0,<2.0.0",
+]
+# Optional extra for `export_canvas(..., format="png")`. cairosvg is a
+# native dependency (requires libcairo) so it ships behind an extra and
+# the PNG emitter raises ExportError(reason="missing_dependency") when
+# it cannot be imported.
+export-png = ["cairosvg>=2.7.0,<3.0.0"]
+
+[tool.hatch.metadata.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+# The shared scrub hook discovers the actual src/workbay_canvas_mcp tree and
+# force-includes its scrubbed snapshot at this import root. It uses the same
+# root layout in sdists, so rebuilding a public sdist needs no private src tree.
+only-include = ["workbay_canvas_mcp"]
+
+[tool.hatch.build.targets.sdist]
+# README.md must ride the sdist: readme is dynamic (ScrubMetadataHook), so
+# hatchling no longer auto-includes it, and a wheel rebuilt FROM the sdist
+# would otherwise silently lose its long-description.
+only-include = ["workbay_canvas_mcp", "hatch_build.py", "_scrub_core.py", "README.md"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["build", "src/*.egg-info"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+
+# WorkBay is released git-only, so canvas consumes released tags.
+# The override is needed because uv ignores sources for transitive packages.
+
+[tool.uv]
+override-dependencies = []

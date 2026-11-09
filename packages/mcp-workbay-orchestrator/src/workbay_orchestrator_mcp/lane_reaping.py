@@ -896,6 +896,12 @@ def _run_reclaim_command(
     if mutating is None:
         mutating = _is_reclaim_git_mutation(command)
     if mutating:
+        # Tombstone removal also reaches this boundary, after its own final
+        # checks. Its candidate root may have moved since the original grant.
+        if any(command[index : index + 2] == ["worktree", "remove"] for index in range(len(command) - 1)):
+            changed_detail = _primary_copy_changed_detail(command[-1])
+            if changed_detail:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr=changed_detail)
         return _run_reclaim_mutation(command, timeout=timeout, stdin_text=stdin_text, env=env)
     try:
         return subprocess.run(  # noqa: S603 — fixed argv, no shell
@@ -2578,6 +2584,55 @@ class _ContentIdentityContext:
     #: authority on its own -- without this bound, any ignored scratch file that
     #: happened to duplicate one in the primary would authorize its own delete.
     primary_config_paths: frozenset[str] = frozenset()
+    #: Surface files or directories declared by the ledger, regardless of source
+    #: label or provenance. Each leaf still needs a separate surviving copy.
+    primary_surface_paths: frozenset[str] = frozenset()
+
+
+# Only the actuator holding the reclaim lock enables this collector. Keep the
+# per-leaf grants rather than trying to recover paths from the capped histogram.
+_PRIMARY_COPY_GRANTS: contextvars.ContextVar[dict[str, _ContentIdentityContext] | None] = contextvars.ContextVar(
+    "primary_copy_grants", default=None
+)
+_PRIMARY_COPY_REFUSALS: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "primary_copy_refusals", default=None
+)
+
+
+def _primary_copy_changed_detail(worktree_path: str) -> str:
+    """Re-verify every primary-backed grant at the destructive boundary."""
+    grants = _PRIMARY_COPY_GRANTS.get()
+    if grants is None:
+        # Landing callers also use the shared removal helper directly while
+        # holding their claim. With no actuator collector, re-prove the whole
+        # ignored-content verdict here; a failed comparison must not disappear
+        # just because it no longer grants identical_to_primary.
+        identity = _content_identity_context(worktree_path)
+        if identity is None or identity.primary_root is None:
+            return ""
+        if not identity.primary_config_paths and not identity.primary_surface_paths:
+            return ""
+        refused: list[str] = []
+        grants_token = _PRIMARY_COPY_GRANTS.set({})
+        refusals_token = _PRIMARY_COPY_REFUSALS.set(refused)
+        try:
+            safe, detail = _probe_worktree_ignored(worktree_path)
+        finally:
+            _PRIMARY_COPY_REFUSALS.reset(refusals_token)
+            _PRIMARY_COPY_GRANTS.reset(grants_token)
+        if safe is not True:
+            return "primary_copy_changed:" + json.dumps(sorted(refused) or [detail], separators=(",", ":"))
+        return ""
+    if not grants:
+        return ""
+    changed = [
+        path
+        for path, identity in grants.items()
+        if _content_identity_rule(path, replace(identity, worktree_path=worktree_path)) != "identical_to_primary"
+    ]
+    if not changed:
+        return ""
+    return "primary_copy_changed:" + json.dumps(sorted(changed), separators=(",", ":"))
 
 
 def _payload_provenance_roots(surfaces: Sequence[object]) -> list[str]:
@@ -2626,7 +2681,13 @@ def _primary_worktree_root(worktree_path: str) -> str | None:
 
 
 def _ledger_config_paths(configs: Sequence[object]) -> frozenset[str]:
-    """Normalized config surfaces the ledger declares, bounding primary identity."""
+    """Normalize ledger config entries to bound primary identity comparisons.
+
+    Non-path entries (Git config keys such as ``core.hooksPath`` and tracked
+    top-level files such as ``Makefile``) are admitted too, but grant nothing
+    on their own: authority comes from the primary's regular-file byte identity.
+    Keys name no file, and tracked files never enter the ignored enumeration.
+    """
     paths = set()
     for entry in configs:
         if not isinstance(entry, Mapping):
@@ -2649,13 +2710,20 @@ def _content_identity_context(worktree_path: str) -> _ContentIdentityContext | N
         if tracked:
             tracked_by_root[root] = tracked
     config_paths = _ledger_config_paths(configs)
-    if not tracked_by_root and not config_paths:
+    surface_paths = frozenset(
+        normalized
+        for entry in surfaces
+        if isinstance(entry, Mapping)
+        if (normalized := _normalized_reclaim_relpath(entry.get("path"))) is not None
+    )
+    if not tracked_by_root and not config_paths and not surface_paths:
         return None
     return _ContentIdentityContext(
         worktree_path=worktree_path,
         tracked_by_root=tracked_by_root,
         primary_root=_primary_worktree_root(worktree_path),
         primary_config_paths=config_paths,
+        primary_surface_paths=surface_paths,
     )
 
 
@@ -2874,11 +2942,11 @@ def _tracked_under_root(tracked: frozenset[str], relative: str) -> bool:
 
 
 def _content_identity_rule(path: str, identity: _ContentIdentityContext | None) -> str | None:
-    """Authorize one ignored file whose bytes already exist in tracked history.
+    """Authorize an ignored file backed by tracked payload or a primary copy.
 
-    Deleting a byte-identical copy of a committed file loses nothing this
-    worktree does not already carry, so the ledger's ``local`` label cannot
-    outvote it.  Every comparison that cannot be completed -- unreadable,
+    Tracked payload or a separate surviving primary copy backs the bytes, so
+    the ledger's ``local`` label cannot outvote that evidence. Every comparison
+    that cannot be completed -- unreadable,
     symlinked, non-regular, oversized, escaping the worktree -- contributes no
     rule and therefore still blocks (default-deny).
     """
@@ -2906,13 +2974,26 @@ def _content_identity_rule(path: str, identity: _ContentIdentityContext | None) 
             continue
         if _files_have_identical_bytes(candidate, Path(identity.worktree_path) / root / normalized):
             return f"payload_identical:{root}"
-    # A merged config surface has no tracked counterpart anywhere -- the
-    # installer writes it into an ignored path in every checkout. The primary's
-    # copy is the only thing that survives, and it does survive: the sweep
-    # never reclaims the main working tree.
-    if identity.primary_root is not None and normalized in identity.primary_config_paths:
-        if _files_have_identical_bytes(candidate, Path(identity.primary_root) / normalized):
-            return "identical_to_primary"
+    # Configs and copied surfaces may have no tracked payload counterpart. The
+    # sweep never reclaims the primary, so its separate, contained regular-file
+    # copy survives. A directory bound grants nothing without per-leaf identity.
+    within_surface = any(
+        normalized == surface or normalized.startswith(surface + "/")
+        for surface in identity.primary_surface_paths
+    )
+    if identity.primary_root is not None and (normalized in identity.primary_config_paths or within_surface):
+        contained_candidate = _contained_worktree_path(identity.worktree_path, normalized)
+        primary_copy = _contained_worktree_path(identity.primary_root, normalized)
+        if contained_candidate is not None and primary_copy is not None:
+            try:
+                if primary_copy.resolve(strict=True).is_relative_to(Path(identity.worktree_path).resolve(strict=True)):
+                    return None
+                if not os.path.samefile(contained_candidate, primary_copy) and _files_have_identical_bytes(
+                    contained_candidate, primary_copy
+                ):
+                    return "identical_to_primary"
+            except (OSError, RuntimeError, ValueError):
+                return None
     return None
 
 
@@ -3141,6 +3222,44 @@ def _nested_repository_verdict(worktree_path: str, ignored: Sequence[str]) -> _I
     return _IgnoredContentVerdict(False, detail[:_RECLAIM_DETAIL_CAP])
 
 
+def _unique_roots_refusal_detail(detail: str, paths: Sequence[str], surface_paths: frozenset[str]) -> str:
+    """Append longest-surface counts, eliding low-count roots as whole JSON."""
+    surfaces = sorted(surface_paths, key=lambda surface: (-len(surface), surface))
+    histogram: Counter[str] = Counter()
+    for path in paths:
+        normalized = _normalized_reclaim_relpath(path) or path
+        root = next(
+            (surface for surface in surfaces if normalized == surface or normalized.startswith(surface + "/")),
+            normalized.split("/", 1)[0],
+        )
+        histogram[root] += 1
+    marker = ";unique_roots_json:"
+
+    def render(counts: Mapping[str, int]) -> str:
+        return detail + marker + json.dumps(counts, sort_keys=True, separators=(",", ":"))
+
+    full = render(histogram)
+    if len(full) <= _RECLAIM_DETAIL_CAP:
+        return full
+    rest = len(paths)
+    # Reserve a complete suffix even when the three legacy sample paths alone
+    # exceed the cap. Ordinary prefixes are preserved byte-for-byte.
+    minimum_suffix = marker + json.dumps({"...": rest}, separators=(",", ":"))
+    detail = detail[: _RECLAIM_DETAIL_CAP - len(minimum_suffix)]
+    bounded = render({"...": rest})
+    selected: dict[str, int] = {}
+    for root, count in sorted(histogram.items(), key=lambda item: (-item[1], item[0])):
+        if root == "...":
+            continue
+        selected[root] = count
+        rest -= count
+        trial = render({**selected, "...": rest} if rest else selected)
+        if len(trial) > _RECLAIM_DETAIL_CAP:
+            break
+        bounded = trial
+    return bounded
+
+
 def _classification_verdict(
     ignored: Sequence[str],
     managed_roots: Mapping[str, str],
@@ -3167,9 +3286,16 @@ def _classification_verdict(
     ]
     potentially_unique = [path for path, rule in classified if rule is None]
     if potentially_unique:
+        refusals = _PRIMARY_COPY_REFUSALS.get()
+        if refusals is not None:
+            refusals.extend(potentially_unique)
         sample = ",".join(potentially_unique[:3])
         detail = f"ignored_content:{len(ignored)};potentially_unique:{len(potentially_unique)};first:{sample}"
-        return _IgnoredContentVerdict(False, detail[:_RECLAIM_DETAIL_CAP])
+        surface_paths = identity.primary_surface_paths if identity is not None else frozenset()
+        return _IgnoredContentVerdict(False, _unique_roots_refusal_detail(detail, potentially_unique, surface_paths))
+    grants = _PRIMARY_COPY_GRANTS.get()
+    if grants is not None and identity is not None:
+        grants.update({path: identity for path, rule in classified if rule == "identical_to_primary"})
     rules = [rule for _path, rule in classified if rule is not None]
     histogram = Counter(rules)
     rule_detail = json.dumps(dict(sorted(histogram.items())), separators=(",", ":"))
@@ -4172,6 +4298,9 @@ def _remove_lane_worktree(
 
         if not lane_id or not task_ref:
             return (False, "worktree_removal_identity_missing")
+        changed_detail = _primary_copy_changed_detail(str(worktree_path))
+        if changed_detail:
+            return (False, changed_detail)
         # landing_lock_held is True only when the caller already holds the landing
         # lock in this process (lane_land); otherwise the drain takes it itself.
         return retire_worktree(
@@ -4193,6 +4322,16 @@ def _remove_lane_worktree(
         )
         if intent_path is None:
             return (False, intent_refusal)
+    # The caller still holds the reclaim lock. Primary writers do not share
+    # that lock: this final comparison narrows the check-then-act window but
+    # cannot close it. A retained-object snapshot is needed to close the race.
+    changed_detail = _primary_copy_changed_detail(str(worktree_path))
+    if changed_detail:
+        if intent_path is not None:
+            from .orchestration.worktree_tombstone import _remove_intent  # noqa: PLC0415
+
+            _remove_intent(intent_path)
+        return (False, changed_detail)
     # An interruption, including the hook watchdog, leaves the intent for the next sweep.
     proc = run(argv)
     if intent_path is not None:
@@ -4272,6 +4411,8 @@ def _remove_interrupted_lane_worktree(
         **({"landing_lock_held": True} if landing_lock_held else {}),
     )
     if not removed:
+        if remove_detail.startswith("primary_copy_changed:"):
+            return (False, remove_detail)
         detail = f"interrupted_removal_remove_failed:{remove_detail}"[:_RECLAIM_DETAIL_CAP]
         return (False, _with_fence_release_detail(detail, remove_detail))
     return (True, remove_detail)
@@ -5132,6 +5273,7 @@ def release_no_work_lane_worktree(
             "refused_lock_held" if _is_peer_held_reaping_claim(claim_detail) else "refused_lock_unavailable",
             claim_detail,
         )
+    primary_grants_token = _PRIMARY_COPY_GRANTS.set({})
     try:
         with ExitStack() as stack:
             try:
@@ -5231,11 +5373,15 @@ def release_no_work_lane_worktree(
                         root, path, expected_tip=None, lane_id=lane_id, task_ref=task_ref
                     )
                     if not removed:
-                        return ("remove_failed", removal)
+                        reason = (
+                            "primary_copy_changed" if removal.startswith("primary_copy_changed:") else "remove_failed"
+                        )
+                        return (reason, removal)
                 return ("released_no_work", _with_fence_release_detail("zero_own_commits;" + detail, removal))
 
             return _run_under_no_work_fence(row=fresh, binding=binding, actuator=remove)
     finally:
+        _PRIMARY_COPY_GRANTS.reset(primary_grants_token)
         _release_lane_worker_lock(claim_handle)
 
 
@@ -6711,6 +6857,7 @@ def _reclaim_lane_worktree(
             return ("refused_lock_held", lock_detail)
         own_lock = True
 
+    primary_grants_token = _PRIMARY_COPY_GRANTS.set({})
     try:
         # Re-read the authority under the lock, before any dry-run return, so a
         # dry run never reports would_reclaim for a row apply would refuse.
@@ -6889,10 +7036,14 @@ def _reclaim_lane_worktree(
                     detail = f"{detail};{reopen_detail}"
                 return ("tip_moved_after_close", _with_fence_release_detail(detail, remove_detail))
             if not removed:
-                return ("remove_failed", remove_detail)
+                reason = (
+                    "primary_copy_changed" if remove_detail.startswith("primary_copy_changed:") else "remove_failed"
+                )
+                return (reason, remove_detail)
         # A removal that ran under the row's fence but could not release it says so beside its success.
         return ("reclaimed", _with_fence_release_detail(f"{merged_detail};{ignored_detail}", remove_detail))
     finally:
+        _PRIMARY_COPY_GRANTS.reset(primary_grants_token)
         if own_lock:
             _release_lane_worker_lock(lock_handle)
 

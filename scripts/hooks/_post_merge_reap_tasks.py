@@ -24,7 +24,7 @@ from pathlib import Path
 
 _INTEGRATION_BRANCHES = frozenset({"main", "master"})
 _SOURCE = "post-merge-reap"
-_ROWLESS_REAP_TIMEOUT_S = 10.0
+_ROWLESS_REAP_TIMEOUT_S = 20.0
 _RUN_FAILURES: list[dict[str, str | None]] | None = None
 # Signals whose Python handlers can unwind the hook; defer them while mutating
 # or restoring process-global signal state, including the default SIGINT handler.

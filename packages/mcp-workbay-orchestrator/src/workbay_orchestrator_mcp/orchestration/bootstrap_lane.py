@@ -16,11 +16,10 @@ from pathlib import Path
 # Other package.json roots without the marker keep provisioning.
 _PARKED_WEB_MARKER = ".workbay-parked-web"
 
-# Canonical opt-in spelling. Must match root Makefile WB_PROVISION_WEB_ON:
-#   WB_PROVISION_WEB_ON := $(filter 1,$(WORKBAY_PROVISION_WEB))
-# Only the literal "1" enables. A falsy-set + .lower() approach diverged from
-# Make's case-sensitive filter-out (FALSE off here, on in Make). A single
-# truthy token keeps both consumers identical without Make case-folding.
+# Canonical opt-in spelling. This is the flag's only reader: the root Makefile
+# stopped consuming it when canvas left the root gates (canvas provisions and
+# gates on its own). Only the literal "1" enables -- a single case-sensitive
+# truthy token, so no falsy-set or case-folding rule can drift from the docs.
 _PROVISION_WEB_TRUTHY = "1"
 
 

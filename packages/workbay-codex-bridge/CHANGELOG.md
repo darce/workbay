@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.3] — 2026-11-09
+
+- Align bridge dependency floors with the qualified WorkBay v0.1.88 component set.
+
+### Changed
+- Metadata-only revision aligning the Codex bridge with the new v0.1.88 family tags; bridge runtime behavior is unchanged.
+
+### Changed
+- internal: delivered as a git-mirror member of `darce/workbay`; PyPI publish retired for the stack.
+
 ## [0.3.1] — 2026-10-22
 
 ### Changed

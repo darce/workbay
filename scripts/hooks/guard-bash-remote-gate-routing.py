@@ -213,7 +213,9 @@ _PRIOR_WORD_SPLIT = re.compile(r"""[\s;&|<>()'"`=]+""")
 _INPUT_REDIRECT = re.compile(r"^\d*<(?![<>&(])(.*)$")
 
 _IMPLICIT_MAKEFILES = frozenset({"GNUmakefile", "makefile", "Makefile"})
-_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.ASCII)
+# A prefix assignment, including an array element (seen[$k]=1) and an append (n+=1, arr+=(x)).
+# It never names the program; substitutions in its subscript or value are scanned on their own.
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=.*$", re.ASCII)
 _ENV_ASSIGNMENT = re.compile(rf"^{re.escape(_BYPASS_ENV)}=(.*)$", re.ASCII)
 _RUNNER_WORD = re.compile(
     r"(?<![\w.-])(?:pytest|py\.test|run_named_tests\.py)(?![\w.-])"
@@ -1138,7 +1140,7 @@ class _MakeArgv:
                         self.unparsed = word
                         return
             elif _ASSIGNMENT.fullmatch(word):
-                self.source_env = self.source_env or word.partition("=")[0] in {"MAKEFILES", "MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS"}
+                self.source_env = self.source_env or word.partition("=")[0].rstrip("+") in {"MAKEFILES", "MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS"}
             else:
                 self.goals.append(word)
             for option, value in options:
@@ -2370,7 +2372,7 @@ def _reads_startup_file(command: list[str], assignments: dict[str, str], scan: _
     if not command or _command_name(command[0]) not in _SHELLS:
         return False
     return (
-        any(key in {"BASH_ENV", "ENV", "ZDOTDIR"} for key in assignments)
+        any(key.rstrip("+") in {"BASH_ENV", "ENV", "ZDOTDIR"} for key in assignments)
         # An export or earlier assignment can name the file the shell reads, as in export BASH_ENV=s; bash -c ...
         or scan.prior.matches(_STARTUP_ENV)
         or any(word in _STARTUP_FILE_OPTIONS for word in command[1:])

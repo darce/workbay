@@ -1711,3 +1711,90 @@ def remint_capability_receipt(
         "predecessor_receipt_id": predecessor_receipt_id,
         "capability_config_digest": config_digest,
     }
+
+
+def validate_execution_preflight(proof: Mapping[str, Any], *, now: Callable[[], float] = time.time,
+                                capability: str = "workspace-write") -> dict[str, Any]:
+    """Consume a fresh native observation; operator JSON is never a grant.
+
+    This validates provenance/integrity, not authority against same-uid code.
+    The process boundary supplies the observation directly and never loads a
+    user-provided attestation path or extends its TTL from a legacy write gate.
+    """
+    if proof.get("schema") != "workbay/execution-preflight@1":
+        return {"ok": False, "reason": "execution_preflight_schema_unknown"}
+    if proof.get("status") != "PASS":
+        return {"ok": False, "reason": proof.get("reason", "execution_preflight_unknown")}
+    stamp = now()
+    started, finished, expires = (proof.get(k) for k in ("started_at", "finished_at", "expires_at"))
+    if (
+        not all(_finite_timestamp(v) for v in (started, finished, expires))
+        or not started <= finished <= stamp < expires
+        or expires - started > PREFLIGHT_ATTESTATION_TTL_S
+    ):
+        return {"ok": False, "reason": STALE_CAPABILITY_RECEIPT_REASON}
+    material = {k: v for k, v in proof.items() if k != "evidence_digest"}
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    if hashlib.sha256(encoded).hexdigest() != proof.get("evidence_digest"):
+        return {"ok": False, "reason": RECEIPT_INTEGRITY_MISMATCH_REASON}
+    roots = proof.get("roots")
+    writes = proof.get("sandbox_writes")
+    negative = proof.get("sandbox_negative")
+    if (
+        not isinstance(roots, list)
+        or not roots
+        or not all(isinstance(root, Mapping) for root in roots)
+        or not isinstance(writes, list)
+        or proof.get("cache_reused") is not False
+        or not isinstance(negative, Mapping)
+        or negative.get("outside_write_denied") is not True
+        or type(negative.get("errno")) is not int
+        or negative.get("errno") not in (1, 13, 30)
+        or not isinstance(proof.get("live_context"), dict)
+        or not isinstance(proof.get("cwd"), str)
+        or proof.get("outside_host_control") != [{"root": str(Path(proof["cwd"]).parent), "create_read_unlink": True}]
+    ):
+        return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    from .execution_preflight import (
+        ANALYSIS_CAPABILITY,
+        WRITE_CAPABILITY,
+        Refused,
+        _policy,
+        valid_readonly_denials,
+    )
+
+    # The boundary supplies its required contract. A read-only PASS cannot
+    # authorize ordinary write work, nor can a write PASS authorize analysis.
+    if proof.get("capability") != capability or capability not in {ANALYSIS_CAPABILITY, WRITE_CAPABILITY}:
+        return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    paths = [r.get("path") for r in roots]
+    if not all(isinstance(p, str) and Path(p).is_absolute() for p in paths):
+        return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    policy = proof.get("policy")
+    try:
+        if not isinstance(policy, Mapping) or not isinstance(policy.get("config"), list):
+            raise Refused("sandbox_policy_unavailable")
+        profile, _ = _policy(["exec", "--ignore-user-config", *policy["config"]], paths, capability=capability)
+        if policy.get("profile") != profile:
+            raise Refused("sandbox_policy_unavailable")
+    except (Refused, TypeError, ValueError):
+        return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    if capability == ANALYSIS_CAPABILITY:
+        if (writes != [] or not valid_readonly_denials(proof.get("sandbox_readonly"), paths)
+                or proof.get("host_writes") != [{"root": p, "create_read_unlink": True} for p in paths]
+                or any(row.get("create_read_unlink") is not True for row in proof["host_writes"])):
+            return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    elif (writes != [{"root": p, "create_read_unlink": True} for p in paths]
+          or any(not isinstance(row, Mapping) or row.get("create_read_unlink") is not True for row in writes)
+          or "sandbox_readonly" in proof):
+        return {"ok": False, "reason": CAPABILITY_INCOMPLETE_REASON}
+    # Re-reading a PASS after its observing owner has exited is never a grant.
+    owner = proof.get("owner")
+    try:
+        if (not isinstance(owner, Mapping) or owner.get("uid") != os.getuid()
+                or type(owner.get("pid")) is not int or owner["pid"] != os.getpid()
+                or Path("/proc/self/stat").read_text().split()[21] != owner["start"]):
+            return {"ok": False, "reason": "execution_owner_unavailable"}
+    except (OSError, KeyError, ValueError, TypeError):
+        return {"ok": False, "reason": "execution_owner_unavailable"}
+    return {"ok": True, "reason": "native_execution_preflight"}

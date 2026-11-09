@@ -28,7 +28,7 @@ _PAGE_SIZE = 200
 _LOGGER = logging.getLogger(__name__)
 # Statuses a refused retirement may restore. The close compare-and-set returns
 # whichever of these the live row actually held; an earlier snapshot must not.
-_RESTORABLE_PREDECESSOR_STATUSES = frozenset({"planned", "active", "blocked", "review"})
+_RESTORABLE_PREDECESSOR_STATUSES = frozenset({"planned", "active", "blocked", "review", "validated", "gated"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +418,216 @@ def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _NativePredecessorClose:
+    """Live compensation context, never a deserialized milestone permit."""
+
+    before: dict[str, Any]
+    policy: dict[str, Any]
+    closed: dict[str, Any]
+    binding: Any
+
+
+_NATIVE_PREDECESSOR_STATUSES = frozenset({"validated", "gated"})
+_NATIVE_CLOSE_IDENTITY = (
+    "id",
+    "task_ref",
+    "lane_id",
+    "identity_seq",
+    "branch",
+    "worktree_path",
+    "branch_tip_sha",
+    "branch_tip_source",
+    "owner_agent",
+    "lane_kind",
+    "reclaim_fence",
+)
+
+
+def _native_predecessor_policy(conn: Any, row: Mapping[str, Any]) -> dict[str, Any] | None:
+    policy = conn.execute("SELECT * FROM lane_validation_state WHERE lane_row_id=?", (row["id"],)).fetchone()
+    return dict(policy) if policy is not None else None
+
+
+def _restore_native_predecessor(claim: object) -> bool:
+    """Compensate this close using retained policy, source and producer custody.
+
+    This reuses an already persisted milestone, without minting a permit or
+    appending another validation event. Git probes precede the writer lock;
+    the transaction fences the exact merged row and retained policy again.
+    """
+    if not isinstance(claim, _NativePredecessorClose):
+        return False
+    import sqlite3
+
+    from workbay_handoff_mcp import validation_lane
+    from workbay_handoff_mcp.lane_resource_producer import execute_lane_change, prepare_lane_binding
+
+    from workbay_orchestrator_mcp.lanes_support import _get_db_connection
+
+    before, closed = claim.before, claim.closed
+    prior_status = before.get("status")
+    if prior_status not in _NATIVE_PREDECESSOR_STATUSES or prior_status not in _RESTORABLE_PREDECESSOR_STATUSES:
+        return False
+    try:
+        with _get_db_connection() as conn:
+            current = conn.execute("SELECT * FROM worktree_lanes WHERE id=?", (before["id"],)).fetchone()
+            if current is None or dict(current) != closed or current["status"] != "merged":
+                return False
+            if _native_predecessor_policy(conn, before) != claim.policy:
+                return False
+            source_current = validation_lane.policy_source_current(conn, current)
+        if not source_current:
+            return False
+        binding = prepare_lane_binding(before["worktree_path"], before["branch"])
+        if binding != claim.binding:
+            return False
+        with _get_db_connection(begin_immediate=True) as conn:
+            current = conn.execute("SELECT * FROM worktree_lanes WHERE id=?", (before["id"],)).fetchone()
+            if current is None or dict(current) != closed:
+                return False
+            policy = _native_predecessor_policy(conn, before)
+            if (
+                policy != claim.policy
+                or policy is None
+                or (policy["task_ref"], policy["lane_id"], policy["milestone"])
+                != (before["task_ref"], before["lane_id"], prior_status)
+            ):
+                return False
+            # An immutable native event, not caller JSON, establishes the
+            # milestone being restored. Policy changes invalidate the claim.
+            event = conn.execute(
+                "SELECT result_json FROM lane_validation_events WHERE lane_row_id=? AND milestone=? ORDER BY id DESC LIMIT 1",
+                (before["id"], prior_status),
+            ).fetchone()
+            if event is None or event[0] != policy["result_json"]:
+                return False
+            result = json.loads(policy["result_json"])
+            if hashlib.sha256(Path(result["receipt_path"]).read_bytes()).hexdigest() != result["receipt_sha256"]:
+                return False
+            if result["source"]["tip"]["commit"] != before["branch_tip_sha"]:
+                return False
+            if prior_status == "gated":
+                # Reuse the canonical policy's source/custody/findings/blocker
+                # guard on the status this close replaced, never a new policy.
+                if validation_lane.transition_error(conn, before, "merged", source_current=source_current):
+                    return False
+            elif (
+                conn.execute(
+                    "SELECT 1 FROM blockers WHERE task_ref=? AND (lane_id=? OR lane_id IS NULL) AND status='open' LIMIT 1",
+                    (before["task_ref"], before["lane_id"]),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            cursor, receipt = execute_lane_change(
+                conn,
+                "UPDATE worktree_lanes SET status=?, updated_at=datetime('now') WHERE id=? AND status='merged' AND cycle_epoch IS ?",
+                (prior_status, before["id"], closed["cycle_epoch"]),
+                binding=binding,
+                task_ref=before["task_ref"],
+                lane_id=before["lane_id"],
+                operation="restore_contained_predecessor",
+                expected_row=dict(current),
+            )
+            if cursor.rowcount != 1 or receipt.get("knowledge") != "observed":
+                # Do not commit a milestone when source/custody is UNKNOWN.
+                raise ValueError("native predecessor restoration custody unknown")
+        return True
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+        return False
+
+
+def _close_native_predecessor(
+    *,
+    root: Path,
+    task_ref: str,
+    lane_id: str,
+    lane_row: Mapping[str, object],
+    containing_sha: str,
+) -> tuple[bool, str | None, dict[str, object] | None]:
+    """Keep the native close on the existing guarded Handoff/Git authority.
+
+    Premarking merged defeats active-policy admission (which requires gated),
+    so only the legacy path uses that claim. A validated lane remains held.
+    """
+    from uuid import uuid4
+
+    from workbay_handoff_mcp import validation_lane
+    from workbay_handoff_mcp.lane_resource_producer import prepare_lane_binding
+
+    from workbay_orchestrator_mcp.lanes_support import _get_db_connection
+
+    from . import offload_pass
+
+    with _get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM worktree_lanes WHERE task_ref=? AND lane_id=?", (task_ref, lane_id)
+        ).fetchone()
+        if row is None:
+            return False, "contained_lane_close_failed:lane_missing", None
+        before = dict(row)
+        if any(before[k] != lane_row.get(k) for k in ("branch", "worktree_path", "branch_tip_sha")):
+            return False, "contained_lane_close_failed:predecessor_identity_changed", None
+        policy = _native_predecessor_policy(conn, before)
+        fresh = validation_lane.policy_source_current(conn, row)
+        error = validation_lane.transition_error(conn, row, "merged", source_current=fresh)
+        if policy is None or before["status"] not in _NATIVE_PREDECESSOR_STATUSES or error:
+            return False, f"contained_lane_close_failed:{error or 'native_policy_unavailable'}", None
+
+    binding = prepare_lane_binding(before["worktree_path"], before["branch"])
+    if binding.reason or binding.resource is None or binding.source is None:
+        return False, "contained_lane_close_failed:native_source_custody_unknown", None
+    # The existing close port persists notes atomically with its status write.
+    # Bind compensation to this invocation, including failures after commit;
+    # another actor's merge must never be adopted as this attempt's close.
+    close_notes = (before.get("notes") or "") + f"\nContained predecessor close attempt {uuid4().hex}."
+    close_error = None
+    try:
+        result = offload_pass.close_offload_lane_merged(
+            task_ref=task_ref,
+            lane_id=lane_id,
+            notes=close_notes,
+            force=True,
+            orchestrator_root=root,
+            lane_row=before,
+            landed_sha=containing_sha,
+        )
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            close_error = (
+                str(result.get("error") or "unreadable_result") if isinstance(result, Mapping) else "unreadable_result"
+            )
+    except Exception as exc:
+        close_error = type(exc).__name__
+    with _get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM worktree_lanes WHERE id=?", (before["id"],)).fetchone()
+        after = dict(row) if row is not None else {}
+    if after == before and close_error:
+        return False, f"contained_lane_close_failed:{close_error}", None
+    if (
+        any(after.get(k) != before[k] for k in _NATIVE_CLOSE_IDENTITY)
+        or after.get("status") != "merged"
+        or after.get("landing_commit_sha") != containing_sha
+        or after.get("notes") != close_notes
+    ):
+        return False, "contained_lane_close_failed:predecessor_identity_changed", None
+    claim = _NativePredecessorClose(before, policy, after, binding)
+    replaced = dict(before, _native_close=claim)
+    if close_error:
+        if not _undo_contained_predecessor_merge(
+            task_ref=task_ref,
+            lane_id=lane_id,
+            prior_status=before["status"],
+            branch=before["branch"],
+            worktree_path=before["worktree_path"],
+            branch_tip_sha=before["branch_tip_sha"],
+            native_close=claim,
+        ):
+            return False, "contained_lane_close_failed:predecessor_open_row_restore_failed", None
+        return False, f"contained_lane_close_failed:{close_error}", None
+    return True, None, replaced
+
+
 def _undo_contained_predecessor_merge(
     *,
     task_ref: str,
@@ -426,8 +636,26 @@ def _undo_contained_predecessor_merge(
     branch: object,
     worktree_path: object,
     branch_tip_sha: object,
+    native_close: object = None,
 ) -> bool:
     """Put back the status a compare-and-set close claimed, if that claim is still merged."""
+
+    if prior_status in _NATIVE_PREDECESSOR_STATUSES:
+        if not isinstance(native_close, _NativePredecessorClose):
+            return False
+        expected = (task_ref, lane_id, prior_status, branch, worktree_path, branch_tip_sha)
+        observed = tuple(
+            native_close.before.get(k)
+            for k in (
+                "task_ref",
+                "lane_id",
+                "status",
+                "branch",
+                "worktree_path",
+                "branch_tip_sha",
+            )
+        )
+        return expected == observed and _restore_native_predecessor(native_close)
 
     import sqlite3
 
@@ -474,6 +702,28 @@ def _cas_close_contained_predecessor(
 
     from . import offload_pass
 
+    # Native policy requires the real gated row at its close port. Do not
+    # premark it merged or bypass the canonical transition/source guards.
+    try:
+        with _get_db_connection() as conn:
+            native_row = conn.execute(
+                "SELECT * FROM worktree_lanes WHERE task_ref=? AND lane_id=?", (task_ref, lane_id)
+            ).fetchone()
+            native_policy = _native_predecessor_policy(conn, dict(native_row)) if native_row is not None else None
+    except sqlite3.Error as exc:
+        return False, f"contained_lane_close_failed:{type(exc).__name__}", None
+    if native_row is not None and (native_row["status"] in _NATIVE_PREDECESSOR_STATUSES or native_policy is not None):
+        try:
+            return _close_native_predecessor(
+                root=root,
+                task_ref=task_ref,
+                lane_id=lane_id,
+                lane_row=lane_row,
+                containing_sha=containing_sha,
+            )
+        except Exception as exc:
+            return False, f"contained_lane_close_failed:{type(exc).__name__}", None
+
     expected_branch = lane_row.get("branch")
     expected_worktree = lane_row.get("worktree_path")
     expected_tip = lane_row.get("branch_tip_sha")
@@ -481,7 +731,7 @@ def _cas_close_contained_predecessor(
         with _get_db_connection(begin_immediate=True) as conn:
             probed = conn.execute(
                 """
-                SELECT status, branch, worktree_path, branch_tip_sha
+                SELECT id, status, branch, worktree_path, branch_tip_sha
                 FROM worktree_lanes
                 WHERE task_ref = ? AND lane_id = ?
                 """,
@@ -490,6 +740,10 @@ def _cas_close_contained_predecessor(
             if probed is None:
                 return False, "contained_lane_close_failed:lane_missing", None
             replaced_status = probed["status"]
+            if replaced_status in _NATIVE_PREDECESSOR_STATUSES or _native_predecessor_policy(
+                conn, {"id": probed["id"]}
+            ):
+                return False, "contained_lane_close_failed:predecessor_status_changed", None
             if not isinstance(replaced_status, str) or not replaced_status:
                 return False, "contained_lane_close_failed:status_unreadable", None
             if (
@@ -782,6 +1036,8 @@ def _reopen_predecessor_after_refusal(
     worktree_path = lane_row.get("worktree_path")
     branch = lane_row.get("branch")
     if not isinstance(worktree_path, str) or not isinstance(branch, str) or not Path(worktree_path).exists():
+        if prior_status in _NATIVE_PREDECESSOR_STATUSES:
+            return False, "predecessor_open_row_native_source_unavailable"
         return True, None
 
     try:
@@ -805,6 +1061,19 @@ def _reopen_predecessor_after_refusal(
         or current_lane.get("landing_commit_sha") != identity.get("landing_commit")
     ):
         return False, "predecessor_open_row_identity_changed"
+
+    if prior_status in _NATIVE_PREDECESSOR_STATUSES:
+        if not _undo_contained_predecessor_merge(
+            task_ref=task_ref,
+            lane_id=lane_id,
+            prior_status=str(prior_status),
+            branch=branch,
+            worktree_path=worktree_path,
+            branch_tip_sha=identity.get("expected_tip"),
+            native_close=lane_row.get("_native_close"),
+        ):
+            return False, "predecessor_open_row_native_restore_held"
+        return True, None
 
     try:
         reopened = lanes_recording.open_lane(

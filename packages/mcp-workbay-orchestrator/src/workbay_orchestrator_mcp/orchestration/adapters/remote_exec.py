@@ -67,7 +67,6 @@ from ..backend_spec import REMOTE_EFFORTS as _REMOTE_EFFORTS
 from ..codex_lane_config import (
     CODEX_SPEED_TO_SERVICE_TIER,
     LANE_SANDBOX,
-    LANE_WRITABLE_ROOTS,
     PREFLIGHT_PROBE_MAX_LIVE,
     PREFLIGHT_PROBE_MAX_LIVE_ENV,
     PREFLIGHT_PROBE_MODEL_ENV,
@@ -6420,21 +6419,7 @@ def _stamp_backend_result_path(
 #: lane under ``--ignore-user-config`` can write ``.git`` [CARD-12].
 WRITABLE_ROOTS_PREFLIGHT_ENV = "WORKBAY_REMOTE_WRITABLE_ROOTS_PREFLIGHT_OK"
 WORKBAY_PREFLIGHT_HOST_PROBE_ENV = "WORKBAY_PREFLIGHT_HOST_PROBE"
-#: Wall-clock budget for the writable_roots live probe.
-#:
-#: The probe is not a filesystem check -- it runs a full ``codex exec`` turn, so
-#: its floor is *model* latency, not sandbox latency. The former 30s default
-#: (28s effective, after the 2s ``communicate`` haircut) sat *inside the noise
-#: band* of that latency rather than above it. Measured 2026-08-30 on the
-#: operator host, the identical argv took 24.8s / 31.0s / 32.9s across three
-#: runs -- straddling the 28s cutoff -- while the gate VM landed the same commit
-#: in 8s. So the gate was a coin flip, and because the probe is fail-closed a
-#: lost flip is indistinguishable from a writable_roots *denial*: lane
-#: ``fix-taskrefclosure-01`` refused with a policy blocker on a policy that
-#: demonstrably works (VM commit 1d5c784, host commit 42ca07b).
-#:
-#: A fail-closed gate must not sit inside the noise band of what it measures.
-#: Budget for a slow turn instead; the probe is still bounded.
+#: Existing total transport/queue bound; no model turn runs in a probe.
 WRITABLE_ROOTS_PROBE_TIMEOUT_S = 180
 SANDBOX_PREFLIGHT_ENV = "WORKBAY_REMOTE_SANDBOX_PREFLIGHT_OK"
 
@@ -6451,12 +6436,9 @@ _PROBE_GIT = (
 
 def writable_roots_preflight_argv() -> list[str]:
     """Sandbox flags the host-side writable_roots check shares with the lane."""
-    return [
-        "-s",
-        LANE_SANDBOX,
-        "-c",
-        f"sandbox_workspace_write.writable_roots={json.dumps(list(LANE_WRITABLE_ROOTS))}",
-    ]
+    from ..codex_lane_config import EXECUTION_PERMISSION_PROFILE, EXECUTION_PERMISSION_TEMPLATE
+    return ["-c", f'default_permissions="{EXECUTION_PERMISSION_PROFILE}"', "-c", EXECUTION_PERMISSION_TEMPLATE]
+
 
 
 def _probe_identity_pids(root_pid: int, nonce: str | None = None) -> set[int]:
@@ -6736,7 +6718,7 @@ def _sandbox_attestation_flags(argv: Sequence[str]) -> list[str]:
     flags = []
     for index, arg in enumerate(argv[:-1]):
         value = argv[index + 1]
-        if arg in {"-s", "--sandbox"} or (arg == "-c" and value.startswith("sandbox_")):
+        if arg in {"-s", "--sandbox"} or (arg == "-c" and value.startswith(("sandbox_", "permissions", "default_permissions"))):
             flags.extend((arg, value))
     return flags
 
@@ -6757,6 +6739,7 @@ ProbeReason = Literal[
     "probe_result_invalid",
     "script_unparseable",
     "local_exec_failed",
+    "sandbox_policy_unavailable",
 ]
 ProbeVerdict = Literal["positive", "negative", "unknown"]
 
@@ -6828,6 +6811,7 @@ class WritableRootsProbe:
             "probe_result_invalid",
             "script_unparseable",
             "local_exec_failed",
+            "sandbox_policy_unavailable",
         }:
             return replace(self, elapsed_s=elapsed)
         return WritableRootsProbe(
@@ -6870,38 +6854,21 @@ def _default_writable_roots_sandbox_exec(
     timeout: int = WRITABLE_ROOTS_PROBE_TIMEOUT_S,
     on_spawn: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[str] | WritableRootsProbe:
-    """Run host ``codex exec`` with the same ``-s``/``-c`` pair as the lane.
+    """Compatibility diagnostics only; help cannot attest sandbox writes.
 
-    This is a host-side version check, **not** VM attestation [CARD-12]. A
-    passing host commit does not prove the remote lane under
-    ``--ignore-user-config`` can write ``.git``. Fail-closed: missing flags,
-    missing binary, timeout, or spawn error yields a typed refusal. Tests inject
-    an honoring/ignoring ``sandbox_exec`` instead of requiring a live Codex.
+    Keep missing flags/binary, spawn and timeout classifications for existing
+    consumers, but never launch a paid host model or return a write grant.
     """
     started = time.monotonic()
     joined = " ".join(argv)
-    if (
-        "-s" not in argv
-        or LANE_SANDBOX not in argv
-        or "sandbox_workspace_write.writable_roots=" not in joined
-        or ".git" not in joined
-    ):
+    legacy = ("-s" in argv and LANE_SANDBOX in argv
+              and "sandbox_workspace_write.writable_roots=" in joined and ".git" in joined)
+    if not legacy and argv != writable_roots_preflight_argv():
         return WritableRootsProbe(False, "flags_missing", time.monotonic() - started)
     codex = shutil.which("codex")
     if not codex:
         return WritableRootsProbe(False, "binary_missing", time.monotonic() - started)
-    # Match build_agent_spec / _codex_remote_argv for the host-config hole:
-    # --ignore-user-config and -C . ; do not add --skip-git-repo-check (the
-    # lane recipe does not). Host which(codex) is still not VM evidence.
-    cmd = [
-        codex,
-        "exec",
-        "--ignore-user-config",
-        "-C",
-        ".",
-        *argv,
-        "git add -A && git -c commit.gpgsign=false commit -m writable-roots-probe",
-    ]
+    cmd = [codex, "sandbox", "--help"]
     probe_nonce = f"workbay-preflight-{uuid.uuid4().hex}"
     probe_env = os.environ.copy()
     probe_env["WORKBAY_PROBE_NONCE"] = probe_nonce
@@ -6929,7 +6896,7 @@ def _default_writable_roots_sandbox_exec(
             return WritableRootsProbe(False, "timeout", time.monotonic() - started)
         except OSError:
             return WritableRootsProbe(False, "spawn_error", time.monotonic() - started)
-        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        return WritableRootsProbe(False, "sandbox_policy_unavailable", time.monotonic() - started, verdict="unknown")
     finally:
         # This finally covers normal completion, timeout, transport errors, and
         # callback failures. The outer probe has a second explicit-PID guard.
@@ -7315,6 +7282,10 @@ def probe_writable_roots_git_commit(
     Codex can write ``.git`` [CARD-12]. Fail-closed, with a typed reason:
     a timeout says only that we did not hear back, never that a grant is broken.
     """
+    if sandbox_exec is None:
+        # A host Codex model turn is neither a non-model capability probe nor
+        # evidence of the future VM sandbox. Do not spend it.
+        return WritableRootsProbe(False, "sandbox_policy_unavailable", 0.0, verdict="unknown")
     started = time.monotonic()
 
     def outcome(ok: bool, reason: ProbeReason) -> WritableRootsProbe:
@@ -7612,6 +7583,7 @@ def _probe_receipt_result(
         "probe_result_invalid": "probe_result_invalid",
         "exception": "exception",
         "flags_missing": "flags_missing",
+        "sandbox_policy_unavailable": "sandbox_policy_unavailable",
         "workspace_write": "committed",
         "ok": "committed",
     }
@@ -8103,6 +8075,8 @@ def _run_vm_preflight_pair(
     authenticated_transport=None,
 ) -> tuple[WritableRootsProbe, WritableRootsProbe]:
     """Single-flight the VM arm with a durable shared result and cooldown."""
+    if backend_id == "codex-remote" and script is None:
+        return _unknown_preflight_pair("sandbox_policy_unavailable")
     durable_deadline = time.monotonic() + timeout
     if deadline is not None:
         durable_deadline = min(durable_deadline, deadline)
@@ -8126,6 +8100,8 @@ def _run_vm_preflight_pair(
             "model": probe_env.get(PREFLIGHT_PROBE_MODEL_ENV, ""),
             "effort": probe_env.get("WORKBAY_PREFLIGHT_PROBE_EFFORT", ""),
             "path_env": probe_env.get("PATH", ""),
+            # A new TMPDIR/environment must never share an old PASS flight.
+            "execution_environment_digest": preflight_attestation.configuration_digest(probe_env),
         },
         sort_keys=True,
     )
@@ -9243,6 +9219,22 @@ class RemoteExecAdapter(BackendAdapter):
             if provenance is not None:
                 raw = dict(stamped.raw_payload or {})
                 raw["source_provenance"] = provenance
+                execution_proof = provenance.get("execution_preflight")
+                if isinstance(execution_proof, dict):
+                    raw["execution_preflight"] = execution_proof
+                    if execution_proof.get("status") != "PASS":
+                        raw.update(
+                            failure_reason=execution_proof.get("reason", "execution_preflight_unknown"),
+                            preflight_required=True,
+                            failure_class="transport" if execution_proof.get("retryable") is True else "configuration",
+                            retryable=execution_proof.get("retryable") is True,
+                        )
+                        stamped = replace(
+                            stamped,
+                            merge_ready=False,
+                            handoff_action="needs_guidance",
+                            blockers=[*stamped.blockers, "execution_preflight_refused"],
+                        )
                 if provenance.get("model_process_started") is not True:
                     raw["execution_failure"] = "model_process_not_started"
                 if spool_tmpdir_fallback:
@@ -9317,6 +9309,29 @@ class RemoteExecAdapter(BackendAdapter):
             raw = dict(stamped.raw_payload or {})
             raw["remote_exec_mode"] = remote_exec_mode
             raw["review_cycle"] = cycle_decision
+            # Consume only a completed native transport's protected producer
+            # evidence. No model JSON, generic exit7, exception or zero-token
+            # claim can mint this phase. The engine reads the same host proof.
+            from ..review_cycle_dispatch import (
+                execution_refusal_reason,
+                read_execution_effect,
+                record_native_pre_model_refusal,
+            )
+            if (completed_rc == 7 and isinstance(provenance, dict)
+                    and not stamped.token_usage and not stamped.changed_files and not stamped.merge_ready
+                    and not any(p.exists() and p.stat().st_size for p in
+                                (result_file, patch_file, stream_file, debug_file, uncommitted_file))):
+                try:
+                    from ..review_cycle_dispatch import _receipt_path
+                    protected = json.loads(_receipt_path(worktree_path, cycle_receipt["identity"]["dispatch_id"]).read_bytes())
+                    if execution_refusal_reason(protected, provenance, completed_rc,
+                        effect=read_execution_effect(Path(str(provenance_file) + ".effect"))) is not None:
+                        record_native_pre_model_refusal(worktree_path, phase="execution_preflight", active=cycle_receipt,
+                            execution={"provenance": provenance, "rc": str(completed_rc),
+                                       "effect": read_execution_effect(Path(str(provenance_file) + ".effect"))})
+                        raw["outcome"] = "dispatch_refused"
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    raw["native_pre_model_refusal_error"] = type(exc).__name__
             if not cycle_engine_owned:
                 actual_outcome = raw.get("outcome") or ("dispatch_refused" if constructor_refusal else "error")
                 provenance_evidence = raw.get("source_provenance")
@@ -10769,7 +10784,9 @@ class RemoteExecAdapter(BackendAdapter):
                         payload["retryable"] = False
                 if WRITABLE_ROOTS_REQUIRES_LIVE_PREFLIGHT and not roots_ok:
                     blockers.append(
-                        "writable_roots live probe failed: the bounded VM-side arm did not establish "
+                        "writable_roots live probe failed: no exact native sandbox policy evidence is available. "
+                        "Configure an approved named permissions profile shared by exec and sandbox; "
+                        "do not broaden roots or use a paid model probe. The bounded VM-side arm did not establish "
                         "a git commit under -s workspace-write with writable_roots=['.git']; "
                         "a timeout is UNKNOWN and cannot authorize or open the breaker [FM-08][CARD-12]"
                     )
@@ -10795,6 +10812,7 @@ class RemoteExecAdapter(BackendAdapter):
                         local_configuration_probe = probe_outcome.reason in {
                             "script_unparseable",
                             "local_exec_failed",
+                            "sandbox_policy_unavailable",
                         }
                         payload["failure_class"] = (
                             "configuration"

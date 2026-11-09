@@ -174,8 +174,8 @@ close-check: ## Check the active task is ready to close (gate before merge) [LIF
 	@$(LIFECYCLE) close-check $(LIFECYCLE_ARGS)
 handoff-close-check: ## Enforced merge-readiness gate on the final branch HEAD: [TASK=<ref>] [LIFECYCLE_ARGS=--json]
 	@$(LIFECYCLE) handoff-close-check $(if $(TASK),--task-ref '$(TASK)') $(LIFECYCLE_ARGS)
-plan-review: ## Broadcast a planning-review skill intent: DOC=<plan path>
-	@$(LIFECYCLE) plan-review $(if $(DOC),--doc '$(DOC)') $(LIFECYCLE_ARGS)
+plan-review: ## Execute one bounded remote plan review: DOC=<path> [TASK=] [ROUND=] [BASE_SHA=] [RUN_ID=] [LIFECYCLE_ARGS=--json]
+	@$(LIFECYCLE) plan-review $(if $(DOC),--doc '$(DOC)') $(if $(or $(TASK_REF),$(TASK)),--task-ref '$(or $(TASK_REF),$(TASK))') $(if $(ROUND),--round '$(ROUND)') $(if $(BASE_SHA),--base-sha '$(BASE_SHA)') $(if $(RUN_ID),--review-run-id '$(RUN_ID)') $(if $(SESSION),--session '$(SESSION)') $(LIFECYCLE_ARGS)
 plan-analyze: ## Broadcast a plan-analyze skill intent: DOC=<plan path>
 	@$(LIFECYCLE) plan-analyze $(if $(DOC),--doc '$(DOC)') $(LIFECYCLE_ARGS)
 merge-probe: ## Probe a landing merge for dead parallel code and silently reverted main fixes: MERGE=<rev> [MERGE_PROBE_ARGS=--probe dead|revert]

@@ -9,7 +9,6 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
-import re
 import subprocess
 import tempfile
 from copy import deepcopy
@@ -120,6 +119,10 @@ def _skill_replace(
     upstream_digest = override.upstream_digest
     base_digest = sha256_digest(composed[slug])
     projected_base = _projected_base_digest(slug, composed[slug], link_space)
+    if projected_base:
+        # The composer-space digest rides beside the projected one, so a
+        # reader can tell which space a recorded digest is in (GATinternal).
+        projected_base = {"current_base_digest": base_digest, **projected_base}
     stale_component: dict[str, str] = {}
     if upstream_digest != base_digest:
         on_upstream_change = override.on_upstream_change
@@ -205,16 +208,13 @@ def _aligned_lines(source: list[str], target: list[str]) -> dict[int, int]:
     }
 
 
-# A link projection may retarget: neither ``#fragment``-only nor a URL scheme.
-_RELATIVE_LINK_RE = re.compile(r"\]\((?!#|[A-Za-z][A-Za-z0-9+.-]*:)[^)\s]+\)")
-
-
 def _unproject_merged_lines(
     merged: str,
     upstream: tuple[str, str],
     consumer: tuple[str, str],
     *,
     base: tuple[str, str] | None = None,
+    has_relative_link: Callable[[str], bool] | None = None,
 ) -> str:
     """Return each merged line as the composer line it was projected from.
 
@@ -235,6 +235,8 @@ def _unproject_merged_lines(
     Such a line takes the raw form its text projects from when that form is
     unambiguous; otherwise it stays as merged. Re-projecting the result yields
     the merged bytes, and the composer keeps its link space.
+    ``has_relative_link`` is the projection's own link scan (required with
+    ``base``), so a link the projection skips never marks a fork as emitted.
     """
     merged_lines = merged.splitlines(keepends=True)
     raw_forms: dict[str, set[str]] = {}
@@ -257,9 +259,9 @@ def _unproject_merged_lines(
     # with no relative link is its own projection either way, so nothing marks
     # it as emitted and the consumer keeps its bytes. Without a base, such a
     # line is taken as projected.
-    projected_fork = base is None or (
-        base[0] == base[1] and _RELATIVE_LINK_RE.search(base[0]) is not None
-    )
+    if base is not None and has_relative_link is None:
+        raise ValueError("a fork base needs the projection's link scan")
+    projected_fork = base is None or (base[0] == base[1] and has_relative_link(base[0]))
     consumer_changed: set[int] = set()
     if base is not None:
         base_lines, base_projected = (text.splitlines(keepends=True) for text in base)
@@ -300,6 +302,7 @@ def _skill_patch(
     composed: dict[str, str],
     override_root: Path,
     link_space: Callable[[str, str], str] | None = None,
+    has_relative_link: Callable[[str], bool] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     if slug not in composed:
         raise SystemExit(
@@ -337,6 +340,7 @@ def _skill_patch(
             (current_upstream, projected[2]),
             (consumer_edit, projected[1]),
             base=(forked_base, projected[0]),
+            has_relative_link=has_relative_link,
         )
     if conflicted:
         composed[slug] = consumer_edit
@@ -372,7 +376,10 @@ def compose_plugin_skill_overrides(
     payload: PluginOverrideManifest,
     *,
     link_space: Callable[[str, str], str] | None = None,
+    has_relative_link: Callable[[str], bool] | None = None,
 ) -> tuple[dict[str, str], list[str], list[dict[str, str]]]:
+    """``link_space`` projects a skill text into the emitted tree's link space
+    and ``has_relative_link`` is that projection's link scan."""
     composed = dict(rendered_skills)
     skill_order = list(rendered_skills)
     components: list[dict[str, str]] = []
@@ -421,6 +428,7 @@ def compose_plugin_skill_overrides(
                 composed=composed,
                 override_root=override_root,
                 link_space=link_space,
+                has_relative_link=has_relative_link,
             )
             components.append(component)
     return composed, skill_order, components

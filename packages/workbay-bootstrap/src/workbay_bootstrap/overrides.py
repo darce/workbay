@@ -7,9 +7,11 @@ space: the unprojected rendering) and ``current_base_projected_digest``
 (projected space: the emitted SKILL.md), and ``recorded_upstream_digest_space``
 names the one the recorded digest is compared with: projected, the space
 relock and accept-upstream record in, unless the recorded digest equals the
-composer digest or the receipt predates the projected key. The status comes
-from the receipt either way. ``accept_upstream`` re-records one skill override's
-``upstream_digest`` against the current base tree (and, for ``patch`` mode,
+composer digest or the receipt predates the projected key, and
+``recorded_matches_current`` says whether it names the current base in
+either space. The status comes from the receipt either way.
+``accept_upstream`` re-records one skill override's ``upstream_digest``
+against the current base tree (and, for ``patch`` mode,
 refreshes the stored ``base_path`` fork copy), writing accept provenance into
 the tracked ``overrides.lock.json``.
 
@@ -121,6 +123,11 @@ def _recorded_digest_space(recorded: object, lock_entry: dict[str, Any]) -> str 
     return "composer" if composer is not None else None
 
 
+def _recorded_matches_current(recorded: object, lock_entry: dict[str, Any]) -> bool | None:
+    current = {lock_entry.get("current_base_digest"), lock_entry.get("current_base_projected_digest")} - {None}
+    return recorded in current if current else None
+
+
 def overrides_status(*, target: Path, plugin_overrides: Path | None = None) -> dict[str, Any]:
     """Report every declared override with its current composition status."""
     target = Path(target).resolve()
@@ -143,6 +150,7 @@ def overrides_status(*, target: Path, plugin_overrides: Path | None = None) -> d
                 "current_base_digest": lock_entry.get("current_base_digest"),
                 "current_base_projected_digest": lock_entry.get("current_base_projected_digest"),
                 "recorded_upstream_digest_space": _recorded_digest_space(override.upstream_digest, lock_entry),
+                "recorded_matches_current": _recorded_matches_current(override.upstream_digest, lock_entry),
                 "status": lock_entry.get("status") or "clean",
             }
         )

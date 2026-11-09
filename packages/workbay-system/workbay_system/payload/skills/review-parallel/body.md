@@ -20,6 +20,7 @@ Produce one merged finding set under the coordinator `task_ref` whose `merged_fr
 
 ## Canonical Policy
 
+- [Frozen acceptance qualification](../../docs/workbay/rules/frozen-acceptance-qualification.md) owns independent original-case measurement before fan-out and evidence-based repair dispatch.
 - [../../../docs/workbay/rules/branch-review-guide.md](../../../docs/workbay/rules/branch-review-guide.md)
 - [../../../docs/workbay/rules/development-workflow.md](../../../docs/workbay/rules/development-workflow.md)
 - Heuristics: follow the [heuristics canon pointer](../../../docs/workbay/rules/heuristics-canon.md) (one pinned, digest-verified release). Route the diff by what it changes (an arbitrary diff has no single route label), keep only the rows whose trigger fires, apply the Verification of every card that lists a kept ID, and cite `[FAM-NN]` with the rule's bold name and Source cell. `B` blocks, `S` needs a named exemption, and a `J` rule you lack context for is escalated, not skipped.
@@ -48,6 +49,16 @@ An **unreachable orchestrator MCP is itself a negative signal**, not a separate 
 
 
 ## Core Process
+
+Before model merge-review fan-out, one independent owner evaluates the exact
+assembled candidate against the original cases and supplies the same
+[minimum packet](../../docs/workbay/rules/frozen-acceptance-qualification.md#minimum-independent-packet)
+to every slice and harmonization reviewer. Author slice receipts do not qualify
+the train. Apply [the qualification order](../../docs/workbay/rules/frozen-acceptance-qualification.md#required-order)
+before repair dispatch or another review run: classify original-case failures,
+introduced regressions, new scope and UNKNOWN separately, and require a new
+demonstrated reason beyond two runs. Do not fan out a broad review while the
+same unchanged case is pending; preserve original history and custody.
 
 0. **Ensure coordinator task scope before any cwd-resolving MCP read.** If `get_handoff_state(sections="identity")` returns `Ambiguous active task`, run `make task-reap` (dry-run) to see closeable vs active rows; `make task-reap REAP_ARGS=--apply` closes only closeable rows, then re-run `make context` (exits `2` on this ambiguity). If no task is active and this is ad-hoc work on main, register a coordinator MAINT task first — `set_handoff_state(task_ref="MAINT-<slug>-<YYYYMMDD>", objective="...", status="in_progress", target_branch="main")` — before step 1.
 

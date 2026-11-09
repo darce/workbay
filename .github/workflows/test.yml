@@ -50,6 +50,9 @@ jobs:
           import workbay_handoff_mcp
           import workbay_orchestrator_mcp
           import workbay_protocol
+          import workbay_canvas_mcp
+          from pathlib import Path
+          assert (Path(workbay_canvas_mcp.__file__).parent / "web_dist/index.html").is_file()
 
           print("public import smoke passed")
           PY

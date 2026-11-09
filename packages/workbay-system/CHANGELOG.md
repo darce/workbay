@@ -3,6 +3,19 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.27] — 2026-11-09
+
+- Provision present standalone Canvas sources during remote bootstrap while preserving CLI workspace separation and isolated origin checks.
+
+### Changed
+- Provision present standalone Canvas sources during native remote bootstrap while preserving the separate CLI workspace and isolated source-origin checks.
+
+### Added
+- Ship deterministic plan anchor lint, including the distinction between semantic-version strings and source anchors, and the frozen-byte planning-review subject producer.
+
+### Changed
+- Deliver the matching linked planning-review workflow with the v0.1.88 SDK family; the full 92-review reduction remains disabled.
+
 ## [0.4.25] — 2026-11-07
 
 ### Changed

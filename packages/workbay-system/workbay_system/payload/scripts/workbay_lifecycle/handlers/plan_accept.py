@@ -29,16 +29,23 @@ do not hold, ``apply_skip_reason`` documents why the write was skipped.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import resolver
 
 from . import _common
+
+try:
+    from ..plan_review_freeze import plan_bytes
+except ImportError:  # direct lifecycle runner exposes handlers at top level
+    from plan_review_freeze import plan_bytes
 from .plan_baseline import (
     build_acceptance_next_command,
     evaluate_plan_baseline,
@@ -82,20 +89,14 @@ def _query_handoff_identity(repo: Path, task_ref: str) -> tuple[dict[str, Any] |
     return active, "active"
 
 
-def _build_accept_command(*, task_ref: str, branch: str, plan_path: str) -> str:
-    """Return the docs-only commit recipe operators can copy-paste."""
-    msg = f"docs({task_ref.lower()}): accept plan {plan_path}"
-    if branch == "main":
-        return (
-            f"git switch main && "
-            f"git add {shlex.quote(plan_path)} && "
-            f"git commit -m {shlex.quote(msg)}"
-        )
-    return (
-        f"git switch main && "
-        f"git checkout {shlex.quote(branch)} -- {shlex.quote(plan_path)} && "
-        f"git add {shlex.quote(plan_path)} && "
-        f"git commit -m {shlex.quote(msg)}"
+def _build_accept_command(*, task_ref: str, branch: str, plan_path: str, review_task_ref: str | None = None) -> str:
+    """Keep operator recovery on the same byte-checked public entry point."""
+    return build_acceptance_next_command(
+        task_ref,
+        plan_path=plan_path,
+        source_branch=branch,
+        review_task_ref=review_task_ref,
+        local=True,
     )
 
 
@@ -810,7 +811,9 @@ def _production_warning(reason: str, exc: Exception, operation_id: str | None = 
     return {"reason": reason, "detail": str(exc), "operation_id": operation_id}
 
 
-def _apply_recorded_accept(repo: Path, *, task_ref: str, branch: str, plan_path: str) -> _LocalApplyOutcome:
+def _apply_recorded_accept(
+    repo: Path, *, task_ref: str, branch: str, plan_path: str, expected_subject_sha256: str | None = None
+) -> _LocalApplyOutcome:
     try:
         production = _plan_production(repo, task_ref, branch)
     except ImportError:
@@ -823,7 +826,9 @@ def _apply_recorded_accept(repo: Path, *, task_ref: str, branch: str, plan_path:
         outcome.production_history_unavailable = warning
         return outcome
     if production is None:
-        return _apply_local_accept(repo, task_ref=task_ref, branch=branch, plan_path=plan_path)
+        return _apply_local_accept(
+            repo, task_ref=task_ref, branch=branch, plan_path=plan_path, expected_subject_sha256=expected_subject_sha256
+        )
 
     from uuid import uuid4
 
@@ -867,7 +872,12 @@ def _apply_recorded_accept(repo: Path, *, task_ref: str, branch: str, plan_path:
             )
             reason = "production_settlement_pending"
             outcome = _apply_local_accept(
-                repo, task_ref=task_ref, branch=branch, plan_path=plan_path, production_operation=operation_id
+                repo,
+                task_ref=task_ref,
+                branch=branch,
+                plan_path=plan_path,
+                production_operation=operation_id,
+                expected_subject_sha256=expected_subject_sha256,
             )
             outcome.production_tracked = True
             prepared = {"operation_id": operation_id, "payload": json.loads(record.payload_json)}
@@ -932,6 +942,90 @@ def _pre_mutation_refusal(repo: Path, branch: str, plan_path: str) -> str | None
     return None
 
 
+def _commit_reviewed_index(
+    repo: Path,
+    *,
+    plan_path: str,
+    expected_digest: str,
+    old_head: str,
+    message: str,
+    production_operation: str | None,
+):
+    """Run normal commit hooks on a detached candidate, then CAS main.
+
+    The accepted object is checked after hooks. A mutable worktree or index
+    cannot substitute different bytes after the check. Canon v0.26.2 CON-11,
+    Atomicity violation (check-then-act), Operating Systems: Three Easy
+    Pieces, ch. 32.
+    """
+    import subprocess
+
+    def failure(reason):
+        return subprocess.CompletedProcess([], 1, "", reason)
+
+    try:
+        if hashlib.sha256(plan_bytes(repo, plan_path, "")).hexdigest() != expected_digest:
+            return failure("review_subject_staged_bytes_changed")
+        tree = _common.run_subprocess(["git", "-C", str(repo), "write-tree"])
+        common = _common.run_subprocess(
+            ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )
+        if tree.returncode != 0 or common.returncode != 0:
+            return failure("review_subject_index_unavailable")
+        with tempfile.TemporaryDirectory(prefix="workbay-plan-accept-") as directory:
+            detached = Path(directory)
+            (detached / "HEAD").write_text(old_head + "\n")
+            env = dict(
+                os.environ,
+                GIT_DIR=str(detached),
+                GIT_COMMON_DIR=common.stdout.strip(),
+                GIT_WORK_TREE=str(repo),
+                GIT_INDEX_FILE=str(detached / "index"),
+            )
+            loaded = _common.run_subprocess(["git", "-C", str(repo), "read-tree", tree.stdout.strip()], env=env)
+            if loaded.returncode != 0:
+                return loaded
+            commit = _common.run_subprocess(["git", "-C", str(repo), "commit", "-m", message], env=env)
+            if commit.returncode != 0:
+                return commit
+            candidate = _common.run_subprocess(["git", "-C", str(repo), "rev-parse", "HEAD"], env=env)
+            if candidate.returncode != 0:
+                return candidate
+            oid = candidate.stdout.strip()
+            parent = _common.run_subprocess(["git", "-C", str(repo), "show", "-s", "--format=%P", oid])
+            changed = _common.run_subprocess(
+                ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", old_head, oid]
+            )
+            entry = _common.run_subprocess(["git", "-C", str(repo), "ls-tree", "-z", oid, "--", plan_path])
+            header, _, entry_path = entry.stdout.partition("\t")
+            if (
+                parent.returncode != 0
+                or parent.stdout.strip() != old_head
+                or changed.returncode != 0
+                or changed.stdout.split("\0") != [plan_path, ""]
+                or entry.returncode != 0
+                or header.split()[:2] not in (["100644", "blob"], ["100755", "blob"])
+                or entry_path != plan_path + "\0"
+                or hashlib.sha256(plan_bytes(repo, plan_path, oid)).hexdigest() != expected_digest
+            ):
+                return failure("review_subject_commit_bytes_changed")
+            if _current_branch(repo) != "main":
+                return failure("apply_target_branch_moved: not_on_main")
+            reflog = (
+                "workbay-plan-accept:" + production_operation + ": " if production_operation else "commit: "
+            ) + message
+            # This is the only main-ref mutation. The already-checked object is
+            # immutable and the expected old ref is part of the atomic effect.
+            applied = _common.run_subprocess(
+                ["git", "-C", str(repo), "update-ref", "-m", reflog, "refs/heads/main", oid, old_head]
+            )
+            if applied.returncode != 0:
+                return applied
+            return applied
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return failure(str(exc))
+
+
 def _apply_local_accept(
     repo: Path,
     *,
@@ -939,6 +1033,7 @@ def _apply_local_accept(
     branch: str,
     plan_path: str,
     production_operation: str | None = None,
+    expected_subject_sha256: str | None = None,
 ) -> _LocalApplyOutcome:
     """Run the docs-only checkout+commit inline.
 
@@ -950,12 +1045,19 @@ def _apply_local_accept(
     refusal = _pre_mutation_refusal(repo, branch, plan_path)
     if refusal is not None:
         return _LocalApplyOutcome(False, refusal, False)
+    if not expected_subject_sha256 or len(expected_subject_sha256) != 64:
+        return _LocalApplyOutcome(False, "review_subject_unbound", False)
+    old_head = _head_sha(repo)
+    try:
+        source = plan_bytes(repo, plan_path, branch if branch != "main" else None)
+    except (OSError, ValueError, RuntimeError):
+        return _LocalApplyOutcome(False, "review_subject_source_unreadable", False)
+    if hashlib.sha256(source).hexdigest() != expected_subject_sha256:
+        return _LocalApplyOutcome(False, "review_subject_bytes_changed", False)
     # Capture before any mutating step: restore must not destroy a draft
     # that was already on disk (untracked, absent from HEAD).
     preserve_untracked = _is_preexisting_untracked_draft(repo, plan_path)
-    pre_porcelain = (
-        _path_scoped_porcelain(repo, plan_path) if preserve_untracked else ""
-    )
+    pre_porcelain = _path_scoped_porcelain(repo, plan_path) if preserve_untracked else ""
 
     def _residual_after_restore() -> bool:
         if preserve_untracked:
@@ -970,42 +1072,42 @@ def _apply_local_accept(
             ["git", "-C", str(repo), "checkout", branch, "--", plan_path],
         )
         if checkout.returncode != 0:
-            _restore_path_from_head(
-                repo, plan_path, preserve_untracked=preserve_untracked
-            )
+            _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
             err = f"checkout_failed: {checkout.stderr.strip() or checkout.stdout.strip()}"
             return _LocalApplyOutcome(False, err, _residual_after_restore())
+    try:
+        copied_matches = hashlib.sha256(plan_bytes(repo, plan_path)).hexdigest() == expected_subject_sha256
+    except (OSError, ValueError, RuntimeError):
+        copied_matches = False
+    if not copied_matches:
+        _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
+        return _LocalApplyOutcome(False, "review_subject_bytes_changed", _residual_after_restore())
     add = _common.run_subprocess(
         ["git", "-C", str(repo), "add", "--", plan_path],
     )
     if add.returncode != 0:
-        _restore_path_from_head(
-            repo, plan_path, preserve_untracked=preserve_untracked
-        )
+        _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
         err = f"add_failed: {add.stderr.strip() or add.stdout.strip()}"
         return _LocalApplyOutcome(False, err, _residual_after_restore())
     # Path-scope cleanliness immediately before commit: abort+restore if the
     # tree gained unrelated staged/dirty paths since the outer precheck.
     if not _is_worktree_clean_or_only_plan(repo, plan_path):
-        _restore_path_from_head(
-            repo, plan_path, preserve_untracked=preserve_untracked
-        )
+        _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
         return _LocalApplyOutcome(
             False,
             "unrelated_staged_changes",
             _residual_after_restore(),
         )
-    commit_kwargs = {}
-    if production_operation is not None:
-        commit_kwargs["env"] = dict(os.environ, GIT_REFLOG_ACTION="workbay-plan-accept:" + production_operation)
-    commit = _common.run_subprocess(
-        ["git", "-C", str(repo), "commit", "-m", msg, "--", plan_path],
-        **commit_kwargs,
+    commit = _commit_reviewed_index(
+        repo,
+        plan_path=plan_path,
+        expected_digest=expected_subject_sha256,
+        old_head=old_head,
+        message=msg,
+        production_operation=production_operation,
     )
     if commit.returncode != 0:
-        _restore_path_from_head(
-            repo, plan_path, preserve_untracked=preserve_untracked
-        )
+        _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
         err = f"commit_failed: {commit.stderr.strip() or commit.stdout.strip()}"
         return _LocalApplyOutcome(False, err, _residual_after_restore())
     return _LocalApplyOutcome(True, None, False)
@@ -1382,6 +1484,7 @@ def run(argv: list[str]) -> int:
             task_ref=task_ref,
             branch=str(target_branch),
             plan_path=plan_path_str,
+            review_task_ref=effective_review_task_ref,
         )
         if baseline.acceptance_ready and plan_path_reject is None
         else None
@@ -1521,6 +1624,7 @@ def run(argv: list[str]) -> int:
                     task_ref=task_ref,
                     branch=str(target_branch),
                     plan_path=plan_path_str,
+                    expected_subject_sha256=baseline.reviewed_subject_sha256,
                 )
                 ok, err = apply_outcome
                 residual = apply_outcome.residual

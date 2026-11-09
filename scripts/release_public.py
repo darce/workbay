@@ -12,6 +12,7 @@ Authoritative playbook: docs/RELEASING.md.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -46,7 +47,7 @@ from check_consumer_install import _UV_TIMEOUT_S as _GATE_UV_TIMEOUT_S  # noqa: 
 from check_consumer_install import excerpt as _resolver_excerpt  # noqa: E402
 from check_mcp_pin_drift import _version_triple  # noqa: E402
 
-# The public consumer-facing repository the export is force-pushed to. Git-only
+# The public consumer-facing repository receiving approved fast-forward exports. Git-only
 # delivery (Dist-1) from darce/workbay release tags needs no Trusted-Publisher binding.
 # Kept literal so this release script stays free of a workbay_protocol import;
 # `make distribution-url-check` asserts it equals workbay_protocol.brand.REPO_URL
@@ -54,7 +55,7 @@ from check_mcp_pin_drift import _version_triple  # noqa: E402
 PUBLIC_GIT_REMOTE = "git@github.com:darce/workbay.git"
 # Ordered list of pipeline steps. ``export``, ``install-check``, and ``status``
 # never mutate remote state; ``push`` and ``tag-sync`` are the network-mutating
-# steps guarded behind --execute + confirmation (MUTATING_STEPS). install-check
+# steps guarded by the retained publication subject (MUTATING_STEPS). install-check
 # always runs (including dry-run) so a skipped gate cannot green-light a broken
 # export.
 PIPELINE_STEPS = ("export", "install-check", "push", "tag-sync", "status")
@@ -215,26 +216,27 @@ class TagPushRequired(NamedTuple):
     command: tuple[str, ...]
 
 
-def _advance_local_monorepo_tag(repo_root: Path, monorepo_tag: str, distro_sha: str) -> TagPushRequired:
-    """Create/advance the monorepo v-tag in the LOCAL repo after a successful
-    mirror push.
-
-    release.sh's ``suggested_next_tag`` is ``max(git tag -l 'v*') + 1``. Because
-    tag-sync creates the consumer tag only in the ephemeral export tree and
-    pushes it to the mirror, the local repo never learned about it — so the next
-    release re-suggested the already-published tag and force-clobbered it on the
-    mirror. Advancing the local tag here keeps ``git tag -l`` in step with what
-    was published. The local tag marks the local source release commit (HEAD);
-    the mirror tag marks the scrubbed export commit — both legitimate.
-    """
-    monorepo_sha = _run_text(["git", "-C", str(repo_root), "rev-parse", "HEAD"]).strip()
+def _advance_local_monorepo_tag(
+    repo_root: Path, monorepo_tag: str, distro_sha: str, source_sha: str | None = None,
+) -> TagPushRequired:
+    """Record the source tag without overwriting an existing version's history."""
+    if not _MONOREPO_TAG_RE.fullmatch(monorepo_tag):
+        raise ValueError("invalid monorepo version tag")
+    monorepo_sha = source_sha or _run_text(["git", "-C", str(repo_root), "rev-parse", "HEAD"]).strip()
     message = f"workbay monorepo release {monorepo_tag}\nmonorepo: {monorepo_sha}\ndistro: darce/workbay@{distro_sha}"
+    ref = f"refs/tags/{monorepo_tag}"
+    existing = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--verify", ref + "^{commit}"],
+                              capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
+    if existing.returncode == 0:
+        if existing.stdout.strip() != monorepo_sha:
+            raise ValueError("existing source version tag requires a proper version bump")
+        return TagPushRequired(("git", "push", "origin", ref))
     subprocess.run(
-        ["git", "-C", str(repo_root), "tag", "-a", "-f", "-m", message, monorepo_tag, monorepo_sha],
+        ["git", "-C", str(repo_root), "tag", "-a", "-m", message, monorepo_tag, monorepo_sha],
         check=True,
         timeout=_GIT_TIMEOUT_S,
     )
-    return TagPushRequired(("git", "push", "--force", "origin", f"refs/tags/{monorepo_tag}"))
+    return TagPushRequired(("git", "push", "origin", f"refs/tags/{monorepo_tag}"))
 
 
 def _abort_origin_monorepo_tag(reason: str, command: tuple[str, ...]) -> int:
@@ -248,14 +250,13 @@ def _origin_tag_object_sha(monorepo_tag: str) -> str:
 
 
 def _origin_ls_remote_tag_sha(monorepo_tag: str) -> str | None:
-    """SHA of ``refs/tags/<tag>`` on origin (exact ref, not peeled ``^{}``)."""
+    """Exact tag object at origin's resolved push destination, including pushurl."""
+    import release_publication as publication
+
     expected_ref = f"refs/tags/{monorepo_tag}"
-    out = _run_text(["git", "ls-remote", "origin", expected_ref])
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == expected_ref:
-            return parts[0]
-    return None
+    return publication.remote_refs(
+        REPO_ROOT, publication.remote_identity(REPO_ROOT, "origin"), destinations=[expected_ref]
+    ).get(expected_ref)
 
 
 def _push_and_verify_origin_monorepo_tag(monorepo_tag: str, command: tuple[str, ...]) -> int:
@@ -265,9 +266,20 @@ def _push_and_verify_origin_monorepo_tag(monorepo_tag: str, command: tuple[str, 
     the local tag object SHA. OBS-08: a failed or unverified push is nonzero
     with a typed recovery command; never a printed instruction plus exit 0.
     """
+    # This owned helper is tag-only, never a caller-selected Git executor.
+    # Explicit refs and no-mirror/no-follow-tags prevent implicit main updates.
+    if (not _MONOREPO_TAG_RE.fullmatch(monorepo_tag)
+            or command != ("git", "push", "origin", f"refs/tags/{monorepo_tag}")):
+        return _abort_origin_monorepo_tag("unsupported tag publication command", command)
     try:
+        local = _origin_tag_object_sha(monorepo_tag)
+        observed = _origin_ls_remote_tag_sha(monorepo_tag)
+        if observed == local:
+            return 0
+        if observed is not None:
+            return _abort_origin_monorepo_tag("existing origin version tag requires a proper version bump", command)
         subprocess.run(
-            list(command),
+            ["git", "push", "--no-mirror", "--no-follow-tags", "origin", f"{local}:refs/tags/{monorepo_tag}"],
             check=True,
             cwd=REPO_ROOT,
             timeout=_GIT_TIMEOUT_S,
@@ -376,7 +388,8 @@ def build_report(
     dry-run too) and carries a ``verdict`` field (``pass``|``fail``|``pending``)
     plus an optional ``resolver_output`` excerpt populated after the gate runs.
     """
-    will_mutate = bool(execute and confirmed)
+    # Release intent/legacy confirmation is never remote-main authority.
+    will_mutate = False
 
     steps = []
     for name in PIPELINE_STEPS:
@@ -418,7 +431,7 @@ def build_report(
         "mode": "execute" if execute else "dry-run",
         "confirmed": confirmed,
         "will_mutate": will_mutate,
-        "public_remote": PUBLIC_GIT_REMOTE,
+        "public_remote": os.environ.get("RELEASE_PUBLIC_REMOTE", PUBLIC_GIT_REMOTE),
         "monorepo_tag": (plan.get("monorepo", {}) or {}).get("suggested_next_tag"),
         "allow_higher_existing_tags": allow_higher_existing_tags,
         "steps": steps,
@@ -486,6 +499,10 @@ def render_text(report: dict[str, object]) -> str:
             f"{entry['public_export_branch']:<16} {entry['public_tag']:<16}"
         )
     lines.append("")
+    if report.get("prepared"):
+        lines.append("Prepared publication: " + json.dumps(report["prepared"], sort_keys=True))
+    if report.get("publication"):
+        lines.append("Publication: " + json.dumps(report["publication"], sort_keys=True))
 
     if report["mode"] == "execute" and not report["confirmed"]:
         lines.append(
@@ -495,7 +512,7 @@ def render_text(report: dict[str, object]) -> str:
     elif report["mode"] == "dry-run":
         lines.append(
             "[release-public] dry-run only — no network mutation performed. "
-            "Re-run with --execute to push/tag after confirmation."
+            "Inspect the retained plan, obtain exact operator approval, then use --execute --prepared <plan_id>."
         )
     return "\n".join(lines) + "\n"
 
@@ -509,16 +526,12 @@ def _emit_report(report: dict[str, object], *, as_json: bool) -> None:
 
 
 def confirm_interactively() -> bool:
-    """Prompt the operator before any network-mutating step.
-
-    Reads from stdin; returns False on EOF / non-tty so a non-interactive
-    --execute invocation never mutates. ``--assume-yes`` bypasses this.
-    """
+    """Legacy release-intent prompt; never used as publication authority."""
     # Write the prompt to stderr so a --json run keeps stdout machine-clean.
     sys.stderr.write(
-        "About to force-push the exported tree to the public darce/workbay git mirror and "
-        "force-push its tag family (released git-only).\n"
-        "This mutates remote state. Type 'release' to proceed: "
+        "Legacy release intent for darce/workbay (released git-only). "
+        "This cannot authorize remote-main publication.\n"
+        "Type 'release' to record intent only: "
     )
     sys.stderr.flush()
     try:
@@ -538,8 +551,28 @@ def run(argv: list[str]) -> int:
 
     execute = bool(args.execute)
     confirmed = False
-    if execute:
-        confirmed = True if args.assume_yes else confirm_interactively()
+    # Automation never opens an implicit prompt. Exact approval is a separate
+    # operator-only operation, after a concrete retained plan has been printed.
+    if args.command in ("publication-setup", "approve-publication"):
+        import release_publication as publication
+        try:
+            result = publication.operator(REPO_ROOT,
+                "setup" if args.command == "publication-setup" else "approve", args.prepared)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            result = dict(status="publication_held", reason=str(exc))
+            sys.stdout.write(json.dumps(result) + "\n")
+            return publication.HELD
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0
+    if args.prepared:
+        report = build_report(execute=execute, confirmed=False, plan={}, packages=[])
+        if not execute:
+            _publication_hold(report, "--prepared effect requires --execute")
+            _emit_report(report, as_json=bool(args.json))
+            return 3
+        rc = _effect_prepared(report, args.prepared)
+        _emit_report(report, as_json=bool(args.json))
+        return rc
 
     # These helpers run before the normal report is assembled. Keep their
     # timeout handlers here so an expiry can still build and emit an abort report.
@@ -579,56 +612,9 @@ def run(argv: list[str]) -> int:
         allow_higher_existing_tags=bool(args.allow_higher_existing_tags),
     )
 
-    if execute and not confirmed:
-        # Operator aborted: no export, no gate, no mutation. Report stays plan-shaped
-        # (install-check verdict remains ``pending``).
-        _emit_report(report, as_json=bool(args.json))
-        return 0
-
-    if execute and confirmed:
-        # _execute runs export + install-check + (on pass) push/tag-sync, then
-        # populates the install-check verdict before we emit the report.
-        rc = _execute(report)
-        if rc == 0:
-            try:
-                refreshed = build_report(
-                    execute=execute,
-                    confirmed=confirmed,
-                    plan=release_plan(),
-                    packages=packages,
-                    allow_higher_existing_tags=bool(args.allow_higher_existing_tags),
-                )
-                remote = os.environ.get("RELEASE_PUBLIC_REMOTE", PUBLIC_GIT_REMOTE)
-                refs = _run_text(["git", "ls-remote", "--heads", "--tags", "--refs", remote])
-                public_refs = {line.split()[1] for line in refs.splitlines() if len(line.split()) == 2}
-                package_paths = _package_paths()
-                for entry in refreshed["status"]:
-                    package = entry["name"]
-                    version = _package_version(package_paths.get(package, f"packages/{package}"))
-                    entry["public_export_branch"] = "published" if "refs/heads/main" in public_refs else "missing"
-                    entry["public_tag"] = "tagged" if f"refs/tags/{package}-v{version}" in public_refs else "missing"
-                # Execution evidence belongs to the completed pipeline, not the
-                # fresh plan (whose install-check verdict starts as pending).
-                refreshed["steps"] = report["steps"]
-                suggested_next_tag = refreshed.get("monorepo_tag")
-                refreshed["monorepo_tag"] = report["monorepo_tag"]
-                if suggested_next_tag:
-                    refreshed["suggested_next_tag"] = suggested_next_tag
-                refreshed["status_table"] = "post_mutation"
-            except Exception as exc:
-                # Publishing already succeeded. A failed observation must not
-                # disguise the old plan as current state or erase its verdict.
-                report["status_table"] = "pre_mutation"
-                sys.stderr.write(f"[release-public] status refresh failed; showing pre_mutation table: {exc}\n")
-            else:
-                report = refreshed
-        _emit_report(report, as_json=bool(args.json))
-        return rc
-
-    # Dry-run: still run export + install-check so the report carries a real
-    # verdict. A dry-run that skips the gate proves nothing about consumer
-    # installability (implementation note S2).
-    rc = _run_export_and_install_check(report)
+    rc = _execute(report, publish=execute)
+    if rc not in (0, 3) and "publication" not in report:
+        report["preparation"] = dict(status="preparation_failed")
     _emit_report(report, as_json=bool(args.json))
     return rc
 
@@ -922,6 +908,11 @@ def _run_install_check(export_dir: Path, report: dict[str, object]) -> int:
         )
         return 1
     combined = (proc.stdout or "") + (proc.stderr or "")
+    report["install_receipt"] = dict(
+        command=[*_install_check_command(), str(export_dir)], returncode=proc.returncode,
+        stdout_sha256=hashlib.sha256((proc.stdout or "").encode()).hexdigest(),
+        stderr_sha256=hashlib.sha256((proc.stderr or "").encode()).hexdigest(),
+    )
     passed = proc.returncode == 0
     set_install_check_verdict(report, passed=passed, resolver_output="" if passed else combined)
     if not passed:
@@ -1034,31 +1025,11 @@ def _run_export_and_install_check(report: dict[str, object]) -> int:
         shutil.rmtree(export_dir, ignore_errors=True)
 
 
-def _execute(report: dict[str, object]) -> int:
-    """Perform the public-release steps under ``--execute`` + confirmation.
+def _execute(report: dict[str, object], *, publish: bool = True) -> int:
+    """Prepare once, retain the checked Git subject, then attempt guarded effect.
 
-    Four idempotent steps (export, install-check, push, tag-sync), each shelled
-    out so the orchestration is hermetically testable (stub ``git`` on PATH +
-    the ``RELEASE_PUBLIC_*`` env seams):
-
-      1. export         — build the fresh-history public tree (single scrubbed
-                          commit) via ``scripts/export_public.py --out <tmp>
-                          --force``.
-      2. install-check  — non-mutating pre-push gate: scratch-venv replay of the
-                          consumer install recipe against the export tree
-                          (``scripts/check_consumer_install.py``). On failure,
-                          abort before any remote mutation.
-      3. push           — force-push that commit to the public ``main``. The
-                          export rewrites history every run, so a force
-                          replacement is the intended, convergent behavior.
-      4. tag-sync       — create the per-package tag family (``<pkg>-vX.Y.Z``)
-                          plus the consumer-facing ``vX.Y.Z`` monorepo tag on the
-                          exported commit and force-push them. Then create or
-                          advance the local annotated source tag, push it to
-                          origin, and verify ``git ls-remote origin
-                          refs/tags/<tag>`` matches the local tag object SHA.
-
-    Released git-only: git mirror push + tag-sync is the sole release action.
+    Legacy --execute/--assume-yes selects an attempt, never an approval. A held
+    publication keeps the prepared bytes and cannot trigger another source run.
     """
     monorepo_tag = report.get("monorepo_tag")
     if not monorepo_tag:
@@ -1114,7 +1085,7 @@ def _execute(report: dict[str, object]) -> int:
             "not covered by the tag-sync guard this run.\n"
         )
     try:
-        mirror_tags = _ls_remote_tags(remote)
+        mirror_tags = _ls_remote_tags(remote) if publish else []
     except RuntimeError as exc:
         sys.stderr.write(f"[release-public] ABORT: {exc}\n")
         return 1
@@ -1145,14 +1116,6 @@ def _execute(report: dict[str, object]) -> int:
 
     export_dir = Path(tempfile.mkdtemp(prefix="workbay-public-export-"))
 
-    def _git(*args: str) -> None:
-        subprocess.run(
-            ["git", "-C", str(export_dir), *args],
-            check=True,
-            cwd=REPO_ROOT,
-            timeout=_GIT_TIMEOUT_S,
-        )
-
     try:
         # Resolve the export bound in its own tiny scope so only a malformed
         # RELEASE_PUBLIC_EXPORT_TIMEOUT_S can reach _abort_export_configuration.
@@ -1160,6 +1123,8 @@ def _execute(report: dict[str, object]) -> int:
             export_timeout_s = _configured_export_timeout_s()
         except ValueError as exc:
             return _abort_export_configuration(report, exc)
+        import release_publication as publication
+        source_before = publication.source_identity(REPO_ROOT)
         # 1. export (stdout captured/forwarded to stderr; see _run_export)
         _run_export(export_dir, timeout_s=export_timeout_s)
 
@@ -1171,42 +1136,90 @@ def _execute(report: dict[str, object]) -> int:
         if check_rc != 0:
             return check_rc
 
-        # 3. push the exported fresh history to the public main.
-        sys.stderr.write(f"[release-public] push -> {remote} (force, main)\n")
-        _git("push", "--force", remote, "HEAD:refs/heads/main")
+        if publication.source_identity(REPO_ROOT) != source_before:
+            return _publication_hold(report, "source_changed_during_preparation")
+        tags = [f"{package}-v{_package_version(package_paths.get(package, f'packages/{package}'))}"
+                for package in packages] + [str(monorepo_tag)]
+        gate = dict(verdict="pass", export_command=_export_command(),
+                    install_command=_install_check_command(),
+                    install_step=_install_check_step(report), receipt=report.get("install_receipt"))
+        try:
+            plan_id, subject = publication.prepare(REPO_ROOT, export_dir, remote=remote,
+                refspecs=["HEAD:refs/heads/main", *[f"HEAD:refs/tags/{tag}" for tag in tags]],
+                gate=gate, release=dict(report=report, tags=tags, monorepo_tag=str(monorepo_tag)))
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            return _publication_hold(report, str(exc))
+        report["prepared"] = dict(plan_id=plan_id, subject=subject,
+                                  path=str(publication.store(REPO_ROOT) / plan_id))
+        report["preparation"] = dict(status="prepared", plan_id=plan_id)
+        # Concrete tuple precedes any request for human authorization, including
+        # the legacy front door used by automation and the independent oracle.
+        sys.stderr.write("[release-public] prepared " + json.dumps(report["prepared"]) + "\n")
+        if not publish:
+            report["publication"] = dict(status="prepared", plan_id=plan_id)
+            return 0
+        return _effect_prepared(report, plan_id)
+    except subprocess.TimeoutExpired as exc:
+        set_install_check_verdict(report, passed=False, resolver_output=f"export timed out after {exc.timeout}s")
+        return 1
+    except subprocess.CalledProcessError as exc:
+        set_install_check_verdict(report, passed=False, resolver_output=f"export failed (rc={exc.returncode})")
+        return 1
 
-        # 4. tag-sync: per-package family + the monorepo consumer tag, on the
-        #    exported commit, force-pushed (the public commit changes every export).
-        tags = [
-            f"{package}-v{_package_version(package_paths.get(package, f'packages/{package}'))}" for package in packages
-        ]
-        tags.append(str(monorepo_tag))
-        for tag in tags:
-            _git("tag", "-f", tag)
-        _git("push", "--force", remote, *tags)
-        # Advance the LOCAL monorepo v-tag so release.sh's suggested_next_tag
-        # (computed from `git tag -l`) tracks what was just published instead of
-        # lagging the mirror and re-suggesting an already-published tag (which
-        # would force-clobber it on the next release). The local tag marks the
-        # local source release commit; the mirror tag marks the scrubbed export.
-        distro_sha = _run_text(["git", "-C", str(export_dir), "rev-parse", "HEAD"]).strip()
-        push_required = _advance_local_monorepo_tag(REPO_ROOT, str(monorepo_tag), distro_sha)
-        origin_rc = _push_and_verify_origin_monorepo_tag(str(monorepo_tag), push_required.command)
-        if origin_rc != 0:
-            return origin_rc
-        sys.stderr.write(f"[release-public] origin tag {monorepo_tag} pushed and verified\n")
-
-        sys.stderr.write(
-            "[release-public] tag-sync -> "
-            + ", ".join(tags)
-            + "\n[release-public] done: export -> install-check -> push -> "
-            "tag-sync (released git-only).\n"
-        )
-        return 0
     finally:
         # Always remove the throwaway export tree, even on a partial failure,
         # so repeated --execute runs do not accumulate /tmp export dirs.
         shutil.rmtree(export_dir, ignore_errors=True)
+
+
+def _publication_hold(report: dict, reason: str) -> int:
+    report["publication"] = dict(status="publication_held", reason=reason,
+        next_action="Inspect prepared plan; operator approves its digest; retry --execute --prepared <plan_id>")
+    report["will_mutate"] = False
+    sys.stderr.write(f"[release-public] publication_held: {reason}\n")
+    return 3
+
+
+def _effect_prepared(report: dict, plan_id: str) -> int:
+    import release_publication as publication
+    try:
+        subject, _ = publication.load(REPO_ROOT, plan_id)
+        # Resume uses the frozen report/version/gate, never another export/plan.
+        frozen = subject["release"]["report"]
+        report.update(frozen)
+        report["mode"] = "execute"
+        report["prepared"] = dict(plan_id=plan_id, subject=subject,
+                                  path=str(publication.store(REPO_ROOT) / plan_id))
+        source_tag = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", f"refs/tags/{subject['release']['monorepo_tag']}^{{commit}}"],
+            capture_output=True, text=True, timeout=_GIT_TIMEOUT_S,
+        )
+        if source_tag.returncode == 0 and source_tag.stdout.strip() != subject["source"]["head"]:
+            return _publication_hold(report, "existing source version tag requires a proper version bump")
+        result = publication.effect(REPO_ROOT, plan_id)
+        report["publication"] = result
+        report["confirmed"] = True
+        report["will_mutate"] = result["status"] == "published"
+        # Tags retain their existing release scope, with no new approval policy.
+        # The mirror update set is atomic; existing version tags cannot be moved.
+        push_required = _advance_local_monorepo_tag(REPO_ROOT,
+            subject["release"]["monorepo_tag"], subject["prepared_commit"], subject["source"]["head"])
+        if push_required.command is not None:
+            rc = _push_and_verify_origin_monorepo_tag(subject["release"]["monorepo_tag"], push_required.command)
+            if rc:
+                report["origin_tag"] = "publication_failed"
+                return rc
+        for entry in report.get("status", []):
+            entry.update(public_export_branch="published", public_tag="tagged")
+        report["status_table"] = "post_mutation"
+        sys.stderr.write("[release-public] done: prepared export -> install-check -> approved push -> tag-sync (released git-only).\n")
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        if report.get("publication", {}).get("status") in ("published", "already_applied"):
+            # A later source-origin tag failure cannot erase the main receipt.
+            report["origin_tag"] = dict(status="publication_failed", reason=str(exc))
+            return 1
+        return _publication_hold(report, str(exc))
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1214,7 +1227,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("audit-tags",),
+        choices=("audit-tags", "publication-setup", "approve-publication"),
         default=None,
         help=(
             "Optional read-only subcommand. 'audit-tags' lists pre-rebrand "
@@ -1223,6 +1236,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "pipeline plan."
         ),
     )
+    parser.add_argument("--prepared", help="Retained content-addressed plan ID (effect/approval; no re-export).")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
@@ -1233,12 +1247,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode.add_argument(
         "--execute",
         action="store_true",
-        help="Perform network-mutating steps after interactive confirmation.",
+        help="Prepare and attempt publication; remote main requires a separate exact operator approval.",
     )
     parser.add_argument(
         "--assume-yes",
         action="store_true",
-        help="Skip the interactive confirmation prompt (operator automation).",
+        help="Legacy automation flag; does not grant remote-main publication authority.",
     )
     parser.add_argument(
         "--json",

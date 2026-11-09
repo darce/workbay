@@ -85,10 +85,16 @@ _GROK_BRIEF_SUBAGENT_STEP_PATTERNS = re.compile(
     r"(?i)(/review-parallel|subagent\s+fan[- ]?out|fan[- ]?out\s+reviews?)",
 )
 BRIEF_CITES_UNREACHABLE_HISTORY_WARNING = "brief_cites_unreachable_history"
+# A hex run joined to a word by ``-`` or ``_`` is part of a task ref or slug
+# (``internal``), not a standalone commit identifier.
 _BRIEF_COMMIT_SHA_OR_RANGE_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])[0-9a-f]{7,64}(?:\.{2,3}[0-9a-f]{7,64})?(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_]-)[0-9a-f]{7,64}(?:\.{2,3}[0-9a-f]{7,64})?(?![A-Za-z0-9_])(?!-[A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_BRIEF_COMMIT_RANGE_SEPARATOR = re.compile(r"\.{2,3}")
+BRIEF_CITES_UNREACHABLE_HISTORY_REMEDY = "embed the diff or file excerpt inline; the worker cannot `git show` this"
+_BRIEF_COMMIT_RESOLVE_TIMEOUT_S = 5.0
+_BRIEF_COMMIT_RESOLVE_MAX_ATTEMPTS = 32
 
 # ---------------------------------------------------------------------------
 # Whole-call write-lock retry policy ([RES-01], [RES-02]).
@@ -141,6 +147,7 @@ LOCK_RETRY_EXCLUDED_TOOLS: dict[str, str] = {
     "lane_dag": "read path; whole-call write-lock retry is unnecessary",
     "host_reservation": "VM-side store lock; reserve/renew/release mutate remote state",
     "lane_status": "read path; persistent census window is not advanced",
+    "fleet_tree": "read path; bounded host observations without write-lock retry",
     "offload_preflight": "preflight probe; not a verified write-lock retry candidate",
     "materialize_offload_lane_manifest": (
         "materializes files outside SQLite; identical replay is not verified idempotent"
@@ -542,6 +549,19 @@ def lane_status(task_ref: str | None = None, limit: int = 20, byte_cap: int = 24
     )
 
 
+def fleet_tree(root_id: str | None = None, limit: int = 200, byte_cap: int = 65_536) -> dict[str, Any]:
+    """Return bounded lineage from live read-only host observations."""
+    from workbay_orchestrator_mcp.orchestration.fleet_lineage import (
+        bound_tree_bytes,
+        build_lineage_tree,
+        read_lineage_snapshot,
+    )
+
+    runtime = get_runtime_config()
+    snapshot = read_lineage_snapshot(runtime.workspace_root, runtime=runtime)
+    return bound_tree_bytes(build_lineage_tree(snapshot, root_id=root_id, limit=limit), byte_cap)
+
+
 worker_reports = _lanes.worker_reports
 plan_cursor = _lanes.plan_cursor
 
@@ -582,6 +602,11 @@ _REMOTE_JOB_PENDING_DOC = (
     "with the same pass_id checks the recorded job: an open job remains remote_job_pending, while a finished "
     "job is collected, applied, self-verified, checkpointed, and returned with its terminal outcome. "
 )
+_OFFLOAD_PREVIEW_DOC = (
+    "dry_run=True selects a separate synchronous preview contract, regardless of wait_seconds: "
+    "preview_complete or preview_refused, mode=preview, model_dispatched=false and execution_admitted=false. "
+    "Preview receipts never create an execution-state constructor or consume a launch grant. "
+)
 
 
 def _bind_run_offload_pass_contract(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -597,6 +622,8 @@ def _bind_run_offload_pass_contract(fn: Callable[..., Any]) -> Callable[..., Any
         if pending_anchor not in doc:
             raise RuntimeError("run_offload_pass docstring lost the outcome-list anchor")
         doc = doc.replace(pending_anchor, pending_anchor + " " + _REMOTE_JOB_PENDING_DOC, 1)
+    if _OFFLOAD_PREVIEW_DOC not in doc:
+        doc += "\n\n" + _OFFLOAD_PREVIEW_DOC
     fn.__doc__ = doc
     return fn
 
@@ -628,6 +655,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "run_structured_turn": "Execute one synchronous structured bridge turn through a registered non-CLI backend.",
     "dispatch_lane_work": "Update lane dispatch parameters (model, backend, effort, test_cmd) for the next execution cycle. Optional test_cmd is a tri-state write: omit the argument to preserve the stored command; pass an empty string to clear the stored command. Review lanes are trust-gated here: trusted history-stripped remote backends automatically receive the bounded, redacted, secret-scanned subject declared in lane notes as review_subject.base_ref + review_subject.tip_ref; non-allowlisted backends return review_context_refused before dispatch. Brief text and context_targets can never select review-payload files. Optional include_context_packet + context_targets append a deterministic codemap lane-context packet to the brief (implementation note S12); auto when CLI present and targets provided. Surfaces packet_bytes/sections on the result; codemap absence degrades typed without failing dispatch. Optional actor is an explicit write-actor identity dict; when omitted, identity defaults to ambient resolution.",
     "run_offload_pass": (
+        _OFFLOAD_PREVIEW_DOC +
         "Run one offload pass over an actionable lane: bounded execute→review→fix with a commit gate; positive "
         "token_budget and timeout_seconds are mandatory. Omit wait_seconds for the existing synchronous behavior; "
         "wait_seconds=0 submits to a process-owned worker and immediately returns pass_id with status=running. "
@@ -637,7 +665,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "server_stale_restart_required|admission_deferred|admission_refused|dispatch_refused|remote_required|"
         "worktree_unrecoverable|worktree_claim_held|remote_job_pending|ceremony_failed|review_incomplete|verification_failed|"
         "verification_skipped|verification_harness_error|"
-        "guidance_contract_invalid). Terminal outcomes carry "
+        "guidance_contract_invalid). Execution terminal outcomes carry "
         "commit_landed, work_status (landed|not_landed|uncommitted_salvaged), ceremony_status "
         "(clean|failed|not_attempted), failed_stage, and findings. A still_running poll is ok=true, terminal=false. "
         "needs_guidance means the worker submitted a blocked/unverified handoff and is never merge-ready. "
@@ -684,6 +712,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "host_reservation": "Manage leased host reservations through the VM authority; reserve/renew/release mutate the VM-side store and are not read-only. Returns typed success, refusal, configuration, transport, lock-timeout, or invalid-response outcomes.",
     "lane_status": "Read a bounded snapshot of non-terminal lane status using read-only census helpers. Optional task_ref limits the snapshot to one task; limit defaults to 20 and is clamped to 50; byte_cap defaults to 24576 and is clamped to 1024–65536. The call does not advance the persistent census window and returns truncation metadata.",
+    "fleet_tree": "Read live host lineage as a deterministic graph of sessions, tasks, lanes, passes and jobs. Optional root_id follows containment and lineage edges; limit defaults to 200 (1–2000), byte_cap to 65536 (1024–65536). Missing or ambiguous evidence remains unknown. No SSH, provisioning, cache writes or reaping.",
     "list_available_backends": "List supported execution backends and their capabilities. By default includes probed is_available plus availability_state/detail per backend so skills can route safely. Probing is NOT cheap: remote backends each make an SSH round-trip to the gate VM and openrouter-remote additionally calls an external HTTPS key-info endpoint, so a cold call can take tens of seconds. Probes are bounded — per-probe deadline 20s (WORKBAY_BACKEND_PROBE_TIMEOUT_S) and aggregate deadline 45s (WORKBAY_BACKEND_PROBE_AGGREGATE_TIMEOUT_S); backends that miss a deadline report availability_state=unknown with is_available=false. Pass probe=false for the cheap static declaration-only view (no SSH, no network, no subprocesses).",
     "get_metrics_summary": (
         "Return an ACE metrics snapshot for the active task covering token burn, context pressure, FTS5 "
@@ -1014,6 +1043,7 @@ def _orchestrator_domain_tool_entries() -> list[ToolEntry]:
         ToolEntry("lane_dag", lane_dag, TOOL_DESCRIPTIONS["lane_dag"]),
         ToolEntry("host_reservation", host_reservation, TOOL_DESCRIPTIONS["host_reservation"]),
         ToolEntry("lane_status", lane_status, TOOL_DESCRIPTIONS["lane_status"]),
+        ToolEntry("fleet_tree", fleet_tree, TOOL_DESCRIPTIONS["fleet_tree"]),
         ToolEntry("offload_preflight", offload_preflight, TOOL_DESCRIPTIONS["offload_preflight"]),
         ToolEntry(
             "materialize_offload_lane_manifest",
@@ -2863,8 +2893,36 @@ def _grok_brief_subagent_steps_warning(backend: str | None, brief: str | None) -
     )
 
 
-def _brief_cites_unreachable_history_warning(backend: str | None, brief: str | None) -> str | None:
-    """Warn when an off-box brief cites commit IDs absent from its shallow sandbox."""
+def _resolve_brief_commit(repo: str, rev: str, *, timeout: float = _BRIEF_COMMIT_RESOLVE_TIMEOUT_S) -> str | None:
+    """Return the full commit SHA ``rev`` names in ``repo``, or None when it is not a commit.
+
+    Raises ``OSError`` / ``subprocess.SubprocessError`` when git itself cannot answer.
+    """
+    from workbay_handoff_mcp.shared_write_context import run_subprocess  # noqa: PLC0415
+
+    proc = run_subprocess(
+        ["git", "-C", repo, "rev-parse", "-q", "--verify", f"{rev}^{{commit}}"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    return sha or None
+
+
+def _brief_cites_unreachable_history_warning(
+    backend: str | None, brief: str | None, *, repo: str | None = None
+) -> str | None:
+    """Warn when an off-box brief cites commit IDs absent from its shallow sandbox.
+
+    ``repo`` is the dispatch worktree; its HEAD is the dispatch base the pass
+    ships as ``source_commit``. The sandbox root is a fresh commit holding only
+    the base tree, so every other commit (ancestors included) is absent there.
+    A token warns only when it resolves to such a commit in ``repo``; when git
+    cannot be consulted the shape-only verdict stands (warn-only either way).
+    Runs git, so call it before the dispatch takes its write lock.
+    """
     resolved = (backend or "").strip().lower()
     if not resolved:
         return None
@@ -2875,12 +2933,49 @@ def _brief_cites_unreachable_history_warning(backend: str | None, brief: str | N
         return None
 
     text = brief if isinstance(brief, str) else ""
-    tokens = list(dict.fromkeys(_BRIEF_COMMIT_SHA_OR_RANGE_PATTERN.findall(text)))
+    # Ignore wholly decimal tokens (dates, ordinals and counts), but resolve
+    # every endpoint of a mixed range: abbreviated commits can be all digits.
+    tokens = [
+        token
+        for token in dict.fromkeys(_BRIEF_COMMIT_SHA_OR_RANGE_PATTERN.findall(text))
+        if not all(endpoint.isdigit() for endpoint in _BRIEF_COMMIT_RANGE_SEPARATOR.split(token))
+    ]
+    truncated = False
+    if tokens and repo:
+        deadline = time.monotonic() + _BRIEF_COMMIT_RESOLVE_TIMEOUT_S
+        attempts = 1  # HEAD counts against the same budget as cited endpoints.
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("brief commit resolution", _BRIEF_COMMIT_RESOLVE_TIMEOUT_S)
+            base = _resolve_brief_commit(repo, "HEAD", timeout=remaining)
+            if base is not None:
+                cited = []
+                for index, token in enumerate(tokens):
+                    for endpoint in _BRIEF_COMMIT_RANGE_SEPARATOR.split(token):
+                        remaining = deadline - time.monotonic()
+                        if attempts >= _BRIEF_COMMIT_RESOLVE_MAX_ATTEMPTS or remaining <= 0:
+                            truncated = True
+                            cited.extend(tokens[index:])
+                            break
+                        attempts += 1
+                        if _resolve_brief_commit(repo, endpoint, timeout=remaining) not in (None, base):
+                            cited.append(token)
+                            break
+                    if truncated:
+                        break
+                tokens = cited
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Preserve the shape-only advisory when git cannot finish resolving.
+            truncated = isinstance(exc, subprocess.TimeoutExpired)
+            _logger.debug("brief commit resolution unavailable in %s: %s", repo, exc)
     if not tokens:
         return None
     return (
         f"{BRIEF_CITES_UNREACHABLE_HISTORY_WARNING}: history-stripped remote backend {resolved} "
-        f"may not contain cited commit SHA/range token(s): {', '.join(tokens)}"
+        f"may not contain cited commit SHA/range token(s): {', '.join(tokens)}; "
+        f"{'commit resolution was truncated; ' if truncated else ''}"
+        f"{BRIEF_CITES_UNREACHABLE_HISTORY_REMEDY}"
     )
 
 
@@ -3503,6 +3598,11 @@ def dispatch_lane_work(
                         "context_packet": context_packet_meta,
                     }
                 )
+        # The history check resolves cited tokens with git, so it runs here,
+        # before the first DML takes RESERVED; the warning is attached below.
+        history_warning = _brief_cites_unreachable_history_warning(
+            resolved_dispatch_backend, normalized_brief, repo=worktree_for_dispatch
+        )
         # Align the DB lane backend with the ledger-resolved value (bra2), not
         # the raw caller/lane_row local pin that may have been refused above.
         # First DML: deferred connection escalates to RESERVED here.
@@ -3720,7 +3820,6 @@ def dispatch_lane_work(
         if brief_warning:
             warnings.append(brief_warning)
             _logger.warning("%s", brief_warning)
-        history_warning = _brief_cites_unreachable_history_warning(resolved_backend, normalized_brief)
         if history_warning:
             warnings.append(history_warning)
             _logger.warning("%s", history_warning)
@@ -4544,6 +4643,8 @@ def run_offload_pass(
         admission_override=admission_override,
         canon_proposal_path=canon_proposal_path,
     )
+    if dry_run:
+        return _run_offload_preview(run_args)
     if wait_seconds is None:
         return _run_offload_pass_synchronous(run_args)
 
@@ -4573,6 +4674,56 @@ def run_offload_pass(
     wait_window = max(0.0, wait_window)
 
     return _submit_offload_pass(run_args, wait_window)
+
+
+def _run_offload_preview(run_args: dict) -> dict:
+    """Preview has no submitted/admitted execution-state constructor."""
+    import uuid  # noqa: PLC0415
+
+    from workbay_orchestrator_mcp.orchestration.nonexecution_history import NonexecutionHold  # noqa: PLC0415
+
+    prepared, response = _prepare_offload_pass_request(run_args)
+    if response is not None:
+        return response
+    assert prepared is not None
+    pass_id = str(run_args.get("pass_id") or uuid.uuid4()).strip()
+    paths = prepared["paths"]
+    try:
+        with _offload_invocation_lease(paths["state_dir"], pass_id):
+            with _offload_lane_admission(paths["state_dir"], prepared["task_ref"], run_args["lane_id"]):
+                routing = prepared["routing"]
+                result = _import_orchestration_module("offload_pass").run_offload_pass_engine(
+                    orchestrator_root=paths["workspace_root"], task_ref=prepared["task_ref"],
+                    lane_id=run_args["lane_id"], worktree_path=prepared["worktree_path"],
+                    backend=prepared["resolved_backend"], model=routing["model"] or prepared["lane_row"].get("model"),
+                    reasoning_effort=routing["reasoning_effort"], speed=routing["speed"], tier=routing["tier"],
+                    token_budget=run_args["token_budget"], timeout_seconds=run_args["timeout_seconds"],
+                    max_review_cycles=run_args["max_review_cycles"], turn_timeout_seconds=run_args["turn_timeout_seconds"],
+                    session=run_args["session"] or f"{prepared['task_ref']}-{run_args['lane_id']}",
+                    session_mode=run_args["session_mode"], dry_run=True, pass_id=pass_id, state_dir=paths["state_dir"],
+                    test_cmd=prepared["lane_row"].get("test_cmd"), grok_max_turns=run_args["grok_max_turns"],
+                    canon_proposal_path=run_args["canon_proposal_path"],
+                )
+        return core._json_response(result)
+    except (OSError, ValueError, RuntimeError, NonexecutionHold) as exc:
+        return core._json_response({"ok": False, "outcome": "preview_refused", "mode": "preview",
+                                    "reason": str(exc), "pass_id": pass_id, "model_dispatched": False})
+
+
+def reconcile_offload_nonexecution(
+    pass_id: str, operation: str = "inspect", expected_record_sha256: str | None = None,
+    expected_attestation_sha256: str | None = None,
+) -> dict:
+    """Classify/reconcile exact historical constructors using existing operator authority.
+
+    Inspect is read-only. Apply appends custody after a separate operator TTY
+    attestation; it cannot authorize a preview label or alter a ledger/grant.
+    """
+    from workbay_orchestrator_mcp.orchestration.nonexecution_history import reconcile  # noqa: PLC0415
+
+    config = get_runtime_config()
+    return core._json_response(reconcile(config.workspace_root, config.state_dir, pass_id, operation=operation,
+        expected_record_sha256=expected_record_sha256, expected_attestation_sha256=expected_attestation_sha256))
 
 
 class _OffloadInvocationBusy(RuntimeError):

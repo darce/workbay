@@ -36,6 +36,7 @@ No polling and no background monitors.
 
 ## Canonical Policy
 
+- [Frozen acceptance qualification](../../docs/workbay/rules/frozen-acceptance-qualification.md) governs original criteria, independent observations, and evidence before repair/review spend.
 - [../../../docs/workbay/rules/development-workflow.md](../../../docs/workbay/rules/development-workflow.md)
 - Heuristics: follow the [heuristics canon pointer](../../../docs/workbay/rules/heuristics-canon.md) (one pinned, digest-verified release). Route each lane's artifact as the route of what that lane changes, keep only the rows whose trigger fires, apply the Verification of every card that lists a kept ID, and cite `[FAM-NN]` with the rule's bold name and Source cell. `B` blocks, `S` needs a named exemption, and a `J` rule you lack context for is escalated, not skipped. Every dispatched brief must carry the pointer's repo-root path (see T17 below); for a network-less sandbox, inline the fired rows and their cards, tagged with the pointer's pinned release, into each brief (never the full rule set).
 - Task plan: `docs/tasks/internal-synchronous-offload-dispatch-task-plan.md`
@@ -160,6 +161,14 @@ default:
    fallback subsection.
 
 ## Core Process
+
+Before author dispatch, the independent coordinator/observer completes
+[qualification steps 1–2](../../docs/workbay/rules/frozen-acceptance-qualification.md#required-order)
+and includes the [minimum packet](../../docs/workbay/rules/frozen-acceptance-qualification.md#minimum-independent-packet)
+in the brief. Before any repair dispatch, independently recompute original results
+on the exact candidate and classify the causal evidence. A third or later author
+dispatch requires the rule's canon proposal with prior paths, semantic context,
+and frozen results; preserve original counters and custody.
 
 1. Confirm an active feature-branch task (`get_handoff_state(sections="identity")`).
    Abort on `main`/`master`/unset `target_branch`.
@@ -298,7 +307,7 @@ default:
    Use the worker's verified tip, not a later branch lookup. A `moved`, incomplete, or
    indeterminate receipt is a typed refusal/retry state. Lane landing is not a main merge
    and does not wait for review.
-10. Run one branch-complete review off the landing critical path and adjudicate its findings
+10. Independently evaluate the exact assembled candidate's original cases before model merge review; pass the qualification packet to reviewers and repair assignments. Run one branch-complete review off the landing critical path and adjudicate its findings
     against source, recording accepted/rejected/deferred dispositions with evidence. Group
     accepted fixes by actual data, resource/side-effect and ownership/conflict edges, and
     validate each landed fix wave with focused tests and scoped review of the exact integrated

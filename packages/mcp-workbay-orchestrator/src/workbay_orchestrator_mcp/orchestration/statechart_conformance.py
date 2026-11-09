@@ -11,6 +11,7 @@ claim full design-note §2 semantic enforcement or gate totality beyond gates[].
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -46,6 +47,8 @@ CHART_FILENAME = "lifecycle_statechart.json"
 
 # A failed runtime load is returned as-is for this long before the chart is re-read.
 _FAILURE_RETRY_SECONDS = 5.0
+# Every name a chart declares or references: predicate ids, state names, machine, transition, gate and region ids.
+_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 
 
 class ConformanceError(Exception):
@@ -90,11 +93,12 @@ class IllegalTransition(ConformanceError):
 
 @lru_cache(maxsize=1)
 def _load_valid_runtime_chart() -> dict[str, Any]:
-    """Load and validate the shipped chart; raise on failure so lru_cache keeps only successes."""
+    """Load and validate the shipped chart; raise on failure so lru_cache keeps only successes.
+
+    validate_chart requires a nonempty string chart ``id`` and ``version``, which the receipts carry.
+    """
     chart = load_chart()
     validate_chart_or_raise(chart)
-    if not all(isinstance(chart.get(key), str) and chart[key] for key in ("id", "version")):
-        raise ConformanceError(["chart id and version must be nonempty strings"])
     return chart
 
 
@@ -139,6 +143,30 @@ def assert_transition(chart: Mapping[str, Any], machine: str, source: str, targe
     if any(src == source and dest == target for _, src, dest in _machine_edges(definition["transitions"])):
         return
     raise IllegalTransition([f"{definition['id']}: illegal transition {source!r} -> {target!r}"])
+
+
+def assert_validation_transition(
+    chart: Mapping[str, Any],
+    source: str,
+    target: str,
+    *,
+    active_policy: bool,
+    fresh_qualified: bool,
+    strict_review: bool = False,
+) -> None:
+    """Native milestone policy, in addition to the existing edge-membership API.
+
+    Phase1 observation for unrelated legacy edges is unchanged. The native
+    consumer calls this before its guarded persisted write; the handoff port
+    independently checks permit custody and current row order transactionally.
+    """
+    assert_transition(chart, "child", source, target)
+    if target not in {"validated", "gated"}:
+        return
+    if not active_policy or not fresh_qualified:
+        raise IllegalTransition(["native milestones require active policy and fresh full40377 qualification"])
+    if target == "gated" and (source != "validated" or not strict_review):
+        raise IllegalTransition(["native gated requires validated then applicable strict review and holds"])
 
 
 MACHINE_KEYS: tuple[str, ...] = ("outer", "child")
@@ -197,17 +225,43 @@ def _iter_guards(transition: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _machine_edges(transitions: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
-    """Return (transition_id, from_state, to_state) edges."""
+    """Return (transition_id, from_state, to_state) edges; raise ConformanceError for a transition with no edge.
+
+    A transition needs a string ``id`` and ``from`` and a ``to`` that is a string or a nonempty list of strings.
+    validate_chart reports every transition that lacks one (check_machine_hygiene for a non-object, an absent key or
+    an empty ``to``; check_chart_ids for a wrong type), so a chart that passed it never raises here.
+    """
+    return [edge for index, transition in enumerate(transitions) for edge in _transition_edges(index, transition)]
+
+
+def _transition_edges(index: int, transition: object) -> list[tuple[str, str, str]]:
+    if not isinstance(transition, Mapping):
+        raise ConformanceError([f"transitions[{index}] must be an object, got {type(transition).__name__}"])
+    tid, src, raw = transition.get("id"), transition.get("from"), transition.get("to")
+    targets = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    valid = {
+        "id": isinstance(tid, str),
+        "from": isinstance(src, str),
+        "to": bool(targets) and all(isinstance(dest, str) for dest in targets),
+    }
+    for key, ok in valid.items():
+        if not ok:
+            raise ConformanceError([f"transitions[{index}]: {key} is missing or malformed, so it has no edge"])
+    return [(tid, src, dest) for dest in targets]
+
+
+def _well_formed_edges(transitions: Sequence[object]) -> list[tuple[str, str, str]]:
+    """The edges of every transition that has one, for the graph walks; the rest are hygiene's and check_chart_ids'.
+
+    Dropping a malformed transition removes only its own edges, so the walks still report the machine's other
+    unreachable and cannot-reach-terminal states without naming the malformed transition a second time.
+    """
     edges: list[tuple[str, str, str]] = []
-    for transition in transitions:
-        if not isinstance(transition, Mapping):
+    for index, transition in enumerate(transitions):
+        try:
+            edges.extend(_transition_edges(index, transition))
+        except ConformanceError:
             continue
-        tid = transition.get("id")
-        src = transition.get("from")
-        if not isinstance(tid, str) or not isinstance(src, str):
-            continue
-        for dest in _targets(transition):
-            edges.append((tid, src, dest))
     return edges
 
 
@@ -261,8 +315,15 @@ def _collect_transition_index(chart: Mapping[str, Any]) -> dict[str, dict[str, A
 
 
 def check_machine_hygiene(chart: Mapping[str, Any]) -> list[str]:
-    """Graph hygiene: initial ∈ states, terminals ⊆ states, endpoints ∈ states."""
+    """Graph hygiene: initial ∈ states, terminals ⊆ states, every transition has id/from/to, endpoints ∈ states.
+
+    Also the chart's own ``id`` and ``version``: both are required, and ``version`` is a nonempty string. A present
+    ``id`` is check_chart_ids' to judge, so a malformed one is reported once.
+    """
     errors: list[str] = []
+    errors.extend(f"chart: missing required key {key!r}" for key in ("id", "version") if key not in chart)
+    if "version" in chart and not (isinstance(chart["version"], str) and chart["version"]):
+        errors.append(f"chart: version must be a nonempty string, got {chart['version']!r}")
     for key in ("outer", "child"):
         machine = chart.get(key)
         if not isinstance(machine, Mapping):
@@ -290,9 +351,16 @@ def check_machine_hygiene(chart: Mapping[str, Any]) -> list[str]:
         if not isinstance(transitions, list):
             errors.append(f"{machine_id}: transitions must be a list")
             continue
-        for transition in transitions:
+        for index, transition in enumerate(transitions):
+            where = f"{machine_id} transitions[{index}]"
             if not isinstance(transition, Mapping):
+                errors.append(f"{where}: must be an object, got {type(transition).__name__}")
                 continue
+            errors.extend(
+                f"{where}: missing required key {key!r}" for key in ("id", "from", "to") if key not in transition
+            )
+            if transition.get("to") == []:
+                errors.append(f"{where}: to must name at least one state")
             tid = transition.get("id", "<unknown>")
             src = transition.get("from")
             if isinstance(src, str) and src not in state_set:
@@ -324,8 +392,7 @@ def check_reachability(chart: Mapping[str, Any]) -> list[str]:
         if not isinstance(transitions, list):
             errors.append(f"{machine_id}: transitions must be a list")
             continue
-        edges = _machine_edges(transitions)
-        reached = _reachable(initial, edges)
+        reached = _reachable(initial, _well_formed_edges(transitions))
         for state in states:
             if state not in reached:
                 errors.append(f"{machine_id}: unreachable state {state!r} from initial {initial!r}")
@@ -357,8 +424,7 @@ def check_terminal_reachability(chart: Mapping[str, Any]) -> list[str]:
         if not valid_terminals:
             errors.append(f"{machine_id}: no terminals that are members of states[]")
             continue
-        edges = _machine_edges(transitions)
-        reach_map = _can_reach_terminal(states, valid_terminals, edges)
+        reach_map = _can_reach_terminal(states, valid_terminals, _well_formed_edges(transitions))
         for state, ok in reach_map.items():
             if not ok:
                 errors.append(f"{machine_id}: state {state!r} cannot reach any terminal in {terminals!r}")
@@ -655,7 +721,7 @@ def check_guard_shapes(chart: Mapping[str, Any]) -> list[str]:
 
 
 def check_guard_predicate_ids(chart: Mapping[str, Any]) -> list[str]:
-    """Every guard names its predicate: ``predicate_id`` is a string that is not blank (else it renders as no guard)."""
+    """Every guard names its predicate: ``predicate_id`` is an identifier, so no invisible or blank id renders."""
     errors: list[str] = []
     for key in ("outer", "child"):
         machine = chart.get(key)
@@ -671,11 +737,71 @@ def check_guard_predicate_ids(chart: Mapping[str, Any]) -> list[str]:
             tid = transition.get("id", "<unknown>")
             for guard in _iter_guards(transition):
                 predicate_id = guard.get("predicate_id")
-                if not (isinstance(predicate_id, str) and predicate_id.strip()):
+                if not (isinstance(predicate_id, str) and _IDENTIFIER.fullmatch(predicate_id)):
                     errors.append(
-                        f"{machine_id} transition {tid!r}: guard predicate_id must be a nonempty string, "
-                        f"got {predicate_id!r}"
+                        f"{machine_id} transition {tid!r}: guard predicate_id must be an identifier matching "
+                        f"{_IDENTIFIER.pattern}, got {predicate_id!r}"
                     )
+    return errors
+
+
+def check_chart_ids(chart: Mapping[str, Any]) -> list[str]:
+    """Every chart name is an identifier like ``predicate_id``, so no invisible or odd-shaped name renders or matches.
+
+    Covers the chart's own ``id``, machine ``id``, ``states``, ``initial``, ``terminals``, ``projection`` keys,
+    transition ``id``/``from``/``to``, ``nested_region`` ``id``/``parent_states``/``child_machine`` and gate
+    ``id``/``transition_id``. A present value of any type is checked; absence and membership stay with the hygiene,
+    nested-region and gate checks (a missing chart ``id`` or ``version`` with check_machine_hygiene).
+    """
+    errors: list[str] = []
+
+    def check(where: str, name: str, value: object) -> None:
+        if not (isinstance(value, str) and _IDENTIFIER.fullmatch(value)):
+            errors.append(f"{where}: {name} must be an identifier matching {_IDENTIFIER.pattern}, got {value!r}")
+
+    def check_fields(where: str, owner: Mapping[str, Any], scalars: Sequence[str], lists: Sequence[str]) -> None:
+        for name in scalars:
+            if name in owner:
+                check(where, name, owner[name])
+        for name in lists:
+            if isinstance(owner.get(name), list):
+                for index, item in enumerate(owner[name]):
+                    check(where, f"{name}[{index}]", item)
+
+    check_fields("chart", chart, ("id",), ())
+    for key in MACHINE_KEYS:
+        machine = chart.get(key)
+        if not isinstance(machine, Mapping):
+            continue
+        check_fields(key, machine, ("id",), ())
+        machine_id = machine.get("id")
+        where = machine_id if isinstance(machine_id, str) and _IDENTIFIER.fullmatch(machine_id) else key
+        check_fields(where, machine, ("initial",), ("states", "terminals"))
+        projection = machine.get("projection")
+        if isinstance(projection, Mapping):
+            for state in projection:
+                check(where, "projection key", state)
+        region = machine.get("nested_region")
+        if isinstance(region, Mapping):
+            check_fields(f"{where} nested_region", region, ("id", "child_machine"), ("parent_states",))
+        transitions = machine.get("transitions")
+        if not isinstance(transitions, list):
+            continue
+        for transition in transitions:
+            if not isinstance(transition, Mapping):
+                continue
+            to_list = isinstance(transition.get("to"), list)
+            check_fields(
+                f"{where} transition {transition.get('id', '<unknown>')!r}",
+                transition,
+                ("id", "from") if to_list else ("id", "from", "to"),
+                ("to",) if to_list else (),
+            )
+    gates = chart.get("gates")
+    if isinstance(gates, list):
+        for index, gate in enumerate(gates):
+            if isinstance(gate, Mapping):
+                check_fields(f"gates[{index}]", gate, ("id", "transition_id"), ())
     return errors
 
 
@@ -691,6 +817,7 @@ def validate_chart(chart: Mapping[str, Any]) -> ConformanceReport:
     errors.extend(check_evidence_classes(chart))
     errors.extend(check_guard_shapes(chart))
     errors.extend(check_guard_predicate_ids(chart))
+    errors.extend(check_chart_ids(chart))
     return ConformanceReport(ok=not errors, errors=errors)
 
 
@@ -712,7 +839,9 @@ __all__ = [
     "IllegalTransition",
     "MACHINE_KEYS",
     "assert_transition",
+    "assert_validation_transition",
     "chart_path",
+    "check_chart_ids",
     "check_evidence_classes",
     "check_gate_bijection",
     "check_gate_injectivity",

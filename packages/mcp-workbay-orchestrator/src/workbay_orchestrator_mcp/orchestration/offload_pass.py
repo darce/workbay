@@ -25,6 +25,7 @@ Contract highlights (task plan `internal`):
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import html
@@ -1064,6 +1065,7 @@ def _merge_pass_state(
         "started_at",
         "dispatch_id",
         "lane_spec",
+        "lineage",
         "branch",
         "worktree_path",
         "agent_stream_path",
@@ -1225,6 +1227,25 @@ def write_pass_state(
                     raise LanePassPublicationRefused("lane_pass_publication_destructive_owner")
             with _pass_publication_lock(path, deadline=deadline):
                 previous_record = read_pass_state(state_dir, pass_id)
+                if previous_record is not None:
+                    from .nonexecution_history import authenticated_nonexecution
+
+                    # A reconciled constructor's original bytes are immutable.
+                    # This uses configured host authority, never payload paths.
+                    try:
+                        runtime_config = get_runtime_config()
+                    except RuntimeError:
+                        runtime_config = None
+                    if (runtime_config is not None
+                            and (Path(runtime_config.workspace_root) / ".git").exists()
+                            and Path(runtime_config.state_dir).resolve() == Path(state_dir).resolve()):
+                        try:
+                            if authenticated_nonexecution(
+                                Path(runtime_config.workspace_root), Path(state_dir), pass_id, path.read_bytes()
+                            ):
+                                return False
+                        except (OSError, ValueError, KeyError, TypeError) as exc:
+                            raise LanePassPublicationRefused("nonexecution_custody_invalid") from exc
                 # A malformed/link-swapped record is never an absent first
                 # publication. The fence and write share this native lock.
                 if previous_record is None and os.path.lexists(path):
@@ -1825,6 +1846,10 @@ def _detached_artifact_paths(argv: Any, worktree_path: Path) -> dict[str, Path]:
         if not path.is_absolute():
             path = worktree_path / path
         paths[name] = path
+    if "provenance" in paths:
+        # The collector installs this separately from its protected ROOT source;
+        # an author outbox field or a new public output flag has no authority.
+        paths["preflight_effect"] = Path(str(paths["provenance"]) + ".effect")
     return paths
 
 
@@ -2199,7 +2224,8 @@ def _install_detached_result(
             raise _DetachedArtifactPersistenceError(str(exc)) from exc
     run_ctx.final_result_path = result_path
     run_ctx.final_result_snapshot = dict(result_payload)
-    run_ctx.current_process_ran = True
+    # Harvesting a transport result is not evidence of paid model entry.
+    run_ctx.current_process_ran = (raw_payload.get("source_provenance") or {}).get("model_process_started") is True
     run_ctx.event_turn_usage_seen = False
     # Usage-free harvest contexts need no config; the promoter short-circuits.
     _worker_daemon_module()._maybe_record_result_token_telemetry(
@@ -7373,8 +7399,24 @@ def _matching_terminal_passes(
             continue
         if not isinstance(persisted, dict):
             continue
+        from .nonexecution_history import authenticated_nonexecution
+
+        try:
+            host_repo = Path(orchestrator_root) if orchestrator_root is not None else Path(state_dir).parent
+            if (host_repo / ".git").exists() and authenticated_nonexecution(
+                host_repo, Path(state_dir), pass_id, _pass_state_path(state_dir, pass_id).read_bytes()
+            ):
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            complete = False
+            doubtful_pass_ids.add(pass_id)
+            continue
         record_session = persisted.get("session")
         if record_session is not None and record_session != session:
+            continue
+        if "nonexecution_evidence_error" in (persisted.get("result") or {}):
+            complete = False
+            doubtful_pass_ids.add(pass_id)
             continue
         status = persisted.get("status")
         if status != "done":
@@ -9617,14 +9659,14 @@ def close_offload_lane_merged(
         row = _lookup_worktree_lane(task_ref=task_ref, lane_id=lane_id)
     if not force:
         current_status = str((row or {}).get("status") or "").strip() or None
-        if current_status != "review":
+        if current_status not in {"review", "gated"}:
             return {
                 "ok": False,
                 "lane_id": lane_id,
                 "task_ref": task_ref,
                 "error": (
                     f"lane_not_in_review: lane '{lane_id}' status is "
-                    f"{current_status!r} (expected 'review'); refuse terminal "
+                    f"{current_status!r} (expected 'review' or 'gated'); refuse terminal "
                     "merged close — pass force=True to override"
                 ),
             }
@@ -10334,6 +10376,8 @@ def run_offload_pass_engine(
     detached_completion_job_id: str | None = None,
     detached_completion_start_head: str | None = None,
     canon_proposal_path: str | None = None,
+    native_validation_config: Path | str | None = None,
+    native_validation_digest: str | None = None,
 ) -> dict[str, Any]:
     # bool is a subclass of int; token_budget=True would pass isinstance(_, int) and
     # run a pass with an effective budget of 1 token. Reject it explicitly.
@@ -10348,7 +10392,28 @@ def run_offload_pass_engine(
     if tier is not None and tier not in ("junior", "senior"):
         raise ValueError("tier must be 'junior' or 'senior'.")
 
+    if dry_run:
+        from .nonexecution_history import preview_pass
+
+        return preview_pass(
+            orchestrator_root=orchestrator_root, task_ref=task_ref, lane_id=lane_id,
+            worktree_path=worktree_path, pass_id=pass_id or str(uuid.uuid4()),
+            state_dir=Path(state_dir) if state_dir is not None else Path(orchestrator_root) / ".task-state",
+            request=dict(backend=backend, model=model, reasoning_effort=reasoning_effort, speed=speed, tier=tier,
+                         token_budget=token_budget, timeout_seconds=timeout_seconds, max_review_cycles=max_review_cycles,
+                         turn_timeout_seconds=turn_timeout_seconds, grok_max_turns=grok_max_turns,
+                         session=session, session_mode=session_mode, test_cmd=test_cmd,
+                         canon_proposal_path=canon_proposal_path),
+        )
+
     started = time.monotonic()
+    # Freeze the public coordinator configuration into completion custody
+    # before dispatch, including detached begin/complete on different processes.
+    from .native_validation import select_request_pair
+
+    native_validation_config, native_validation_digest = select_request_pair(
+        native_validation_config, native_validation_digest
+    )
     deadline = started + float(timeout_seconds)
     completion_deadline = _ACTIVE_COMPLETION_DEADLINE.get()
     if completion_deadline is not None:
@@ -10422,12 +10487,28 @@ def run_offload_pass_engine(
             "capability_config_digest": capability_config_digest,
             "dispatch_id": dispatch_id,
             "start_head_ref": start_head_ref,
+            "native_validation_config": (
+                str(native_validation_config) if isinstance(native_validation_config, Path) else native_validation_config
+            ),
+            "native_validation_digest": native_validation_digest,
         },
     }
     pass_sweep_state: dict[str, Any] = {"terminal_durable": False, "trigger": None}
     # Durable authority this callback accepted at its first source-bearing
     # publication. Engine rewrites never change these fields.
     accepted = read_pass_state(resolved_state_dir, resolved_pass_id) or {}
+    if accepted:
+        from .nonexecution_history import authenticated_nonexecution
+
+        if authenticated_nonexecution(Path(worktree_path), resolved_state_dir, resolved_pass_id,
+                                     _pass_state_path(resolved_state_dir, resolved_pass_id).read_bytes()):
+            return {"ok": False, "outcome": "dispatch_refused", "reason": "nonexecution_recovered_identity",
+                    "pass_id": resolved_pass_id, "task_ref": task_ref, "lane_id": lane_id}
+    # Only this invocation's pre-exposure control flow may produce a constructor
+    # receipt. Existing execution/unknown records cannot acquire that authority.
+    constructor_only = not any(accepted.get(key) for key in (
+        "completion_config", "branch", "job_id", "agent_stream_path", "review_cycle_dispatch_id", "progress"
+    ))
     if detached_completion_job_id is None and _terminal_review_cycle_publication(accepted):
         # Same-ID retry of a consumed reservation, in EVERY mode (attached or
         # detached begin) and before the WorkerLock or any other mode-specific
@@ -10454,7 +10535,8 @@ def run_offload_pass_engine(
         return refusal
     publication_authority: dict[str, Any] = {
         "invocation_token": accepted.get("invocation_token"),
-        "orchestrator_root": accepted.get("orchestrator_root") or str(orchestrator_root),
+        "orchestrator_root": (accepted.get("orchestrator_root") if constructor_only
+                              else accepted.get("orchestrator_root") or str(orchestrator_root)),
     }
     checkpoints: list[str] = []
     # ``checkpoints`` records implementation checkpoint commits only. Review
@@ -10507,6 +10589,8 @@ def run_offload_pass_engine(
             raise _PassAuthorityChanged(changed)
 
     def _publish_running_state(payload: dict[str, Any]) -> None:
+        if constructor_only and review_cycle_receipt is None and not production_history.access_started:
+            return
         # The accepted token must reach the locked comparison at every write;
         # an earlier authority read cannot protect a later publication.
         if not write_pass_state(
@@ -10516,6 +10600,7 @@ def run_offload_pass_engine(
             expected_invocation_token=publication_authority["invocation_token"],
         ):
             raise _PassAuthorityChanged(("invocation_token",))
+        publication_authority["orchestrator_root"] = payload.get("orchestrator_root")
 
     _unset_model_call_boundary = object()
 
@@ -10883,6 +10968,11 @@ def run_offload_pass_engine(
             "next_wave_style_debt": next_wave_records,
             "next_wave_style_debt_section": next_wave_section,
         }
+        if run_ctx is not None and getattr(run_ctx, "native_validation_result", None) is not None:
+            result["native_validation"] = run_ctx.native_validation_result.as_dict() | {
+                "milestone": run_ctx.native_validation_milestone,
+                "milestone_error": run_ctx.native_validation_error,
+            }
         if task_open_blockers is not None:
             result["task_open_blockers"] = list(task_open_blockers)
         if findings_scope is not None:
@@ -10979,6 +11069,27 @@ def run_offload_pass_engine(
         return result
 
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        if constructor_only and review_cycle_receipt is None and not production_history.access_started:
+            from .nonexecution_history import constructor_result
+
+            try:
+                result = constructor_result(
+                    Path(worktree_path), pass_id=resolved_pass_id, task_ref=task_ref, lane_id=lane_id,
+                    request=rescue_identity["completion_config"], result=result,
+                    invocation_token=publication_authority["invocation_token"],
+                )
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                # A broken/missing authority cannot turn an early typed refusal
+                # into an exception, nor authorize history exclusion. Its native
+                # receipt stays explicitly doubtful in the governor.
+                result = {**result, "nonexecution_evidence_error": str(exc)}
+            # Compatibility for await: a terminal admission receipt contains no
+            # execution constructor/source identity. The immutable mode authority
+            # lives above, outside the executable-history namespace.
+            write_pass_state(resolved_state_dir, resolved_pass_id,
+                {"status": "done", "task_ref": task_ref, "lane_id": lane_id, "result": result},
+                expected_invocation_token=publication_authority["invocation_token"])
+            return result
         if review_cycle_receipt is not None:
             from .review_cycle_dispatch import (
                 _model_or_unknown_evidence,
@@ -11306,7 +11417,6 @@ def run_offload_pass_engine(
         # caller must survive the worker's dynamic row refresh; otherwise a
         # stale provider-only manifest field can undo the preflight route.
         from workbay_orchestrator_mcp.orchestration.codex_lane_config import CODEX_MODEL_TIERS
-        from workbay_orchestrator_mcp.orchestration.lane_manifest import get_lane_config
         from workbay_orchestrator_mcp.orchestration.lane_routing import (
             RoutingDisagreement,
             RoutingQuad,
@@ -11316,10 +11426,6 @@ def run_offload_pass_engine(
 
         requested_routing = RoutingQuad(backend, model, reasoning_effort, speed, tier)
         try:
-            try:
-                manifest_routing = get_lane_config(task_ref, lane_id, orchestrator_root=str(orchestrator_root))
-            except FileNotFoundError:
-                manifest_routing = None
             resolved_routing = resolve_routing_quad(
                 caller=requested_routing,
                 row=wd._fetch_mcp_lane_params(Path(orchestrator_root), task_ref, lane_id),
@@ -11658,7 +11764,13 @@ def run_offload_pass_engine(
             capability_config_digest=worker_config_digest,
             dispatch_id=worker_dispatch_id,
             remote_phase_budget=remote_phase_budget,
+            native_validation_config=native_validation_config,
+            native_validation_digest=native_validation_digest,
         )
+        from .native_validation import begin_native, prepare_native
+        from .native_validation import configure as configure_native_validation
+
+        config = configure_native_validation(config)
         config = wd._resolve_grok_cycle_bounds(config)
         if is_remote_worker_backend(backend) and worker_receipt_id is None:
             minted = mint_worktree_capability_receipt(
@@ -11735,6 +11847,9 @@ def run_offload_pass_engine(
         # Conservatively mark access before setup; a constructor can consume or
         # publish source even if it raises before returning its context.
         production_history.access_started = True
+        _publish_running_state(
+            {**rescue_identity, "status": "running", "task_ref": task_ref, "lane_id": lane_id},
+        )
         run_ctx, _ = wd._setup_worker_run(config)
         run_ctx.review_ratchet_context = ratchet_context
         if ratchet_context is not None:
@@ -11973,6 +12088,8 @@ def run_offload_pass_engine(
             verified_gate_evidence = None
             if run_ctx is not None:
                 run_ctx.verified_gate_evidence = verified_gate_evidence
+                run_ctx.native_validation_result = None
+                run_ctx.native_validation_milestone = None
             run_ctx.cycle = cycle
             run_ctx.current_process_ran = False
             try:
@@ -12040,6 +12157,7 @@ def run_offload_pass_engine(
                     "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 }
             )
+            prepare_native(run_ctx)
             if detached_completion_record is not None and detached_completion_job_id is not None:
                 execute_succeeded = _install_detached_result(
                     run_ctx=run_ctx,
@@ -12688,6 +12806,12 @@ def run_offload_pass_engine(
                         f"{verified_gate_evidence.get('reason') or 'unknown persistence failure'}"
                     )
                     break
+            # Actual one-pass consumer, after checkpoint and before strict review.
+            # Missing/below-floor evidence still reaches the existing reviewer.
+            begin_native(run_ctx, deadline=deadline)
+            if getattr(run_ctx.native_validation_result, "reason", None) == "battery_cancelled":
+                outcome, failed_stage, error_reason = "needs_guidance", "self_verify", "native_validation_cancelled"
+                break
             if time.monotonic() >= deadline:
                 outcome = "timeout"
                 break
@@ -13421,11 +13545,18 @@ def run_offload_pass_engine(
         lane_status_transition: dict[str, Any] | None = None
         next_lane_action: dict[str, Any] | None = None
         if outcome == "handoff_ready":
-            lane_status_transition = _mark_lane_review_on_handoff_ready(
-                task_ref=task_ref,
-                lane_id=lane_id,
-                worktree_path=Path(worktree_path),
-            )
+            if getattr(run_ctx, "native_validation_milestone", None) == "gated":
+                lane_status_transition = {
+                    "ok": True,
+                    "status": "gated",
+                    "native_validation": run_ctx.native_validation_result.as_dict(),
+                }
+            else:
+                lane_status_transition = _mark_lane_review_on_handoff_ready(
+                    task_ref=task_ref,
+                    lane_id=lane_id,
+                    worktree_path=Path(worktree_path),
+                )
             next_lane_action = next_lane_close_action(task_ref=task_ref, lane_id=lane_id)
         elif outcome == "needs_guidance" and landed_before_salvage and _worker_requested_guidance(run_ctx):
             next_lane_action = next_lane_guidance_action(
@@ -13820,6 +13951,17 @@ def run_offload_pass_engine(
                     )
                     detached_job_id = identity.job_id
                     detached_job_attempt = identity.attempt
+            # Capture this dispatch's manifest before the outer first running
+            # publication, not only the later publication inside _execute_pass.
+            # Routing still uses the same get_lane_config observation below.
+            from workbay_orchestrator_mcp.orchestration.lane_manifest import get_lane_config
+
+            try:
+                manifest_routing = get_lane_config(task_ref, lane_id, orchestrator_root=str(orchestrator_root))
+            except FileNotFoundError:
+                manifest_routing = None
+            if isinstance(manifest_routing, dict) and "lineage" in manifest_routing:
+                rescue_identity["lineage"] = copy.deepcopy(manifest_routing["lineage"])
             _publish_running_state(
                 {
                     **rescue_identity,
@@ -14802,6 +14944,8 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 receive_paths = paths
                 if vm_rc != 0:
                     receive_paths = {name: Path(temporary) / name for name in paths}
+                    if "provenance" in receive_paths:
+                        receive_paths["preflight_effect"] = Path(str(receive_paths["provenance"]) + ".effect")
                     for index in range(2, len(collect_argv) - 1):
                         if collect_argv[index] in {
                             "--out",
@@ -14887,6 +15031,13 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                             start_head=completion_config.get("start_head_ref"),
                         )
                         if refusal == "missing":
+                            if vm_rc == 7:
+                                return custody_hold(
+                                    "detached_preflight_evidence_hold",
+                                    error="source_provenance_missing",
+                                    stderr=collected.stderr,
+                                    collection_rc=collected.returncode,
+                                )
                             # A complete receive from a finished failed producer
                             # has no provenance to retry (setup failed before it).
                             return custody_hold(
@@ -14933,6 +15084,52 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
 
     remainder: dict[str, Any] = {}
     _stamp_detached_remainder_evidence(remainder, paths.get("uncommitted"))
+    if vm_rc == 7:
+        # Exit 7 alone is unknown. Only the real collector's authenticated
+        # wrapper/protected-effect observation can release this reservation.
+        # Re-read that proof and the installed pair on every crash/retry; never
+        # derive forgiveness from the author result or rewrite settled history.
+        from .review_cycle_dispatch import (
+            _receipt_path,
+            managed_refusal_evidence,
+            read_execution_effect,
+            settle_actual,
+        )
+
+        try:
+            receipt = json.loads(_receipt_path(worktree_path, job_id).read_bytes())
+            refusal = managed_refusal_evidence(worktree_path, receipt)
+            execution = (receipt.get("native_pre_model_refusal") or {}).get("execution")
+            if (
+                receipt.get("settlement_owner") != "engine"
+                or receipt.get("identity", {}).get("dispatch_id") != job_id
+                or refusal is None
+                or refusal.get("phase") != "execution_preflight"
+                or not isinstance(execution, dict)
+                or execution.get("provenance") != read_execution_effect(paths["provenance"])
+                or execution.get("effect") != read_execution_effect(paths["preflight_effect"])
+                or collection.get("artifacts") != _detached_collection_manifest(paths)
+            ):
+                raise ValueError("detached_preflight_proof_unknown")
+            settled = settle_actual(worktree_path, receipt["identity"], outcome=refusal["outcome"],
+                                    refusal_reason=refusal["reason"])
+            if settled.status != "settled":
+                raise ValueError(f"detached_preflight_settlement_{settled.reason}")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return custody_hold("detached_preflight_evidence_hold", error=str(exc))
+        return persist_terminal({
+            "ok": False,
+            "outcome": refusal["outcome"],
+            "reason": refusal["reason"],
+            "failed_stage": "execute",
+            "summary": "Native provisioning refused before model entry; original reservation settled.",
+            "commit_landed": False,
+            "work_status": "not_landed",
+            "ceremony_status": "not_attempted",
+            "findings": [],
+            "pre_dispatch_refusal": refusal,
+            "review_cycle": {"reservation": receipt["decision"], "settlement": asdict(settled)},
+        })
     if vm_rc != 0:
         # The exit code alone certifies nothing: keep every AVAILABLE authentic
         # fact of a paid attempt at first publication (same derivation as repair).

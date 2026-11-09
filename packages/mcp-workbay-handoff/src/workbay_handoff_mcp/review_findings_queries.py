@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from workbay_protocol.review_impact import is_blocking
 
+from . import review_subject
 from .enums import FindingSeverity, FindingStatus, HandoffStatus
 from .review_findings_recording import _retire_merged_source_rows
 from .review_findings_support import (
@@ -1655,6 +1656,8 @@ def record_review_run(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     wall_ms: int | None = None,
+    source_ref: str | None = None,
+    _completion_expected_sha256: str | None = None,
 ) -> dict:
     review_run_id = (review_run_id or "").strip()
     session = (session or "").strip()
@@ -1666,11 +1669,17 @@ def record_review_run(
         return _envelope(
             ok=False, tool="record_review_run", data={"error": "session is required."}, entity="review_run"
         )
-    canonical_subject = (
-        (subject_path or "").strip()
-        if subject_kind == "branch" and len((subject_path or "").split("...")) == 2
-        else _canonicalize_subject_path(subject_path)
-    )
+    try:
+        canonical_subject = (
+            (subject_path or "").strip()
+            if _completion_expected_sha256 is not None
+            or (subject_kind == "branch" and len((subject_path or "").split("...")) == 2)
+            else _canonicalize_subject_path(subject_path)
+        )
+    except (OSError, ValueError, RuntimeError):
+        return _envelope(
+            ok=False, tool="record_review_run", data={"error": "review_subject_path_invalid"}, entity="review_run"
+        )
     if subject_kind == "branch" and not canonical_subject:
         canonical_subject = None
     if canonical_subject is None:
@@ -1730,6 +1739,23 @@ def record_review_run(
     stored_verdict = verdict
     stored_verdict_decision = verdict_decision
     extra_data: dict[str, object] = {}
+    completing = _completion_expected_sha256 is not None
+    subject_metadata = review_subject.metadata(judge_pin_json)
+    if not completing and any(
+        key in subject_metadata for key in (review_subject.SUBJECT_KEY, review_subject.COMPLETE_KEY)
+    ):
+        return _envelope(
+            ok=False, tool="record_review_run", data={"error": "reserved_review_subject_metadata"}, entity="review_run"
+        )
+    if source_ref is not None and (
+        verdict is not None or subject_kind == "branch" or normalized_review_mode != "planning"
+    ):
+        return _envelope(
+            ok=False,
+            tool="record_review_run",
+            data={"error": "freeze_requires_pending_planning_file"},
+            entity="review_run",
+        )
     branch_changed_paths = None
     scope_data: dict[str, object] = {}
     source_probe = SourceProbe(str(_workspace_root().resolve()))
@@ -1773,6 +1799,7 @@ def record_review_run(
                 entity="review_run",
             )
         normalized_task_ref = known_task_ref
+        canonical_subject = _existing_canonical_subject_path(conn, normalized_task_ref, canonical_subject)
         resolved_actor = _resolve_write_actor(conn, actor, task_ref=normalized_task_ref)
         warnings = collect_target_context_warnings(conn, resolved_actor, task_ref=normalized_task_ref)
         source_rows = (
@@ -1790,9 +1817,46 @@ def record_review_run(
     if source_rows and pinned_revisions:
         foreign_sources = foreign_source_snapshots(source_probe, pinned_revisions, actor, source_rows)
 
+    frozen_subject = None
+    if not completing and verdict is None and normalized_review_mode == "planning" and subject_kind != "branch":
+        root = review_subject.subject_root()
+        if source_ref is not None or (root / canonical_subject).is_file():
+            try:
+                # Do not let path canonicalization hide a source symlink change.
+                review_subject.source_bytes(root, subject_path.replace("\\", "/"))
+                frozen_subject = review_subject.freeze_subject(
+                    root,
+                    normalized_task_ref,
+                    canonical_subject,
+                    source_ref if source_ref is not None else "HEAD",
+                    review_run_id,
+                    subject_sha,
+                )
+                subject_sha = frozen_subject["subject_sha256"]
+                subject_metadata[review_subject.SUBJECT_KEY] = frozen_subject
+                judge_pin_json = json.dumps(subject_metadata, sort_keys=True)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                return _envelope(ok=False, tool="record_review_run", data={"error": str(exc)}, entity="review_run")
+
     with _get_db_connection(begin_immediate=True) as conn:
-        existing = conn.execute("SELECT id FROM review_runs WHERE review_run_id = ?", (review_run_id,)).fetchone()
-        if existing is not None:
+        existing = conn.execute("SELECT * FROM review_runs WHERE review_run_id = ?", (review_run_id,)).fetchone()
+        if completing:
+            if existing is None or existing["verdict"] is not None:
+                return _envelope(
+                    ok=False, tool="complete_review_run", data={"error": "review_run_not_pending"}, entity="review_run"
+                )
+            try:
+                frozen_subject = review_subject.check_frozen_subject(
+                    _workspace_root().resolve(), existing, _completion_expected_sha256
+                )
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                return _envelope(ok=False, tool="complete_review_run", data={"error": str(exc)}, entity="review_run")
+            # Retain the original run/cycle/provenance, including any judge pin.
+            subject_metadata = review_subject.metadata(existing["judge_pin_json"])
+            subject_metadata[review_subject.COMPLETE_KEY] = True
+            judge_pin_json = json.dumps(subject_metadata, sort_keys=True)
+            cycle_n = existing["cycle_n"]
+        elif existing is not None:
             return _envelope(
                 ok=False,
                 tool="record_review_run",
@@ -1804,6 +1868,21 @@ def record_review_run(
                 entity="review_run",
             )
         canonical_subject = _existing_canonical_subject_path(conn, normalized_task_ref, canonical_subject)
+        if frozen_subject is not None and not completing:
+            try:
+                review_subject.check_frozen_subject(
+                    _workspace_root().resolve(),
+                    {
+                        "review_run_id": review_run_id,
+                        "task_ref": normalized_task_ref,
+                        "subject_path": canonical_subject,
+                        "subject_sha": subject_sha,
+                        "judge_pin_json": judge_pin_json,
+                    },
+                    subject_sha,
+                )
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                return _envelope(ok=False, tool="record_review_run", data={"error": str(exc)}, entity="review_run")
         if ENFORCE_REVIEW_ROUND_BOUND:
             prior_rounds = _count_prior_review_rounds(
                 conn,
@@ -1891,8 +1970,33 @@ def record_review_run(
             ).fetchone()[0]
         )
         extra_data["findings_recorded_count"] = findings_recorded_count
-        conn.execute(
-            """
+        if completing:
+            updated = conn.execute(
+                """UPDATE review_runs SET verdict = ?, verdict_decision = ?, judge_pin_json = ?,
+                   session = ?, agent = ?, model = ?, model_label = ?, reviewed_at = CURRENT_TIMESTAMP
+                   WHERE review_run_id = ? AND verdict IS NULL AND subject_sha = ?""",
+                (
+                    stored_verdict,
+                    stored_verdict_decision,
+                    judge_pin_json,
+                    session,
+                    resolved_actor.agent,
+                    resolved_actor.model,
+                    resolved_actor.model_label,
+                    review_run_id,
+                    _completion_expected_sha256,
+                ),
+            )
+            if updated.rowcount != 1:
+                return _envelope(
+                    ok=False,
+                    tool="complete_review_run",
+                    data={"error": "review_run_completion_conflict"},
+                    entity="review_run",
+                )
+        else:
+            conn.execute(
+                """
             INSERT INTO review_runs (
                 review_run_id, task_ref, subject_path, subject_kind, review_mode,
                 verdict_decision, verdict, session, agent, model, model_label,
@@ -1900,48 +2004,84 @@ def record_review_run(
                 new_findings, carried_findings, regressed_findings, input_tokens, output_tokens, wall_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                review_run_id,
-                normalized_task_ref,
-                canonical_subject,
-                subject_kind,
-                normalized_review_mode,
-                stored_verdict_decision,
-                stored_verdict,
-                session,
-                resolved_actor.agent,
-                resolved_actor.model,
-                resolved_actor.model_label,
-                resolved_actor.branch,
-                resolved_actor.commit_sha,
-                cycle_n,
-                parent_run_id,
-                subject_sha,
-                judge_pin_json,
-                new_findings,
-                carried_findings,
-                regressed_findings,
-                input_tokens,
-                output_tokens,
-                wall_ms,
-            ),
-        )
+                (
+                    review_run_id,
+                    normalized_task_ref,
+                    canonical_subject,
+                    subject_kind,
+                    normalized_review_mode,
+                    stored_verdict_decision,
+                    stored_verdict,
+                    session,
+                    resolved_actor.agent,
+                    resolved_actor.model,
+                    resolved_actor.model_label,
+                    resolved_actor.branch,
+                    resolved_actor.commit_sha,
+                    cycle_n,
+                    parent_run_id,
+                    subject_sha,
+                    judge_pin_json,
+                    new_findings,
+                    carried_findings,
+                    regressed_findings,
+                    input_tokens,
+                    output_tokens,
+                    wall_ms,
+                ),
+            )
         row = dict(conn.execute("SELECT * FROM review_runs WHERE review_run_id = ?", (review_run_id,)).fetchone())
         task_revision = _current_task_revision(conn, normalized_task_ref)
     return _envelope(
         ok=True,
-        tool="record_review_run",
-        data={"review_run": row, **extra_data},
+        tool="complete_review_run" if completing else "record_review_run",
+        data={"review_run": row, **extra_data, **({"review_subject": frozen_subject} if frozen_subject else {})},
         task_ref=normalized_task_ref,
         entity="review_run",
         mutation={
             "entity": "review_run",
-            "operation": "insert",
+            "operation": "update" if completing else "insert",
             "affected_ids": [row["id"]],
             "affected_keys": [review_run_id],
             "task_revision": task_revision,
         },
         warnings=warnings or None,
+    )
+
+
+def complete_review_run(
+    review_run_id: str,
+    session: str,
+    expected_subject_sha256: str,
+    verdict: str,
+    verdict_decision: str | None = None,
+    actor: WriteActor | None = None,
+    max_review_rounds: int = DEFAULT_MAX_REVIEW_ROUNDS,
+) -> dict:
+    """Finish one authoritative pending freeze, never upsert a final row."""
+    if verdict not in _REVIEW_RUN_VERDICTS:
+        return _envelope(
+            ok=False, tool="complete_review_run", data={"error": "invalid_completion_verdict"}, entity="review_run"
+        )
+    with _get_db_connection() as conn:
+        raw = conn.execute("SELECT * FROM review_runs WHERE review_run_id = ?", (review_run_id,)).fetchone()
+        row = dict(raw) if raw else None
+    if row is None or row["verdict"] is not None:
+        return _envelope(
+            ok=False, tool="complete_review_run", data={"error": "review_run_not_pending"}, entity="review_run"
+        )
+    return record_review_run(
+        review_run_id=review_run_id,
+        session=session,
+        subject_path=row["subject_path"],
+        subject_kind=row["subject_kind"],
+        review_mode=row["review_mode"],
+        task_ref=row["task_ref"],
+        verdict=verdict,
+        verdict_decision=verdict_decision,
+        actor=actor,
+        max_review_rounds=max_review_rounds,
+        _completion_expected_sha256=expected_subject_sha256,
     )
 
 

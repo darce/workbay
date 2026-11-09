@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=50min
 ExecStart=%h/.local/lib/workbay/workbay_vm_reclaim.py apply --max 20 --if-free-below 10737418240
 Nice=10
 IOSchedulingClass=idle

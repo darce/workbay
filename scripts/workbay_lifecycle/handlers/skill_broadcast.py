@@ -13,6 +13,9 @@ receipt reports ``intent_event_id: null`` with
 ``handoff_projection: "spooled"`` (CLI ran and rejected) or
 ``"pending"`` (CLI unreachable). Exit 0 on success or spool; exit
 non-zero if cwd is not a git repo or the slash-command lookup fail-closes.
+
+Planning review consumes the authoritative freeze and deterministic lint before
+intent, then executes one bounded remote round through plan_review_driver.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import datetime as _dt
 import json
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -53,14 +57,7 @@ def _portable_commands_manifest_path() -> Path:
         direct = parent / _MANIFEST_RELATIVE
         if direct.is_file():
             return direct
-        nested = (
-            parent
-            / "packages"
-            / "workbay-system"
-            / "workbay_system"
-            / "payload"
-            / _MANIFEST_RELATIVE
-        )
+        nested = parent / "packages" / "workbay-system" / "workbay_system" / "payload" / _MANIFEST_RELATIVE
         if nested.is_file():
             return nested
     return start.parent / _MANIFEST_RELATIVE
@@ -118,20 +115,18 @@ def _slash_command_for_skill(skill: str) -> str:
     if live_ids:
         raise SlashCommandLookupError(
             "slash_command_ambiguous",
-            f"slash_command_ambiguous: skill {skill!r} matches live "
-            f"command_ids {live_ids}",
+            f"slash_command_ambiguous: skill {skill!r} matches live command_ids {live_ids}",
         )
     if tombstone_ids:
         raise SlashCommandLookupError(
             "slash_command_tombstone",
-            f"slash_command_tombstone: skill {skill!r} resolves only to "
-            f"tombstone command_id(s) {tombstone_ids}",
+            f"slash_command_tombstone: skill {skill!r} resolves only to tombstone command_id(s) {tombstone_ids}",
         )
     raise SlashCommandLookupError(
         "slash_command_not_found",
-        f"slash_command_not_found: skill {skill!r} has no live command_id "
-        "in portable_commands.json",
+        f"slash_command_not_found: skill {skill!r} has no live command_id in portable_commands.json",
     )
+
 
 # A numbered plan doc leads with its zero-padded ordinal (``docs/plans/0081-*.md``).
 _NUMBERED_PLAN_RE = re.compile(r"^(\d+)[-_]")
@@ -190,9 +185,7 @@ def _spool_pending_event(repo_root: Path, payload: dict[str, Any]) -> bool:
 _CLI_UNREACHABLE_RETURNCODES = frozenset({124, 127})
 
 
-def _record_intent_event(
-    decision_id: str, skill: str, doc: str, slash_command: str
-) -> tuple[str | None, str, int]:
+def _record_intent_event(decision_id: str, skill: str, doc: str, slash_command: str) -> tuple[str | None, str, int]:
     """Return (intent_event_id, projection_status, returncode).
 
     intent_event_id is None on failure. internal: distinguish ``spooled``
@@ -202,9 +195,13 @@ def _record_intent_event(
     the retry-storm breaker symmetrically (only genuine unreachability counts).
     """
     rationale = f"invoke /{slash_command} for {doc}"
+    try:
+        handoff_bin = _common.mcp_handoff_bin()
+    except (RuntimeError, OSError, ValueError):
+        return None, "pending", 127
     proc = _common.run_subprocess(
         [
-            _common.mcp_handoff_bin(),
+            handoff_bin,
             "event",
             "--event-kind",
             "decision",
@@ -238,10 +235,89 @@ def _record_intent_event(
         return decision_id, "synced", 0
 
 
+def _planning_preflight(repo: Path, args: argparse.Namespace) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Consume NWI02's authoritative freeze, then validate its exact delivery bytes.
+
+    A missing producer is an explicit integration dependency, never a local
+    substitute freeze or a successful review. Direct skill entry uses this
+    same preflight via --preflight-only.
+    """
+    from plan_anchor_lint import lint_review_subject
+
+    def unavailable(code: str) -> tuple[None, dict[str, Any]]:
+        return None, {
+            "schema": "workbay/plan-anchor-lint@1",
+            "status": "unknown",
+            "subject_sha256": None,
+            "source_commit": None,
+            "source_tree": None,
+            "citations": [],
+            "errors": [{"code": code, "status": "unknown"}],
+        }
+
+    try:
+        from plan_review_freeze import freeze_plan_review
+    except ImportError:
+        return unavailable("plan_review_freeze_unavailable")
+    task_ref = args.task_ref
+    if not task_ref:
+        try:
+            view = _common.derive_workspace_summary_view(repo)
+            task_ref = view.resolved_task_ref or view.task_ref
+        except (OSError, RuntimeError, ValueError):
+            return unavailable("task_scope_unavailable")
+    if not task_ref:
+        return unavailable("task_scope_unavailable")
+    try:
+        from workbay_orchestrator_mcp.orchestration.plan_review_driver import existing_subject
+
+        # Anchor to the caller, retaining symlinks and '..' for core validation.
+        plan_path = Path.cwd() / args.doc
+        run_id = args.review_run_id or f"plan-review-{uuid.uuid4().hex}"
+        subject = (
+            existing_subject(repo, task_ref, run_id, plan_path, args.source_ref) if args.review_run_id else None
+        )
+        if subject is None:
+            subject = freeze_plan_review(
+                repo=repo,
+                task_ref=task_ref,
+                plan_path=plan_path,
+                source_ref=args.source_ref,
+                review_run_id=run_id,
+                session=args.session,
+            )
+    except Exception as exc:
+        # The separately owned producer's public errors remain named. No intent
+        # is recoverable from a failed freeze, regardless of its failure mode.
+        code = getattr(exc, "code", "plan_review_freeze_failed")
+        return unavailable(code if isinstance(code, str) else "plan_review_freeze_failed")
+    result = lint_review_subject(subject, repo=repo)
+    if not isinstance(subject, dict) or any(error["code"] == "malformed_review_subject" for error in result["errors"]):
+        return None, result
+    if isinstance(subject, dict) and subject.get("task_ref") != task_ref:
+        return unavailable("review_subject_task_mismatch")
+    return subject, result
+
+
 def run(command: str, argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=f"lifecycle {command}", add_help=True)
     parser.add_argument("--doc", required=True)
     parser.add_argument("--json", dest="emit_json", action="store_true", default=False)
+    if command == "plan-review":
+        parser.add_argument("--task", "--task-ref", dest="task_ref")
+        parser.add_argument("--source-ref", "--base-sha", dest="source_ref", default="HEAD")
+        parser.add_argument("--round", type=int, default=1)
+        parser.add_argument("--prior-adjudication")
+        parser.add_argument("--scope-decision")
+        parser.add_argument("--round-justification")
+        parser.add_argument("--review-route", default="codex-remote")
+        parser.add_argument("--model", default="gpt-6.1-sol")
+        parser.add_argument("--effort", default="high")
+        parser.add_argument("--speed", default="standard")
+        parser.add_argument("--timeout", type=int, default=900)
+        parser.add_argument("--review-run-id")
+        parser.add_argument("--session", default="lifecycle-plan-review")
+        parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args(argv)
 
     skill = SKILL_BY_COMMAND[command]
@@ -278,10 +354,35 @@ def run(command: str, argv: list[str]) -> int:
         _common.emit(receipt)
         return 2
 
-    decision_id = _build_decision_id(skill, args.doc)
-    intent_event_id, projection, returncode = _record_intent_event(
-        decision_id, skill, args.doc, slash_command
+    review_subject = None
+    anchor_lint = None
+    if command == "plan-review":
+        review_subject, anchor_lint = _planning_preflight(repo_root, args)
+        status = anchor_lint["status"]
+        if status != "valid" or args.preflight_only:
+            _common.emit(
+                {
+                    "ok": status == "valid",
+                    "command": command,
+                    "doc": args.doc,
+                    "delegation_mode": "in_session_skill",
+                    "delegated_to": f"skill:{skill}",
+                    "intent_event_id": None,
+                    "handoff_projection": "not_attempted",
+                    "events": [],
+                    "anchor_lint": anchor_lint,
+                    "review_subject": review_subject,
+                    **({"error": f"plan_anchor_{status}"} if status != "valid" else {}),
+                }
+            )
+            return {"valid": 0, "invalid": 1, "unknown": 2}[status]
+
+    decision_id = (
+        f"plan_review_intent_{review_subject['review_run_id']}"
+        if review_subject is not None
+        else _build_decision_id(skill, args.doc)
     )
+    intent_event_id, projection, returncode = _record_intent_event(decision_id, skill, args.doc, slash_command)
 
     # Feed the retry-storm breaker symmetrically: skill_broadcast is the dominant
     # handoff-CLI caller, so the breaker must observe ITS failures, not just the
@@ -297,6 +398,7 @@ def run(command: str, argv: list[str]) -> int:
         spooled = _spool_pending_event(
             repo_root,
             {
+                **({"event_id": decision_id} if review_subject is not None else {}),
                 "kind": "workflow_intent",
                 "command": command,
                 "skill": skill,
@@ -334,6 +436,21 @@ def run(command: str, argv: list[str]) -> int:
         "handoff_projection": projection,
         "events": [intent_event],
     }
+    if review_subject is not None:
+        receipt.update(review_subject=review_subject, anchor_lint=anchor_lint)
+
+    if review_subject is not None:
+        from workbay_orchestrator_mcp.orchestration.plan_review_driver import drive
+
+        rc, execution = drive(repo_root, review_subject, anchor_lint, args)
+        receipt.update(
+            execution,
+            delegation_mode="remote_plan_review",
+            delegated_to="codex-remote",
+            skill_command=f"/{slash_command}",
+        )
+        _common.emit(receipt)
+        return rc
 
     if not args.emit_json:
         sys.stderr.write(
@@ -341,6 +458,13 @@ def run(command: str, argv: list[str]) -> int:
             f"is a skill-broadcast wrapper. Invoke `/{slash_command} {args.doc}` "
             f"in-session to run the actual review.\n"
         )
+        if review_subject is not None:
+            sys.stderr.write(
+                f"Review only frozen snapshot {review_subject['snapshot_path']} "
+                f"(sha256 {review_subject['subject_sha256']}, "
+                f"review_run_id {review_subject['review_run_id']}). "
+                "Carry this receipt into the skill; revalidate its digest before review.\n"
+            )
 
     _common.emit(receipt)
     return 0

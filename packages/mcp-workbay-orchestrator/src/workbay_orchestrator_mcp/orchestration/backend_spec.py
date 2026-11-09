@@ -519,6 +519,20 @@ def _codex_remote_argv(
 
     invocation = resolve_codex_invocation(model, effort=effort, service_tier=service_tier)
     argv = _codex_cli_argv(model=invocation.model, effort=invocation.effort, service_tier=invocation.service_tier)
+    from workbay_orchestrator_mcp.orchestration.codex_lane_config import (
+        EXECUTION_PERMISSION_PROFILE,
+        EXECUTION_PERMISSION_TEMPLATE,
+    )
+
+    # Only the remote Codex native boundary materializes this exact template.
+    # Keep local/OpenRouter recipes and model routing unchanged.
+    legacy = argv.index("-s")
+    del argv[legacy - 2:legacy + 2]
+    insert_at = argv.index("--output-schema")
+    argv[insert_at:insert_at] = [
+        "-c", f'default_permissions="{EXECUTION_PERMISSION_PROFILE}"',
+        "-c", EXECUTION_PERMISSION_TEMPLATE,
+    ]
     if coordination_bridge is not None:
         if not isinstance(coordination_bridge, CoordinationBridgeConfig):
             raise TypeError("coordination_bridge must be a validated CoordinationBridgeConfig")
