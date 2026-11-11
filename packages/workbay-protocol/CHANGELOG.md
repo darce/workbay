@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.13] — 2026-11-11
+
+### Changed
+- Add the shared bootstrap-ledger view and read the protocol readers through it, so every member reads one tracked ledger plus the host-fact receipt.
+
 ## [0.3.12] — 2026-11-09
 
 ### Changed

@@ -993,10 +993,10 @@ def _settings_hooks_receipt_known(target: Path) -> bool:
     """True when the on-disk bootstrap receipt records the sidecar -- evidence
     that a previous adoption (not the user) wrote the current copy. A missing
     or unreadable receipt is no such evidence and reads as unknown."""
-    from workbay_bootstrap.install import BOOTSTRAP_MANIFEST_NAME
+    from workbay_protocol.bootstrap_ledger_view import load_ledger_view
 
     try:
-        receipt = json.loads((target / BOOTSTRAP_MANIFEST_NAME).read_text())
+        receipt = load_ledger_view(target)
     except (OSError, ValueError):
         return False
     if not isinstance(receipt, dict):

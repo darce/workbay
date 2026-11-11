@@ -355,8 +355,33 @@ def owning_receipt_specs():
     return uv_receipt_specs(receipt) if receipt.exists() else pep610_specs()
 
 
+def read_ledger():
+    # The shared view is imported here, not with the closure helpers, so a
+    # runtime whose workbay_protocol predates it (or fails to import it) still
+    # updates a ledger with no host receipt: the tracked file is then the whole
+    # view. A host receipt that this runtime cannot read refuses.
+    try:
+        from workbay_protocol.bootstrap_ledger_view import load_ledger_view
+    except ImportError as exc:
+        receipt = Path(target_arg) / ".workbay/host-receipt.json"
+        try:
+            receipt.lstat()
+        except FileNotFoundError:
+            return json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        except OSError:
+            pass  # an inaccessible receipt is not an absent one
+        missing = exc.name or "workbay_protocol.bootstrap_ledger_view"
+        refuse(
+            "ledger_view_unavailable",
+            f"{receipt} is present, but the owning runtime cannot import {missing} to read it ({exc})",
+            remedy="the host receipt is read only through workbay_protocol.bootstrap_ledger_view; install the "
+            "WorkBay closure that ships it into this runtime from its Git source (docs/CONSUMER.md).",
+        )
+    return load_ledger_view(Path(target_arg))
+
+
 try:
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    manifest = read_ledger()
     if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
         refuse("invalid_manifest", "unsupported manifest schema; re-run workbay-bootstrap install to regenerate it")
     if "stack_source" in manifest:

@@ -109,10 +109,13 @@ _TEST_TARGETS = frozenset(
 # recipe-closure evidence and an allowance control. plan-accept stays refused:
 # its recipe's `test -n` guard fails the closure check. The recipe-closure guard
 # tests every tracked definition.
+# slice-commit and task-start pass the same closure check; the shipped Git
+# pre-commit hook runs branch/checklist guards, not tests. maint-start's two
+# `test -n` guards fail that check, so its refusal names the metadata CLI.
 # A missing goal is an availability cost; adding an unproven goal is a bypass.
 _INERT_MAKE_GOALS = frozenset({
     "help", "check-remote", "lane-land", "finalize-plan", "handoff-write",
-    "offload-flock", "lane-reap", "plan-done",
+    "offload-flock", "lane-reap", "plan-done", "slice-commit", "task-start", "vm-reap",
 })
 
 # Drift-scan exemptions: operator flows with their own preflight, and a help
@@ -2769,6 +2772,17 @@ def _refusal_message(findings: list[_Finding]) -> str:
     ):
         word = next((word for kind, _target, _via, word in findings if kind == reason), None)
         if word is not None:
+            if reason == "make_goal_not_allowlisted" and word == "maint-start":
+                return (
+                    f"BLOCKED ({reason}): {prefix}; refused word '{word}'.\n"
+                    "For on-main maintenance in the primary checkout, use maint-start's metadata registration:\n"
+                    '  WORKBAY_HANDOFF_DEFAULT_AGENT=${WORKBAY_HANDOFF_DEFAULT_AGENT:-operator} '
+                    'mcp-workbay-handoff set --task-ref MAINT-... --objective "..." '
+                    '--target-branch main --target-worktree-path "$(git rev-parse --show-toplevel)"\n'
+                    "Replace MAINT-... and the objective with the maintenance task and objective. "
+                    "Then run make slice-commit TASK=<task-ref> MSG=\"<message>\" PATHS=\"<owned paths>\" "
+                    "and make plan-done TASK=<task-ref>.\n"
+                )
             if reason.startswith("make_"):
                 admission = ""
                 if reason == "make_goal_not_allowlisted":

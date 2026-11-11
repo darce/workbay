@@ -11180,17 +11180,32 @@ def run_offload_pass_engine(
                     evidence_hold = LedgerDecision(
                         "ledger_hold", "adapter_refusal_evidence_unavailable", {"producer_reason": str(exc)}
                     )
+            from .review_cycle_dispatch import provider_refusal_proof
+            provider_refusal = None
+            candidate = cycle_raw.get("provider_refusal_proof") if isinstance(cycle_raw, dict) else None
+            if (isinstance(candidate, dict) and cycle_raw.get("provider_error_code") == "provider_model_refused"
+                    and cycle_final.get("handoff_action") == "transport_failure"):
+                provider_refusal = provider_refusal_proof(candidate.get("_stream_path"), candidate.get("_spec_path"),
+                    result=candidate.get("_result"), patch=candidate.get("_patch"),
+                    refusal_code="provider_model_refused")
+                if provider_refusal != candidate:
+                    provider_refusal = None
             settled = evidence_hold or settle_actual(
                 Path(worktree_path),
                 review_cycle_receipt["identity"],
                 outcome=result["outcome"],
-                model_started=model_started,
-                judgment=process_evidence or cycle_judgment,
+                model_started=model_started or process_evidence,
+                judgment=cycle_judgment,
                 commit_landed=bool(result.get("commit_landed")),
                 refusal_reason=result.get("reason"),
                 harvest=result.get("findings_harvest"),
+                provider_refusal=provider_refusal,
             )
             result["review_cycle"] = {"reservation": review_cycle_receipt["decision"], "settlement": asdict(settled)}
+            if isinstance(settled.row, dict) and settled.row.get("provider_refusal") is not None:
+                result["round_charged"] = settled.row["round_charged"]
+                result["provider_refusal"] = settled.row["provider_refusal"]
+                result["retry_after_seconds"] = settled.row["provider_refusal"]["retry_after_seconds"]
             # Raw model/job/token/artifact observations live only in the
             # temporary carrier, which a failed execute never publishes and
             # normalization drops. Retain the engine's own observation in pass
@@ -12577,7 +12592,8 @@ def run_offload_pass_engine(
             if exec_probe.get("handoff_action") == "transport_failure":
                 if isinstance(raw_payload, dict):
                     transport_payload = dict(raw_payload)
-                outcome = "error"
+                outcome = ("transport_failure" if isinstance(raw_payload, dict)
+                           and raw_payload.get("provider_error_code") == "provider_model_refused" else "error")
                 failed_stage = "execute"
                 error_reason = _transport_failure_reason(exec_probe, raw_payload)
                 break
@@ -13738,6 +13754,9 @@ def run_offload_pass_engine(
             ):
                 if field_name in transport_payload:
                     payload[field_name] = transport_payload[field_name]
+        if transport_payload.get("provider_error_code") == "provider_model_refused":
+            payload.update(reason="provider_model_refused", retryable=True,
+                           retry_after_seconds=transport_payload.get("retry_after_seconds", 120))
         # E8ROUTE-LOCAL-02: typed channel distinct from free-form error prose.
         if execute_failure_reason:
             payload["failure_reason"] = execute_failure_reason

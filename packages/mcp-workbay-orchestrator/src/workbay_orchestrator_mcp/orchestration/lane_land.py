@@ -3540,6 +3540,110 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Outcome -> (owner-local check, captured reader status). None means the
+# refusal measures no registered gate-surface check (e.g. custody or locks).
+# Detail overrides below distinguish a completed negative lookup from a source
+# failure. In particular, a generic merge_refused says nothing about merge-tree.
+_CHECKLIST_OUTCOMES: dict[str, tuple[str, str] | None] = {
+    "gate_missing": ("verified_test_at_tip", "unreadable"),
+    "dirty_target": ("integration_target", "present"),
+    "conflict": ("merge_tree", "present"),
+    "moved": ("lane_identity", "present"),
+    "lane_unresolved": ("lane_identity", "unreadable"),
+    "indeterminate": ("landing_receipt", "unreadable"),
+    "merge_refused": None,
+    "probe_unavailable": None,  # Containment probe, not receipt verification.
+    "contained_no_receipt": None,  # Contained-disposition/custody controls.
+    "contained_kept": None,
+    "cleanup_pending": None,
+    "lock_held": None,
+    "invalid_request": None,
+    "landed": None,
+    "already_landed": None,
+    "landed_then_moved": None,
+    "contained_reaped": None,
+    "contained_retired": None,
+}
+_CHECKLIST_DETAILS = {
+    ("gate_missing", None): ("verified_test_at_tip", "absent"),
+    ("gate_missing", "verified_tests_unreadable"): ("verified_test_at_tip", "unreadable"),
+    ("dirty_target", "tracked_status_unavailable"): ("integration_target", "unreadable"),
+    ("dirty_target", "integration_dirty_or_unresolved"): ("integration_target", "unreadable"),
+    ("moved", "branch_absent"): ("lane_identity", "absent"),
+    ("merge_refused", "branch_probe_failed"): ("lane_identity", "unreadable"),
+    ("merge_refused", "integration_ref_unresolved"): ("integration_target", "unreadable"),
+    ("merge_refused", "task_integration_ref_unresolved"): ("integration_target", "unreadable"),
+    ("merge_refused", "manifest_task_ref_mismatch"): ("integration_target", "malformed"),
+    ("merge_refused", "manifest_integration_ref_invalid"): ("integration_target", "malformed"),
+    ("merge_refused", "integration_ref_not_task_registered"): ("integration_target", "present"),
+    ("merge_refused", "merge_tree_probe_failed"): ("merge_tree", "unreadable"),
+}
+
+
+def _checklist_refusal_line(result: Mapping[str, Any]) -> str:
+    """Explain this envelope only; never collect another git or ledger view.
+
+    Canon v0.26.2, INPUT/canon-rows.md: [AGT-04] **Evidence verbatim**,
+    lexicons/engineering.md#agt-04 (bootstrap, practice label); [OPS-78]
+    **Name the pause point**, lexicons/planning.md#ops-78
+    (The Checklist Manifesto, ch. 6).
+    """
+    from . import harness_checklist as checklist
+
+    outcome = str(result.get("outcome"))
+    detail = result.get("detail")
+    if isinstance(detail, str) and detail.startswith("task_integration_ref_unresolved:"):
+        detail = "task_integration_ref_unresolved"
+    measurement = _CHECKLIST_DETAILS.get((outcome, detail), _CHECKLIST_OUTCOMES.get(outcome))
+    no_row = f"CHECKLIST not_observed: no applicable gate-surface row; lane-land outcome={outcome}"
+    if measurement is None:
+        return no_row
+
+    key, status = measurement
+    now = datetime.now(timezone.utc)
+    # This operation attempts the review -> merged edge. This is an operation
+    # selection context, not a second lookup or claim about the lane's status.
+    # The envelope does not carry an integration ref; do not invent one.
+    subject = checklist.Subject(
+        task_ref=result["task_ref"],
+        lane_id=result["lane_id"],
+        current_state="review",
+        tip_sha=result.get("expected_tip"),
+        base_sha=result.get("integration_before"),
+    )
+    evidence = checklist.Evidence(
+        task_ref=subject.task_ref,
+        lane_id=subject.lane_id,
+        sha=subject.tip_sha,
+        base_sha=subject.base_sha,
+        command=None,
+        parameters={"outcome": outcome, "detail": result.get("detail")},
+        observed_at=now.isoformat(),
+    )
+    # A measured negative is not a generic observed_fail input. Let the frozen
+    # reducer describe its own limits (unknown/evidence_inconclusive on base).
+    observation = checklist.Observation(key, status, evidence, {"satisfied": False})
+    report = checklist.build_checklist(
+        subject,
+        now=now,
+        observations=checklist.Observations((observation,)),
+        pause_point="before_lane_land",
+    )
+    if report["selection"] == "unknown":
+        raise ValueError("checklist selection unavailable")
+    pair = ("lane_merged_to_task_branch", "commit_ancestry")
+    if pair in checklist.REGISTRY:
+        for row in report["rows"]:
+            if (row["predicate_id"], row["evidence_class"]) == pair:
+                for check in row["checks"]:
+                    if check["key"] == key:
+                        return (
+                            f"CHECKLIST {pair[0]} [{pair[1]}] / {key}: "
+                            f"{check['state']} ({check['reason']}); lane-land outcome={outcome}"
+                        )
+    return no_row
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     workspace_root = Path(args.workspace_root).expanduser().resolve()
@@ -3556,7 +3660,18 @@ def main(argv: list[str] | None = None) -> int:
         orchestrator_root=workspace_root,
     )
     print(json.dumps(result, sort_keys=True))
-    return EXIT_CODES.get(str(result.get("outcome")), 10)
+    outcome = str(result.get("outcome"))
+    exit_code = EXIT_CODES.get(outcome, 10)
+    if exit_code != 0 and outcome not in _SUCCESS:
+        try:
+            line = _checklist_refusal_line(result)
+        except Exception as exc:
+            # Canon v0.26.2 [AGT-10] **Degrade loudly**, INPUT/canon-rows.md,
+            # lexicons/engineering.md#agt-10 (The Art of UNIX Programming,
+            # ch. 1). Never leak exception bodies or change the landing result.
+            line = f"CHECKLIST unavailable: checklist_line_failed={type(exc).__name__}; lane-land outcome={outcome}"
+        print(line, file=sys.stderr)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -109,7 +109,8 @@ pre-merge evidence.
 **Enforcement status: command-text only, deny-by-default for `make`.** Under `remote_only`,
 the PreToolUse(Bash) guard `guard-bash-remote-gate-routing.py` refuses every `make` call whose
 explicit goals are not all in its inert allowlist: `help`, `check-remote`, `lane-land`,
-`finalize-plan`, `handoff-write`, `offload-flock`, `lane-reap` and `plan-done`. It also refuses a `make`
+`finalize-plan`, `handoff-write`, `offload-flock`, `lane-reap`, `plan-done`,
+`slice-commit`, `task-start` and `vm-reap`. It also refuses a `make`
 call with no explicit goal, because the default goal may run tests. Numeric option values such
 as `-j 2` and `-l 1` are not goals. A `-n` / `--dry-run` call is allowed. Pytest, py.test and
 `run_named_tests.py` are refused as command text too. Not inspected: JS runners, unittest, tox,

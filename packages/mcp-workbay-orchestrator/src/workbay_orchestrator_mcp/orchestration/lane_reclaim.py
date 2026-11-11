@@ -52,6 +52,7 @@ from workbay_orchestrator_mcp.orchestration.orchestrator_lanes import (
     _git_is_ancestor,
     _lane_branch_contained_in,
     _lifecycle_dir,
+    _reclaim_candidate_rationale,
     _safe_log,
     record_branch_reclaim_candidate,
     record_reclaim_candidate,
@@ -269,7 +270,8 @@ class ReclaimCandidate:
     """One terminal-on-disk lane evaluated by the Slice-2 scan.
 
     Stores the whole ``ReclaimVerdict`` so a refusal's ``observed`` map remains
-    diagnosable [OBS-06]. ``recorded`` reports whether the ledger write succeeded.
+    diagnosable [OBS-06]. ``recorded`` reports whether the ledger holds the
+    verdict, including an unchanged negative verdict whose write was skipped.
     """
 
     task_ref: str
@@ -305,6 +307,10 @@ class ScanResult(tuple):
     cannot be reported as a healthy scan merely because the predicate returned
     normally.
 
+    ``unchanged_skipped`` counts worktree and branch verdicts whose persisted
+    reclaimable/reason/observed_digest already match a negative evaluation.
+    Positive verdicts always refresh their evaluation timestamp.
+
     ``snapshot_consistent`` answers a narrower question: whether the collected
     universe is known to come from a single ``list_lanes`` page (one seam
     transaction). Multi-page keyset walks are not snapshot-isolated; equal-
@@ -325,6 +331,7 @@ class ScanResult(tuple):
     unadmitted_pair_counts: dict[str, int]
     examined_count: int
     decided_count: int
+    unchanged_skipped: int
 
     def __new__(
         cls,
@@ -341,6 +348,7 @@ class ScanResult(tuple):
         unadmitted_pair_counts: dict[str, int] | None = None,
         examined_count: int = 0,
         decided_count: int = 0,
+        unchanged_skipped: int = 0,
     ) -> ScanResult:
         instance = super().__new__(cls, items)
         instance.complete = complete
@@ -354,6 +362,7 @@ class ScanResult(tuple):
         instance.unadmitted_pair_counts = dict(unadmitted_pair_counts or {})
         instance.examined_count = int(examined_count)
         instance.decided_count = int(decided_count)
+        instance.unchanged_skipped = int(unchanged_skipped)
         return instance
 
     def __repr__(self) -> str:
@@ -369,7 +378,8 @@ class ScanResult(tuple):
             f"snapshot_consistent={self.snapshot_consistent!r}, "
             f"unadmitted_pair_counts={self.unadmitted_pair_counts!r}, "
             f"examined_count={self.examined_count!r}, "
-            f"decided_count={self.decided_count!r})"
+            f"decided_count={self.decided_count!r}, "
+            f"unchanged_skipped={self.unchanged_skipped!r})"
         )
 
 
@@ -2805,6 +2815,63 @@ class _PendingScanWrite:
     candidate: ReclaimCandidate | None = None
 
 
+def _scan_candidate_payload(rationale: Any) -> dict[str, Any]:
+    """Decode both prefixed and prefix-dropped recorder envelopes."""
+    if not isinstance(rationale, str):
+        return {}
+    try:
+        payload = json.loads(rationale if rationale.startswith("{") else rationale.split("\n", 1)[-1])
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _scan_stored_verdicts(rows: list[Any], *, task_ref: str | None, log: Any) -> dict[tuple[str, str, bool], dict]:
+    """Read both decision families in one read-only query per lane chunk.
+
+    Match the latest-candidate readers' identity and newest-wins ordering.
+    Missing, malformed, or unreadable evidence only disables the optimization.
+    """
+    from workbay_handoff_mcp.lanes_recording import (  # noqa: PLC0415
+        branch_reclaim_candidate_decision_id,
+        reclaim_candidate_decision_id,
+    )
+
+    identities: dict[tuple[str, str], tuple[str, str, bool]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        task = str(row.get("task_ref") or task_ref or "").strip()
+        lane = str(row.get("lane_id") or "").strip()
+        if not task or not lane:
+            continue
+        for branch, builder in ((False, reclaim_candidate_decision_id), (True, branch_reclaim_candidate_decision_id)):
+            identities[(task, builder(task_ref=task, lane_id=lane))] = (task, lane, branch)
+    if not identities:
+        return {}
+    try:
+        with _scan_read_connection() as conn:
+            placeholders = ",".join("?" for _ in identities)
+            stored = conn.execute(
+                f"SELECT task_ref, lane_id, decision, rationale FROM decisions WHERE decision IN ({placeholders}) "
+                "ORDER BY created_at DESC, id DESC",
+                tuple(decision for _, decision in identities),
+            ).fetchall()
+        result = {}
+        seen = set()
+        for row in stored:
+            key = identities.get((row["task_ref"], row["decision"]))
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            if str(row["lane_id"] or "").strip() == key[1]:
+                result[key] = _scan_candidate_payload(row["rationale"])
+        return result
+    except Exception as exc:  # noqa: BLE001 — a cache read cannot suppress a write
+        _safe_log(log, "WARNING", "lane_reclaim_scan_stored_verdicts_unavailable", error=str(exc))
+        return {}
+
+
 def _scan_cursor_scope(*, task_ref: str | None, all_tasks: bool) -> str:
     if all_tasks:
         return "all-tasks"
@@ -3146,11 +3213,32 @@ def scan_terminal_lanes(
     unrecorded_lanes: list[str] = []
     branch_failed_lanes: list[str] = []
     branch_unrecorded_lanes: list[str] = []
+    branch_unrecorded_reasons: list[str] = []
     failed_seams: dict[str, int] = {}
     unadmitted_pair_counts: dict[str, int] = {}
     examined_count = 0
     decided_count = 0
     pending_writes: list[_PendingScanWrite] = []
+    unchanged_skipped = 0
+    skipped_verdicts: set[tuple[str, str, bool]] = set()
+    stored_verdicts: dict[tuple[str, str, bool], dict] = {}
+
+    def queue_write(pending: _PendingScanWrite) -> None:
+        nonlocal unchanged_skipped
+        key = (pending.task_ref, pending.lane_id, pending.branch)
+        previous = stored_verdicts.get(key, {})
+        # Positive verdicts must refresh evaluated_at: the branch queue uses
+        # that timestamp as observed_at. Negative evidence has no freshness TTL.
+        if getattr(pending.verdict, "reclaimable", None) is False and previous.get("reclaimable") is False:
+            current = _scan_candidate_payload(_reclaim_candidate_rationale(pending.verdict))
+            if all(previous.get(field) == current.get(field) for field in ("reclaimable", "reason", "observed_digest")):
+                unchanged_skipped += 1
+                skipped_verdicts.add(key)
+                if pending.candidate is not None:
+                    pending.candidate.recorded = True
+                return
+        pending_writes.append(pending)
+
     budget_hit = False
     # Derive snapshot provenance before any durable write so every recorded
     # verdict carries torn-ness rather than discovering it after the loop.
@@ -3196,6 +3284,10 @@ def scan_terminal_lanes(
         if budget_expired():
             budget_hit = True
             break
+        if row_index % _LIST_LANES_PAGE_SIZE == 0:
+            stored_verdicts = _scan_stored_verdicts(
+                lanes[row_index : row_index + _LIST_LANES_PAGE_SIZE], task_ref=task_ref, log=log
+            )
         if not isinstance(raw_lane, dict):
             # Malformed row must not masquerade as a clean complete sweep
             # (PLAN0181-S2GATE-NONDICT-SKIP-01) [OBS-08][RES-13][AGT-10].
@@ -3362,7 +3454,7 @@ def scan_terminal_lanes(
                 )
             _count_failed_seam(failed_seams, branch_verdict)
             if branch_target is not None and branch_verdict is not None:
-                pending_writes.append(
+                queue_write(
                     _PendingScanWrite(
                         task_ref=row_task_ref,
                         lane_id=lane_id,
@@ -3442,7 +3534,7 @@ def scan_terminal_lanes(
                     recorded=False,
                 )
                 candidates.append(timeout_candidate)
-            pending_writes.append(
+            queue_write(
                 _PendingScanWrite(
                     task_ref=row_task_ref,
                     lane_id=lane_id,
@@ -3465,11 +3557,11 @@ def scan_terminal_lanes(
             verdict=verdict,
             recorded=False,
             branch_verdict=branch_verdict,
-            branch_recorded=False,
+            branch_recorded=(row_task_ref, lane_id, True) in skipped_verdicts,
         )
         candidates.append(candidate)
         if worktree_target is not None:
-            pending_writes.append(
+            queue_write(
                 _PendingScanWrite(
                     task_ref=row_task_ref,
                     lane_id=lane_id,
@@ -3496,10 +3588,29 @@ def scan_terminal_lanes(
     # All ledger writes happen after the read/evaluation pass. Each recorder
     # owns one short transaction; chunking keeps this maintenance path from
     # creating a single long RESERVED window [DBG-06][OBS-08].
+    writes_attempted = 0
     for chunk_start in range(0, len(pending_writes), _SCAN_WRITE_CHUNK_SIZE):
+        if budget_hit:
+            break
         chunk = pending_writes[chunk_start : chunk_start + _SCAN_WRITE_CHUNK_SIZE]
         for pending in chunk:
+            if budget_expired():
+                budget_hit = True
+                break
+            writes_attempted += 1
             recorded = False
+            write_error_type: str | None = None
+
+            def _record_log(level: str, event: str, **fields: Any) -> None:
+                nonlocal write_error_type
+                # Recorders may catch the exception and return False. Retain
+                # their first typed failure as well as exceptions raised here.
+                if level == "ERROR" and event.endswith("record_failed") and write_error_type is None:
+                    error_type = fields.get("error_type")
+                    if isinstance(error_type, str) and error_type:
+                        write_error_type = error_type
+                _safe_log(log, level, event, **fields)
+
             try:
                 if pending.branch:
                     recorded = bool(
@@ -3507,7 +3618,7 @@ def scan_terminal_lanes(
                             task_ref=pending.task_ref,
                             lane_id=pending.lane_id,
                             verdict=pending.verdict,
-                            log=log,
+                            log=_record_log,
                         )
                     )
                 else:
@@ -3521,7 +3632,7 @@ def scan_terminal_lanes(
                     )
             except Exception as write_exc:  # noqa: BLE001 — one write must not abort a batch
                 _safe_log(
-                    log,
+                    _record_log,
                     "ERROR",
                     ("lane_branch_reclaim_scan_record_failed" if pending.branch else "lane_reclaim_scan_record_failed"),
                     lane=pending.lane_id,
@@ -3536,11 +3647,26 @@ def scan_terminal_lanes(
                     candidate.branch_recorded = recorded
                 if not recorded:
                     branch_unrecorded_lanes.append(pending.lane_id)
+                    branch_unrecorded_reasons.append(
+                        f"{pending.lane_id}:{write_error_type}" if write_error_type else pending.lane_id
+                    )
             else:
                 if candidate is not None:
                     candidate.recorded = recorded
                 if not recorded:
                     unrecorded_lanes.append(pending.lane_id)
+
+    # Evaluated but unflushed rows are explicitly unrecorded and must be
+    # evaluated again. Retaining the incoming cursor below also covers a
+    # lane whose branch write landed but whose worktree write did not.
+    for pending in pending_writes[writes_attempted:]:
+        if pending.branch:
+            branch_unrecorded_lanes.append(pending.lane_id)
+            branch_unrecorded_reasons.append(pending.lane_id)
+        else:
+            unrecorded_lanes.append(pending.lane_id)
+    if budget_expired():
+        budget_hit = True
 
     # One aggregate degraded event per cycle when any lane was dropped or
     # left unrecorded — in addition to per-lane failure lines [OBS-06]
@@ -3576,7 +3702,11 @@ def scan_terminal_lanes(
     # PLAN0181-S2GATE3-KEYSET-EQUALCOUNT-CHURN-01).
     truncated = bool(getattr(lanes, "truncated", False))
     next_after_id = getattr(lanes, "next_after_id", None)
-    if truncated:
+    if budget_hit:
+        # Do not persist the listing cursor: it can point past writes that
+        # never landed. Replaying this prefix is safe and skips durable noops.
+        scan_complete = False
+    elif truncated:
         if type(next_after_id) is not int:
             _safe_log(
                 log,
@@ -3598,6 +3728,7 @@ def scan_terminal_lanes(
                 unadmitted_pair_counts=dict(unadmitted_pair_counts),
                 examined_count=examined_count,
                 decided_count=decided_count,
+                unchanged_skipped=unchanged_skipped,
             )
         try:
             _save_scan_cursor(
@@ -3627,9 +3758,8 @@ def scan_terminal_lanes(
                 unadmitted_pair_counts=dict(unadmitted_pair_counts),
                 examined_count=examined_count,
                 decided_count=decided_count,
+                unchanged_skipped=unchanged_skipped,
             )
-        scan_complete = False
-    elif budget_hit:
         scan_complete = False
     else:
         _clear_scan_cursor(root, task_ref=task_ref, all_tasks=all_tasks)
@@ -3661,7 +3791,7 @@ def scan_terminal_lanes(
         # exception: the durable seed may still stand, so the scan must not
         # report complete success [REV2-FIX-REAPSEED-04 F1] [RLSE-05].
         scan_complete = False
-        refusal_reason = "branch_unrecorded:" + ",".join(branch_unrecorded_lanes)
+        refusal_reason = "branch_unrecorded:" + ",".join(branch_unrecorded_reasons)
     elif failed_seams:
         scan_complete = False
         refusal_reason = "failed_seams:" + ",".join(
@@ -3680,6 +3810,7 @@ def scan_terminal_lanes(
         unadmitted_pair_counts=dict(unadmitted_pair_counts),
         examined_count=examined_count,
         decided_count=decided_count,
+        unchanged_skipped=unchanged_skipped,
     )
 
 

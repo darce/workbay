@@ -19,13 +19,23 @@ if TYPE_CHECKING:
 
 
 def _write_abort_snapshot(receipt: InstallReceipt, target: Path, **kwargs: Any) -> None:
-    """Refresh closure pins even when the receipt preserves an existing ledger."""
+    """Refresh closure pins even when the receipt preserves an existing ledger.
+
+    The pins land on the tracked document the abort snapshot just wrote, so
+    receipt-only host observations never reach the tracked ledger. The host
+    view is read only as a check: a malformed host receipt raises
+    ``InvalidHostReceipt`` after the abort record is written and before the
+    pins are, for the caller to classify.
+    """
     import json
+
+    from workbay_protocol.bootstrap_ledger_view import load_ledger_view
 
     from workbay_bootstrap.install import BOOTSTRAP_MANIFEST_NAME, _write_install_manifest
 
     receipt.write_abort_snapshot(target, **kwargs)
     if kwargs.get("source_kind") == "package":
+        load_ledger_view(target)
         manifest = json.loads((target / BOOTSTRAP_MANIFEST_NAME).read_text())
         manifest["gitonly_closure_url"] = kwargs.get("remote_url")
         manifest["gitonly_closure_ref"] = kwargs.get("remote_ref")
@@ -418,6 +428,8 @@ def _execute_gitonly_mcp_tools_step(
     """
     import subprocess
 
+    from workbay_protocol.bootstrap_ledger_view import InvalidHostReceipt
+
     from workbay_bootstrap.external import (
         DeferredExternalCall,
         ExternalCallTimeout,
@@ -532,6 +544,7 @@ def _execute_gitonly_mcp_tools_step(
         # Snapshot + raise outside the OSError-catching try so a disk
         # error writing the abort receipt cannot demote this to a
         # deferred soft-success (P0-2 / D2).
+        abort_message = f"gitonly_mcp_tools failed: {abort_reason}"
         try:
             _write_abort_snapshot(
                 receipt,
@@ -551,10 +564,15 @@ def _execute_gitonly_mcp_tools_step(
         except OSError:
             # Best-effort snapshot; the hard abort must still raise.
             pass
-        raise InstallExecutionError(
-            f"gitonly_mcp_tools failed: {abort_reason}",
-            failure_class=abort_failure_class,
-        )
+        except InvalidHostReceipt as exc:
+            # The abort record is on disk; the closure pins are not. Raise
+            # the same classified abort so execute_install_plan still runs
+            # its deferred-abort finalization, with the corruption named.
+            raise InstallExecutionError(
+                f"{abort_message}; closure pins not refreshed: {exc}",
+                failure_class=abort_failure_class,
+            ) from exc
+        raise InstallExecutionError(abort_message, failure_class=abort_failure_class)
 
 
 def _execute_mcp_env_prep(

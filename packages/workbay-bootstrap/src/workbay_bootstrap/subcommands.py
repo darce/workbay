@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
@@ -64,6 +65,7 @@ from workbay_bootstrap.install import (
     _is_uvx_command,
     _migrate_legacy_manifest,
     _names_clone_subtree,
+    _persist_install_manifest_bytes,
     _plugin_tree_out,
     _relative_plugin_tree_path,
     _resolve_in_clone,
@@ -1001,7 +1003,7 @@ def _repair_deferred_install_steps(
             # attach_to_manifest omits offline_latch when False; mirror that
             # convention rather than persisting an explicit false.
             manifest.pop("offline_latch", None)
-            (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+            _persist_install_manifest_bytes(target, manifest)
             repaired.append(
                 {
                     "kind": "install_step_repair",
@@ -1128,7 +1130,7 @@ def _repair_deferred_install_steps(
             # attach_to_manifest omits offline_latch when False; mirror that
             # convention rather than persisting an explicit false.
             manifest.pop("offline_latch", None)
-            (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+            _persist_install_manifest_bytes(target, manifest)
             repaired.append(
                 {
                     "kind": "install_step_repair",
@@ -1158,7 +1160,7 @@ def _repair_deferred_install_steps(
                     install_result.receipt_error,
                 )
                 if json.dumps(steps) != steps_before:
-                    (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+                    _persist_install_manifest_bytes(target, manifest)
     return repaired, skipped
 
 
@@ -2108,6 +2110,41 @@ def _doctor_gitonly_mcp_tool_sources(
     return findings
 
 
+def _doctor_ledger_baseline(target: Path) -> list[Finding]:
+    """Advisory host-field inventory, only for index/HEAD ledger members."""
+    from workbay_protocol.bootstrap_ledger_view import split_ledger
+
+    try:
+        indexed = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", BOOTSTRAP_MANIFEST_NAME],
+            cwd=target, capture_output=True, check=False, timeout=30,
+        ).returncode == 0
+        in_head = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{BOOTSTRAP_MANIFEST_NAME}"],
+            cwd=target, capture_output=True, check=False, timeout=30,
+        ).returncode == 0
+        if not indexed and not in_head:
+            return []
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    try:
+        manifest = json.loads((target / BOOTSTRAP_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []  # The ordinary manifest facet reports unreadable ledgers.
+    if not isinstance(manifest, dict):
+        return []
+    baseline, _host = split_ledger(manifest)
+    keys = sorted(key for key, value in manifest.items() if key not in baseline or baseline[key] != value)
+    if not keys:
+        return []
+    return [{
+        "kind": "ledger_host_facts_in_tracked",
+        "path": BOOTSTRAP_MANIFEST_NAME,
+        "severity": "info",
+        "detail": f"host facts in tracked ledger: {', '.join(keys)}; installs also record these in .workbay/host-receipt.json; tracked removal follows reader migration",
+    }]
+
+
 def doctor(
     *,
     target: Path,
@@ -2222,7 +2259,8 @@ def doctor(
     Returns an empty list when everything is clean.
     """
     target = Path(target).resolve()
-    findings: list[Finding] = _doctor_mcp_launcher_version_skew(target)
+    findings: list[Finding] = _doctor_ledger_baseline(target)
+    findings.extend(_doctor_mcp_launcher_version_skew(target))
 
     # Worktree short-circuit (M4): a bare linked worktree lacks the whole overlay,
     # so the marker/clone/surface checks below would emit a missing_clone +
@@ -5554,7 +5592,7 @@ def _flip_execution_mode(
         # Byte-compat convention: local_ok is the schema default — remove the
         # key rather than write it, matching install's conditional write.
         manifest.pop("execution_mode", None)
-    (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+    _persist_install_manifest_bytes(target, manifest)
     print(f"repair: execution_mode -> {new_mode}", file=sys.stdout)
     return {
         "kind": "execution_mode",
@@ -5725,7 +5763,7 @@ def repair(
                     manifest["execution_mode"] = desired
                 else:
                     manifest.pop("execution_mode", None)
-                (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+                _persist_install_manifest_bytes(target, manifest)
     deferred_repairs, deferred_skips = _repair_deferred_install_steps(target, manifest, mcp_servers)
     receipt_repairs = list(mode_repairs) + list(presync_repairs) + list(deferred_repairs)
     override_root = _discover_plugin_override_root(
@@ -5852,7 +5890,7 @@ def repair(
                             current["source"] = new_entry["source"]
                         else:
                             surfaces_list.append(new_entry)
-                (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+                _persist_install_manifest_bytes(target, manifest)
             repaired.append(finding)
             continue
 

@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.28] — 2026-11-11
+
+### Changed
+- Read the handoff ledger reader through the shared bootstrap-ledger view.
+- Raise the protocol floor to 0.3.13 and the `lifecycle` extra's orchestrator floor to 0.3.34 for the WorkBay v0.1.90 tuple.
+
 ## [0.3.27] — 2026-11-09
 
 ### Changed

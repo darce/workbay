@@ -48,6 +48,7 @@ from .shared_primitives import (
 from .shared_schema import _get_db_connection, _handoff_deadline_timeout_ms
 from .shared_write_context import (
     ResolvedWriteContext,
+    WorktreeNotFoundError,
     WriteActor,
     _resolve_write_actor,
     collect_target_context_warnings,
@@ -340,13 +341,43 @@ def _record_decision_with_conn(
     from .review_findings_updates import _LOG, _deleted_target_branch_note
 
     deleted_note = _deleted_target_branch_note(conn, resolved_task_ref) if resolved_ctx is None else None
-    ctx = (
-        resolved_ctx
-        if resolved_ctx is not None
-        else _resolve_write_actor(
-            conn, actor, task_ref=resolved_task_ref, allow_missing_worktree_fallback=deleted_note is not None
+    system_absent_note = None
+    try:
+        ctx = (
+            resolved_ctx
+            if resolved_ctx is not None
+            else _resolve_write_actor(
+                conn, actor, task_ref=resolved_task_ref, allow_missing_worktree_fallback=deleted_note is not None
+            )
         )
-    )
+    except WorktreeNotFoundError as missing_worktree:
+        if decision_origin != "system" or (actor and _normalize_optional_text(actor.get("worktree_path"))):
+            raise
+        # System maintenance can record a verdict after a legacy task's branch
+        # is gone. Only rc=1 proves absence; unknown probes stay fail-closed.
+        from . import shared_write_context
+
+        row = conn.execute(
+            "SELECT target_branch FROM handoff_state WHERE task_ref = ?", (resolved_task_ref,)
+        ).fetchone()
+        branch = _normalize_optional_text(row["target_branch"]) if row else None
+        if branch is None:
+            raise
+        branch_ref = branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
+        try:
+            root = str(shared_write_context.get_runtime_config().workspace_root)
+            branch_probe = shared_write_context._run_cmd(
+                ["git", "-C", root, "rev-parse", "--verify", "--quiet", branch_ref], timeout=5
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            raise missing_worktree
+        if branch_probe.returncode != 1:
+            raise missing_worktree
+        ctx = _resolve_write_actor(conn, actor, task_ref=resolved_task_ref, allow_missing_worktree_fallback=True)
+        system_absent_note = (
+            f"system_origin_target_branch_absent: task_ref={resolved_task_ref} target_branch={branch}; "
+            "recorded against the root checkout"
+        )
     if target_context_warnings is not None:
         precomputed_target_warnings = list(target_context_warnings)
     else:
@@ -355,8 +386,11 @@ def _record_decision_with_conn(
             ctx,
             task_ref=resolved_task_ref,
             target_worktree_path=precomputed_target_worktree_path,
-            enforce_branch=deleted_note is None,
+            enforce_branch=deleted_note is None and system_absent_note is None,
         )
+    if system_absent_note is not None:
+        _LOG.warning(system_absent_note)
+        precomputed_target_warnings.append(system_absent_note)
     if deleted_note is not None:
         _LOG.warning(deleted_note)
         precomputed_target_warnings.append(deleted_note)

@@ -65,6 +65,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from workbay_protocol.bootstrap_ledger_view import (
+    HOST_RECEIPT_REL,
+    InvalidHostReceipt,
+    overlay_ledger_view,
+    parse_host_receipt,
+)
+
+from workbay_bootstrap.hook_helpers import _read_file, _Refused
 from workbay_bootstrap.install import (
     BOOTSTRAP_MANIFEST_NAME,
     InvalidCodexConfigError,
@@ -683,7 +691,28 @@ def _assert_published_destination_identities(pinned: _PinnedRoot) -> None:
             _assert_replaced_destination_identity(parent_fd, dest_name, identity, dest)
 
 
-def _preflight_ledger(pinned: _PinnedRoot) -> None:
+def _pinned_ledger_view(pinned: _PinnedRoot, payload: dict[str, Any]) -> dict[str, Any]:
+    """Read observations through the pinned root, never through its pathname."""
+    try:
+        os.stat(HOST_RECEIPT_REL.parts[0], dir_fd=pinned.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return overlay_ledger_view(payload, None)
+    try:
+        with _pin_contained_parent(pinned, HOST_RECEIPT_REL.as_posix(), create=False) as contained:
+            parent_fd, name, _dest, validate = contained
+            try:
+                data, _info = _read_file(parent_fd, name, limit=16 * 1024 * 1024)
+            except FileNotFoundError:
+                receipt = None
+            else:
+                receipt = parse_host_receipt(data)
+            validate()
+        return overlay_ledger_view(payload, receipt)
+    except (OSError, _Refused, InvalidHostReceipt) as exc:
+        raise SurfacePathRefusalError(f"refusing host receipt {HOST_RECEIPT_REL}: {exc}") from exc
+
+
+def _preflight_ledger(pinned: _PinnedRoot) -> dict[str, Any] | None:
     """Refuse apply when the ledger cannot be updated (HARM3FIX06R2RV-004).
 
     Open the ledger no-follow through the pinned root. It must be a
@@ -728,6 +757,7 @@ def _preflight_ledger(pinned: _PinnedRoot) -> None:
         if infd >= 0:
             os.close(infd)
 
+    return _pinned_ledger_view(pinned, payload)
 
 @contextmanager
 def _pin_contained_parent(
@@ -1070,6 +1100,10 @@ def _rewrite_ledger_mcp_servers(pinned: _PinnedRoot, names: list[str]) -> tuple[
         finally:
             if infd >= 0:
                 os.close(infd)
+        # Check the host receipt through the pinned root, but never publish the
+        # view: the tracked payload keeps its own keys (legacy inline facts
+        # included) and only ``mcp_servers`` changes.
+        _pinned_ledger_view(pinned, payload)
         payload["mcp_servers"] = list(names)
         text = json.dumps(payload, indent=2) + "\n"
         tmp_name = f".{dest_name}.{uuid.uuid4().hex}.tmp"

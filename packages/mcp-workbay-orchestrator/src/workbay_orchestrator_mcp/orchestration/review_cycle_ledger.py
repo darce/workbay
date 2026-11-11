@@ -254,6 +254,44 @@ class LedgerDecision:
     row: dict | None = None
 
 
+PROVIDER_REFUSAL_FREE_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class SettlementDecision(LedgerDecision):
+    """A completed round exposes its charge and any bounded provider exception."""
+
+    round_charged: bool = True
+    provider_refusal: dict | None = None
+
+
+def _settled_decision(status: str, reason: str, row: dict) -> SettlementDecision:
+    return SettlementDecision(status, reason, copy.deepcopy(row),
+                              row["outcome_class"] != PassOutcomeClass.INFRA_STOP.value,
+                              copy.deepcopy(row.get("provider_refusal")))
+
+
+def _provider_refusal_attempt(data: dict, subject: str, kind: str) -> int:
+    """Derive the streak from the same durable rows under the charge lock.
+
+    Canon v0.26.2 [FM-08] **Agent loops must be bounded** (AI Engineering).
+    Settlement order, rather than reservation order, defines consecutive.
+    Any VERDICT for this subject/kind resets the streak, including an error.
+    """
+    rows = sorted((row for row in data["rows"].values()
+                   if row["subject_branch"] == subject and row["kind"] == kind
+                   and row.get("settled_sequence") is not None),
+                  key=lambda row: row["settled_sequence"], reverse=True)
+    count = 0
+    for row in rows:
+        if effective_outcome_class(data, row) == PassOutcomeClass.VERDICT.value:
+            break
+        if (row["outcome_class"] == PassOutcomeClass.INFRA_STOP.value
+                and row["completion"].get("refusal_reason") == "provider_model_refused"):
+            count += 1
+    return count + 1
+
+
 class _Hold(Exception):
     pass
 
@@ -770,6 +808,7 @@ class ReviewCycleLedger:
         refusal_reason: str | None = None,
         blocking_ids: tuple[str, ...] | None = None,
         blocking_fingerprints: tuple[str, ...] | None = None,
+        provider_refusal: dict | None = None,
     ) -> LedgerDecision:
         """Settle actual D2 outcome; harvest supplies canonical, classified blockers.
 
@@ -777,6 +816,10 @@ class ReviewCycleLedger:
         sets (empty means clear). A source verdict denotes a completed fix pass.
         Infra stops and pending outcomes never mutate gate/repeated-state history.
         """
+        proven_provider = (provider_refusal is not None and outcome == "dispatch_refused"
+                           and refusal_reason == "provider_model_refused")
+        if refusal_reason == "provider_model_refused" and not proven_provider:
+            outcome, refusal_reason = "error", None
         classification = (
             classify_pass_outcome(outcome, refusal_reason=refusal_reason) if isinstance(outcome, str) else None
         )
@@ -804,18 +847,42 @@ class ReviewCycleLedger:
         }
 
         def operation(data):
+            nonlocal classification
+            actual_completion = dict(completion)
             row = data["rows"].get(dispatch_id)
             if row is None or (row["subject_branch"], row["kind"]) != (subject_branch, kind):
                 return LedgerDecision("ledger_hold", "dispatch_identity_mismatch")
             if row["decision"] != "reserved":
                 return LedgerDecision("ledger_hold", "dispatch_was_not_reserved")
             if row["completion"] is not None:
-                if row["completion"] != completion:
+                if proven_provider and row.get("provider_refusal") is not None:
+                    # Replays use the already committed bound, never the current
+                    # streak (which may have advanced on another dispatch).
+                    if row["provider_refusal"]["bound_exhausted"]:
+                        actual_completion.update(outcome="error", refusal_reason=None)
+                    if any(row["provider_refusal"][key] != provider_refusal[key]
+                           for key in ("stream_sha256", "message", "http_status", "error_code", "request_id")):
+                        return LedgerDecision("ledger_hold", "dispatch_outcome_mismatch")
+                if row["completion"] != actual_completion:
                     return LedgerDecision("ledger_hold", "dispatch_outcome_mismatch")
-                return LedgerDecision(row["settlement_status"], "replay", copy.deepcopy(row))
+                raise _Unchanged(_settled_decision(row["settlement_status"], "replay", row))
             if classification == PassOutcomeClass.PENDING:
                 return LedgerDecision("pending", "actual_outcome_required", copy.deepcopy(row))
-            row["completion"] = completion
+            if proven_provider:
+                attempt = _provider_refusal_attempt(data, subject_branch, kind)
+                exhausted = attempt > PROVIDER_REFUSAL_FREE_ATTEMPTS
+                row["provider_refusal"] = dict(
+                    attempt=attempt, free_attempts=PROVIDER_REFUSAL_FREE_ATTEMPTS,
+                    free_remaining=max(0, PROVIDER_REFUSAL_FREE_ATTEMPTS - attempt),
+                    bound_exhausted=exhausted, retry_after_seconds=min(120 * 2 ** (attempt - 1), 900),
+                    **{key: provider_refusal[key] for key in
+                       ("message", "stream_sha256", "http_status", "error_code", "request_id")},
+                    note="provider refused this model; this is not an account quota (quota is reported as rate_limited)")
+                if exhausted:
+                    actual_completion.update(outcome="error", refusal_reason=None)
+                    classification = PassOutcomeClass.VERDICT
+                row["round_charged"] = classification != PassOutcomeClass.INFRA_STOP
+            row["completion"] = actual_completion
             row["outcome_class"] = classification.value
             data["sequence"] += 1
             row["settled_sequence"] = data["sequence"]
@@ -827,7 +894,7 @@ class ReviewCycleLedger:
             if classification == PassOutcomeClass.VERDICT:
                 if kind == "implement":
                     state["fixes"] = _subject_fixes(data, subject_branch)
-                elif kind == "gate":
+                elif kind == "gate" and not proven_provider:
                     previous = state["last_gate"]
                     repeated = (
                         previous is not None
@@ -840,7 +907,7 @@ class ReviewCycleLedger:
                     if repeated:
                         status = "cycle_budget_stop"
             row["settlement_status"] = status
-            return LedgerDecision(status, "", copy.deepcopy(row))
+            return _settled_decision(status, "", row)
 
         return self._transaction(operation)
 

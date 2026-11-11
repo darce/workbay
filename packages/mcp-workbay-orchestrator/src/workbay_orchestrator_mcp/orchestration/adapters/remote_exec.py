@@ -216,6 +216,7 @@ _RC_POLICY_REFUSED = 7  # implementation note D7 — policy/placeholder refuse; 
 # transport_failure action (TSIG-01).
 _RC_BOUND_EXPIRED = 8
 _RC_RATE_LIMITED = 9
+_RC_PROVIDER_MODEL_REFUSED = 18
 _RC_SERVICE_TIER_UNCONFIRMED = 10
 _RC_UNSAFE_HARVEST = 11
 _REMOTE_SUBMIT_PENDING_STATES = frozenset(
@@ -1560,6 +1561,8 @@ def _transport_failure_result(
             "provider_error_detail": raw_detail,
         }
     )
+    if stable_code == "provider_model_refused" and exit_code == _RC_PROVIDER_MODEL_REFUSED:
+        payload.update(provider_error_detail=detail, retryable=True, retry_after_seconds=120)
     if exit_failure is not None:
         payload.update({exit_failure[0]: True, "retryable": False})
     return BackendResult(
@@ -9332,8 +9335,18 @@ class RemoteExecAdapter(BackendAdapter):
                         raw["outcome"] = "dispatch_refused"
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     raw["native_pre_model_refusal_error"] = type(exc).__name__
+            from ..review_cycle_dispatch import provider_refusal_proof
+            provider_refusal = None
+            if (completed_rc == _RC_PROVIDER_MODEL_REFUSED and stamped.handoff_action == "transport_failure"
+                    and raw.get("provider_error_code") == "provider_model_refused"):
+                provider_refusal = provider_refusal_proof(stream_file, spec_json_path,
+                    result=result_file, patch=patch_file, refusal_code="provider_model_refused")
+            # Host-written producer locators survive to the engine, which must
+            # reopen them under its receipt lock; a dictionary is never proof.
+            raw["provider_refusal_proof"] = provider_refusal
             if not cycle_engine_owned:
-                actual_outcome = raw.get("outcome") or ("dispatch_refused" if constructor_refusal else "error")
+                actual_outcome = ("dispatch_refused" if provider_refusal else
+                                  raw.get("outcome") or ("dispatch_refused" if constructor_refusal else "error"))
                 provenance_evidence = raw.get("source_provenance")
                 from ..review_cycle_dispatch import (
                     _model_or_unknown_evidence,
@@ -9380,8 +9393,13 @@ class RemoteExecAdapter(BackendAdapter):
                     worktree_path, cycle_receipt["identity"], outcome=actual_outcome,
                     model_started=isinstance(provenance_evidence, dict) and provenance_evidence.get("model_process_started") is True,
                     judgment=bool(result_file.is_file() and result_file.stat().st_size),
-                    commit_landed=bool(stamped.changed_files),
+                    commit_landed=bool(stamped.changed_files) or _worktree_head_sha(worktree_path) != head_sha,
+                    refusal_reason="provider_model_refused" if provider_refusal else None,
+                    provider_refusal=provider_refusal,
                 ))
+                provider_receipt = raw["review_cycle_settlement"].get("provider_refusal")
+                if provider_receipt is not None:
+                    raw["retry_after_seconds"] = provider_receipt["retry_after_seconds"]
             stamped = replace(stamped, raw_payload=raw)
             return _attribute_refusal(
                 stamped,
@@ -11721,6 +11739,13 @@ class RemoteExecAdapter(BackendAdapter):
                             backend_id=self.backend_id,
                         )
                     )
+
+            if rc == _RC_PROVIDER_MODEL_REFUSED:
+                provider_error = _provider_error_from_stream(stream_file)
+                return _envelope(_transport_failure_result(
+                    code="provider_model_refused",
+                    detail=provider_error["message"] if provider_error is not None else "",
+                    exit_code=rc, model=effective_model, effort=applied_effort, backend_id=self.backend_id))
 
             if rc == _RC_RATE_LIMITED:
                 # remote_agent.sh salvages any commits already landed on the VM

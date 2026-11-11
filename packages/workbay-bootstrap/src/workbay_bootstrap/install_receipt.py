@@ -2,17 +2,209 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
+import subprocess
+import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
 GIT_WRITE_SIDECAR_REL = Path(".workbay") / "git-writes.json"
+INSTALL_RECEIPT_REL = Path(".workbay") / "install-receipt.json"
 
 StepStatus = Literal["ok", "failed", "deferred", "skipped"]
 FailureClass = Literal["system", "application"] | None
+
+
+@dataclass
+class TrackedFileSnapshot:
+    status: str
+    dirty: set[str] = field(default_factory=set)
+    head_blobs: dict[str, str] = field(default_factory=dict)
+    content_blobs: dict[str, str | None] = field(default_factory=dict)
+    reason: str | None = None
+
+
+def _receipt_git(target: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    from workbay_bootstrap.external import run_external
+
+    return run_external(["git", *args], cwd=target, call_class="git", check=check, capture_output=True)
+
+
+def snapshot_tracked_files(target: Path) -> TrackedFileSnapshot:
+    """Read Git state without staging, refreshing the index, or writing blobs."""
+    try:
+        probe = _receipt_git(target, "rev-parse", "--show-toplevel", check=False)
+        if probe.returncode:
+            return TrackedFileSnapshot(status="not_a_git_checkout")
+        root = Path(os.fsdecode(probe.stdout).rstrip("\n"))
+        status = _receipt_git(root, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=no")
+        records = iter(status.stdout.split(b"\0"))
+        dirty: set[str] = set()
+        for record in records:
+            if not record:
+                continue
+            dirty.add(os.fsdecode(record[3:]))
+            if b"R" in record[:2] or b"C" in record[:2]:
+                dirty.add(os.fsdecode(next(records)))
+        # An unborn branch has no HEAD blobs; staged files are already dirty.
+        head = _receipt_git(root, "rev-parse", "--verify", "HEAD", check=False)
+        entries = _receipt_git(root, "ls-tree", "-rz", "HEAD").stdout if head.returncode == 0 else b""
+        blobs: dict[str, str] = {}
+        modes: dict[str, bytes] = {}
+        for entry in entries.split(b"\0"):
+            if not entry:
+                continue
+            metadata, path = entry.split(b"\t", 1)
+            mode, _, oid = metadata.split()
+            name = os.fsdecode(path)
+            blobs[name] = oid.decode("ascii")
+            modes[name] = mode
+        content: dict[str, str | None] = {}
+        for path in dirty:
+            dest = root / path
+            if dest.is_symlink():
+                data = os.fsencode(os.readlink(dest))
+                algorithm = "sha256" if len(blobs.get(path, "")) == 64 else "sha1"
+                content[path] = hashlib.new(algorithm, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            elif not dest.exists():
+                content[path] = None
+            elif modes.get(path) == b"160000":
+                content[path] = _receipt_git(dest, "rev-parse", "HEAD").stdout.decode("ascii").strip()
+            elif dest.is_dir():
+                # A carved directory can replace a formerly tracked file or
+                # symlink. The old blob is gone; its children are untracked.
+                content[path] = None
+            else:
+                # Git applies the path's clean filters, so CRLF/check-out
+                # conversions and executable-bit-only changes are not content.
+                content[path] = (
+                    _receipt_git(root, "hash-object", f"--path={path}", "--", path).stdout.decode("ascii").strip()
+                )
+        return TrackedFileSnapshot(status="ok", dirty=dirty, head_blobs=blobs, content_blobs=content)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return TrackedFileSnapshot(status="unavailable", reason=f"{type(exc).__name__}: {exc}")
+
+
+# PATHS crosses the operator's shell, Make's `--paths '$(PATHS)'` expansion and
+# slice-commit's shlex.split. These cannot cross all three verbatim.
+_FACADE_UNSAFE = {"'": "a single quote", '"': "a double quote", "\\": "a backslash", "$": "a dollar sign"}
+
+
+def _lifecycle_paths(paths: list[str]) -> tuple[str | None, str | None]:
+    """Return a PATHS value that slice-commit splits back into ``paths``, or why none exists."""
+    for path in paths:
+        try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
+            return None, "a reported path is not valid UTF-8"
+        for ch in path:
+            if ch in _FACADE_UNSAFE:
+                return None, f"a reported path contains {_FACADE_UNSAFE[ch]}"
+            if unicodedata.category(ch) == "Cc":
+                return None, "a reported path contains a control character"
+    # Double quotes keep spaces inside one shlex token, and a leading quote
+    # stops argparse reading a leading-dash value as an option.
+    return " ".join(f'"{path}"' if " " in path or path.startswith("-") else path for path in paths), None
+
+
+@dataclass
+class TrackedChangeReport:
+    status: str
+    files: list[dict[str, str]] = field(default_factory=list)
+    commit_recipe: dict[str, Any] | None = None
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        result = {"status": self.status, "files": self.files, "commit_recipe": self.commit_recipe}
+        if self.reason is not None:
+            result["reason"] = self.reason
+        return result
+
+    @classmethod
+    def between(cls, target: Path, before: TrackedFileSnapshot, after: TrackedFileSnapshot) -> TrackedChangeReport:
+        from workbay_bootstrap.surfaces import SURFACE_PROVENANCE
+
+        for snapshot in (before, after):
+            if snapshot.status != "ok":
+                return cls(status=snapshot.status, reason=snapshot.reason)
+        candidates = after.dirty | {
+            path
+            for path in before.head_blobs.keys() | after.head_blobs.keys()
+            if before.head_blobs.get(path) != after.head_blobs.get(path)
+        }
+        files = []
+        for path in sorted(candidates - before.dirty):
+            current = after.content_blobs.get(path) if path in after.dirty else after.head_blobs.get(path)
+            if before.head_blobs.get(path) == current:
+                continue
+            kind = "unclassified"
+            for surface in sorted(SURFACE_PROVENANCE, key=len, reverse=True):
+                if path == surface or path.startswith(surface + "/"):
+                    kind = SURFACE_PROVENANCE[surface]
+                    break
+            if path == ".workbay-bootstrap.json":
+                kind = "bootstrap_ledger"
+            files.append({"path": path, "kind": kind})
+        if not files:
+            return cls(status="no_changes")
+        try:
+            facade = (target / "Makefile.d/lifecycle.mk").read_text()
+        except OSError:
+            facade = ""
+        lifecycle_paths, fallback_reason = None, None
+        if re.search(r"^maint-start\s*:(?!=)", facade, re.MULTILINE):
+            # Without PATHS, slice-commit stages every tracked change (git add -u).
+            lifecycle_paths, fallback_reason = _lifecycle_paths([entry["path"] for entry in files])
+        if lifecycle_paths is not None:
+            recipe = {
+                "kind": "lifecycle",
+                "commands": [
+                    'make maint-start TASK=<ref> OBJECTIVE="..."',
+                    f'make slice-commit TASK=<ref> MSG="..." PATHS={shlex.quote(lifecycle_paths)}',
+                    "make plan-done TASK=<ref>",
+                ],
+            }
+        else:
+            paths = " ".join(shlex.quote(entry["path"]) for entry in files)
+            # Literal pathspecs also protect names containing Git glob syntax.
+            # Ordinary names keep the familiar, copyable git command form.
+            prefix = (
+                "git --literal-pathspecs" if any(ch in entry["path"] for entry in files for ch in "*?[:") else "git"
+            )
+            recipe = {
+                "kind": "git",
+                "commands": [
+                    f"{prefix} add -- {paths}",
+                    f'{prefix} commit -m "..." -- {paths}',
+                ],
+            }
+            if fallback_reason is not None:
+                recipe["fallback_reason"] = f"{fallback_reason}, which the lifecycle PATHS cannot carry losslessly"
+        return cls(status="changed", files=files, commit_recipe=recipe)
+
+    def print_block(self) -> None:
+        if self.status == "unavailable":
+            print(f"warning: tracked change report unavailable: {self.reason}", file=sys.stderr)
+        if not self.files:
+            return
+        print("Tracked files changed by WorkBay:")
+        for kind in dict.fromkeys(entry["kind"] for entry in self.files):
+            print(f"  {kind}:")
+            for entry in self.files:
+                if entry["kind"] == kind:
+                    print(f"    {entry['path']}")
+        print("Commit from the target repository (review first):")
+        if (self.commit_recipe or {}).get("fallback_reason"):
+            print(f"  # git, not make slice-commit: {self.commit_recipe['fallback_reason']}")
+        for command in (self.commit_recipe or {}).get("commands", []):
+            print(f"  {command}")
 
 
 @dataclass
@@ -45,6 +237,7 @@ class InstallReceipt:
     gitonly_mcp_tools: list[dict[str, str] | str] = field(default_factory=list)
     git_writes: list[dict[str, Any]] = field(default_factory=list)
     offline_latch: bool = False
+    tracked_changes: TrackedChangeReport | None = None
 
     def record(self, receipt: StepReceipt) -> None:
         self.steps.append(receipt)
@@ -99,6 +292,8 @@ class InstallReceipt:
 
     def attach_to_manifest(self, manifest: dict[str, object]) -> None:
         manifest["install_steps"] = [step.as_dict() for step in self.steps]
+        if self.tracked_changes is not None:
+            manifest["tracked_changes"] = self.tracked_changes.as_dict()
         if self.presync_projects:
             manifest["presync_projects"] = self.presync_projects
         if self.prewarm_refs:
@@ -112,6 +307,19 @@ class InstallReceipt:
         # Persist it on the gitignored sidecar instead.
         if self.offline_latch:
             manifest["offline_latch"] = True
+
+    def write_tracked_changes(self, target: Path, manifest: dict[str, Any]) -> None:
+        """Attach the CLI's report and persist it without rewriting the ledger.
+
+        The report describes this run, including a possible ledger change. It
+        belongs on a local receipt rather than becoming another tracked diff.
+        """
+        if self.tracked_changes is None:
+            return
+        manifest["tracked_changes"] = self.tracked_changes.as_dict()
+        dest = target / INSTALL_RECEIPT_REL
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     def write_git_write_measurements(self, target: Path) -> None:
         """Write the run-local git-write log next to the tracked ledger.

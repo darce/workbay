@@ -20,6 +20,12 @@ from workbay_protocol.bootstrap import (
     EmbeddingsInferenceReceipt,
     EmbeddingsOperatorPolicy,
 )
+from workbay_protocol.bootstrap_ledger_view import (
+    HOST_RECEIPT_REL,
+    InvalidHostReceipt,
+    overlay_ledger_view,
+    parse_host_receipt,
+)
 from workbay_protocol.capability_mode import MANIFEST_READ_LIMIT_BYTES
 from workbay_protocol import paths
 
@@ -44,7 +50,12 @@ PolicyIntent = Literal["known", "unknown"]
 EmbeddingsModeValue = Literal["unspecified", "verified", "disabled"]
 AvailabilityStatus = Literal["ready", "missing", "unavailable", "failed", "unknown"]
 
-_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | os.O_NOFOLLOW
+)
 
 
 class EmbeddingPolicyError(ValueError):
@@ -172,9 +183,16 @@ def _select_manifest(
     return None
 
 
-def _read_manifest_bytes(path: Path) -> tuple[bytes | None, PolicyReadStatus | None]:
+def _read_manifest_bytes(
+    path: Path,
+    *,
+    dir_fd: int | None = None,
+    missing_ok: bool = False,
+) -> tuple[bytes | None, PolicyReadStatus | None]:
     try:
-        fd = os.open(path, _OPEN_FLAGS)
+        fd = os.open(path, _OPEN_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None, None if missing_ok else "unreadable"
     except OSError:
         return None, "unreadable"
     try:
@@ -195,6 +213,29 @@ def _read_manifest_bytes(path: Path) -> tuple[bytes | None, PolicyReadStatus | N
     if len(raw) > MANIFEST_READ_LIMIT_BYTES:
         return None, "oversized"
     return raw, None
+
+
+def _read_host_receipt(root: Path) -> tuple[dict | None, PolicyReadStatus | None]:
+    # Pin the receipt directory too: O_NOFOLLOW on the leaf alone would still
+    # allow .workbay to redirect the read outside the selected root.
+    try:
+        directory_fd = os.open(root / HOST_RECEIPT_REL.parent, _OPEN_FLAGS | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "unreadable"
+    try:
+        raw, fail_status = _read_manifest_bytes(
+            Path(HOST_RECEIPT_REL.name), dir_fd=directory_fd, missing_ok=True
+        )
+    finally:
+        os.close(directory_fd)
+    if fail_status is not None or raw is None:
+        return None, fail_status
+    try:
+        return parse_host_receipt(raw, source=root / HOST_RECEIPT_REL), None
+    except InvalidHostReceipt:
+        return None, "malformed"
 
 
 def _schema_version_supported(data: dict[object, object]) -> bool:
@@ -240,6 +281,11 @@ def load_embeddings_policy(
 
     if not _schema_version_supported(parsed):
         return _typed_missing("unsupported_schema")
+
+    host_receipt, fail_status = _read_host_receipt(root)
+    if fail_status is not None:
+        return _typed_missing(fail_status)
+    parsed = overlay_ledger_view(parsed, host_receipt)
 
     embeddings_mode = _mode_from_payload(parsed)
 

@@ -24,6 +24,8 @@
 #                      Exit 3 retains partial rows with truncated=true.
 #   scripts/remote_agent.sh doctor          # grok readiness on the host
 #   scripts/remote_agent.sh reap [--idle-seconds N] [--dry-run] [--authorized-only] [--eligible-keys-stdin] [--eligible-key K]...
+#                      Key flags select only; sandbox release requires the native wrapper:
+#                      mcp-workbay-orchestrator remote-sandbox-reap --apply
 #   scripts/remote_agent.sh status [--sweep] --job-id <j+20hex> [--job-id ...]
 #   scripts/remote_agent.sh status --list   # read-only: one JSON row per VM job dir,
 #                      typed error rows for bad dirs; refuses --sweep and --job-id.
@@ -142,6 +144,7 @@
 #       exhausted pre-grok, or a same-branch lane already holding the lane lock)
 #       · 7 = no process bound obtainable (policy refusal)
 #       · 8 wall-clock bound expiry (deadline reached or timeout(1) status 124)
+#       · 18 retryable provider model refusal
 #       · 12 source ref missing · 13 source commit mismatch ·
 #       14 source tree mismatch · 78 host not configured · 2 usage/validation error.
 #
@@ -261,6 +264,122 @@ PROBE_TRUST_PY
 PROBE_TRUST_SH
 )
 
+# The mcp-workbay-orchestrator release this transport renders against. It must
+# equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
+_BOUNDARY_RUNTIME_VERSION=0.3.33
+# One resolver for every WorkBay control-plane import on the VM: the codex
+# model-boundary handshake, the analysis classifier and harvest, and doctor.
+# Dispatch and doctor ship this same text, so both select the same interpreter.
+# Read it outside command substitution: Bash 3.2 scans a heredoc inside $(...)
+# for parentheses, and the case arms below end that substitution early. read
+# stops at EOF with status 1; only an empty result is a failure, and it still
+# exits under set -e as the substitution did. $(...) removed the one final
+# newline; remove exactly that one below.
+_boundary_runtime_sh=
+IFS= read -r -d '' _boundary_runtime_sh <<'BOUNDARY_RUNTIME_SH' || [ -n "$_boundary_runtime_sh" ]
+# _boundary_runtime_resolve [LANE_PYTHON LANE_PYPROJECT]
+# A sandbox that carries the orchestrator source runs it from its
+# origin-verified lane venv, because the native handshake refuses any other
+# import origin there; its version is the one that source declares. Otherwise
+# the operator override WORKBAY_BOUNDARY_PYTHON, else the declared uv tool,
+# must hold this rendering tag. Never PATH, never the user site: the probe runs
+# isolated (-I), as do all callers. Sets _boundary_runtime_python, or prints
+# one named, non-retryable refusal and returns 7.
+_boundary_runtime_resolve() {
+    local _expected="$_BOUNDARY_RUNTIME_VERSION" _pyproject="${2:-}" _candidate _source _out _rc=0
+    _boundary_runtime_python=''
+    _boundary_runtime_refusal=''
+    if [ -n "${1:-}" ]; then
+        _source=lane_source
+        _candidate=$1
+        _expected=''
+    elif [ -n "${WORKBAY_BOUNDARY_PYTHON:-}" ]; then
+        _source=operator_override
+        _candidate=$WORKBAY_BOUNDARY_PYTHON
+    else
+        _source=uv_tool
+        _candidate="${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}/mcp-workbay-orchestrator/bin/python"
+    fi
+    if [ ! -x "$_candidate" ]; then
+        _out="boundary_runtime_missing error_type=FileNotFoundError module=python"
+    else
+        _out=$(timeout -k 5 60 "$_candidate" -I -c '
+import importlib
+import importlib.metadata
+import sys
+import tomllib
+
+expected, pyproject = sys.argv[1:3]
+
+
+def refuse(kind, **fields):
+    print(kind, *(key + "=" + str(value).replace(" ", "_") for key, value in fields.items()))
+    sys.exit(3)
+
+
+if pyproject:
+    try:
+        with open(pyproject, "rb") as stream:
+            expected = tomllib.load(stream)["project"]["version"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        refuse("boundary_runtime_missing", error_type=type(exc).__name__, module=pyproject)
+try:
+    found = importlib.metadata.version("mcp-workbay-orchestrator")
+except importlib.metadata.PackageNotFoundError as exc:
+    refuse("boundary_runtime_missing", error_type=type(exc).__name__, module="mcp-workbay-orchestrator")
+if found != expected:
+    refuse("boundary_runtime_version_mismatch", expected=expected, found=found)
+# Every module the VM control plane imports, so a broken install refuses
+# here instead of after a paid model turn.
+for name in (
+    "workbay_orchestrator_mcp.orchestration.execution_preflight",
+    "workbay_orchestrator_mcp.orchestration.preflight_attestation",
+    "workbay_orchestrator_mcp.orchestration.plan_review_driver",
+    "workbay_orchestrator_mcp.orchestration.adapters.remote_exec",
+):
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        refuse("boundary_runtime_missing", error_type=type(exc).__name__, module=getattr(exc, "name", None) or name)
+print("boundary_runtime_ok version=" + found)
+' "$_expected" "$_pyproject" </dev/null 2>/dev/null) || _rc=$?
+        _out=${_out##*$'\n'}
+        case "$_rc:$_out" in
+            "0:boundary_runtime_ok "*|"3:boundary_runtime_missing "*|"3:boundary_runtime_version_mismatch "*) ;;
+            *) _out="boundary_runtime_missing error_type=probe_exit_$_rc module=-" ;;
+        esac
+    fi
+    case "$_out" in
+        boundary_runtime_ok\ *)
+            _boundary_runtime_python=$_candidate
+            printf 'remote_agent: boundary_runtime selected source=%s interpreter=%s %s\n' \
+                "$_source" "$_candidate" "${_out#boundary_runtime_ok }" >&2
+            return 0
+            ;;
+    esac
+    _boundary_runtime_refusal="$_out source=$_source interpreter=$_candidate"
+    printf 'remote_agent: %s (non-retryable; provision the WorkBay runtime or set WORKBAY_REMOTE_BOUNDARY_PYTHON)\n' \
+        "$_boundary_runtime_refusal" >&2
+    return 7
+}
+BOUNDARY_RUNTIME_SH
+_boundary_runtime_sh=${_boundary_runtime_sh%$'\n'}
+
+# Host values the VM resolver reads, rendered before its first use. The
+# override is a VM path; it is single-quoted into the remote shell.
+_boundary_runtime_preamble() {
+    case "${WORKBAY_REMOTE_BOUNDARY_PYTHON:-}" in
+        ''|/*) ;;
+        *) echo "remote_agent: invalid WORKBAY_REMOTE_BOUNDARY_PYTHON (need an absolute VM path)" >&2; return 2 ;;
+    esac
+    case "${WORKBAY_REMOTE_BOUNDARY_PYTHON:-}" in
+        *[!A-Za-z0-9._/+-]*) echo "remote_agent: invalid WORKBAY_REMOTE_BOUNDARY_PYTHON (characters outside [A-Za-z0-9._/+-])" >&2; return 2 ;;
+    esac
+    printf "_BOUNDARY_RUNTIME_VERSION='%s'\n" "$_BOUNDARY_RUNTIME_VERSION"
+    printf "WORKBAY_BOUNDARY_PYTHON='%s'\n" "${WORKBAY_REMOTE_BOUNDARY_PYTHON:-}"
+    printf '%s\n' "$_boundary_runtime_sh"
+}
+
 
 repo_root="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 repo_slug="$(basename "$repo_root")"
@@ -339,7 +458,10 @@ _remote_agent_check_companions() {
 # Validate before any dispatch rendering or transport. Other commands can still
 # inspect or clean up remote jobs when a local install needs repair.
 case "${1:-}" in
-    build|submit) _remote_agent_check_companions || exit "$?" ;;
+    build|submit)
+        _remote_agent_check_companions || exit "$?"
+        _boundary_runtime_preamble >/dev/null || exit 2
+        ;;
 esac
 
 QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
@@ -2990,6 +3112,22 @@ REMOTE_PREFLIGHT_BODY_EOF
     ;;
 doctor)
     _remote_agent_check_companions || true
+    # First VM probe: the boundary runtime every codex/analysis dispatch
+    # resolves, through the same resolver text, before anything is dispatched.
+    if _doc_boundary=$(_boundary_runtime_preamble); then
+        if ! { printf '%s\n' "$_doc_boundary"; cat <<'DOCTOR_BOUNDARY_EOF'; } | "${SSH[@]}" 'bash -s'
+if _boundary_runtime_resolve 2>/dev/null; then
+    echo "boundary: ok interpreter=$_boundary_runtime_python version=$_BOUNDARY_RUNTIME_VERSION"
+else
+    echo "boundary: REFUSED $_boundary_runtime_refusal"
+fi
+DOCTOR_BOUNDARY_EOF
+        then
+            echo 'boundary: PROBE FAILED (ssh; remote probe unavailable)'
+        fi
+    else
+        echo 'boundary: REFUSED invalid WORKBAY_REMOTE_BOUNDARY_PYTHON'
+    fi
     "${SSH[@]}" 'g="$HOME/.grok/bin/grok"
         [ -x "$g" ] && echo "grok    : $("$g" --version)" || echo "grok    : MISSING (install per runbook)"
         # implementation note: per-backend binary/env paths are AgentSpec data, not doctor
@@ -3207,13 +3345,14 @@ reap)
             -h|--help)
                 cat <<'REAP_USAGE_EOF'
 usage: remote_agent.sh reap [--idle-seconds N] [--caller-budget-seconds N] [--dry-run] [--authorized-only] [--eligible-keys-stdin] [--eligible-key K]...
-  --idle-seconds N       reclaim only sandboxes idle for more than N seconds
+  --idle-seconds N       inspect sandboxes idle for more than N seconds
   --caller-budget-seconds N  the caller's wait; the /tmp accounting window ends inside it (absent: default window)
-  --dry-run              report what would be reclaimed; delete nothing
+  --dry-run              run read-only custody checks and report release readiness
   --authorized-only      act only on keys named by --eligible-key or --eligible-keys-stdin
-  --eligible-keys-stdin  read authorized lane keys from stdin, one per line (empty input is a valid sweep)
-  --eligible-key K       authorize lane key K (repeatable)
-  --custody-checks-file F  host-rendered native per-key custody checks (absent proof holds the key)
+  --eligible-keys-stdin  select lane keys from stdin, one per line (empty input is a valid sweep)
+  --eligible-key K       select lane key K (repeatable); selection does not authorize deletion
+  --custody-checks-file F  host-rendered native custody checks for release to the VM reclaimer
+  Sandbox release: mcp-workbay-orchestrator remote-sandbox-reap --apply
 REAP_USAGE_EOF
                 exit 0
                 ;;
@@ -3285,10 +3424,6 @@ REAP_USAGE_EOF
         _reap_degraded_reason=no_allowlist
     fi
 
-    if [ "$REAP_DRY" -eq 0 ] && [ "$REAP_AUTHORIZED_ONLY" -eq 0 ] && [ ! -s "$_reap_authorized" ]; then
-        echo "remote_agent: no authoritative eligible-key allowlist; reap is observation-only" >&2
-        REAP_DRY=1
-    fi
     : >"$_reap_selected"
     if [ -s "$_reap_authorized" ] && { [ "$REAP_DRY" -eq 0 ] || [ "$REAP_AUTHORIZED_ONLY" -eq 1 ]; }; then
         _reap_list_script() {
@@ -3501,7 +3636,7 @@ _reap_add_candidate() {
         return 0
     fi
     _rac_key_json="$(_reap_json_escape "$_rac_key")"
-    _rac_row="{\"key\":\"$_rac_key_json\",\"bytes\":$_rac_bytes}"
+    _rac_row="{\"key\":\"$_rac_key_json\",\"bytes\":$_rac_bytes,\"verdict\":\"release_ready\"}"
     if [ -n "$_reap_candidates_json" ]; then
         _reap_candidates_json="$_reap_candidates_json,$_rac_row"
     else
@@ -3514,6 +3649,7 @@ _reap_record_hold() {
     local _rh_key="${1:-}" _rh_reason="${2:-}" _rh_pid="${3:-}" _rh_comm="${4:-}" _rh_uid="${5:-}" _rh_age="${6:-0}"
     local _rh_key_json _rh_reason_json _rh_journal_reason="${7:-${2:-}}" _rh_journal_reason_json
     local _rh_comm_json _rh_row _rh_pid_json _rh_uid_json _rh_outcome
+    printf '%s held:%s\n' "$_rh_key" "$_rh_reason" >&2
     _reap_hold_journal_ok=1
     _rh_key_json="$(_reap_json_escape "$_rh_key")"
     _rh_reason_json="$(_reap_json_escape "$_rh_reason")"
@@ -3540,7 +3676,7 @@ _reap_record_hold() {
         case "$_rh_reason" in
             held_lock) _rh_outcome=kept_locked ;;
             held_live_lease) _rh_outcome=kept_live_lease ;;
-            missing_source_proof|unknown_*|source_proof_changed|reachable_history) _rh_outcome=kept_custody ;;
+            missing_source_proof:*|standalone_no_custody_proof|unknown_*|source_proof_changed|reachable_history) _rh_outcome=kept_custody ;;
         esac
         case "$_rh_age" in ''|*[!0-9]*) _rh_age=0 ;; esac
         if ! printf '{"key":"%s","outcome":"%s","reason":"%s","age":%s,"actor":"maintenance","at":%s}\n' \
@@ -3562,6 +3698,119 @@ _reap_record_hold() {
     fi
 }
 
+# Called only after RELEASE_READY, with reap (7), lane (8), and lease (6)
+# locks held. The host streams these exact immutable proof values alongside
+# the custody function; the sandbox itself is never a publication target.
+_reap_write_release() {
+    local _release_key="$1" _release_proof
+    declare -F _workbay_reap_release_proof >/dev/null || return 1
+    _release_proof=$(_workbay_reap_release_proof "$_release_key") || return 1
+    python3 - "$ROOT" "$_release_key" "$_release_proof" "$_sweep_run_id" "$2" <<'PYRELEASE'
+# WORKBAY_LANE_RELEASE_RECORD
+import datetime
+import json
+import os
+import re
+import socket
+import sys
+import uuid
+
+root, key, raw_proof, run_id, dry_run = sys.argv[1:]
+root_fd = release_fd = None
+temporary = None
+try:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", key) or key in {".", ".."}:
+        raise ValueError("unsafe release key")
+    proof = json.loads(raw_proof)
+    if proof["key"] != key:
+        raise ValueError("release proof key mismatch")
+    for name in ("proven_tip", "proven_tree"):
+        if not re.fullmatch(r"[0-9a-f]{40}", proof[name]):
+            raise ValueError("invalid " + name)
+    for name in ("proven_generation", "proven_artifacts"):
+        if not isinstance(proof[name], str) or not proof[name]:
+            raise ValueError("missing " + name)
+    if not isinstance(proof["proven_delta"], str):
+        raise ValueError("invalid proven_delta")
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if dry_run == "1":
+        try:
+            os.stat(".workbay-release", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            sys.exit(0)
+    else:
+        try:
+            os.mkdir(".workbay-release", 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+    release_fd = os.open(".workbay-release", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+    if os.fstat(release_fd).st_uid != os.getuid():
+        raise ValueError("foreign release directory")
+    if dry_run == "1":
+        sys.exit(0)
+    os.fchmod(release_fd, 0o700)
+    names = [key, ".venv-lane-" + key, ".venv-sync-stamp-" + key]
+    record = {"schema": 1, "kind": "lane_sandbox_release", "key": key,
+              "owner": "workbay-sandbox-reap", "reason": "completion_proven",
+              **{name: proof[name] for name in ("proven_tip", "proven_tree", "proven_generation", "proven_artifacts", "proven_delta")},
+              "paths": [os.path.join(root, name) for name in names if os.path.lexists(os.path.join(root, name))],
+              "released_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+              "host": socket.gethostname(), "sweep_run_id": run_id}
+    temporary = "." + key + "." + uuid.uuid4().hex + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=release_fd)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(record, stream, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, key + ".json", src_dir_fd=release_fd, dst_dir_fd=release_fd)
+    temporary = None
+    os.fsync(release_fd)
+    os.fsync(root_fd)
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    print("remote_agent: release_record_failed: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if temporary is not None and release_fd is not None:
+        os.unlink(temporary, dir_fd=release_fd)
+    for fd in (release_fd, root_fd):
+        if fd is not None:
+            os.close(fd)
+PYRELEASE
+}
+
+_reap_writer_exclusions() {
+    python3 - "$1" <<'PYEXCLUSIONS'
+import json, sys
+raw = sys.argv[1]
+def unique_fields(pairs):
+    row = dict(pairs)
+    if len(row) != len(pairs):
+        raise ValueError("duplicate exclusion fields")
+    return row
+try:
+    if len(raw) > 65536 or "\n" in raw or "\r" in raw or not raw.startswith("WRITER_EXCLUDED "):
+        raise ValueError("invalid exclusion framing")
+    rows = json.loads(raw[len("WRITER_EXCLUDED "):], object_pairs_hook=unique_fields)
+    if not isinstance(rows, list) or len(rows) > 256:
+        raise ValueError("invalid exclusion list")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"pid", "comm", "class"}:
+            raise ValueError("invalid exclusion fields")
+        if type(row["pid"]) is not int or row["pid"] <= 0 or row["pid"] in seen:
+            raise ValueError("invalid exclusion pid")
+        seen.add(row["pid"])
+        if row["class"] not in {"user_manager", "gpg_agent", "ssh_session_daemon"}:
+            raise ValueError("invalid exclusion class")
+        if not isinstance(row["comm"], str) or not 0 < len(row["comm"]) <= 64 or any(ord(c) < 32 for c in row["comm"]):
+            raise ValueError("invalid exclusion comm")
+    print(json.dumps(rows, separators=(",", ":"), ensure_ascii=True))
+except (ValueError, TypeError, KeyError):
+    sys.exit(1)
+PYEXCLUSIONS
+}
+
 _reap_holds_json=
 _reap_holds_count=0
 _reap_holds_truncated=false
@@ -3576,6 +3825,21 @@ fi
 _reap_script_sha_field=
 if [ -n "$_script_sha256" ]; then
     _reap_script_sha_field=",\"script_sha256\":\"$_script_sha256\""
+fi
+
+# A key selector supplies no custody proof. Keep independent maintenance running,
+# but make any sandbox-bearing standalone invocation machine-legibly unsuccessful.
+_standalone_unsupported=0
+_reap_refusal_field=
+_reap_has_custody=0
+if declare -F _workbay_reap_custody_check >/dev/null; then
+    _reap_has_custody=1
+elif [ "$(_sandbox_count)" -gt 0 ]; then
+    _standalone_unsupported=1
+    reap_mode=observation_only
+    _refusal='standalone_sandbox_delete_unsupported: run mcp-workbay-orchestrator remote-sandbox-reap --apply'
+    printf '%s\n' "$_refusal" >&2
+    _reap_refusal_field=",\"standalone_sandbox_delete_unsupported\":\"$_refusal\""
 fi
 
 # Fixed descriptors, not {var}> automatic allocation. This body normally runs
@@ -3595,7 +3859,7 @@ if ! flock -n "$reap_lock_fd"; then
     printf 'remote_agent: reap lock held: %s\n' "$ROOT/.reap.lock" >&2
     # ur-rp-30: the same mode and degradation fields as the main receipt (API-01). Nothing
     # was examined, so candidates is empty and not truncated.
-    printf '{"reaped":0,"would_reap":0,"skipped_live":0,"skipped_locked":0,"bytes_freed":0,"would_free_bytes":0,"sandbox_count_after":%s,"uv_cache_bytes":0,"tmp_scratch_bytes":0,"tmp_scratch_reaped":0,"would_uv_cache_bytes":0,"would_tmp_scratch_bytes":0,"would_tmp_scratch_reaped":0,"holds":[],"holds_truncated":false,"candidates":[],"candidates_truncated":false,"mode":"%s"%s%s}\n' "$(_sandbox_count)" "$reap_mode" "$_reap_degraded_field" "$_reap_script_sha_field"
+    printf '{"released_to_reclaim":0,"release_pending_bytes":0,"free_after":0,"reaped":0,"would_reap":0,"skipped_live":0,"skipped_locked":0,"bytes_freed":0,"would_free_bytes":0,"sandbox_count_after":%s,"uv_cache_bytes":0,"tmp_scratch_bytes":0,"tmp_scratch_reaped":0,"would_uv_cache_bytes":0,"would_tmp_scratch_bytes":0,"would_tmp_scratch_reaped":0,"holds":[],"holds_truncated":false,"candidates":[],"candidates_truncated":false,"mode":"%s"%s%s%s}\n' "$(_sandbox_count)" "$reap_mode" "$_reap_degraded_field" "$_reap_script_sha_field" "$_reap_refusal_field"
     exit 75
 fi
 
@@ -5412,6 +5676,9 @@ _disk_used_pct() {
 }
 
 reaped=0
+released_to_reclaim=0
+release_pending_bytes=0
+_sweep_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 would_reap=0
 skipped_live=0
 skipped_locked=0
@@ -5511,7 +5778,7 @@ for _sd in "$ROOT"/*/; do
     _key="${_sd##*/}"
     # Skip non-allowlisted keys before lock/lease/proc-scan so a 90 s budget
     # can still reach later eligible sandboxes [COST-06].
-    if [ "$dry_run" -eq 0 ] || [ "$authorized_only" -eq 1 ]; then
+    if [ "$_reap_has_custody" -eq 1 ] && { [ "$authorized_only" -eq 1 ] || [ -n "$eligible_keys" ]; }; then
         case ",$eligible_keys," in
             *",$_key,"*) ;;
             *)
@@ -5616,105 +5883,73 @@ for _key in $_order_keys; do
             continue
         fi
     fi
-    if [ "$dry_run" -eq 0 ] || [ "$authorized_only" -eq 1 ]; then
-        case ",$eligible_keys," in
-            *",$_key,"*) ;;
-            *)
-                flock -u "$lane_lock_fd" || true
-                exec 8>&-
-                continue
-                ;;
-        esac
-    fi
     _venv="$ROOT/.venv-lane-$_key"
     _stamp="$ROOT/.venv-sync-stamp-$_key"
     _before="$(_du_bytes "$_sd" "$_venv" "$_stamp" 2>/dev/null || true)"
     case "$_before" in ''|*[!0-9]*) _before=0 ;; esac
-    would_reap=$((would_reap + 1))
-    would_free_bytes=$((would_free_bytes + _before))
-    # ur-rp-30: a dry run lists its would-reap set here. An apply lists a sandbox only once
-    # its last re-check has passed, just before the delete below, so a kept sandbox never
-    # appears in candidates. would_reap and would_free_bytes keep counting every candidate.
-    if [ "$dry_run" -eq 1 ]; then
-        _reap_add_candidate "$_key" "$_before"
+    # The same read-only classification runs in both modes. The reclaimer
+    # alone owns process/dependency revalidation and deletion.
+    # The lease writer shares this mutation lock, acquired after the lane
+    # lock. FD 7 retains the sweep mutex; FD 6 holds the lease lock.
+    # Retain all three across native proof revalidation and record publication.
+    _lease_lock="$ROOT/.lane-lease-$_key.lock"
+    if [ -L "$_lease_lock" ] || { [ -e "$_lease_lock" ] && [ ! -f "$_lease_lock" ]; } ||
+        ! { exec 6>>"$_lease_lock"; } || ! flock -n 6; then
+        _reap_record_hold "$_key" held_lock
+        exec 6>&-
+        flock -u "$lane_lock_fd" || true
+        exec 8>&-
+        continue
     fi
-    if [ "$dry_run" -eq 0 ]; then
-        _reason=sandbox_idle
-        [ "$_merged" -eq 1 ] && _reason=sandbox_merged
-        if [ "$_merged" -eq 1 ]; then
-            if ! _lane_stop_processes "$_key" "$_sd"; then
-                skipped_live=$((skipped_live + 1))
-                _stop_outcome=kept_process_survived
-                if [ "${_LANE_STOP_REASON:-}" = stop_budget_exhausted ]; then
-                    _stop_outcome=kept_process_cleanup_budget_exhausted
-                    _reason=stop_budget_exhausted
-                fi
-                printf '{"key":"%s","outcome":"%s","reason":"%s","age":%s,"actor":"maintenance","at":%s}\n' \
-                    "$_key" "$_stop_outcome" "$_reason" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
-                    echo "remote_agent: kept_process_survived journal failed for $_key" >&2
-                flock -u "$lane_lock_fd" || true
-                exec 8>&-
-                continue
+    _custody="SKIPPED_CHANGED $_key standalone_no_custody_proof"
+    if [ "$_reap_has_custody" -eq 1 ]; then
+        _custody=$(_workbay_reap_custody_check "$_key" && printf '.') || _custody=$'SKIPPED_CHANGED '"$_key"$' source_proof_changed\n.'
+        _custody=${_custody%.}
+        _custody=${_custody%$'\n'}
+    fi
+    # Decode only the native writer's three release verdicts. Missing or
+    # malformed detail cannot confer release authority or forge journal JSON.
+    _writer_census=
+    _custody_verdict=${_custody%%$'\n'*}
+    _exclusion_line='WRITER_EXCLUDED []'
+    if [[ "$_custody" == *$'\n'* ]]; then
+        _exclusion_line=${_custody#*$'\n'}
+    fi
+    _writer_excluded=$(_reap_writer_exclusions "$_exclusion_line") || {
+        _custody="SKIPPED_CHANGED $_key unknown_reference_census"
+        _custody_verdict=$_custody
+    }
+    case "$_custody_verdict" in
+        "RELEASE_READY $_key IDLE") _writer_census=IDLE ;;
+        "RELEASE_READY $_key UNKNOWN:privileged_census_unavailable")
+            _writer_census='UNKNOWN privileged_census_unavailable' ;;
+        "RELEASE_READY $_key UNKNOWN:reader_acquisition_unfenced")
+            _writer_census='UNKNOWN reader_acquisition_unfenced' ;;
+    esac
+    if [ -n "$_writer_census" ]; then
+        _release_reason=
+        if [ -L "$ROOT/.workbay-release" ] || { [ -e "$ROOT/.workbay-release" ] && [ ! -d "$ROOT/.workbay-release" ]; }; then
+            _release_reason=release_directory_unsafe
+        elif ! _reap_write_release "$_key" "$dry_run"; then
+            _release_reason=release_record_failed
+        fi
+        if [ -z "$_release_reason" ]; then
+            if [ "$dry_run" -eq 0 ]; then
+                released_to_reclaim=$((released_to_reclaim + 1))
+                release_pending_bytes=$((release_pending_bytes + _before))
+                printf '{"key":"%s","outcome":"released_to_reclaim","bytes_before":%s,"writer_census":"%s","writer_excluded":%s,"at":%s}\n' \
+                    "$_key" "$_before" "$_writer_census" "$_writer_excluded" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
+                    echo "remote_agent: release journal failed for $_key" >&2
             fi
-            # CON-11: a pid can enter the sandbox after the pre-loop snapshot
-            # (for example during the systemctl stop calls). Re-probe live
-            # immediately before unlink. Distinct from kept_process_survived
-            # (a snapshot pid that outlived TERM/KILL).
-            if _pid_in_sandbox_live "$_sd"; then
-                skipped_live=$((skipped_live + 1))
-                _probe_outcome=kept_late_pid
-                _probe_reason="$_reason"
-                if [ -n "${_PROC_CWD_PROBE_REASON:-}" ] && [ "$_PROC_CWD_PROBE_REASON" != live_pid ]; then
-                    _probe_outcome=kept_proc_probe_unknown
-                    _probe_reason="proc_probe_unknown:${_PROC_CWD_PROBE_REASON}"
-                fi
-                printf '{"key":"%s","outcome":"%s","reason":"%s","age":%s,"actor":"maintenance","at":%s}\n' \
-                    "$_key" "$_probe_outcome" "$_probe_reason" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
-                    echo "remote_agent: $_probe_outcome journal failed for $_key" >&2
-                flock -u "$lane_lock_fd" || true
-                exec 8>&-
-                continue
-            fi
+            would_reap=$((would_reap + 1))
+            would_free_bytes=$((would_free_bytes + _before))
+            _reap_add_candidate "$_key" "$_before"
+            printf '%s release_ready\n' "$_key" >&2
         else
-            # CON-11: re-probe the TTL candidate immediately before unlink.
-            # Do not terminate on the TTL-only path.
-            if _pid_in_sandbox_live "$_sd"; then
-                skipped_live=$((skipped_live + 1))
-                _probe_outcome=kept_live_pid
-                _probe_reason="$_reason"
-                if [ -n "${_PROC_CWD_PROBE_REASON:-}" ] && [ "$_PROC_CWD_PROBE_REASON" != live_pid ]; then
-                    _probe_outcome=kept_proc_probe_unknown
-                    _probe_reason="proc_probe_unknown:${_PROC_CWD_PROBE_REASON}"
-                fi
-                printf '{"key":"%s","outcome":"%s","reason":"%s","age":%s,"actor":"maintenance","at":%s}\n' \
-                    "$_key" "$_probe_outcome" "$_probe_reason" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
-                    echo "remote_agent: $_probe_outcome journal failed for $_key" >&2
-                flock -u "$lane_lock_fd" || true
-                exec 8>&-
-                continue
-            fi
+            _reap_record_hold "$_key" "$_release_reason"
         fi
-        # The lease writer shares this mutation lock, acquired after the lane
-        # lock. FD 7 retains the sweep mutex; FD 6 holds the lease lock.
-        # Retain all three across native proof revalidation and any unlink.
-        _lease_lock="$ROOT/.lane-lease-$_key.lock"
-        if [ -L "$_lease_lock" ] || { [ -e "$_lease_lock" ] && [ ! -f "$_lease_lock" ]; } ||
-            ! { exec 6>>"$_lease_lock"; } || ! flock -n 6; then
-            _reap_record_hold "$_key" held_lock
-            exec 6>&-
-            flock -u "$lane_lock_fd" || true
-            exec 8>&-
-            continue
-        fi
-        _custody="SKIPPED_CHANGED $_key missing_source_proof"
-        _custody_has_checks=0
-        if declare -F _workbay_reap_custody_check >/dev/null; then
-            _custody_has_checks=1
-            _custody=$(_workbay_reap_custody_check "$_key") || _custody="SKIPPED_CHANGED $_key source_proof_changed"
-        fi
-        # A check that exits silently is unknown, never authorization. The
-        # shared native validation currently always stops at incoming/cache
-        # custody; completion-based release needs its own supported contract.
+    else
+        # A silent or malformed response never confers release authority.
         _custody_reason=source_proof_changed
         case "$_custody" in
             content_deadline) _custody_reason=content_deadline ;;
@@ -5725,41 +5960,17 @@ for _key in $_order_keys; do
             "SKIPPED_LIVE "*) skipped_live=$((skipped_live + 1)) ;;
             "SKIPPED_LOCK "*) skipped_locked=$((skipped_locked + 1)) ;;
         esac
-        case "$_custody_reason" in ''|*[!a-z0-9_]*) _custody_reason=source_proof_changed ;; esac
+        case "$_custody_reason" in ''|*[!a-zA-Z0-9_:]*) _custody_reason=source_proof_changed ;; esac
         _custody_stage=locked_revalidation
         case "$_custody_reason" in
-            missing_source_proof) _custody_stage=source_authorization ;;
-            unknown_cache_reference_census|unknown_incoming_source_custody|unknown_reference_census|unknown_reader_acquisition_fence)
-                _custody_stage=custody ;;
+            missing_source_proof:*) _custody_stage=source_authorization ;;
+            unknown_reference_census|unknown_reader_acquisition_fence) _custody_stage=custody ;;
         esac
-        [ "$_custody_has_checks" -eq 1 ] || _custody_stage=
+        [ "$_reap_has_custody" -eq 1 ] || _custody_stage=
         _reap_record_hold "$_key" "$_custody_reason" "" "" "" "$_age" "$_custody_reason" "$_custody_stage"
-        flock -u 6 || true
-        exec 6>&-
-        flock -u "$lane_lock_fd" || true
-        exec 8>&-
-        continue
-        if ! printf '{"key":"%s","outcome":"started","reason":"%s","age":%s,"actor":"maintenance","bytes_before":%s,"at":%s}\n' \
-            "$_key" "$_reason" "$_age" "$_before" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl"; then
-            echo "remote_agent: cannot persist reap intent for $_key; deletion refused" >&2
-            flock -u "$lane_lock_fd" || true
-            exec 8>&-
-            continue
-        fi
-        _reap_add_candidate "$_key" "$_before"
-        rm -rf "$_sd" "$_venv" "$_stamp" 2>/dev/null || true
-        if [ ! -e "$_sd" ]; then
-            reaped=$((reaped + 1))
-            bytes_freed=$((bytes_freed + _before))
-            printf '{"key":"%s","outcome":"reaped","reason":"%s","age":%s,"actor":"maintenance","bytes_freed":%s,"at":%s}\n' \
-                "$_key" "$_reason" "$_age" "$_before" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
-                echo "remote_agent: reap completion journal failed for $_key" >&2
-        else
-            printf '{"key":"%s","outcome":"incomplete","reason":"%s","age":%s,"actor":"maintenance","at":%s}\n' \
-                "$_key" "$_reason" "$_age" "$(date +%s)" >>"$ROOT/.reap-outcomes.jsonl" || \
-                echo "remote_agent: incomplete reap journal failed for $_key" >&2
-        fi
     fi
+    flock -u 6 || true
+    exec 6>&-
     flock -u "$lane_lock_fd" || true
     exec 8>&-
 done
@@ -6306,8 +6517,10 @@ sandbox_count_after=$(_sandbox_count)
 flock -u "$reap_lock_fd" || true
 exec 7>&-
 _tmp_account_skipped
-printf '{"reaped":%s,"would_reap":%s,"skipped_live":%s,"skipped_locked":%s,"bytes_freed":%s,"would_free_bytes":%s,"sandbox_count_after":%s,"uv_cache_bytes":%s,"tmp_scratch_bytes":%s,"tmp_scratch_reaped":%s,"would_uv_cache_bytes":%s,"would_tmp_scratch_bytes":%s,"would_tmp_scratch_reaped":%s,"tmp_scratch_candidates_seen":%s,"tmp_scratch_scan_truncated":%s,"tmp_scratch_skipped_unnamed":%s,"tmp_scratch_skipped_no_owner":%s,"tmp_scratch_skipped_live":%s,"tmp_scratch_skipped_fresh":%s,"tmp_scratch_skipped_unmeasurable":%s,"tmp_scratch_skipped_foreign_owner":%s,"tmp_scratch_skipped_unnamed_bytes":%s,"tmp_scratch_skipped_no_owner_bytes":%s,"tmp_scratch_skipped_fresh_bytes":%s,"tmp_scratch_skipped_live_bytes":%s,"tmp_scratch_skipped_foreign_owner_bytes":%s,"tmp_unowned_bytes":%s,"tmp_skipped_bytes_unmeasured":%s,"tmp_skipped_bytes_partial":%s,"tmp_skipped_bytes_truncated":%s,"liveness_examined":%s,"liveness_unreadable":%s,"skipped_not_allowlisted":%s,"holds":[%s],"holds_truncated":%s,"candidates":[%s],"candidates_truncated":%s,"mode":"%s"%s%s%s}\n' \
-    "$reaped" "$would_reap" "$skipped_live" "$skipped_locked" "$bytes_freed" "$would_free_bytes" "$sandbox_count_after" \
+_free_after=$($_df_tw df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {printf "%.0f\n", $4 * 1024}')
+case "$_free_after" in ''|*[!0-9]*) _free_after=0 ;; esac
+printf '{"released_to_reclaim":%s,"release_pending_bytes":%s,"free_after":%s,"reaped":%s,"would_reap":%s,"skipped_live":%s,"skipped_locked":%s,"bytes_freed":%s,"would_free_bytes":%s,"sandbox_count_after":%s,"uv_cache_bytes":%s,"tmp_scratch_bytes":%s,"tmp_scratch_reaped":%s,"would_uv_cache_bytes":%s,"would_tmp_scratch_bytes":%s,"would_tmp_scratch_reaped":%s,"tmp_scratch_candidates_seen":%s,"tmp_scratch_scan_truncated":%s,"tmp_scratch_skipped_unnamed":%s,"tmp_scratch_skipped_no_owner":%s,"tmp_scratch_skipped_live":%s,"tmp_scratch_skipped_fresh":%s,"tmp_scratch_skipped_unmeasurable":%s,"tmp_scratch_skipped_foreign_owner":%s,"tmp_scratch_skipped_unnamed_bytes":%s,"tmp_scratch_skipped_no_owner_bytes":%s,"tmp_scratch_skipped_fresh_bytes":%s,"tmp_scratch_skipped_live_bytes":%s,"tmp_scratch_skipped_foreign_owner_bytes":%s,"tmp_unowned_bytes":%s,"tmp_skipped_bytes_unmeasured":%s,"tmp_skipped_bytes_partial":%s,"tmp_skipped_bytes_truncated":%s,"liveness_examined":%s,"liveness_unreadable":%s,"skipped_not_allowlisted":%s,"holds":[%s],"holds_truncated":%s,"candidates":[%s],"candidates_truncated":%s,"mode":"%s"%s%s%s%s}\n' \
+    "$released_to_reclaim" "$release_pending_bytes" "$_free_after" "$reaped" "$would_reap" "$skipped_live" "$skipped_locked" "$bytes_freed" "$would_free_bytes" "$sandbox_count_after" \
     "$uv_cache_bytes" "$tmp_scratch_bytes" "$tmp_scratch_reaped" "$would_uv_cache_bytes" "$would_tmp_scratch_bytes" "$would_tmp_scratch_reaped" \
     "$tmp_scratch_candidates_seen" "$tmp_scratch_scan_truncated" "$tmp_scratch_skipped_unnamed" "$tmp_scratch_skipped_no_owner" \
     "$tmp_scratch_skipped_live" "$tmp_scratch_skipped_fresh" "$tmp_scratch_skipped_unmeasurable" \
@@ -6317,7 +6530,8 @@ printf '{"reaped":%s,"would_reap":%s,"skipped_live":%s,"skipped_locked":%s,"byte
     "$_reap_liveness_examined" "$_reap_liveness_unreadable" \
     "$skipped_not_allowlisted" "$_reap_holds_json" "$_reap_holds_truncated" \
     "$_reap_candidates_json" "$_reap_candidates_truncated" "$reap_mode" "$_reap_degraded_field" "$_reap_script_sha_field" \
-    "$_reap_liveness_coverage_field"
+    "$_reap_liveness_coverage_field" "$_reap_refusal_field"
+[ "$_standalone_unsupported" -eq 0 ] || exit 1
 REAP_EOF
     } | "${SSH[@]}" bash -s -- "$AGENT_ROOT" "$REAP_IDLE" "$REAP_DRY" \
         "$REAP_AUTHORIZED_ONLY::/tmp:${_reap_script_sha256}:${WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S}:${_reap_outcomes_cap}" \
@@ -7157,9 +7371,9 @@ PY
     # The ledger, not this caller, chooses the required model/effort.
     if [ "$REVIEW_KIND" = analysis ]; then
         _analysis_refusal=""
-        if [ -n "$SELFVERIFY_CMD" ] || [ -n "$CANON_PROPOSAL_PATH" ] || [ -n "$UNCOMMITTED_OUT" ]; then
-            _analysis_refusal="analysis_options_not_read_only"
-        elif ! _analysis_refusal="$(python3 - "$AGENT_SPEC" "$(git rev-parse HEAD 2>/dev/null)" <<'PY'
+        # Keep the Python heredoc outside command substitution for Bash 3.2.
+        _analysis_spec_refusal() {
+            python3 - "$AGENT_SPEC" "$(git rev-parse HEAD 2>/dev/null)" <<'PY'
 import json, sys
 
 spec = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -7273,7 +7487,10 @@ else:
     reason = "analysis_backend_model_mismatch"
 print(reason)
 PY
-)"; then
+        }
+        if [ -n "$SELFVERIFY_CMD" ] || [ -n "$CANON_PROPOSAL_PATH" ] || [ -n "$UNCOMMITTED_OUT" ]; then
+            _analysis_refusal="analysis_options_not_read_only"
+        elif ! _analysis_refusal="$(_analysis_spec_refusal)"; then
             _analysis_refusal="analysis_spec_invalid"
         fi
         if [ -n "$_analysis_refusal" ]; then
@@ -7462,77 +7679,85 @@ except subprocess.TimeoutExpired:
         # race. The per-job submit lock also spans the state decision and the
         # removals, so a remote submit cannot finish its ready -> submitted
         # handoff after cleanup has observed ready.
-        if ! "${SSH[@]}" "_agent_root='${AGENT_ROOT}'; case \"\$_agent_root\" in /*) ;; *) _agent_root=\"\$HOME/\$_agent_root\" ;; esac; \
+        # Read outside command substitution: Bash 3.2 can misparse even a
+        # heredoc inside $(...). Preserve whitespace and remote expansions;
+        # read reaches EOF (status 1), and the final newline is removed below
+        # to match the command substitution's original SSH argument bytes.
+        local _cleanup_command
+        IFS= read -r -d '' _cleanup_command <<CLEANUP_EOF || true
+_agent_root='${AGENT_ROOT}'; case "\$_agent_root" in /*) ;; *) _agent_root="\$HOME/\$_agent_root" ;; esac; \
             _lane_occupant_live() { \
-                _lk=\"\${1:-}\"; \
-                [ -n \"\$_lk\" ] || return 0; \
-                _lf=\"\$_agent_root/.lane-live-\$_lk\"; \
-                [ -f \"\$_lf\" ] || return 1; \
+                _lk="\${1:-}"; \
+                [ -n "\$_lk" ] || return 0; \
+                _lf="\$_agent_root/.lane-live-\$_lk"; \
+                [ -f "\$_lf" ] || return 1; \
                 _expiry=; _issued=; _released=; \
-                while IFS= read -r _lline || [ -n \"\$_lline\" ]; do \
-                    case \"\$_lline\" in \
-                        expiry=*) _expiry=\$(printf '%s\\n' \"\$_lline\" | sed 's/^expiry=//') ;; \
-                        issued=*) _issued=\$(printf '%s\\n' \"\$_lline\" | sed 's/^issued=//') ;; \
-                        released=*) _released=\$(printf '%s\\n' \"\$_lline\" | sed 's/^released=//') ;; \
+                while IFS= read -r _lline || [ -n "\$_lline" ]; do \
+                    case "\$_lline" in \
+                        expiry=*) _expiry=\$(printf '%s\\n' "\$_lline" | sed 's/^expiry=//') ;; \
+                        issued=*) _issued=\$(printf '%s\\n' "\$_lline" | sed 's/^issued=//') ;; \
+                        released=*) _released=\$(printf '%s\\n' "\$_lline" | sed 's/^released=//') ;; \
                     esac; \
-                done <\"\$_lf\" || return 0; \
-                case \"\$_expiry\" in ''|*[!0-9]*) return 0 ;; esac; \
-                case \"\$_issued\" in ''|*[!0-9]*) return 0 ;; esac; \
-                case \"\$_released\" in \
+                done <"\$_lf" || return 0; \
+                case "\$_expiry" in ''|*[!0-9]*) return 0 ;; esac; \
+                case "\$_issued" in ''|*[!0-9]*) return 0 ;; esac; \
+                case "\$_released" in \
                     1) return 1 ;; \
                     ''|0) ;; \
                     *) return 0 ;; \
                 esac; \
                 _now=\$(date +%s); \
-                if [ \"\$_now\" -ge \"\$_expiry\" ]; then return 1; fi; \
+                if [ "\$_now" -ge "\$_expiry" ]; then return 1; fi; \
                 return 0; \
             }; \
-            _lv=\"\$_agent_root/.lane-live-${LANE_KEY}\"; \
+            _lv="\$_agent_root/.lane-live-${LANE_KEY}"; \
             _live=0; \
-            if [ -f \"\$_lv\" ] && grep -qx 'nonce=${DISPATCH_NONCE}' \"\$_lv\" 2>/dev/null; then \
-                if _lane_occupant_live \"${LANE_KEY}\"; then _live=1; fi; \
+            if [ -f "\$_lv" ] && grep -qx 'nonce=${DISPATCH_NONCE}' "\$_lv" 2>/dev/null; then \
+                if _lane_occupant_live "${LANE_KEY}"; then _live=1; fi; \
             fi; \
             _handoff=0; \
             _cleanup=1; \
-            if [ \"\$_live\" != 1 ] && [ -n \"${JOB_ID:-}\" ]; then \
-                _jd=\"\$_agent_root/.jobs/${JOB_ID:-}\"; \
-                _jf=\"\$_jd/state.json\"; \
-                if ! exec 9>>\"\$_jd/.lock\"; then exit 1; fi; \
+            if [ "\$_live" != 1 ] && [ -n "${JOB_ID:-}" ]; then \
+                _jd="\$_agent_root/.jobs/${JOB_ID:-}"; \
+                _jf="\$_jd/state.json"; \
+                if ! exec 9>>"\$_jd/.lock"; then exit 1; fi; \
                 if ! flock -w 5 9; then exit 1; fi; \
-                if [ -f \"\$_jf\" ]; then \
-                    if ! _st=\$(sed -n 's/.*\"state\":\"\\([^\"]*\\)\".*/\\1/p' \"\$_jf\"); then exit 1; fi; \
-                    case \"\$_st\" in \
+                if [ -f "\$_jf" ]; then \
+                    if ! _st=\$(sed -n 's/.*"state":"\\([^"]*\\)".*/\\1/p' "\$_jf"); then exit 1; fi; \
+                    case "\$_st" in \
                         submitted|running|done) _handoff=1 ;; \
                         claiming|ready) _cleanup=1 ;; \
                         *) exit 1 ;; \
                     esac; \
                 fi; \
-                if [ -f \"\$_jd/done.json\" ] || [ -f \"\$_jd/started\" ]; then _handoff=1; _cleanup=0; fi; \
+                if [ -f "\$_jd/done.json" ] || [ -f "\$_jd/started" ]; then _handoff=1; _cleanup=0; fi; \
             fi; \
-            if [ \"\$_live\" = 1 ] || [ \"\$_handoff\" = 1 ]; then \
-                if [ \"\$_handoff\" = 1 ]; then \
+            if [ "\$_live" = 1 ] || [ "\$_handoff" = 1 ]; then \
+                if [ "\$_handoff" = 1 ]; then \
                     echo 'remote_agent: submitted job holds dispatch transients — sparing outbox' >&2; \
                 else \
                     echo 'remote_agent: live lane holds this dispatch nonce — sparing outbox for age-based reaper' >&2; \
                 fi; \
-            elif [ \"\$_cleanup\" = 1 ]; then \
+            elif [ "\$_cleanup" = 1 ]; then \
                 rm -f \
-                \"\$_agent_root/.brief-${LANE_KEY}-${DISPATCH_NONCE}.md\" \
-                \"\$_agent_root/.schema-${LANE_KEY}-${DISPATCH_NONCE}.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.agent-result.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-result.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-debug.log\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-selfverify.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.agent-phases.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-phases.json\" \
-                \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.workbay-source-provenance.json\" \
-                \"\$_agent_root/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json\" \
-                \"\$_agent_root/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.argv\" \
+                "\$_agent_root/.brief-${LANE_KEY}-${DISPATCH_NONCE}.md" \
+                "\$_agent_root/.schema-${LANE_KEY}-${DISPATCH_NONCE}.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.agent-result.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-result.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-debug.log" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-selfverify.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.agent-phases.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.grok-phases.json" \
+                "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}/.workbay-source-provenance.json" \
+                "\$_agent_root/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json" \
+                "\$_agent_root/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.argv" \
                 2>/dev/null; \
-                rmdir \"\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}\" 2>/dev/null; \
-                git -C \"\$HOME/${REMOTE_DIR}\" update-ref -d 'refs/heads/${LANE_KEY}-${DISPATCH_NONCE}' 2>/dev/null; \
+                rmdir "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}" 2>/dev/null; \
+                git -C "\$HOME/${REMOTE_DIR}" update-ref -d 'refs/heads/${LANE_KEY}-${DISPATCH_NONCE}' 2>/dev/null; \
             fi; \
-            true"; then
+            true
+CLEANUP_EOF
+        if ! "${SSH[@]}" "${_cleanup_command%$'\n'}"; then
             echo 'remote_agent: dispatch transient cleanup failed (non-fatal)' >&2
         fi
         return 0
@@ -7542,7 +7767,7 @@ except subprocess.TimeoutExpired:
         if [ "${_review_cycle_finished:-0}" = 0 ] && [ -z "${WORKBAY_REVIEW_CYCLE_TOKEN:-}" ]; then
             local _review_exit_mode=settle
             [ "${_review_model_may_have_started:-0}" = 1 ] || _review_exit_mode=premodel
-            _review_cycle_bridge "$_review_exit_mode" "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$_review_exit_rc" "$RESULT_OUT" "$PROVENANCE_OUT" "${_review_patch_evidence:-${OUT:-$_review_spool/patch}}" || true
+            _review_cycle_bridge "$_review_exit_mode" "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$_review_exit_rc" "$RESULT_OUT" "$PROVENANCE_OUT" "${_review_patch_evidence:-${OUT:-$_review_spool/patch}}" "${STREAM_OUT:-}" || true
         fi
         _cleanup_dispatch_transients
     }
@@ -8239,6 +8464,7 @@ PRODUCTION_CONTEXT_PY
         # injects it via an allowlisted host expansion, not a bare $(...) site.
         _LANE_SCOPE_CGROUP_MEMBERS_SRC="$(declare -f _lane_scope_cgroup_members)"
         printf '%s\n' "$_probe_trust_remote_sh"
+        _boundary_runtime_preamble
         # Only base64 data enters this shell assignment; no raw binding text.
         printf "WORKBAY_PRODUCTION_CONTEXT_B64='%s'\n" "$_production_context_b64"
         # Extractor needle (do not remove): "${SSH[@]}" env "WORKBAY_REMOTE_AGENT_UV_CACHE_CAP_MB=$UV_CACHE_CAP_MB" bash -s <<REMOTE_EOF
@@ -13573,7 +13799,7 @@ _terminate_unsafe_harvest() {
     _unsafe_prior_rc="\${1:-3}"
     echo "remote_agent: unsafe harvest refused: gitdir tampering detected; prior_exit=\${_unsafe_prior_rc}" >&2
     case "\$_unsafe_prior_rc" in
-        5|8|9|10) exit "\$_unsafe_prior_rc" ;;
+        5|8|9|10|18) exit "\$_unsafe_prior_rc" ;;
         *) exit 11 ;;
     esac
 }
@@ -14544,6 +14770,25 @@ if [ '${AGENT_SPEC_ENABLED}' = 1 ]; then
         unset _lane_scratch_root
     fi
     # END LANE_SCRATCH_ROOT
+    # BEGIN BOUNDARY_RUNTIME_SELECT
+    # The codex handshake and the analysis classifier/harvest import WorkBay.
+    # They all run in the one interpreter the shared resolver verifies, never
+    # the lane PATH (a consumer venv) or the VM python3. Other turns run the
+    # stdlib-only boundary as before.
+    _boundary_runtime_python=python3
+    if [ '${REVIEW_KIND}' = analysis ] || python3 -I -S -c 'import json, sys; sys.exit(json.load(open(sys.argv[1])).get("backend_id") != "codex-remote")' \
+            "\$ROOT/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json" 2>/dev/null; then
+        _boundary_runtime_lane=''
+        if [ "\${_ORIGIN_GUARD_STATUS:-}" = verified_roots ] \
+                && [ -f "\$SBX/packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/__init__.py" ]; then
+            _boundary_runtime_lane="\$LANE_VENV/bin/python"
+        fi
+        if ! _boundary_runtime_resolve \${_boundary_runtime_lane:+"\$_boundary_runtime_lane" "\$SBX/packages/mcp-workbay-orchestrator/pyproject.toml"}; then
+            _PHASES_PARTIAL=1
+            exit 7
+        fi
+    fi
+    # END BOUNDARY_RUNTIME_SELECT
     # Launch: env_file and env apply only in the agent subshell (D6); credentials
     # never leak into the D9 post-classifier. exec remains the sole agent launch.
     # Capture rc from the else branch of a non-negated if: under POSIX an if
@@ -14688,7 +14933,10 @@ except (ImportError, OSError, ValueError, json.JSONDecodeError) as exc:
         payload["execution_preflight"] = {
             "schema": "workbay/execution-preflight@1", "status": "UNKNOWN",
             "reason": "runtime_handshake_failed", "error_type": type(exc).__name__,
-            "retryable": False, "repair_hint": "Reprovision the exact lane runtime and companions before model start."}
+            "retryable": False, "repair_hint": "Reprovision the exact lane runtime and companions before model start.",
+            "interpreter": sys.executable}
+        if isinstance(exc, ImportError):
+            payload["execution_preflight"]["missing_module"] = exc.name
         # Even import failure is a typed pre-boundary effect. Hashes bind bytes,
         # never authenticate an author or grant permissions.
         import hashlib
@@ -14710,7 +14958,8 @@ except (ImportError, OSError, ValueError, json.JSONDecodeError) as exc:
             write_refusal_effect(proof)
         except (OSError, ValueError):
             pass  # missing protected observation never qualifies for a refund
-    print("remote_agent: model process boundary refused: runtime_handshake_failed", file=sys.stderr)
+    print("remote_agent: model process boundary refused: runtime_handshake_failed error_type=" + type(exc).__name__
+          + " module=" + str(getattr(exc, "name", None) or "-") + " interpreter=" + sys.executable, file=sys.stderr)
     raise SystemExit(7) from exc
 
 try:
@@ -14760,7 +15009,7 @@ ${AGENT_SPEC_ENV_FILE}
         export WORKBAY_NATIVE_REVIEW_KIND='${REVIEW_KIND}'
         export WORKBAY_EXECUTION_EFFECT_PATH="\$ROOT/.preflight-effect-${LANE_KEY}-${DISPATCH_NONCE}.json"
         # fd 4 (the root's .lock) stays with this body shell; the agent never inherits it.
-        exec \$RUNNER \$TW python3 "\$_model_start_boundary" \
+        exec \$RUNNER \$TW "\$_boundary_runtime_python" -I "\$_model_start_boundary" \
                 "\$OUT_DIR/.workbay-source-provenance.json" \
                 "\$ROOT/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json" \
                 '${AGENT_SPEC_BIN}' "\${AGENT_ARGV[@]}" \
@@ -14812,7 +15061,7 @@ PYPREFLIGHTEFFECT
     # Post-classify from AgentSpec auth_match + result shape (implementation note D7/D9).
     # Patterns/streams live in the JSON spec — never as vendor literals here.
     _spec_json="\$ROOT/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json"
-    _post=\$(python3 - "\$_spec_json" "\$_spec_stdout" "\$_spec_stderr" "\$_agent_rc" <<'PY'
+    _post=\$("\$_boundary_runtime_python" -I - "\$_spec_json" "\$_spec_stdout" "\$_spec_stderr" "\$_agent_rc" <<'PY'
 import json
 import re
 import sys
@@ -14827,6 +15076,9 @@ if not isinstance(auth, dict):
 rate_limit = spec.get("rate_limit_match") or {}
 if not isinstance(rate_limit, dict):
     rate_limit = {}
+provider_refusal = spec.get("provider_refusal_match") or {}
+if not isinstance(provider_refusal, dict):
+    provider_refusal = {}
 service_tier_warning = spec.get("service_tier_warning_match") or {}
 if not isinstance(service_tier_warning, dict):
     service_tier_warning = {}
@@ -14834,16 +15086,18 @@ patterns = [str(p) for p in (auth.get("patterns") or []) if str(p)]
 exit_codes = {int(x) for x in (auth.get("exit_codes") or [])}
 rate_patterns = [str(p) for p in (rate_limit.get("patterns") or []) if str(p)]
 rate_exit_codes = {int(x) for x in (rate_limit.get("exit_codes") or [])}
+refusal_patterns = [str(p) for p in (provider_refusal.get("patterns") or []) if str(p)]
 service_tier_warning_patterns = [str(p) for p in (service_tier_warning.get("patterns") or []) if str(p)]
 
-def _auth_stdout(text):
+def _auth_stdout(text, *, error_records_only=False):
     # internal: JSONL tool output is data, not the agent's error channel.
     errors = []
     for line in text.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            errors.append(line)
+            if not error_records_only:
+                errors.append(line)
             continue
         if not isinstance(event, dict):
             continue
@@ -14939,7 +15193,7 @@ def _rate_limit_stdout(text):
 claude_rate_limit_results = []
 rate_limit_reset_sources = []
 
-def _stream_blob(match, *, auth_only=False, rate_only=False):
+def _stream_blob(match, *, auth_only=False, rate_only=False, error_records_only=False):
     streams = match.get("streams")
     if streams is None and match.get("stream"):
         streams = [match.get("stream")]
@@ -14953,7 +15207,7 @@ def _stream_blob(match, *, auth_only=False, rate_only=False):
         try:
             text = Path(path).read_text(encoding="utf-8", errors="replace")
             if auth_only and name == "stdout":
-                text = _auth_stdout(text)
+                text = _auth_stdout(text, error_records_only=error_records_only)
             elif rate_only and name == "stdout":
                 text = _rate_limit_stdout(text)
                 rate_limit_reset_sources.append(text)
@@ -14966,6 +15220,7 @@ def _stream_blob(match, *, auth_only=False, rate_only=False):
 
 blob = _stream_blob(auth, auth_only=True)
 rate_blob = _stream_blob(rate_limit, rate_only=True)
+refusal_blob = _stream_blob(provider_refusal, auth_only=True, error_records_only=True)
 rate_reset_blob = "\n".join(rate_limit_reset_sources)
 # auth_only: stderr raw + stdout error records only. Worker narration that
 # merely quotes a tier string is data, not a provider tier warning.
@@ -15028,6 +15283,63 @@ if agent_rc != 0 and (agent_rc in rate_exit_codes or (rate_patterns and any(p in
                     file=sys.stderr,
                 )
     print("rate_limited")
+    raise SystemExit(0)
+
+def _provider_refusal_facts():
+    facts = dict.fromkeys(("turn_started", "turn_completed", "turn_failed", "items_completed", "malformed_lines"), 0)
+    facts.update(message=None, http_status=None, error_code=None, request_id=None)
+    try:
+        text = Path(stdout_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    error_records = []
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            facts["malformed_lines"] += 1
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        count_key = {"turn.started": "turn_started", "turn.completed": "turn_completed",
+                     "turn.failed": "turn_failed", "item.completed": "items_completed"}.get(event_type)
+        if count_key:
+            facts[count_key] += 1
+        item = event.get("item")
+        if event_type in ("error", "turn.failed") or (isinstance(item, dict) and item.get("type") == "error"):
+            error_records.append(event)
+
+    def _error_values(record):
+        # Walk provider records only; retain supplied values without inventing
+        # an HTTP status or decoding an error code into a different value.
+        if not isinstance(record, dict):
+            return
+        for key, value in record.items():
+            if key in ("message", "error") and isinstance(value, str) and facts["message"] is None:
+                if any(pattern in value for pattern in refusal_patterns):
+                    facts["message"] = value[:300]
+            fact_key = {"http_status_code": "http_status", "codex_error_info": "error_code",
+                        "request_id": "request_id", "x-request-id": "request_id", "cf-ray": "request_id"}.get(key)
+            if fact_key and facts[fact_key] is None and value is not None:
+                facts[fact_key] = value
+            if isinstance(value, dict):
+                _error_values(value)
+
+    for record in error_records:
+        _error_values(record)
+    if facts["message"] is None:
+        # Raw stderr is an error channel too. _stream_blob has already applied
+        # the spec's stream selection and excluded worker narration on stdout.
+        facts["message"] = next(line[:300] for line in refusal_blob.splitlines()
+                                if any(pattern in line for pattern in refusal_patterns))
+    return facts
+
+if agent_rc != 0 and refusal_patterns and any(p in refusal_blob for p in refusal_patterns):
+    refusal_facts = _provider_refusal_facts()
+    print(f"remote_agent: provider_model_refused (retryable): {refusal_facts['message']}", file=sys.stderr)
+    print("remote_agent: provider_refusal_facts=" + json.dumps(refusal_facts, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+    print("provider_model_refused")
     raise SystemExit(0)
 # Shared with the result-shape fallback below (_result_text.py source of truth).
 _RESULTISH_KEYS = frozenset(
@@ -15403,6 +15715,12 @@ PY
             tail -8 "\$_spec_stderr" >&2 || true
             exit 9
             ;;
+        provider_model_refused)
+            _salvage_committed_work || true
+            _terminate_unsafe_harvest 18
+            _STDERR_TAIL_DONE=1
+            exit 18
+            ;;
         auth_failed)
             # Auth may fail mid-turn after commits: keep the EXIT-hook salvage,
             # but never run TEST_CMD for an auth-failed lane.
@@ -15471,7 +15789,7 @@ PY
             echo 'remote_agent: analysis source changed or dirty (exit 17)' >&2
             exit 17
         fi
-        if ! python3 - "\$OUT_DIR/.workbay-source-provenance.json" "\$_spec_json" "\$SOURCE_COMMIT" "\$SOURCE_TREE" "\$BASE" "\$_spec_stdout" <<'ANALYSIS_RESULT_PY'
+        if ! "\$_boundary_runtime_python" -I - "\$OUT_DIR/.workbay-source-provenance.json" "\$_spec_json" "\$SOURCE_COMMIT" "\$SOURCE_TREE" "\$BASE" "\$_spec_stdout" <<'ANALYSIS_RESULT_PY'
 import json
 import os
 import sys
@@ -15846,7 +16164,7 @@ PY
     echo "remote_agent: phases summary rc=${rc} phases=${_phases_status} fetch_rc=${_phases_fetch_rc}" >&2
     _review_cycle_finished=1
     if [ -z "${WORKBAY_REVIEW_CYCLE_TOKEN:-}" ]; then
-        _review_cycle_bridge settle "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$rc" "$RESULT_OUT" "$PROVENANCE_OUT" "${_review_patch_evidence:-${OUT:-$_review_spool/patch}}" || true
+        _review_cycle_bridge settle "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$rc" "$RESULT_OUT" "$PROVENANCE_OUT" "${_review_patch_evidence:-${OUT:-$_review_spool/patch}}" "${STREAM_OUT:-}" || true
     fi
     exit "$rc"
     # END BUILD_DISPATCH

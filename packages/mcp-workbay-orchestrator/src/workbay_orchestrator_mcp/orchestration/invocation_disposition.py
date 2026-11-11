@@ -173,6 +173,213 @@ def regular_bytes(path: Path, *, limit: int = _LIMIT) -> bytes:
         return bytes(raw)
 
 
+_LEGACY_IDENTITY_BYTE_BUDGET = 64 * 1024 * 1024
+
+
+class _LegacyIdentityReader:
+    """Validate JSON without retaining payloads; capture only receipt identity.
+
+    A prefix is insufficient: a later duplicate identity or malformed suffix
+    must not turn charged history into an omitted foreign receipt. Memory is
+    bounded by a 64 KiB chunk, nesting depth 64, 4096-character tokens,
+    and at most 128 active object keys totaling 4096 characters.
+    """
+
+    _space = re.compile(r"[ \t\r\n]+")
+    _string_run = re.compile(r'[^"\\\x00-\x1f]+')
+
+    def __init__(self, fd: int, size: int, *, include_bindings: bool):
+        import codecs
+
+        _require(size <= _LEGACY_IDENTITY_BYTE_BUDGET, "too_large_identity_unproven")
+        self.fd = fd
+        self.remaining = size
+        self.decoder = codecs.getincrementaldecoder("utf-8")()
+        self.chunk = ""
+        self.pos = 0
+        self.task_ref = None
+        self.seen_task_ref = False
+        self.key_characters = 0
+        self.key_count = 0
+        self.include_bindings = include_bindings
+        self.binding_object = False
+        self.identity = {}
+
+    def peek(self) -> str:
+        while self.pos == len(self.chunk):
+            if not self.remaining:
+                self.decoder.decode(b"", final=True)
+                return ""
+            raw = os.read(self.fd, min(65536, self.remaining))
+            _require(bool(raw), "malformed")
+            self.remaining -= len(raw)
+            self.chunk = self.decoder.decode(raw)
+            self.pos = 0
+        return self.chunk[self.pos]
+
+    def take(self, expected: str) -> None:
+        _require(self.peek() == expected, "malformed")
+        self.pos += 1
+
+    def whitespace(self) -> None:
+        while self.peek() and self.peek() in " \t\r\n":
+            match = self._space.match(self.chunk, self.pos)
+            self.pos = match.end()
+
+    def string(self, *, capture: bool = False) -> str | None:
+        self.take('"')
+        parts = []
+        length = 0
+
+        def retain(text):
+            nonlocal length, capture
+            if capture:
+                length += len(text)
+                if length > 4096:
+                    capture = False
+                    parts.clear()
+                else:
+                    parts.append(text)
+
+        while True:
+            char = self.peek()
+            _require(bool(char), "malformed")
+            if char == '"':
+                self.pos += 1
+                return json.loads('"' + "".join(parts) + '"') if capture else None
+            if char == "\\":
+                self.pos += 1
+                escape = self.peek()
+                _require(bool(escape) and escape in '"\\/bfnrtu', "malformed")
+                self.pos += 1
+                text = "\\" + escape
+                if escape == "u":
+                    for _ in range(4):
+                        digit = self.peek()
+                        _require(bool(digit) and digit in "0123456789abcdefABCDEF", "malformed")
+                        self.pos += 1
+                        text += digit
+                retain(text)
+            else:
+                match = self._string_run.match(self.chunk, self.pos)
+                _require(match is not None, "malformed")
+                retain(match.group())
+                self.pos = match.end()
+
+    def identity_string(self) -> str | None:
+        if self.peek() == "n":
+            for char in "null":
+                self.take(char)
+            return None
+        value = self.string(capture=True)
+        _require(value is not None, "too_large_identity_unproven")
+        return value
+
+    def value(self, depth: int = 0) -> None:
+        _require(depth <= 64, "too_large_identity_unproven")
+        self.whitespace()
+        char = self.peek()
+        _require(bool(char), "malformed")
+        if char == "{":
+            self.pos += 1
+            keys = set()
+            characters = 0
+            self.whitespace()
+            if self.peek() != "}":
+                while True:
+                    key = self.string(capture=True)
+                    _require(key is not None, "too_large_identity_unproven")
+                    _require(key not in keys, "malformed")
+                    keys.add(key)
+                    characters += len(key)
+                    self.key_characters += len(key)
+                    self.key_count += 1
+                    _require(self.key_characters <= 4096 and self.key_count <= 128,
+                             "too_large_identity_unproven")
+                    self.whitespace()
+                    self.take(":")
+                    self.whitespace()
+                    if depth == 0 and key == "task_ref":
+                        _require(not self.seen_task_ref, "malformed")
+                        self.seen_task_ref = True
+                        self.task_ref = self.string(capture=True)
+                        _require(bool(self.task_ref), "too_large_identity_unproven")
+                    elif self.include_bindings and depth == 0 and key in ("branch", "lane_id", "review_cycle_dispatch_id"):
+                        self.identity[key] = self.identity_string()
+                    elif self.include_bindings and depth == 0 and key == "lane_cycle_binding":
+                        if self.peek() == "n":
+                            self.identity[key] = self.identity_string()
+                        else:
+                            _require(self.peek() == "{", "malformed")
+                            self.identity[key] = {}
+                            self.binding_object = True
+                            self.value(depth + 1)
+                            self.binding_object = False
+                    elif self.binding_object and depth == 1 and key == "branch":
+                        self.identity["lane_cycle_binding"][key] = self.identity_string()
+                    else:
+                        self.value(depth + 1)
+                    self.whitespace()
+                    if self.peek() == "}":
+                        break
+                    self.take(",")
+                    self.whitespace()
+            self.take("}")
+            self.key_characters -= characters
+            self.key_count -= len(keys)
+        elif char == "[":
+            self.pos += 1
+            self.whitespace()
+            if self.peek() != "]":
+                while True:
+                    self.value(depth + 1)
+                    self.whitespace()
+                    if self.peek() == "]":
+                        break
+                    self.take(",")
+            self.take("]")
+        elif char == '"':
+            self.string()
+        elif char in "tfn":
+            for expected in {"t": "true", "f": "false", "n": "null"}[char]:
+                self.take(expected)
+        else:
+            # Bounded scalar validation includes finite numbers, like _json.
+            number = ""
+            while self.peek() and self.peek() in "-+0123456789.eE":
+                _require(len(number) < 4096, "too_large_identity_unproven")
+                number += self.peek()
+                self.pos += 1
+            _require(bool(re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", number)), "malformed")
+            if any(marker in number for marker in ".eE"):
+                _require(math.isfinite(float(number)), "malformed")
+
+
+def legacy_pass_identity(path: Path, *, include_bindings: bool = False) -> dict:
+    """Prove a legacy identity within fixed bounds, never following symlinks.
+
+    This supplies only a foreign-task exclusion, never same-task authority.
+    The descriptor and path must remain the same regular file throughout.
+    """
+    try:
+        with _regular(Path(path)) as fd:
+            reader = _LegacyIdentityReader(fd, os.fstat(fd).st_size, include_bindings=include_bindings)
+            reader.whitespace()
+            _require(reader.peek() == "{", "malformed")
+            reader.value()
+            reader.whitespace()
+            _require(reader.peek() == "", "malformed")
+            _require(reader.task_ref is not None, "too_large_identity_unproven")
+            return {**reader.identity, "task_ref": reader.task_ref}
+    except (UnicodeError, RecursionError) as exc:
+        raise DispositionHold("malformed") from exc
+
+
+def legacy_pass_task_ref(path: Path) -> str:
+    """Prove just the task identity when no branch/dispatch binding is needed."""
+    return legacy_pass_identity(path)["task_ref"]
+
+
 def read_record(path: Path) -> tuple[dict[str, Any], bytes]:
     raw = regular_bytes(path)
     return _json(raw), raw

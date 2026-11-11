@@ -24,6 +24,8 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 
+from workbay_protocol.bootstrap_ledger_view import HOST_RECEIPT_REL, overlay_ledger_view, parse_host_receipt
+
 from .hook_helpers import (
     _DIR_FLAGS,
     _absolute_directory,
@@ -314,7 +316,11 @@ def _manifest(tree: _Tree):
         # Fields unrelated to ownership are allowed on the one exact record.
         if len(owned) != 1 or owned[0].get("path") != _SURFACE or owned[0].get("source") != "lifecycle":
             raise _Refused("ownership: lifecycle must have one exact managed registration without overlapping owners")
-    return observed
+    # The original bytes and identity remain the ownership/CAS authority.
+    # Host registrations are available only in the diagnostic view.
+    receipt = tree.optional(HOST_RECEIPT_REL.as_posix())
+    view = overlay_ledger_view(manifest, parse_host_receipt(receipt[0]) if receipt is not None else None)
+    return (*observed, view)
 
 
 def _consumer_identity(tree: _Tree):

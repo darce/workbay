@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.84] — 2026-11-11
+
+### Changed
+- Pin the v0.1.90 member tuple: the remote lane-sandbox release-to-reclaim fix, the VM reclaimer on the real VM, the `make vm-reap` hook and its guard, and the macOS Bash 3.2 parse fix for `remote_agent.sh`.
+
 ## [0.3.83] — 2026-11-09
 
 ### Changed

@@ -141,6 +141,9 @@ task-finish: ## Close task: status=done -> archive -> dashboard -> remove linked
 	@$(LIFECYCLE) task-finish $(if $(TASK),--task '$(TASK)') $(LIFECYCLE_ARGS)
 task-reap: ## Classify live handoff rows; REAP_ARGS=--apply closes closeable rows: [TASK=<ref>] [LIFECYCLE_ARGS=--json]
 	@$(LIFECYCLE) task-reap $(if $(TASK),--task '$(TASK)') $(REAP_ARGS) $(LIFECYCLE_ARGS)
+.PHONY: vm-reap
+vm-reap: ## Free VM disk the supported way: dry-run by default, APPLY=1 to apply [TASK=<task-ref>] [VM_REAP_ARGS=--json]
+	@$(LIFECYCLE_PYTHON) "$(abspath $(LIFECYCLE_MK_DIR)../scripts/workbay_vm_reap.py)" --workspace-root "$(CURDIR)" $(if $(filter 1,$(APPLY)),--apply) $(if $(TASK),--task-ref '$(TASK)') $(VM_REAP_ARGS)
 orphan-reclaim: ## Reclaim merged branches with no live task or lane row: ORPHAN_RECLAIM_ARGS=--apply [--integration-ref <ref>] [--json]
 	@$(WORKBAY_ORPHAN_RECLAIM_CLI) orphan-reclaim $(ORPHAN_RECLAIM_ARGS)
 finalize-plan: ## Persist final task-plan checklist ticks onto the feature branch BEFORE merge (so they ride into main): TASK=<ref> [LIFECYCLE_ARGS=--json]

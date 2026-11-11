@@ -120,6 +120,12 @@ systemd_units_ready() {
     [ "$ready" -eq 1 ]
 }
 
+# This user installer never acquires root privileges. The operator installs the
+# independent root helper once; it must never execute a gate-writable payload.
+if [ ! -f /etc/systemd/system/workbay-vm-reclaim-owner-repair.service ]; then
+    printf "Owner repair unit absent. Operator: ssh -t ubuntu@<host> 'sudo bash /path/to/workbay/scripts/vm/install_vm_reclaim_owner_repair.sh'\n" >&2
+fi
+
 install_file "$reclaim_source" "$reclaim_destination" 755
 for unit_name in "${unit_names[@]}"; do
     install_file "$script_dir/$unit_name" "$unit_directory/$unit_name" 644

@@ -3,6 +3,25 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.34] — 2026-11-11
+
+### Fixed
+- Remote lane-sandbox reaping frees space again.
+- The release census holds a sandbox while any live task references it through its cwd, root, executable, open files, environment, memory maps or argv.
+- A provider model refusal from a remote lane is now the typed, retryable `provider_model_refused` (exit 18), not a generic failure.
+- Reclaim-scan verdicts for system-origin lanes are recorded even when the task's target branch is gone, and scan errors reach stderr.
+- The local reclaim scan no longer rewrites an unchanged non-reclaimable verdict on every sweep, and the scan budget bounds its write phase.
+- Read the Codex model catalogue under the dispatching transport's originator, so admission no longer refuses a model that the remote host serves.
+- Prove a foreign legacy pass identity before refusing a review ratchet.
+- Pin the boundary interpreter in `remote_agent.sh` and name missing-runtime refusals.
+
+### Added
+- `python -m workbay_orchestrator_mcp.orchestration.provider_probe`: a one-command probe that compares a job dispatch with a direct provider call.
+- The harness-checklist-v1 read model, a read-only checklist collector and `workbay fleet checklist`.
+
+### Changed
+- Read the orchestrator ledger reader through the shared bootstrap-ledger view.
+
 ## [0.3.33] — 2026-11-09
 
 ### Changed

@@ -72,6 +72,18 @@ def _unique_object(pairs):
     return value
 
 
+def _stream_object(pairs):
+    # Native stream events are not the result artifact: codex-cli repeats "id"
+    # inside web_search items. Parse them as stream_turn_facts does (last key
+    # wins), but an event whose "type" is itself ambiguous is no observation.
+    value = {}
+    for key, item in pairs:
+        if key == "type" and key in value and value[key] != item:
+            raise ValueError("ambiguous stream event type")
+        value[key] = item
+    return value
+
+
 def _invalid_constant(value):
     raise ValueError("invalid JSON constant: " + value)
 
@@ -161,7 +173,7 @@ def _validate_analysis_completion(proof: dict, stream: Path, route: dict) -> Non
             raise ValueError("analysis stream oversized")
         raw = stream.read_bytes()
         facts = stream_turn_facts(raw)
-        events = [json.loads(line, object_pairs_hook=_unique_object) for line in raw.splitlines() if line.strip()]
+        events = [json.loads(line, object_pairs_hook=_stream_object) for line in raw.splitlines() if line.strip()]
         if (
             facts["malformed_lines"]
             or facts["turn_failed"]

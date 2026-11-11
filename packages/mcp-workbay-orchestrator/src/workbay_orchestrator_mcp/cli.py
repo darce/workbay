@@ -905,14 +905,19 @@ def _handle_lane_reclaim_scan(
             total = "?" if rows_total is None else str(rows_total)
             print(f"lane-reclaim-scan progress rows={rows_done}/{total}", file=sys.stderr)
 
+        def _log(level: str, event: str, **fields: Any) -> None:
+            print(json.dumps({"level": level, "event": event, **fields}, default=str), file=sys.stderr)
+
         scan = scan_terminal_lanes(
             orchestrator_root=orchestrator_root,
             limit=limit,
             offset=offset,
             progress=_progress,
+            log=_log,
             **({"all_tasks": True} if all_tasks else {"task_ref": task_ref}),
         )
 
+        print(f"unchanged_skipped={scan.unchanged_skipped}")
         if not scan.complete:
             reason = scan.refusal_reason if scan.refusal_reason is not None else "scan_incomplete"
             print(f"refusal_reason={reason}")
@@ -2160,14 +2165,33 @@ def main() -> None:
             run_remote_sandbox_reap,
         )
 
-        _emit_lane_payload(
-            run_remote_sandbox_reap(
-                root=config.workspace_root,
-                task_ref=args.task_ref,
-                apply=args.apply,
-                idle_seconds=args.idle_seconds,
-            )
+        payload = run_remote_sandbox_reap(
+            root=config.workspace_root,
+            task_ref=args.task_ref,
+            apply=args.apply,
+            idle_seconds=args.idle_seconds,
         )
+        if args.apply:
+            summary = payload.get("summary", {})
+            released = summary.get("released_to_reclaim", 0)
+            pending = summary.get("release_pending_bytes", 0)
+            holds = summary.get("holds", [])
+            reasons: dict[str, int] = {}
+            for hold in holds:
+                reason = hold["reason"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+            counts = ",".join(f"{reason}:{count}" for reason, count in sorted(reasons.items()))
+            held_count = summary.get("hold_count", len(holds))
+            held_label = f"held>={held_count} (truncated)" if summary.get("holds_truncated") else f"held={held_count}"
+            print(
+                f"released={released} pending_bytes={pending} {held_label}({counts}) "
+                f"free_after={summary.get('free_after', 0)}",
+                file=sys.stderr,
+            )
+            if summary.get("bytes_freed", 0) == 0 and released == 0 and held_count:
+                _print_json(payload)
+                raise SystemExit(1)
+        _emit_lane_payload(payload)
         return
 
     if cmd == "lane-census":

@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from workbay_protocol import BootstrapManifest
+from workbay_protocol.bootstrap_ledger_view import InvalidLedgerShape, load_ledger_view
 
 try:
     from workbay_protocol import MANIFEST_NAME_PRECEDENCE
@@ -37,8 +38,8 @@ def _load_adjacent_overlay_manifest(config: RuntimeConfig) -> BootstrapManifest 
         if not manifest_path.is_file():
             continue
         try:
-            payload = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError):
+            payload = load_ledger_view(parent, manifest_name=name)
+        except (OSError, json.JSONDecodeError, InvalidLedgerShape):
             continue
         try:
             return BootstrapManifest.model_validate(payload)

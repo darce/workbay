@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -1533,11 +1534,138 @@ def shell_reserve(repo: Path, spec_path: Path, *, dispatch_id: str, subject_bran
         return {"decision": asdict(LedgerDecision("ledger_hold", str(exc)))}
 
 
+def provider_refusal_proof(stream_path, spec_path, *, result, patch, refusal_code=None) -> dict | None:
+    """Read-only, fail-closed proof of contract section 4 from producer bytes.
+
+    Canon v0.26.2 [SECD-05] **Fail-safe defaults** (Security Engineering).
+    The typed exit/result is necessary, never sufficient. Private locators are
+    retained so settle_actual can repeat this proof inside the receipt lock.
+    Nothing supplied in a proof dictionary bypasses that second read.
+    """
+    try:
+        from .offload_pass_recovery import stream_turn_facts
+        if refusal_code not in ("18", "provider_model_refused") or not stream_path or not spec_path:
+            return None
+
+        def regular_bytes(value):
+            path = Path(value).absolute()
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                raise ValueError("provider_refusal_file_invalid")
+            def identity(info):
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if identity(opened) != identity(info):
+                    raise ValueError("provider_refusal_file_changed")
+                raw = handle.read(info.st_size)  # at most 1 MiB, including racing writers
+                after = os.fstat(handle.fileno())
+            if (len(raw) != info.st_size or identity(after) != identity(opened)
+                    or identity(path.lstat()) != identity(info)):
+                raise ValueError("provider_refusal_file_changed")
+            return raw
+
+        def absent_result():
+            if result and os.path.lexists(result):
+                return False  # even an empty/unreadable result is not absence
+            if patch and os.path.lexists(patch):
+                if regular_bytes(patch):
+                    return False
+            return True
+
+        if not absent_result():
+            return None
+        raw, spec_raw = regular_bytes(stream_path), regular_bytes(spec_path)
+        spec = json.loads(spec_raw)
+        patterns = spec["provider_refusal_match"]["patterns"]
+        if (not isinstance(patterns, list) or not patterns
+                or not all(isinstance(pattern, str) and pattern.strip() for pattern in patterns)):
+            return None
+        facts = stream_turn_facts(raw)
+        events = [json.loads(line) for line in raw.splitlines()]
+        if (facts != dict(turn_started=1, turn_completed=0, turn_failed=1, malformed_lines=0)
+                or not events or not all(isinstance(event, dict) and isinstance(event.get("type"), str)
+                                         for event in events)
+                or events[-1]["type"] != "turn.failed"):
+            return None
+        if any(event["type"] in {"item.started", "item.completed"}
+               and (not isinstance(event.get("item"), dict) or event["item"].get("type") != "error")
+               for event in events):
+            return None
+        error = events[-1].get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        if not isinstance(message, str) or not any(pattern in message for pattern in patterns):
+            return None
+        # Only provider error records may contribute diagnostic metadata.
+        metadata = dict(http_status=None, error_code=None, request_id=None)
+        def fields(value):
+            if not isinstance(value, dict):
+                return
+            for target, names in (("http_status", ("http_status_code",)),
+                                  ("error_code", ("codex_error_info",)),
+                                  ("request_id", ("request_id", "x-request-id", "cf-ray"))):
+                for name in names:
+                    if value.get(name) is not None:
+                        metadata[target] = value[name]
+                        break
+            for name in ("error", "headers"):
+                fields(value.get(name))
+        for event in events:
+            if event["type"] in {"error", "turn.failed"}:
+                fields(event)
+            elif event["type"] in {"item.started", "item.completed"}:
+                fields(event["item"])
+        if (regular_bytes(stream_path) != raw or regular_bytes(spec_path) != spec_raw or not absent_result()):
+            return None
+        return dict(message=message, stream_sha256=hashlib.sha256(raw).hexdigest(), **metadata,
+                    _stream_path=str(Path(stream_path).absolute()), _spec_path=str(Path(spec_path).absolute()),
+                    _result=str(Path(result).absolute()) if result else None,
+                    _patch=str(Path(patch).absolute()) if patch else None, _refusal_code=refusal_code,
+                    _head_sha=spec.get("head_sha"), _spec_sha256=hashlib.sha256(spec_raw).hexdigest())
+    except Exception:  # any doubt must charge, never raise into settlement
+        return None
+
+
 def settle_actual(repo: Path, identity: dict, *, outcome: str, model_started: bool = False,
                   judgment: bool = False, commit_landed: bool = False, refusal_reason: str | None = None,
-                  harvest: dict | None = None) -> LedgerDecision:
+                  harvest: dict | None = None, provider_refusal: dict | None = None) -> LedgerDecision:
     """Producer evidence dominates model claims of pending/infra forgiveness."""
     from .pass_outcome_class import PassOutcomeClass, classify_pass_outcome
+    if provider_refusal is not None:
+        path = _receipt_path(repo, identity["dispatch_id"])
+        try:
+            with path.with_suffix(".lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                receipt = json.loads(path.read_bytes())
+                verified = provider_refusal_proof(
+                    provider_refusal.get("_stream_path"), provider_refusal.get("_spec_path"),
+                    result=provider_refusal.get("_result"), patch=provider_refusal.get("_patch"),
+                    refusal_code=provider_refusal.get("_refusal_code"))
+                if (verified is not None and verified == provider_refusal and receipt["identity"] == identity
+                        and refusal_reason == "provider_model_refused"
+                        and outcome in {"dispatch_refused", "transport_failure"}
+                        and not judgment and not commit_landed
+                        and verified["_head_sha"] == _git(repo, "rev-parse", "HEAD")):
+                    # The proof overrides only model_started. A judgment or real
+                    # commit still charges. The ledger bounds and stores this
+                    # exception atomically with ordinary charge accounting.
+                    settled = runtime_ledger(repo).settle(**identity, outcome="dispatch_refused",
+                        refusal_reason="provider_model_refused", provider_refusal=verified)
+                    if settled.row is not None and settled.row.get("provider_refusal") is not None:
+                        receipt["settlement"] = asdict(settled)
+                        _save(path, receipt)
+                        p = settled.row["provider_refusal"]
+                        print("remote_agent: review_cycle provider_model_refused "
+                              f"attempt={p['attempt']}/3 round_charged={str(settled.row['round_charged']).lower()} "
+                              f"retry_after_seconds={p['retry_after_seconds']}", file=sys.stderr)
+                    return settled
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+            return LedgerDecision("ledger_hold", "provider_refusal_receipt_unavailable")
+    # A claim without verified producer bytes cannot use the classifier's
+    # provider exception, even when the caller omits model_started.
+    if refusal_reason == "provider_model_refused":
+        outcome, refusal_reason = "error", None
     if model_started or judgment or commit_landed:
         if classify_pass_outcome(outcome, refusal_reason=refusal_reason) != PassOutcomeClass.VERDICT:
             outcome, refusal_reason = "error", None
@@ -1908,12 +2036,17 @@ def shell_entry() -> None:
             except (OSError, ValueError):
                 return {}
         result, provenance = read(result_path), read(provenance_path)
+        stream_path = sys.argv[11] if mode in {"settle", "premodel"} and len(sys.argv) == 12 else None
+        provider_refusal = provider_refusal_proof(stream_path, spec, result=result_path, patch=patch_path,
+                                                 refusal_code=rc) if rc == "18" else None
         started = provenance.get("model_process_started") is True
         patch = bool(patch_path and Path(patch_path).is_file() and Path(patch_path).stat().st_size)
         # Queue receipt is never model output. Before-model admission is the
         # only rc-only forgiveness; unknown/partial transport fails closed.
         outcome = "remote_job_pending" if mode == "pending" else (
             "transport_failure" if mode == "premodel" and not started and not result and not patch else "error")
+        if provider_refusal is not None:
+            outcome = "dispatch_refused"
         path = _receipt_path(repo, dispatch_id)
         if mode == "settle":  # only a completed synchronous run has a native rc
             # This call owns the transport exit and retained producer files.
@@ -1926,6 +2059,8 @@ def shell_entry() -> None:
             receipt = _publish_native_completion(path, rc, outcome)
         settlement = settle_actual(repo, receipt["identity"], outcome=outcome, model_started=started,
                                    judgment=bool(result), commit_landed=patch,
+                                   refusal_reason="provider_model_refused" if provider_refusal else None,
+                                   provider_refusal=provider_refusal,
                                    harvest=harvest_shell_gate(repo, receipt, result) if kind == "gate" and result else None)
         decision = asdict(settlement)
         with path.with_suffix(".lock").open("a+b") as lock:
@@ -1943,6 +2078,8 @@ def shell_entry() -> None:
                 receipt["native_dispatch"] = native
             receipt["settlement"] = decision
             receipt["producer_artifacts"] = dict(result=result_path, provenance=provenance_path, patch=patch_path)
+            if stream_path is not None:
+                receipt["producer_artifacts"]["stream"] = stream_path
             _save(path, receipt)
     print("remote_agent: review_cycle " + json.dumps(decision, sort_keys=True), file=sys.stderr)
     if mode == "reserve" and decision["status"] != "reserved":

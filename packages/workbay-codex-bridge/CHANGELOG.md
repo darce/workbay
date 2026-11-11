@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.6] — 2026-11-11
+
+### Changed
+- Reissue the bridge member in the immutable WorkBay v0.1.90 tuple; bridge behavior is unchanged.
+
 ## [0.3.5] — 2026-11-09
 
 ### Changed

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from workbay_handoff_mcp.enums import LaneStatus
+from workbay_protocol.bootstrap_ledger_view import InvalidHostReceipt, InvalidLedgerShape, load_ledger_view
 
 from .lanes_support import (
     _BRANCH_PROBE_TIMEOUT_S,
@@ -2455,15 +2456,27 @@ def _bootstrap_schema_supported(payload: Mapping[object, object]) -> bool:
     return type(schema_version) is int and schema_version == _SUPPORTED_BOOTSTRAP_LEDGER_SCHEMA_VERSION
 
 
-def _load_bootstrap_ledger(worktree_path: str) -> tuple[list[object], list[object]] | None:
-    """Load bounded arrays from the one audited bootstrap ledger schema."""
-    ledger = _run_reclaim_command(["git", "-C", worktree_path, "show", "HEAD:.workbay-bootstrap.json"])
-    if ledger is None or ledger.returncode != 0:
-        return None
-    try:
-        payload = json.loads(ledger.stdout or "")
-    except (json.JSONDecodeError, UnicodeError):
-        return None
+class _BootstrapLedgerView(tuple[list[object], list[object]]):
+    """Diagnostic arrays carrying separate HEAD authority.
+
+    Unpacking preserves the historical pair shape. Reaping consumes ``head``;
+    bare pairs from injected loaders retain their historical HEAD-only meaning.
+    """
+
+    head: tuple[list[object], list[object]]
+
+    def __new__(
+        cls,
+        observations: tuple[list[object], list[object]],
+        head: tuple[list[object], list[object]],
+    ) -> _BootstrapLedgerView:
+        view = super().__new__(cls, observations)
+        view.head = head
+        return view
+
+
+def _validated_bootstrap_ledger(payload: object) -> tuple[list[object], list[object]] | None:
+    """Validate declarations and observations under the same bounded schema."""
     if not isinstance(payload, Mapping) or not _bootstrap_schema_supported(payload):
         return None
     surfaces = _bootstrap_ledger_entries(payload, "surfaces")
@@ -2473,6 +2486,25 @@ def _load_bootstrap_ledger(worktree_path: str) -> tuple[list[object], list[objec
     if len(surfaces) + len(configs) > _MAX_REGENERABLE_LEDGER_ROOTS:
         return None
     return (surfaces, configs)
+
+
+def _load_bootstrap_ledger(worktree_path: str) -> _BootstrapLedgerView | None:
+    """Load host diagnostics; keep committed declarations as reaping authority.
+
+    A missing or malformed input retains the existing fail-closed ``None``
+    result. Receipt observations never replace the separately validated HEAD.
+    """
+    ledger = _run_reclaim_command(["git", "-C", worktree_path, "show", "HEAD:.workbay-bootstrap.json"])
+    if ledger is None or ledger.returncode != 0:
+        return None
+    try:
+        head = _validated_bootstrap_ledger(json.loads(ledger.stdout or ""))
+        observations = _validated_bootstrap_ledger(load_ledger_view(Path(worktree_path)))
+    except (OSError, json.JSONDecodeError, UnicodeError, InvalidHostReceipt, InvalidLedgerShape):
+        return None
+    if head is None or observations is None:
+        return None
+    return _BootstrapLedgerView(observations, head)
 
 
 def _roots_from_ledger_entries(
@@ -2495,7 +2527,7 @@ def _bootstrap_regenerable_roots(worktree_path: str) -> dict[str, str]:
     ledger_entries = _load_bootstrap_ledger(worktree_path)
     if ledger_entries is None:
         return {}
-    surfaces, configs = ledger_entries
+    surfaces, configs = getattr(ledger_entries, "head", ledger_entries)
     roots = _roots_from_ledger_entries(surfaces, lambda entry: _bootstrap_surface_root(worktree_path, entry))
     roots.update(_roots_from_ledger_entries(configs, lambda entry: _bootstrap_config_root(worktree_path, entry)))
     return roots
@@ -2703,7 +2735,7 @@ def _content_identity_context(worktree_path: str) -> _ContentIdentityContext | N
     ledger_entries = _load_bootstrap_ledger(worktree_path)
     if ledger_entries is None:
         return None
-    surfaces, configs = ledger_entries
+    surfaces, configs = getattr(ledger_entries, "head", ledger_entries)
     tracked_by_root: dict[str, frozenset[str]] = {}
     for root in _payload_provenance_roots(surfaces):
         tracked = _tracked_paths_under(worktree_path, root)

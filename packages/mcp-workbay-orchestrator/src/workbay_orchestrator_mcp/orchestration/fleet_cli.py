@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 from . import fleet_lineage
@@ -189,12 +190,109 @@ def _summarize_command(argv):
         return 2
 
 
+def _checklist_text(report):
+    def quote(value):
+        return json.dumps(value, ensure_ascii=True, allow_nan=False)
+
+    lines = [
+        f"Checklist {quote(report['subject'])} selection={report['selection']} "
+        f"partial={report['partial']} pause_point={report['pause_point']}",
+        "Observed checks",
+    ]
+    for row in report["rows"]:
+        label = row["state"].upper()
+        if row["freshness"] == "stale":
+            label += " · STALE"
+        lines.append(f"{row['row_id']} {label} reason={row['reason']}")
+        if not row["checks"]:
+            lines.append(
+                f"  owner=validation_battery.run_battery evidence={quote('docs/contracts/harness-checklist-v1.md')}"
+            )
+        for check in row["checks"]:
+            ev = check["evidence"]
+            reference = "docs/contracts/harness-checklist-v1.md"
+            binding = ""
+            if ev:
+                reference = ev.get("receipt_path") or (
+                    f"test_result:{ev['verified_test_id']}"
+                    if ev.get("verified_test_id")
+                    else "workbay fleet checklist --task "
+                    + quote(ev["scope"]["task_ref"])
+                    + (" --lane " + quote(ev["scope"]["lane_id"]) if ev["scope"]["lane_id"] is not None else "")
+                )
+                if ev["binding"]["freshness"] == "stale":
+                    binding = (
+                        f" STALE measured_sha={ev['sha']} current_sha={ev['binding']['current_tip_sha']}"
+                        f" measured_base={ev['base_sha']} current_base={ev['binding']['current_base_sha']}"
+                    )
+            lines.append(
+                f"  {check['key']} {check['state'].upper()} owner={check['owner']} "
+                f"reason={check['reason']} evidence={quote(reference)}{binding}"
+            )
+    lines.append("Claimed")
+    for claim in report["claims"]:
+        lines.append(
+            f"  {claim['kind']} {quote(claim['text'])} source={quote(claim['source_id'])} "
+            f"evidence={quote(claim['evidence_ref'])}"
+        )
+    lines.append("Judgment")
+    for judgment in report["judgments"]:
+        lines.append(
+            f"  {judgment['kind']} decision={judgment['decision_id']} "
+            f"exists={judgment['decision_exists']} pause=true evidence={quote(judgment['evidence_ref'])}"
+        )
+    if report["limits_hit"]:
+        lines.append("Partial reasons: " + ", ".join(report["limits_hit"]))
+    if report["diagnostics"]:
+        lines.append("Diagnostics: " + ", ".join(report["diagnostics"]))
+    return "\n".join(lines)
+
+
+def _checklist_command(argv):
+    from .harness_checklist_collect import collect_checklist, write_checklist_cache
+
+    parser = argparse.ArgumentParser(
+        prog="workbay fleet checklist", description="Read recorded checklist evidence on demand."
+    )
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--lane")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--require-observed", action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
+    args = parser.parse_args(argv)
+    if not args.task or args.lane == "" or len(args.task) > 1024 or (args.lane is not None and len(args.lane) > 1024):
+        parser.error("task and lane must be nonempty identities of at most 1024 characters")
+    try:
+        report = collect_checklist(args.root, args.task, args.lane, deadline=time.monotonic() + 30)
+        if not isinstance(report, dict) or report.get("schema") != "harness-checklist-v1":
+            raise ValueError("no checklist envelope")
+        if not args.no_cache:
+            write_checklist_cache(args.root, report)
+        print(json.dumps(report, sort_keys=True, allow_nan=False) if args.json else _checklist_text(report))
+        # Canon 0.26.2 **Exit status is the outcome contract** [AGT-21],
+        # lexicons/engineering.md#agt-21, The UNIX Programming Environment ch. 5.
+        if args.require_observed and (
+            report["partial"]
+            or report["selection"] != "selected"
+            or not report["rows"]
+            or any(row["state"] != "observed_pass" for row in report["rows"])
+        ):
+            return 1
+        return 0
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
+        print(f"workbay fleet checklist: {exc}", file=sys.stderr)
+        return 2
+
+
 def workbay_front_door(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["summarize"]:
         return _summarize_command(argv[1:])
     if argv[:1] == ["tree"]:
         return _tree_command(argv[1:])
+    if argv[:1] == ["checklist"]:
+        return _checklist_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="workbay fleet",
         description="Bounded fleet snapshot with optional read-only VM inventory; 'tree' shows read-only lineage.",

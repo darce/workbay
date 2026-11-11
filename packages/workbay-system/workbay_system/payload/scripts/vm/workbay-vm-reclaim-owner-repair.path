@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch gate reclaim owner repair requests
+
+[Path]
+PathExistsGlob=/home/gate/.local/state/workbay-reclaim/owner-repair/*.json
+Unit=workbay-vm-reclaim-owner-repair.service
+
+[Install]
+WantedBy=multi-user.target

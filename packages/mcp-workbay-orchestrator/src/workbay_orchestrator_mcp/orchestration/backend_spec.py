@@ -132,6 +132,15 @@ RATE_LIMIT_MATCH_PATTERNS: tuple[str, ...] = (
     "429 Too Many Requests",
     "Too Many Requests",
     "last status: 429",
+    "Quota exceeded. Check your plan and billing details.",
+)
+# Provider capacity is retryable and distinct from account quota. Keep full
+# diagnostics (S4-H-01); stdout matching is restricted to provider errors.
+PROVIDER_REFUSAL_MATCH_PATTERNS: tuple[str, ...] = (
+    "Selected model is at capacity. Please try a different model.",
+    "Flex capacity unavailable.",
+    "We're currently experiencing high demand, which may cause temporary errors.",
+    "Policy-restricted capacity is unavailable",
 )
 CLAUDE_RATE_LIMIT_MATCH_PATTERNS: tuple[str, ...] = (
     "rate_limit_error",
@@ -327,6 +336,7 @@ class AgentSpec:
     agent_exit_to_status: dict[str, str]
     auth_match: dict[str, Any] = field(default_factory=dict)
     rate_limit_match: dict[str, Any] = field(default_factory=dict)
+    provider_refusal_match: dict[str, Any] = field(default_factory=dict)
     service_tier_warning_match: dict[str, Any] = field(default_factory=dict)
     # When True, dispatch must re-probe sandbox/userns before trusting LANE_SANDBOX.
     requires_live_sandbox_preflight: bool = False
@@ -652,6 +662,10 @@ def _build_codex_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
             service_tier_warning_match={
                 "streams": ["stdout", "stderr"],
                 "patterns": list(SERVICE_TIER_WARNING_PATTERNS) if service_tier is not None else [],
+            },
+            provider_refusal_match={
+                "streams": list(AUTH_MATCH_STREAMS),
+                "patterns": list(PROVIDER_REFUSAL_MATCH_PATTERNS),
             },
             requires_live_sandbox_preflight=(
                 WORKSPACE_WRITE_REQUIRES_LIVE_PREFLIGHT or WRITABLE_ROOTS_REQUIRES_LIVE_PREFLIGHT

@@ -25,10 +25,15 @@ _logger = logging.getLogger(__name__)
 # Runs under the execution identity on the gate. Never emits credentials or
 # account fields. model/list may fall back to bundled models on network failure;
 # intersect it with a successful authenticated HTTP response from the provider.
-_REMOTE_READER = r"""
+# codex-remote dispatches via codex exec, whose catalogue is originator-scoped.
+CODEX_REMOTE_ORIGINATOR = "codex_exec"
+_REMOTE_READER = (
+    f"originator = {CODEX_REMOTE_ORIGINATOR!r}\n"
+    + r"""
 import hashlib, json, os, pathlib, subprocess, time
 p = subprocess.Popen(["codex", "app-server", "-c", 'model_provider="openai"'], stdin=subprocess.PIPE,
-                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                     env={**os.environ, "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": originator})
 def rpc(i, method, params):
     p.stdin.write(json.dumps({"id": i, "method": method, "params": params}) + "\n")
     p.stdin.flush()
@@ -76,6 +81,7 @@ try:
         "Authorization": "Bearer " + access_token,
         "ChatGPT-Account-Id": account_id,
         "User-Agent": "codex_cli_rs/" + version,
+        "originator": originator,
     })
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
@@ -97,9 +103,9 @@ try:
         model["serviceTiers"] = evidence.get("service_tiers")
         # additionalSpeedTiers is the CLI spelling, distinct from API tier IDs.
         verified.append(model)
-    identity = hashlib.sha256(json.dumps([account_id, str(home), endpoint], sort_keys=True).encode()).hexdigest()
+    identity = hashlib.sha256(json.dumps([account_id, str(home), endpoint, originator], sort_keys=True).encode()).hexdigest()
     print(json.dumps({"cli_version": version, "codex_home": str(home), "identity": identity,
-                      "fetched_at": time.time(), "models": verified}))
+                      "fetched_at": time.time(), "models": verified, "originator": originator}))
 finally:
     p.terminate()
     try:
@@ -108,6 +114,7 @@ finally:
         p.kill()
         p.wait()
 """
+)
 
 
 CodexCapabilityKind = Literal[
@@ -198,12 +205,13 @@ def remote_catalogue(*, refresh: bool = False) -> dict[str, Any]:
             kind="catalogue_unavailable",
         )
     with _lock:
-        cached = _snapshots.get(host)
+        cache_key = json.dumps([host, CODEX_REMOTE_ORIGINATOR])
+        cached = _snapshots.get(cache_key)
         if not refresh and cached and time.monotonic() - cached[0] < SNAPSHOT_TTL_SECONDS:
             if 0 <= time.time() - float(cached[1]["fetched_at"]) <= CATALOGUE_MAX_AGE_SECONDS:
                 return cached[1]
         value = _read_remote_catalogue(host)
-        _snapshots[host] = (time.monotonic(), value)
+        _snapshots[cache_key] = (time.monotonic(), value)
         return value
 
 
@@ -231,7 +239,8 @@ def _observed_model(model: str, snapshot: dict[str, Any] | None = None):
     rows = [row for row in observed["models"] if isinstance(row, dict) and row.get("model") == model]
     if len(rows) != 1:
         raise CodexCapabilityError(
-            prefix + "unknown_model: absent or ambiguous in authenticated remote catalogue",
+            prefix + "unknown_model: absent or ambiguous in authenticated remote catalogue "
+            f"(originator {observed.get('originator', CODEX_REMOTE_ORIGINATOR)})",
             kind="unknown_model",
         )
     return rows[0], policy, observed

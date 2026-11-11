@@ -273,9 +273,10 @@ def _load_receipt(target: Path) -> dict[str, object] | None:
     """Parsed bootstrap receipt, or ``None`` when the file is missing or
     unreadable/corrupt. Callers must treat ``None`` as "no receipt evidence
     either way" -- never as an empty (config-disowning) receipt."""
-    manifest_path = target / BOOTSTRAP_MANIFEST_NAME
+    from workbay_protocol.bootstrap_ledger_view import load_ledger_view
+
     try:
-        loaded = json.loads(manifest_path.read_text())
+        loaded = load_ledger_view(target)
     except (OSError, ValueError):
         return None
     return loaded if isinstance(loaded, dict) else None

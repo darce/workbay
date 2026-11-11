@@ -57,6 +57,7 @@ OUTCOME_CLASS: Mapping[str, PassOutcomeClass] = MappingProxyType({
 INFRA_REFUSAL_REASONS: frozenset[str] = frozenset({
     STALE_WORKER_CONFIGURATION_REASON,
     "catalogue_unavailable",
+    "provider_model_refused",
 })
 
 

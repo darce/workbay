@@ -394,7 +394,9 @@ def _default_codemap_mode(manifest: dict[str, object]) -> None:
 
 
 def _persist_install_manifest_bytes(target: Path, manifest: dict[str, object]) -> None:
-    (target / BOOTSTRAP_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+    from workbay_bootstrap.ledger_host_facts import write_install_manifest
+
+    write_install_manifest(target, manifest)
 
 
 def _record_installed_gitonly_closure_pin(manifest: dict[str, object], installed_gitonly_mcp_tools: object) -> None:
@@ -4293,39 +4295,45 @@ def install(
         execution_mode=execution_mode,
         embeddings_mode=embeddings_mode,
     )
-    manifest = run_install(
-        InstallRequest.from_install_kwargs(
-            target=target,
-            remote_url=remote_url,
-            remote_ref=remote_ref,
-            source=source,
-            package_root=package_root,
-            mcp_servers=mcp_servers,
-            plugin_overrides=plugin_overrides,
-            reset_overrides=reset_overrides,
-            backup_overrides=backup_overrides,
-            enforce_required_surfaces=enforce_required_surfaces,
-            profile=profile,
-            install_claude_stop_hook_local=install_claude_stop_hook_local,
-            install_codex_stop_hook=install_codex_stop_hook,
-            install_vscode_stop_hook=install_vscode_stop_hook,
-            install_grok_stop_hook=install_grok_stop_hook,
-            install_claude_reinject_hook_local=install_claude_reinject_hook_local,
-            install_codex_ensure_agent_surfaces_hook=install_codex_ensure_agent_surfaces_hook,
-            install_vscode_ensure_agent_surfaces_hook=install_vscode_ensure_agent_surfaces_hook,
-            install_grok_ensure_agent_surfaces_hook=install_grok_ensure_agent_surfaces_hook,
-            allow_member_skew=allow_member_skew,
-            execution_mode=execution_mode,
-            embeddings_mode=embeddings_mode,
-            force_reuse_state=force_reuse_state,
+    from workbay_bootstrap.ledger_host_facts import refresh_host_receipt
+
+    try:
+        manifest = run_install(
+            InstallRequest.from_install_kwargs(
+                target=target,
+                remote_url=remote_url,
+                remote_ref=remote_ref,
+                source=source,
+                package_root=package_root,
+                mcp_servers=mcp_servers,
+                plugin_overrides=plugin_overrides,
+                reset_overrides=reset_overrides,
+                backup_overrides=backup_overrides,
+                enforce_required_surfaces=enforce_required_surfaces,
+                profile=profile,
+                install_claude_stop_hook_local=install_claude_stop_hook_local,
+                install_codex_stop_hook=install_codex_stop_hook,
+                install_vscode_stop_hook=install_vscode_stop_hook,
+                install_grok_stop_hook=install_grok_stop_hook,
+                install_claude_reinject_hook_local=install_claude_reinject_hook_local,
+                install_codex_ensure_agent_surfaces_hook=install_codex_ensure_agent_surfaces_hook,
+                install_vscode_ensure_agent_surfaces_hook=install_vscode_ensure_agent_surfaces_hook,
+                install_grok_ensure_agent_surfaces_hook=install_grok_ensure_agent_surfaces_hook,
+                allow_member_skew=allow_member_skew,
+                execution_mode=execution_mode,
+                embeddings_mode=embeddings_mode,
+                force_reuse_state=force_reuse_state,
+            )
         )
-    )
-    _finish_install_embeddings(
-        target,
-        embeddings_mode=embeddings_mode,
-        no_embeddings=no_embeddings or opt_out,
-    )
-    return manifest
+        _finish_install_embeddings(
+            target,
+            embeddings_mode=embeddings_mode,
+            no_embeddings=no_embeddings or opt_out,
+        )
+        return manifest
+    finally:
+        # Policy consent and abort snapshots have their own legacy writers.
+        refresh_host_receipt(target)
 
 
 # ---------------------------------------------------------------------------

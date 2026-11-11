@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from workbay_protocol import REPO_URL
 
@@ -20,6 +22,7 @@ from workbay_bootstrap.install import (
     _split_managed_optional,
     install,
 )
+from workbay_bootstrap.install_receipt import InstallReceipt, TrackedChangeReport, snapshot_tracked_files
 from workbay_bootstrap.mcp_resolve import resolve_managed_mcp_servers
 from workbay_bootstrap.mcp_sync import (
     DEFAULT_SURFACES,
@@ -54,6 +57,41 @@ INSTALL_PROFILE_CHOICES: tuple[str, ...] = (
 # surface set out of the box. ``--profile minimal`` and
 # ``--profile lifecycle`` remain opt-in for lean installs.
 INSTALL_PROFILE_DEFAULT: str = PROFILE_ALL
+
+
+@contextmanager
+def _install_output(as_json: bool):
+    """Keep both Python and inherited child progress off the JSON stream."""
+    if not as_json:
+        yield
+        return
+    sys.stdout.flush()
+    saved_stdout = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        with redirect_stdout(sys.stderr):
+            yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+
+
+def _run_with_tracked_change_report(
+    operation: Callable[..., dict[str, Any]], *, as_json: bool, **kwargs: Any
+) -> dict[str, Any]:
+    target = kwargs["target"].resolve()
+    before = snapshot_tracked_files(target)
+    with _install_output(as_json):
+        manifest = operation(**kwargs)
+    after = snapshot_tracked_files(target)
+    report = TrackedChangeReport.between(target, before, after)
+    receipt = InstallReceipt(tracked_changes=report)
+    try:
+        receipt.write_tracked_changes(target, manifest)
+    except OSError as exc:
+        print(f"warning: could not save install receipt: {exc}", file=sys.stderr)
+    return manifest
 
 
 def _collect_mcp_opt_in_flags(args: argparse.Namespace) -> frozenset[str]:
@@ -355,6 +393,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Consumer repository root. Must already exist.",
     )
+    p_install.add_argument("--json", dest="as_json", action="store_true", help="Emit the install receipt as JSON.")
     p_install.add_argument(
         "--remote-url",
         default=None,
@@ -705,6 +744,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Consumer repository root that was previously installed.",
     )
+    p_update.add_argument("--json", dest="as_json", action="store_true", help="Emit the update receipt as JSON.")
     p_update.add_argument(
         "--remote-ref",
         default=None,
@@ -1425,7 +1465,9 @@ def main(argv: list[str] | None = None) -> int:
             explicit=_explicit_hook_flags(args),
         )
         try:
-            manifest = install(
+            manifest = _run_with_tracked_change_report(
+                install,
+                as_json=args.as_json,
                 target=args.target.resolve(),
                 remote_url=args.remote_url,
                 remote_ref=(args.remote_ref or DEFAULT_REMOTE_REF) if args.source == "git_overlay" else args.remote_ref,
@@ -1464,6 +1506,9 @@ def main(argv: list[str] | None = None) -> int:
         except BootstrapManifestValidationError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        if args.as_json:
+            print(json.dumps(manifest, indent=2), file=sys.stdout)
+            return 0
         if preserved_mcp:
             print(
                 "info: preserved managed MCP registrations; pass --mcp-servers default to reset to defaults.",
@@ -1492,6 +1537,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"state backup: {manifest['state_backup_path']}", file=sys.stdout)
         _print_local_precedence_skips(manifest, args.target.resolve())
         _advise_optional_mcp_availability(args.target.resolve(), mcp_servers)
+        TrackedChangeReport(**manifest["tracked_changes"]).print_block()
         return 0
 
     if args.command in ("clean", "gc"):
@@ -1590,7 +1636,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "update":
         try:
-            manifest = update(
+            manifest = _run_with_tracked_change_report(
+                update,
+                as_json=args.as_json,
                 target=args.target,
                 remote_ref=args.remote_ref,
                 remote_url=args.remote_url,
@@ -1605,6 +1653,9 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, BootstrapManifestValidationError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        if args.as_json:
+            print(json.dumps(manifest, indent=2), file=sys.stdout)
+            return 0
         update_kind = manifest.get("source_kind") or "git_overlay"
         if update_kind == "package":
             print(
@@ -1629,6 +1680,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stdout,
             )
         _print_local_precedence_skips(manifest, args.target.resolve())
+        TrackedChangeReport(**manifest["tracked_changes"]).print_block()
         return 0
 
     if args.command == "apply-hooks":

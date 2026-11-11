@@ -3,6 +3,21 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.30] — 2026-11-11
+
+### Fixed
+- The VM reclaimer frees lane sandboxes that the reap sweep releases.
+- The reclaimer works on the real VM.
+- A released sandbox is reclaimed under a unit-bound release lease, with an in-run lender cascade.
+- The VM-reclaim dependency census is bounded by probes and the scan budget, and it reports exhaustion distinctly.
+- `remote_agent.sh` classifies provider model refusals as typed and retryable (exit 18).
+- `remote_agent.sh` parses again under macOS `/bin/bash` 3.2.57: no here-document ends its command substitution early, and a guard checks every here-document inside `$(...)`.
+- The standalone workbay-system runtime stays importable when it reads the ledger view, and the system readers, including `update.sh`, read through the shared view.
+- Pin the boundary interpreter in `remote_agent.sh`.
+
+### Added
+- `make vm-reap` runs the writer sweep, then the reclaimer, and reads their real receipts.
+
 ## [0.4.29] — 2026-11-09
 
 ### Changed

@@ -314,7 +314,7 @@ def _collect_transition_index(chart: Mapping[str, Any]) -> dict[str, dict[str, A
     return index
 
 
-def check_machine_hygiene(chart: Mapping[str, Any]) -> list[str]:
+def check_machine_hygiene(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHINE_KEYS) -> list[str]:
     """Graph hygiene: initial ∈ states, terminals ⊆ states, every transition has id/from/to, endpoints ∈ states.
 
     Also the chart's own ``id`` and ``version``: both are required, and ``version`` is a nonempty string. A present
@@ -324,7 +324,7 @@ def check_machine_hygiene(chart: Mapping[str, Any]) -> list[str]:
     errors.extend(f"chart: missing required key {key!r}" for key in ("id", "version") if key not in chart)
     if "version" in chart and not (isinstance(chart["version"], str) and chart["version"]):
         errors.append(f"chart: version must be a nonempty string, got {chart['version']!r}")
-    for key in ("outer", "child"):
+    for key in machines:
         machine = chart.get(key)
         if not isinstance(machine, Mapping):
             errors.append(f"{key}: missing machine definition")
@@ -371,10 +371,10 @@ def check_machine_hygiene(chart: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def check_reachability(chart: Mapping[str, Any]) -> list[str]:
+def check_reachability(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHINE_KEYS) -> list[str]:
     """Property (b): no unreachable states from each machine's initial state."""
     errors: list[str] = []
-    for key in ("outer", "child"):
+    for key in machines:
         machine = chart.get(key)
         if not isinstance(machine, Mapping):
             errors.append(f"{key}: missing machine definition")
@@ -399,10 +399,10 @@ def check_reachability(chart: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def check_terminal_reachability(chart: Mapping[str, Any]) -> list[str]:
+def check_terminal_reachability(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHINE_KEYS) -> list[str]:
     """Property (a): every state reaches a terminal (per machine)."""
     errors: list[str] = []
-    for key in ("outer", "child"):
+    for key in machines:
         machine = chart.get(key)
         if not isinstance(machine, Mapping):
             errors.append(f"{key}: missing machine definition")
@@ -745,7 +745,7 @@ def check_guard_predicate_ids(chart: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def check_chart_ids(chart: Mapping[str, Any]) -> list[str]:
+def check_chart_ids(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHINE_KEYS) -> list[str]:
     """Every chart name is an identifier like ``predicate_id``, so no invisible or odd-shaped name renders or matches.
 
     Covers the chart's own ``id``, machine ``id``, ``states``, ``initial``, ``terminals``, ``projection`` keys,
@@ -769,7 +769,7 @@ def check_chart_ids(chart: Mapping[str, Any]) -> list[str]:
                     check(where, f"{name}[{index}]", item)
 
     check_fields("chart", chart, ("id",), ())
-    for key in MACHINE_KEYS:
+    for key in machines:
         machine = chart.get(key)
         if not isinstance(machine, Mapping):
             continue
@@ -803,6 +803,18 @@ def check_chart_ids(chart: Mapping[str, Any]) -> list[str]:
             if isinstance(gate, Mapping):
                 check_fields(f"gates[{index}]", gate, ("id", "transition_id"), ())
     return errors
+
+
+def validate_machine(chart: Mapping[str, Any], machine: str) -> ConformanceReport:
+    """Check one named machine's graph and identifiers, without parent/child contracts.
+
+    Initial-state and terminal reachability use only the supplied transitions;
+    admission and guard evaluation remain the caller's responsibility.
+    """
+    errors: list[str] = []
+    for check in (check_machine_hygiene, check_terminal_reachability, check_reachability, check_chart_ids):
+        errors.extend(check(chart, machines=(machine,)))
+    return ConformanceReport(ok=not errors, errors=errors)
 
 
 def validate_chart(chart: Mapping[str, Any]) -> ConformanceReport:
@@ -857,5 +869,6 @@ __all__ = [
     "render_mermaid",
     "validate_chart",
     "validate_chart_or_raise",
+    "validate_machine",
     "validate_shipped_chart",
 ]

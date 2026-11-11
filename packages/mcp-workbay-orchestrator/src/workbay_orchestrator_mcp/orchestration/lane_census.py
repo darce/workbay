@@ -186,6 +186,9 @@ REMOTE_REAP_SUMMARY_KEYS = (
 # tuple, so every field the shell emits MUST be listed here or every real reap
 # fails with `invalid_reap_summary` (VMREAP-TMP-SCRATCH-UNSWEPT-01).
 REMOTE_REAP_OPTIONAL_SUMMARY_KEYS = (
+    "released_to_reclaim",
+    "release_pending_bytes",
+    "free_after",
     "uv_cache_bytes",
     "tmp_scratch_bytes",
     "tmp_scratch_reaped",
@@ -223,6 +226,7 @@ REMOTE_REAP_OPTIONAL_SUMMARY_KEYS = (
     "skipped_not_allowlisted",
 )
 REMOTE_REAP_TYPED_SUMMARY_KEYS = (
+    "standalone_sandbox_delete_unsupported",
     "holds",
     "holds_truncated",
     "script_sha256",
@@ -466,6 +470,7 @@ def _standalone_reap_custody_script(
             logger.warning("standalone reap proofs not built: %s", _cap_reap_error(exc))
             proofs.clear()
     cases = []
+    release_cases = []
     for key in keys:
         proof = proofs.get(key)
         if proof is None:
@@ -479,6 +484,12 @@ def _standalone_reap_custody_script(
         }
         assignments = "\n".join(f"export {name}={_sh_single_quote(value)}" for name, value in values.items())
         cases.append(f"{_sh_single_quote(key)})\n{assignments}\n;;")
+        release_proof = json.dumps({
+            "key": proof.key, "proven_tree": proof.tree, "proven_tip": proof.tip,
+            "proven_generation": proof.generation, "proven_artifacts": proof.artifacts,
+            "proven_delta": proof.delta,
+        }, separators=(",", ":"))
+        release_cases.append(f"{_sh_single_quote(key)}) printf '%s\\n' {_sh_single_quote(release_proof)} ;; ")
     # The function runs in a child inheriting the sweep's lane and lease FDs.
     # Native helpers stay in that child: they must not replace the sweep's
     # liveness helpers or mutate its counters. The original deadline bounds
@@ -490,14 +501,21 @@ _sd="$ROOT/$_sk"
 if [ -L "$ROOT/.lane-live-$_sk" ] || {{ [ -e "$ROOT/.lane-live-$_sk" ] && [ ! -f "$ROOT/.lane-live-$_sk" ]; }}; then
   echo "SKIPPED_CHANGED $_sk unknown_lease_identity"; exit 0
 fi
-{native._locked_reap_custody_checks(idle_seconds)}
+{native._locked_reap_custody_checks(idle_seconds, exclusion_receipt=True)}
 """
     bounded = native._bounded_native_script(checks, "content_deadline")
-    return """_workbay_reap_custody_check() (
+    release_function = """_workbay_reap_release_proof() {
+case "$1" in
+""" + "\n".join(release_cases) + """
+*) return 1 ;;
+esac
+}
+"""
+    return release_function + """_workbay_reap_custody_check() (
 export _sk="$1"
 case "$_sk" in
 """ + "\n".join(cases) + """
-*) echo "SKIPPED_CHANGED $_sk missing_source_proof"; exit 0 ;;
+*) echo "SKIPPED_CHANGED $_sk missing_source_proof:_proven_tree"; exit 0 ;;
 esac
 """ + bounded + ")\n"
 
@@ -652,6 +670,11 @@ def run_remote_sandbox_reap(
             if not isinstance(script_sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", script_sha256) is None:
                 raise ValueError("script_sha256 must be a 64-character hex digest")
             summary["script_sha256"] = script_sha256
+        if "standalone_sandbox_delete_unsupported" in raw_summary:
+            refusal = raw_summary["standalone_sandbox_delete_unsupported"]
+            if not isinstance(refusal, str):
+                raise ValueError("standalone refusal must be a string")
+            summary["standalone_sandbox_delete_unsupported"] = refusal
         # Shape only: a future mode or degradation string is preserved, not rejected.
         for name in ("mode", "degraded_reason"):
             if name in raw_summary:

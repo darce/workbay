@@ -1084,7 +1084,25 @@ def source_task_subject_scope(repo: Path, orchestrator_root: Path, snapshot: dic
                 continue
             linked = False
             for pass_path in state_dir.glob("offload-pass-*.json"):
-                state, _ = _read(pass_path, state_dir)
+                try:
+                    state, _ = _read(pass_path, state_dir)
+                except EvidenceHold as exc:
+                    import stat
+
+                    from .invocation_disposition import legacy_pass_identity
+
+                    info = pass_path.lstat()
+                    # Preserve this protected reader's path/owner/mode checks;
+                    # only its size limit may use the foreign identity fallback.
+                    if (str(exc) != "authority_custody_invalid"
+                            or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or info.st_mode & 0o022 or info.st_size <= 32 * 1024 * 1024):
+                        raise
+                    legacy_identity = legacy_pass_identity(pass_path, include_bindings=True)
+                    if (legacy_identity["task_ref"] != snapshot["task_ref"]
+                            and legacy_identity.get("review_cycle_dispatch_id") != identity["dispatch_id"]):
+                        continue
+                    raise
                 if state.get("review_cycle_dispatch_id") != identity["dispatch_id"]:
                     continue
                 if linked:
@@ -1452,8 +1470,14 @@ def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict
                 provenance_path=paths["provenance"], started_at=state.get("started_at") or spec["created_at"], job_path=path))
             detached_states.add(state_path)
         for path in sorted(config.state_dir.glob("offload-pass-*.json")):
-            raw = path.read_bytes()
-            state = _json(raw)
+            from .invocation_disposition import regular_bytes
+
+            try:
+                raw = regular_bytes(path)
+                state = _json(raw)
+            except (OSError, ValueError) as exc:
+                _exclude_unreadable_foreign_pass(path, lane["task_ref"], exc, subject_branch=subject_branch)
+                continue
             record_branch = _historical_pass_branch(state)
             if record_branch is not None and record_branch != subject_branch:
                 continue
@@ -1519,6 +1543,51 @@ def _deduplicate_legacy_sources(records: list[dict]) -> list[dict]:
         else:
             unique.append(record)
     return unique
+
+
+def _exclude_unreadable_foreign_pass(
+    path: Path, task_ref: str, exc: OSError | ValueError, *, subject_branch: str | None = None,
+) -> None:
+    """Only a complete bounded foreign identity may exclude an oversized pass."""
+    import errno
+
+    from .invocation_disposition import DispositionHold, legacy_pass_identity, legacy_pass_task_ref
+
+    # An unreadable identity cannot be safely assigned to another task or
+    # omitted before its charged history is authenticated.
+    reason = "malformed"
+    if isinstance(exc, OSError):
+        reason = "symlink" if exc.errno == errno.ELOOP else "unreadable"
+    elif isinstance(exc, DispositionHold) and str(exc) == "record_too_large":
+        try:
+            if subject_branch is None:
+                proven_task = legacy_pass_task_ref(path)
+                record_branch = None
+            else:
+                legacy_identity = legacy_pass_identity(path, include_bindings=True)
+                proven_task = legacy_identity["task_ref"]
+                record_branch = _historical_pass_branch(legacy_identity)
+        except (OSError, ValueError) as identity_exc:
+            reason = "too_large_identity_unproven"
+            if isinstance(identity_exc, OSError) and identity_exc.errno == errno.ELOOP:
+                reason = "symlink"
+            elif isinstance(identity_exc, DispositionHold) and str(identity_exc) == "malformed":
+                reason = "malformed"
+        else:
+            if proven_task != task_ref:
+                if subject_branch is None or (record_branch is not None and record_branch != subject_branch):
+                    return None  # Exclude only outside this reader's binding.
+                reason = "too_large_identity_unproven"
+            else:
+                reason = "too_large_same_task"
+    detail = (
+        f"{path}: {reason}. Move the receipt to operator custody; "
+        "copy first and verify sha256 before moving it."
+    )
+    # Existing callers render str(exc), so detail must travel in that text.
+    refusal = RatchetRefused(f"review_ratchet_retained_pass_unreadable: {detail}", detail)
+    refusal.reason_class = reason
+    raise refusal from exc
 
 
 def load_context(
@@ -1612,9 +1681,8 @@ def load_context(
             raw = regular_bytes(path)
             prior = _json(raw)
         except (OSError, ValueError) as exc:
-            # An unreadable identity cannot be safely assigned to another
-            # task or omitted before its charged history is authenticated.
-            raise RatchetRefused("review_ratchet_retained_pass_unreadable") from exc
+            _exclude_unreadable_foreign_pass(path, task_ref, exc)
+            continue
         if isinstance(prior, dict) and prior.get("task_ref") == task_ref:
             record_branch = _historical_pass_branch(prior)
             prior_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")

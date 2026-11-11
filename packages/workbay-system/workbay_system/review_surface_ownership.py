@@ -27,6 +27,9 @@ REVIEW_SURFACES = (
     "scripts/assert_gate_interpreter.sh",
 )
 RECEIPT_NAME = ".workbay-bootstrap.json"
+# Host receipt the shared bootstrap-ledger view overlays; duplicated because
+# workbay-protocol is a development dependency of this package, not a runtime one.
+HOST_RECEIPT_REL = Path(".workbay/host-receipt.json")
 _EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 
 
@@ -158,15 +161,43 @@ def classify(
     return Conflict(tuple(conflicts)) if conflicts else Owned()
 
 
+def _read_receipt(root: Path) -> object:
+    """Read the receipt through the shared bootstrap-ledger view.
+
+    The view is imported here so the standalone workbay-system runtime still
+    imports this module; any ImportError counts, since ``workbay_protocol``
+    itself imports pydantic. Without the view a root with no host receipt
+    reads the tracked receipt, which is all the view would return; a host
+    receipt that cannot be read is Unknown, never ignored.
+    """
+    try:
+        from workbay_protocol.bootstrap_ledger_view import (
+            InvalidHostReceipt,
+            InvalidLedgerShape,
+            load_ledger_view,
+        )
+    except ImportError as exc:
+        if _path_present(root / HOST_RECEIPT_REL):
+            missing = exc.name or "workbay_protocol.bootstrap_ledger_view"
+            return Unknown(f"ledger_view_unavailable{{{missing}}}")
+        try:
+            return json.loads((root / RECEIPT_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return Unknown("receipt_unreadable")
+    try:
+        return load_ledger_view(root, manifest_name=RECEIPT_NAME)
+    except (OSError, UnicodeError, json.JSONDecodeError, InvalidLedgerShape, InvalidHostReceipt):
+        return Unknown("receipt_unreadable")
+
+
 def read_recorded_paths(root: Path) -> Collection[str] | None | Unknown:
     """Read receipt surface paths, returning ``None`` when no receipt exists."""
     receipt = root / RECEIPT_NAME
     if not _path_present(receipt):
         return None
-    try:
-        payload = json.loads(receipt.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return Unknown("receipt_unreadable")
+    payload = _read_receipt(root)
+    if isinstance(payload, Unknown):
+        return payload
     if not isinstance(payload, dict):
         return Unknown("receipt_unreadable")
     surfaces = payload.get("surfaces")

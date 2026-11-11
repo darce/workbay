@@ -24,6 +24,9 @@ DEFAULT_SURFACE_ROOTS: dict[SurfaceKind, Path] = {
 # package — the same way the validator scripts probe filenames directly today.
 BOOTSTRAP_MANIFEST_NAME = ".workbay-bootstrap.json"
 LEGACY_OVERLAY_MANIFEST_NAME = ".workbay-overlay.json"
+# Host receipt the shared bootstrap-ledger view overlays, duplicated for the
+# same reason: workbay-protocol is a development dependency, not a runtime one.
+HOST_RECEIPT_REL = Path(".workbay/host-receipt.json")
 
 # internal: the canonical bootstrap ledger keys surfaces by
 # filesystem ``path`` (not by resolver ``kind``), so the resolver maps each
@@ -62,18 +65,61 @@ class ResolvedPath:
     local_path: Path | None = None
 
 
+def _host_receipt_present(project_root: Path) -> bool:
+    """Fail closed: only a receipt that is definitely absent counts as absent."""
+    try:
+        (project_root / HOST_RECEIPT_REL).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _read_ledger(project_root: Path, manifest_name: str, label: str) -> dict:
+    """Read ``manifest_name`` through the shared bootstrap-ledger view.
+
+    The view is imported here, not at module scope, so the standalone runtime
+    (PyYAML only) still imports this module. Any ImportError counts, since
+    ``workbay_protocol`` itself imports pydantic. Without the view a root with
+    no host receipt reads the tracked ledger, which is all the view would
+    return; a receipt that cannot be read fails loudly instead.
+    """
+    try:
+        from workbay_protocol.bootstrap_ledger_view import (
+            InvalidHostReceipt,
+            InvalidLedgerShape,
+            load_ledger_view,
+        )
+    except ImportError as exc:
+        if _host_receipt_present(project_root):
+            missing = exc.name or "workbay_protocol.bootstrap_ledger_view"
+            raise OverlayResolverError(
+                f"{label} host receipt {HOST_RECEIPT_REL} cannot be read: ledger_view_unavailable{{{missing}}} ({exc})"
+            ) from exc
+        try:
+            payload = json.loads((project_root / manifest_name).read_text())
+        except json.JSONDecodeError as decode_exc:
+            raise OverlayResolverError(f"{label} is not valid JSON: {decode_exc}") from decode_exc
+        if not isinstance(payload, dict):
+            raise OverlayResolverError(f"{label} must parse to a mapping")
+        return payload
+    try:
+        return load_ledger_view(project_root, manifest_name=manifest_name)
+    except json.JSONDecodeError as exc:
+        raise OverlayResolverError(f"{label} is not valid JSON: {exc}") from exc
+    except InvalidLedgerShape as exc:
+        raise OverlayResolverError(f"{label} must parse to a mapping") from exc
+    except InvalidHostReceipt as exc:
+        raise OverlayResolverError(f"{label} host receipt is invalid: {exc}") from exc
+
+
 def _load_overlay_manifest(project_root: Path) -> dict | None:
     manifest_path = project_root / ".workbay-overlay.json"
     if not manifest_path.is_file():
         return None
 
-    try:
-        payload = json.loads(manifest_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise OverlayResolverError(f"overlay manifest is not valid JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise OverlayResolverError("overlay manifest must parse to a mapping")
-    return payload
+    return _read_ledger(project_root, LEGACY_OVERLAY_MANIFEST_NAME, "overlay manifest")
 
 
 def _surface_roots(project_root: Path, kind: SurfaceKind) -> tuple[Path, Path] | None:
@@ -245,17 +291,9 @@ def _validate_ledger_materialization(project_root: Path, manifest: dict) -> None
 
 def _load_bootstrap_manifest(project_root: Path) -> dict:
     """Parse and shape-check the canonical ``.workbay-bootstrap.json`` ledger."""
-    manifest_path = project_root / BOOTSTRAP_MANIFEST_NAME
-    try:
-        payload = json.loads(manifest_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise OverlayResolverError(
-            f"canonical bootstrap ledger {BOOTSTRAP_MANIFEST_NAME} is not valid JSON: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise OverlayResolverError(
-            f"canonical bootstrap ledger {BOOTSTRAP_MANIFEST_NAME} must parse to a mapping"
-        )
+    payload = _read_ledger(
+        project_root, BOOTSTRAP_MANIFEST_NAME, f"canonical bootstrap ledger {BOOTSTRAP_MANIFEST_NAME}"
+    )
     if not isinstance(payload.get("schema_version"), int):
         raise OverlayResolverError(
             f"canonical bootstrap ledger {BOOTSTRAP_MANIFEST_NAME} is missing an integer "

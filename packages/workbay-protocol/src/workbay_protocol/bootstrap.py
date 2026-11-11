@@ -661,15 +661,16 @@ def load_stack_source(repo_root: Path | str) -> dict[str, str] | None:
     an old build reading a new ledger (and vice versa) degrades rather
     than crashing.
     """
+    # Import lazily: the view uses the package's manifest-name export, which
+    # is initialized after this schema module.
+    from workbay_protocol.bootstrap_ledger_view import load_ledger_view
+
     root = Path(repo_root)
     for name in paths.MANIFEST_NAME_PRECEDENCE:
-        candidate = root / name
         try:
-            raw = candidate.read_text(encoding="utf-8")
+            data = load_ledger_view(root, manifest_name=name)
         except OSError:
             continue
-        try:
-            data = json.loads(raw)
         except ValueError:
             return None
         if not isinstance(data, dict) or "stack_source" not in data:

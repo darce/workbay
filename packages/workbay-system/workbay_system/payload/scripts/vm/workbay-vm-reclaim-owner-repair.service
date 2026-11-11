@@ -1,0 +1,24 @@
+[Unit]
+Description=Bounded owner repair for gate reclaim tombstones
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /usr/local/lib/workbay/workbay_vm_reclaim_owner_repair.py
+TimeoutStartSec=40
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+# Consuming a request needs write access to gate's private request directory.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/gate /var/log
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+LimitNOFILE=4096

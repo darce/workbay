@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.30] — 2026-11-11
+
+### Changed
+- Add the shared bootstrap-ledger view, dual-write the host receipt, and move the plain, pinned and descriptor readers onto it.
+- Report the run's tracked changes with a path-limited commit recipe.
+
+### Fixed
+- Persist bootstrap writers from the tracked document, classify malformed receipts, and serialize the tracked MCP ledger payload rather than the overlaid host-fact view.
+
 ## [0.4.29] — 2026-11-09
 
 ### Changed

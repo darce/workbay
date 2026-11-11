@@ -19,6 +19,8 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
+from workbay_protocol.bootstrap_ledger_view import HOST_RECEIPT_REL, overlay_ledger_view, parse_host_receipt
+
 from .configured_hooks import _executable_ast
 from .lifecycle_surfaces import (
     _consumer_identity,
@@ -126,7 +128,10 @@ def _manifest(tree):
             owners.append(entry)
     if len(owners) != 1 or owners[0].get("path") != _SURFACE or owners[0].get("source") != "shared":
         raise _Refused("ownership: one exact shared hooks registration without overlapping owners required")
-    return observed
+    # Validate exact baseline ownership above before exposing host diagnostics.
+    receipt = tree.optional(HOST_RECEIPT_REL.as_posix())
+    view = overlay_ledger_view(value, parse_host_receipt(receipt[0]) if receipt is not None else None)
+    return (*observed, view)
 
 
 def _mode(state):

@@ -123,7 +123,7 @@ _LISTING_RE = re.compile(
     r"(?: idle=(?P<idle>[0-9]+))?(?: bytes=(?P<bytes>[0-9]+))?$"
 )
 _REAP_LINE_RE = re.compile(
-    r"^(?P<status>REAPED|SKIPPED_LIVE|SKIPPED_LOCK|SKIPPED_GONE_FAILED|SKIPPED_UNMARKED|SKIPPED_CHANGED) (?P<key>\S+)(?: (?P<detail>[A-Za-z0-9_.:-]+))?$"
+    r"^(?P<status>RELEASE_READY|REAPED|SKIPPED_LIVE|SKIPPED_LOCK|SKIPPED_GONE_FAILED|SKIPPED_UNMARKED|SKIPPED_CHANGED) (?P<key>\S+)(?: (?P<detail>[A-Za-z0-9_.:-]+))?$"
 )
 _REAP_HOLD_REASONS = frozenset({"held_lock", "held_live_lease", "held_live_process"})
 _HEADER_LIST = "# WORKBAY_REMOTE_SANDBOX_REAP op=list"
@@ -964,6 +964,13 @@ def _reap_remote_sandbox_pass(
                 actor=actor,
                 sandbox_key=key,
                 reason=prior.reason if prior else "reaped",
+            )
+        elif status == "RELEASE_READY":
+            updated.append(
+                SandboxVerdict(
+                    sandbox_key=key, lane_id=lane_id, branch=branch,
+                    kind=KIND_SANDBOX_HARVESTED, tip_sha=tip_sha, reason="release_ready",
+                )
             )
         elif status == "SKIPPED_CHANGED":
             updated.append(
@@ -2369,28 +2376,295 @@ def _sh_single_quote(value: str) -> str:
 
 # Executed on the VM, using only read-only, unprivileged operations. A VM without
 # a complete privileged procfs view returns UNKNOWN; no sudo/auth fallback.
-_REFERENCE_CENSUS_PY = r"""import os, re, stat, sys, time
+_REFERENCE_CENSUS_PY = r"""import json, math, os, re, stat, sys, time
 proc_root = "/proc"
 privileged = os.geteuid() == 0
-paths = [os.path.abspath(p) for p in sys.argv[1:4]]
-deadline = float(sys.argv[4])
+# Production paths arrive on a dedicated descriptor, never on timeout's argv.
+# Standalone AST-extracted probes retain argv compatibility only without fd 3.
+try:
+    os.fstat(3)
+except OSError as exc:
+    if exc.errno != 9:  # EBADF: fd 3 is absent, not unreadable input
+        raise
+    inputs = sys.argv[1:]
+    inputs[:3] = [os.path.abspath(p) for p in inputs[:3]]
+else:
+    inputs = os.fdopen(3).read().splitlines()
+    # Reject a malformed producer before inventory; never coerce its paths or
+    # use the standalone argv fallback when the descriptor exists.
+    try:
+        if len(inputs) != 4 or any(not p or not os.path.isabs(p) for p in inputs[:3]):
+            raise ValueError("expected three absolute paths and a deadline")
+        if not math.isfinite(float(inputs[3])):
+            raise ValueError("deadline must be finite")
+    except (ValueError, OverflowError):
+        print("UNKNOWN invalid_reference_input")
+        sys.exit(0)
+paths = [os.path.normpath(p) for p in inputs[:3]]
+deadline = float(inputs[3])
 protected_inodes = set()
+writer_excluded = []
 def check_time():
     if time.monotonic() >= deadline:
         raise RuntimeError("deadline")
 def reference(value):
     value = value.removesuffix(" (deleted)")
     return any(value == p or value.startswith(p + "/") for p in paths)
+def argv_reference(task, cwd):
+    import errno
+    from urllib.parse import unquote
+    check_time()
+    argv = open(task + "/cmdline", "rb").read(8 * 1024 * 1024 + 1)
+    if len(argv) > 8 * 1024 * 1024:
+        raise RuntimeError("argv_limit")
+    bare_values = set()
+    for argument in argv.split(b"\0"):
+        word = os.fsdecode(argument)
+        # Keep the complete word as well as shell/assignment/list tokens.
+        # In particular, tokenizing ':' must not discard a file:// prefix.
+        tokens = {word, *re.split(r"[=:\s'\"]", word)}
+        for token in tokens:
+            check_time()
+            candidates = {token}
+            if token.startswith("-") and not token.startswith("--"):
+                # Option arity is unknowable here. Every letters/rest split is
+                # a possible attached operand; a false hold only costs liveness.
+                for split in range(2, len(token)):
+                    check_time()
+                    if token[split - 1] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                        break
+                    candidates.add(token[split:])
+            for candidate in candidates:
+                check_time()
+                value = candidate.removeprefix("@")
+                if value[:5].lower() == "file:":
+                    value = value[5:]
+                # Local file URIs and scheme-free ':' tokens share authority
+                # handling. A remote authority supplies no local candidate.
+                if value.startswith("//"):
+                    authority, _, rest = value[2:].partition("/")
+                    if authority.lower() not in ("", "localhost"):
+                        continue
+                    value = "/" + rest
+                values = {value}
+                if "%" in value:
+                    values.add(unquote(value))
+                for value in values:
+                    check_time()
+                    if os.path.isabs(value):
+                        path = value
+                    elif value and ("/" in value or value != token):
+                        path = os.path.join(cwd, value)
+                    elif value and value not in bare_values:
+                        # Bare words acquire path meaning only through an
+                        # existing cwd symlink; probe each distinct value once.
+                        bare_values.add(value)
+                        path = os.path.join(cwd, value)
+                        check_time()
+                        try:
+                            info = os.lstat(path)
+                        except OSError as exc:
+                            if exc.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG):
+                                raise RuntimeError("unreadable_census") from exc
+                            check_time()
+                            continue
+                        check_time()
+                        if not stat.S_ISLNK(info.st_mode):
+                            continue
+                    else:
+                        continue
+                    # Test raw, lexical and filesystem meanings independently.
+                    # realpath is non-strict, including for a missing final file.
+                    check_time()
+                    resolved = {path, os.path.normpath(path), os.path.realpath(path)}
+                    check_time()
+                    if any(reference(path) for path in resolved):
+                        return True
+    return False
 def inode_reference(path):
     info = os.stat(path)
     return (info.st_dev, info.st_ino) in protected_inodes
-def identity(task):
+def task_stat(task):
     data = open(task + "/stat").read().rsplit(") ", 1)[1].split()
     return data[19], data[0], int(data[6])
+def identity(task):
+    # The generation fence is starttime alone: state and flags change on every
+    # live task and only classify zombies and kernel threads.
+    return task_stat(task)[0]
+def opaque_class(task, uid):
+    # Only readable metadata can authorize an opaque-task exclusion. Cgroup
+    # membership is the authority; comm and argv narrow the exact unit match.
+    status = open(task + "/status").read()
+    owners = next((line.split()[1:3] for line in status.splitlines()
+                   if line.startswith("Uid:")), [])
+    if owners != [str(uid), str(uid)]:
+        return None
+    cgroups = open(task + "/cgroup").read().splitlines()
+    comm = open(task + "/comm").read().removesuffix("\n")
+    argv = open(task + "/cmdline", "rb").read(65537)
+    if len(cgroups) != 1 or not cgroups[0].startswith("0::") or len(argv) > 65536:
+        return None
+    cgroup = cgroups[0][3:]
+    argv = argv.removesuffix(b"\0").split(b"\0")
+    command = os.path.basename(argv[0])
+    user = "/user.slice/user-" + str(uid) + ".slice/"
+    manager = user + "user@" + str(uid) + ".service/"
+    kind = None
+    if cgroup == manager + "init.scope":
+        if (comm == "systemd" and command == b"systemd" and b"--user" in argv) or (
+            comm == "(sd-pam)" and argv[0] == b"(sd-pam)"
+        ):
+            kind = "user_manager"
+    elif cgroup == manager + "app.slice/gpg-agent.service":
+        if comm == "gpg-agent" and command == b"gpg-agent" and not any(
+            arg == b"--homedir" or arg.startswith(b"--homedir=") for arg in argv
+        ):
+            kind = "gpg_agent"
+    elif re.fullmatch(re.escape(user) + r"session-[A-Za-z0-9_-]+\.scope", cgroup):
+        if (comm == "tailscaled" and command == b"tailscaled" and argv[1:3] == [b"be-child", b"ssh"]) or (
+            comm == "sshd" and argv[0].startswith(b"sshd:")
+        ):
+            kind = "ssh_session_daemon"
+    return {"pid": int(task.rsplit("/", 1)[1]), "comm": comm, "class": kind} if kind else None
+def own_uid_census():
+    import errno
+    uid = os.geteuid()
+    # Keep the same proc-view, deadline and inventory bounds as the privileged
+    # census. Ownership is read per task: real OR effective UID is sufficient.
+    mounts = open(proc_root + "/self/mountinfo").read()
+    if not any(" - proc " in line and line.split()[4] == proc_root and
+               not re.search(r"hidepid=(?!0(?:,|\s|$))", line) for line in mounts.splitlines()):
+        raise RuntimeError("proc_view_unverified")
+    pids = {n for n in os.listdir(proc_root) if n.isdigit()}
+    if not pids:
+        raise RuntimeError("empty_census")
+    # Path-only FD checks miss an open alias that was subsequently unlinked.
+    # Inventory only the exact deletion paths, never a sibling sandbox.
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        info = os.lstat(path)
+        protected_inodes.add((info.st_dev, info.st_ino))
+        if not stat.S_ISDIR(info.st_mode):
+            continue  # a sync stamp is a single file, not a directory census
+        for parent, dirs, files in os.walk(path, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
+            check_time()
+            for name in [None, *dirs, *files]:
+                check_time()
+                info = os.lstat(parent if name is None else os.path.join(parent, name))
+                protected_inodes.add((info.st_dev, info.st_ino))
+                if len(protected_inodes) > 200000:
+                    raise RuntimeError("inventory_limit")
+    for pid in sorted(pids):
+        check_time()
+        if int(pid) == os.getpid():
+            continue
+        base = proc_root + "/" + pid
+        try:
+            tasks = set(os.listdir(base + "/task"))
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            raise
+        if not tasks:
+            raise RuntimeError("partial_census")
+        for tid in sorted(tasks):
+            check_time()
+            task = base + "/task/" + tid
+            original = None
+            try:
+                status = open(task + "/status").read()
+                owners = next((line.split()[1:3] for line in status.splitlines()
+                               if line.startswith("Uid:")), [])
+                if len(owners) != 2:
+                    raise RuntimeError("unreadable_census")
+                if uid not in {int(value) for value in owners}:
+                    continue  # no foreign-UID stat, cwd, fd, environment or maps reads
+                original, state, flags = task_stat(task)
+                if state != "Z" and not flags & 0x00200000:
+                    try:
+                        for name in ("cwd", "root", "exe"):
+                            value = os.readlink(task + "/" + name)
+                            if name == "cwd":
+                                cwd = value
+                            if reference(value) or inode_reference(task + "/" + name):
+                                return "BUSY process_" + name
+                        fds = os.listdir(task + "/fd")
+                        for fd in fds:
+                            check_time()
+                            try:
+                                held = reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd)
+                            except OSError as closed:
+                                if closed.errno != errno.ENOENT:
+                                    raise
+                                continue  # closed after listdir(fd/); keep scanning
+                            if held:
+                                return "BUSY process_fd"
+                        environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
+                        if len(environ) > 8 * 1024 * 1024:
+                            raise RuntimeError("environment_limit")
+                        for value in environ.split(b"\0"):
+                            for token in re.split(r"[=:\s]", os.fsdecode(value)):
+                                if reference(token):
+                                    return "BUSY process_env"
+                        if argv_reference(task, cwd):
+                            return "BUSY process_argv"
+                        with open(task + "/maps") as maps:
+                            for line in maps:
+                                check_time()
+                                fields = line.split(None, 5)
+                                device = fields[3].split(":") if len(fields) >= 5 else []
+                                mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
+                                if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
+                                    return "BUSY process_maps"
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EPERM):
+                            raise
+                        try:
+                            excluded = opaque_class(task, uid)
+                        except OSError as metadata_error:
+                            # Missing classification metadata is not proof of
+                            # exit. Only a vanished task stat permits skipping.
+                            if metadata_error.errno in (errno.ENOENT, errno.ESRCH):
+                                if identity(task) != original:
+                                    raise RuntimeError("pid_generation_changed")
+                            raise exc
+                        if excluded is None:
+                            raise
+                        # Exclusions do not bypass the task-generation fence.
+                        if identity(task) != original:
+                            raise RuntimeError("pid_generation_changed")
+                        if len(writer_excluded) >= 256:
+                            raise RuntimeError("exclusion_limit")
+                        writer_excluded.append(excluded)
+                if identity(task) != original:
+                    raise RuntimeError("pid_generation_changed")
+            except OSError as exc:
+                # Only a vanished task stat proves exit. A proc entry that
+                # vanished while the stat remains is a malfunction, not a skip.
+                if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                    raise
+                try:
+                    current = identity(task)
+                except OSError as gone:
+                    if gone.errno not in (errno.ENOENT, errno.ESRCH):
+                        raise
+                    continue
+                raise RuntimeError("unreadable_census" if current == original else "pid_generation_changed")
+        try:
+            if set(os.listdir(base + "/task")) - tasks:
+                raise RuntimeError("pid_generation_changed")
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                raise
+    if {n for n in os.listdir(proc_root) if n.isdigit()} - pids:
+        raise RuntimeError("partial_census")
+    # No own-UID reference observed; the foreign-UID domain is still unknown.
+    return "UNKNOWN privileged_census_unavailable"
 def census():
     check_time()
     if not privileged:
-        raise RuntimeError("privileged_census_unavailable")
+        return own_uid_census()
     # hidepid can omit PIDs altogether; unreadable entries are not absence.
     mounts = open(proc_root + "/self/mountinfo").read()
     if not any(" - proc " in line and line.split()[4] == proc_root and
@@ -2404,6 +2678,10 @@ def census():
     for path in paths:
         if not os.path.lexists(path):
             continue
+        info = os.lstat(path)
+        protected_inodes.add((info.st_dev, info.st_ino))
+        if not stat.S_ISDIR(info.st_mode):
+            continue  # a sync stamp is a single file, not a directory census
         for parent, dirs, files in os.walk(path, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
             check_time()
             for name in [None, *dirs, *files]:
@@ -2425,14 +2703,17 @@ def census():
         for tid in sorted(tasks):
             check_time()
             task = base + "/task/" + tid
-            original = identity(task)
+            original, state, flags = task_stat(task)
             # Zombies and kernel threads have no user address space or files.
-            if original[1] != "Z" and not original[2] & 0x00200000:
+            if state != "Z" and not flags & 0x00200000:
                 # Stable PID/task generations do not freeze CWD/FD/env/maps.
                 # Arbitrary readers have not joined the native key/lease locks.
                 unfenced_readers = True
                 for name in ("cwd", "root", "exe"):
-                    if reference(os.readlink(task + "/" + name)) or inode_reference(task + "/" + name):
+                    value = os.readlink(task + "/" + name)
+                    if name == "cwd":
+                        cwd = value
+                    if reference(value) or inode_reference(task + "/" + name):
                         return "BUSY process_" + name
                 fds = os.listdir(task + "/fd")
                 for fd in fds:
@@ -2446,6 +2727,8 @@ def census():
                     for token in re.split(r"[=:\s]", os.fsdecode(value)):
                         if reference(token):
                             return "BUSY process_env"
+                if argv_reference(task, cwd):
+                    return "BUSY process_argv"
                 with open(task + "/maps") as maps:
                     for line in maps:
                         check_time()
@@ -2465,6 +2748,37 @@ try:
     print(census())
 except (OSError, ValueError, IndexError, RuntimeError) as exc:
     print("UNKNOWN " + (str(exc) if isinstance(exc, RuntimeError) else "unreadable_census"))
+if writer_excluded:
+    print("WRITER_EXCLUDED " + json.dumps(writer_excluded, separators=(",", ":")))
+"""
+
+_WRITER_EXCLUSIONS_PY = r"""import json, sys
+raw = sys.argv[1]
+def unique_fields(pairs):
+    row = dict(pairs)
+    if len(row) != len(pairs):
+        raise ValueError("duplicate exclusion fields")
+    return row
+try:
+    if len(raw) > 65536 or "\n" in raw or "\r" in raw or not raw.startswith("WRITER_EXCLUDED "):
+        raise ValueError("invalid exclusion framing")
+    rows = json.loads(raw[len("WRITER_EXCLUDED "):], object_pairs_hook=unique_fields)
+    if not isinstance(rows, list) or len(rows) > 256:
+        raise ValueError("invalid exclusion list")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"pid", "comm", "class"}:
+            raise ValueError("invalid exclusion fields")
+        if type(row["pid"]) is not int or row["pid"] <= 0 or row["pid"] in seen:
+            raise ValueError("invalid exclusion pid")
+        seen.add(row["pid"])
+        if row["class"] not in {"user_manager", "gpg_agent", "ssh_session_daemon"}:
+            raise ValueError("invalid exclusion class")
+        if not isinstance(row["comm"], str) or not 0 < len(row["comm"]) <= 64 or any(ord(c) < 32 for c in row["comm"]):
+            raise ValueError("invalid exclusion comm")
+    print(json.dumps(rows, separators=(",", ":"), ensure_ascii=True))
+except (ValueError, TypeError, KeyError):
+    sys.exit(1)
 """
 
 _ARTIFACT_IDENTITY_PY = r"""import hashlib, json, os, stat, sys, time
@@ -2919,10 +3233,22 @@ _artifact_identity() {
 }
 _reference_census() {
   _remaining=$(_guard_remaining) || { echo 'UNKNOWN deadline'; return; }
-  timeout --foreground --signal=KILL "$_remaining" python3 - "$_sd" "$ROOT/.venv-lane-$_sk" "$ROOT/.venv-sync-stamp-$_sk" "$_guard_deadline" <<'WORKBAY_REFERENCE_PY'
+  timeout --foreground --signal=KILL "$_remaining" python3 - 3<<WORKBAY_REFERENCE_INPUT <<'WORKBAY_REFERENCE_PY'
+$_sd
+$ROOT/.venv-lane-$_sk
+$ROOT/.venv-sync-stamp-$_sk
+$_guard_deadline
+WORKBAY_REFERENCE_INPUT
 """
         + _REFERENCE_CENSUS_PY
         + """WORKBAY_REFERENCE_PY
+}
+_writer_exclusions() {
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$1" <<'WORKBAY_EXCLUSIONS_PY'
+"""
+        + _WRITER_EXCLUSIONS_PY
+        + """WORKBAY_EXCLUSIONS_PY
 }
 """
     )
@@ -3699,14 +4025,22 @@ git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" ls-tree -r --full-tree "$
     return _bounded_native_script(payload, "PROBE_FAILED content_deadline")
 
 
-def _locked_reap_custody_checks(idle_seconds: int) -> str:
+def _locked_reap_custody_checks(idle_seconds: int, *, exclusion_receipt: bool = False) -> str:
     """Shared checks for callers already holding the lane and lease locks."""
-    return f"""    if [ -z "$_proven_tree" ] || [ "$_proven_key" != "$_sk" ] || [ -z "$_proven_tip" ] || [ -z "$_proven_artifacts" ]; then
-      echo "SKIPPED_CHANGED $_sk missing_source_proof"
+    receipt = """printf 'WRITER_EXCLUDED %s\\n' "$_writer_excluded" """ if exclusion_receipt else ""
+    return f"""    for _field in _proven_tree _proven_tip _proven_artifacts; do
+      _value="${{!_field}}"
+      if [ -z "$_value" ]; then
+        echo "SKIPPED_CHANGED $_sk missing_source_proof:$_field"
+        exit 0
+      fi
+    done
+    if [ "$_proven_key" != "$_sk" ]; then
+      echo "SKIPPED_CHANGED $_sk missing_source_proof:_proven_key"
       exit 0
     fi
     if [ -n "$_proven_tree" ]; then
-      # CARD-15: retain the dispatch lock across proof revalidation and removal.
+      # Retain the dispatch lock across proof revalidation and release readiness.
       _rowless_worktree_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk $_worktree_reason"; exit 0; }}
       _rowless_index_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk index_flags"; exit 0; }}
       _content_reason=$(_rowless_content_safe "$_sd" "$_proven_host_tip") || {{ echo "SKIPPED_CHANGED $_sk ${{_content_reason:-content_unknown}}"; exit 0; }}
@@ -3730,21 +4064,22 @@ def _locked_reap_custody_checks(idle_seconds: int) -> str:
         exit 0
       fi
     fi
-    # No supported inventory proves the absence of foreign incoming references
-    # to shared caches/stamps without walking sibling keys. Retain custody.
-    for _shared in "$ROOT/.venv-lane-$_sk" "$ROOT/.venv-sync-stamp-$_sk"; do
-      if [ -e "$_shared" ] || [ -L "$_shared" ]; then
-        echo "SKIPPED_CHANGED $_sk unknown_cache_reference_census"
-        exit 0
-      fi
-    done
-    # _pid_in_sandbox's listing snapshot is advisory only. The fresh privileged
-    # CWD/FD/env/maps census below remains inside both deletion locks.
-    _census=$(_reference_census) || _census='UNKNOWN census_timeout'
+    # _pid_in_sandbox's listing snapshot is advisory only. The fresh
+    # reference census below remains inside both native lane/lease locks.
+    # The sentinel preserves trailing newlines so an extra/blank metadata line
+    # cannot disappear through command substitution and confer release authority.
+    _census_output=$(_reference_census && printf '.') || _census_output=$'UNKNOWN census_timeout\n.'
+    _census_output=${{_census_output%.}}
+    _census_output=${{_census_output%$'\n'}}
+    _census=${{_census_output%%$'\n'*}}
+    _exclusion_line='WRITER_EXCLUDED []'
+    if [[ "$_census_output" == *$'\n'* ]]; then
+      _exclusion_line=${{_census_output#*$'\n'}}
+    fi
+    _writer_excluded=$(_writer_exclusions "$_exclusion_line") || {{ echo "SKIPPED_CHANGED $_sk unknown_reference_census"; exit 0; }}
     case "$_census" in
-      IDLE) ;;
+      IDLE|'UNKNOWN privileged_census_unavailable'|'UNKNOWN reader_acquisition_unfenced') ;;
       BUSY*) echo "SKIPPED_LIVE $_sk held_live_process"; exit 0 ;;
-      'UNKNOWN reader_acquisition_unfenced') echo "SKIPPED_CHANGED $_sk unknown_reader_acquisition_fence"; exit 0 ;;
       *) echo "SKIPPED_CHANGED $_sk unknown_reference_census"; exit 0 ;;
     esac
     if _lane_occupant_live "$_sk"; then
@@ -3756,11 +4091,10 @@ def _locked_reap_custody_checks(idle_seconds: int) -> str:
       _fresh_delta=$(_mapped_delta_safe "$_sd") || {{ echo "SKIPPED_CHANGED $_sk ${{_fresh_delta:-delta_unknown}}"; exit 0; }}
       [ "$_fresh_delta" = "$_proven_delta" ] || {{ echo "SKIPPED_CHANGED $_sk delta_changed"; exit 0; }}
     fi
-    # Even a genuinely dead-reader census cannot retire installed .pth/finder,
-    # donor or nested/symlink consumers. No existing authorized closed-domain
-    # incoming-source custody proof is available. Do not walk sibling keys or
-    # mint a trust sentinel to turn that unknown into absence.
-    echo "SKIPPED_CHANGED $_sk unknown_incoming_source_custody"
+    # Reclaim owns the closed-domain incoming-source dependency census.
+    # All checks provable here passed; readiness never authorizes a delete.
+    echo "RELEASE_READY $_sk ${{_census// /:}}"
+    {receipt}
     exit 0
 """
 
@@ -3833,14 +4167,7 @@ _reap_one() {{
     if [ -L "$ROOT/.lane-live-$_sk" ] || {{ [ -e "$ROOT/.lane-live-$_sk" ] && [ ! -f "$ROOT/.lane-live-$_sk" ]; }}; then
       echo "SKIPPED_CHANGED $_sk unknown_lease_identity"; exit 0
     fi
-{_locked_reap_custody_checks(idle_seconds)}    _remaining=$(_guard_remaining) || {{ echo "SKIPPED_CHANGED $_sk deadline"; exit 0; }}
-    timeout "$_remaining" rm -rf -- "$_sd" 2>/dev/null || true
-    if [ ! -e "$_sd" ]; then
-      echo "REAPED $_sk"
-    else
-      echo "SKIPPED_GONE_FAILED $_sk"
-    fi
-  ) 9>>"$_llf" || echo "SKIPPED_LOCK $_sk held_lock"
+{_locked_reap_custody_checks(idle_seconds)}  ) 9>>"$_llf" || echo "SKIPPED_LOCK $_sk held_lock"
 }}
 {calls}
 """

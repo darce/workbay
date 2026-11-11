@@ -606,16 +606,17 @@ def _persist_operator_policy_locked(
     path = _manifest_path_for_write(root)
     if path is None:
         raise EmbeddingPolicyError("invalid embeddings operator policy: manifest missing; cannot persist")
+    from workbay_protocol.bootstrap_ledger_view import load_ledger_view
+
     try:
-        raw = path.read_text(encoding="utf-8")
+        view = load_ledger_view(root, manifest_name=path.name)
+        # The view only feeds the checks below; persist the tracked document
+        # so receipt-only host observations never enter the tracked ledger.
+        data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise EmbeddingPolicyError(f"invalid embeddings operator policy: unreadable ({exc})") from exc
-    try:
-        data = json.loads(raw)
     except ValueError as exc:
         raise EmbeddingPolicyError(f"invalid embeddings operator policy: malformed ({exc})") from exc
-    if not isinstance(data, dict):
-        raise EmbeddingPolicyError("invalid embeddings operator policy: malformed")
 
     existing = data.get(OPERATOR_POLICY_FIELD)
     existing_dict = existing if isinstance(existing, dict) else {}
@@ -646,6 +647,7 @@ def _persist_operator_policy_locked(
     )
     data[OPERATOR_POLICY_FIELD] = record
     try:
+        BootstrapManifest.model_validate({**view, OPERATOR_POLICY_FIELD: record})
         BootstrapManifest.model_validate(data)
     except Exception as exc:  # noqa: BLE001 - surface schema failures as policy errors
         raise EmbeddingPolicyError(f"invalid embeddings operator policy: {exc}") from exc
