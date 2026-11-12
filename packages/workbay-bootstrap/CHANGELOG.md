@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.31] — 2026-11-11
+
+### Fixed
+- The embedding backfill doctor counts only eligible source rows.
+
 ## [0.4.30] — 2026-11-11
 
 ### Changed

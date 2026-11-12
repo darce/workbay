@@ -2526,27 +2526,107 @@ def opaque_class(task, uid):
         ):
             kind = "ssh_session_daemon"
     return {"pid": int(task.rsplit("/", 1)[1]), "comm": comm, "class": kind} if kind else None
+def census_deltas(pids, scan, scanned, own_uid):
+    # Three scans of additions, followed by an observation of the fixed point.
+    # Keys include starttime so PID reuse cannot inherit a completed scan.
+    import errno
+    result = scan(pids)
+    if result:
+        return result
+    for round_index in range(4):
+        check_time()
+        additions = {}
+        count = 0
+        check_time()
+        current = {n for n in os.listdir(proc_root) if n.isdigit()}
+        for pid in sorted(current):
+            check_time()
+            if int(pid) == os.getpid():
+                continue
+            base = proc_root + "/" + pid
+            try:
+                check_time()
+                generation = identity(base)
+                key = (pid, generation)
+                if key not in scanned:
+                    additions[key] = None
+                    count += 1
+                else:
+                    check_time()
+                    tasks = set(os.listdir(base + "/task"))
+                    if not tasks:
+                        raise RuntimeError("partial_census")
+                    new_tasks = tasks - scanned[key].keys()
+                    for tid in sorted(tasks - new_tasks):
+                        # Foreign-UID tasks retain the own-UID branch's rule:
+                        # no stat or reference reads in that task domain.
+                        original = scanned[key][tid]
+                        if original is not None:
+                            check_time()
+                            try:
+                                current_task = identity(base + "/task/" + tid)
+                            except OSError as gone:
+                                if gone.errno not in (errno.ENOENT, errno.ESRCH):
+                                    raise
+                                continue  # an already-scanned task stat vanished
+                            if current_task != original:
+                                raise RuntimeError("pid_generation_changed")
+                    check_time()
+                    if identity(base) != generation:
+                        raise RuntimeError("pid_generation_changed")
+                    if new_tasks:
+                        additions[key] = new_tasks
+                        count += len(new_tasks)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                    raise
+                # Only a vanished process stat proves exit. Unscanned PIDs
+                # keep the branch's original disappearance policy.
+                check_time()
+                try:
+                    identity(base)
+                except OSError as gone:
+                    if gone.errno not in (errno.ENOENT, errno.ESRCH):
+                        raise
+                    if own_uid or any(key[0] == pid for key in scanned):
+                        continue
+                raise
+            if count > 4096:
+                raise RuntimeError("partial_census")
+        check_time()
+        if not additions:
+            return None
+        if round_index == 3:
+            raise RuntimeError("partial_census")
+        result = scan({key[0] for key in additions}, additions)
+        if result:
+            return result
 def own_uid_census():
     import errno
     uid = os.geteuid()
     # Keep the same proc-view, deadline and inventory bounds as the privileged
     # census. Ownership is read per task: real OR effective UID is sufficient.
+    check_time()
     mounts = open(proc_root + "/self/mountinfo").read()
     if not any(" - proc " in line and line.split()[4] == proc_root and
                not re.search(r"hidepid=(?!0(?:,|\s|$))", line) for line in mounts.splitlines()):
         raise RuntimeError("proc_view_unverified")
+    check_time()
     pids = {n for n in os.listdir(proc_root) if n.isdigit()}
     if not pids:
         raise RuntimeError("empty_census")
     # Path-only FD checks miss an open alias that was subsequently unlinked.
     # Inventory only the exact deletion paths, never a sibling sandbox.
     for path in paths:
+        check_time()
         if not os.path.lexists(path):
             continue
+        check_time()
         info = os.lstat(path)
         protected_inodes.add((info.st_dev, info.st_ino))
         if not stat.S_ISDIR(info.st_mode):
             continue  # a sync stamp is a single file, not a directory census
+        check_time()
         for parent, dirs, files in os.walk(path, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
             check_time()
             for name in [None, *dirs, *files]:
@@ -2555,110 +2635,160 @@ def own_uid_census():
                 protected_inodes.add((info.st_dev, info.st_ino))
                 if len(protected_inodes) > 200000:
                     raise RuntimeError("inventory_limit")
-    for pid in sorted(pids):
-        check_time()
-        if int(pid) == os.getpid():
-            continue
-        base = proc_root + "/" + pid
-        try:
-            tasks = set(os.listdir(base + "/task"))
-        except OSError as exc:
-            if exc.errno in (errno.ENOENT, errno.ESRCH):
-                continue
-            raise
-        if not tasks:
-            raise RuntimeError("partial_census")
-        for tid in sorted(tasks):
+    scanned = {}
+    def scan(pids, additions=None):
+        for pid in sorted(pids):
             check_time()
-            task = base + "/task/" + tid
-            original = None
+            if int(pid) == os.getpid():
+                continue
+            base = proc_root + "/" + pid
             try:
-                status = open(task + "/status").read()
-                owners = next((line.split()[1:3] for line in status.splitlines()
-                               if line.startswith("Uid:")), [])
-                if len(owners) != 2:
-                    raise RuntimeError("unreadable_census")
-                if uid not in {int(value) for value in owners}:
-                    continue  # no foreign-UID stat, cwd, fd, environment or maps reads
-                original, state, flags = task_stat(task)
-                if state != "Z" and not flags & 0x00200000:
-                    try:
-                        for name in ("cwd", "root", "exe"):
-                            value = os.readlink(task + "/" + name)
-                            if name == "cwd":
-                                cwd = value
-                            if reference(value) or inode_reference(task + "/" + name):
-                                return "BUSY process_" + name
-                        fds = os.listdir(task + "/fd")
-                        for fd in fds:
-                            check_time()
-                            try:
-                                held = reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd)
-                            except OSError as closed:
-                                if closed.errno != errno.ENOENT:
-                                    raise
-                                continue  # closed after listdir(fd/); keep scanning
-                            if held:
-                                return "BUSY process_fd"
-                        environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
-                        if len(environ) > 8 * 1024 * 1024:
-                            raise RuntimeError("environment_limit")
-                        for value in environ.split(b"\0"):
-                            for token in re.split(r"[=:\s]", os.fsdecode(value)):
-                                if reference(token):
-                                    return "BUSY process_env"
-                        if argv_reference(task, cwd):
-                            return "BUSY process_argv"
-                        with open(task + "/maps") as maps:
-                            for line in maps:
-                                check_time()
-                                fields = line.split(None, 5)
-                                device = fields[3].split(":") if len(fields) >= 5 else []
-                                mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
-                                if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
-                                    return "BUSY process_maps"
-                    except OSError as exc:
-                        if exc.errno not in (errno.EACCES, errno.EPERM):
-                            raise
+                check_time()
+                tasks = set(os.listdir(base + "/task"))
+                if not tasks:
+                    raise RuntimeError("partial_census")
+                check_time()
+                try:
+                    before = identity(base)
+                except OSError as metadata_error:
+                    if metadata_error.errno not in (errno.ENOENT, errno.ESRCH):
+                        raise
+                    # Still scan reachable tasks for positive BUSY evidence.
+                    # Missing process metadata cannot certify a generation.
+                    before = None
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ESRCH):
+                    continue
+                raise
+            key = (pid, before)
+            if additions is not None:
+                if key not in additions:
+                    raise RuntimeError("pid_generation_changed")
+                if additions[key] is not None:
+                    tasks = additions[key]
+            seen_tasks = scanned.setdefault(key, {})
+            for tid in sorted(tasks):
+                check_time()
+                task = base + "/task/" + tid
+                original = None
+                try:
+                    check_time()
+                    status = open(task + "/status").read()
+                    owners = next((line.split()[1:3] for line in status.splitlines()
+                                   if line.startswith("Uid:")), [])
+                    if len(owners) != 2:
+                        raise RuntimeError("unreadable_census")
+                    if uid not in {int(value) for value in owners}:
+                        seen_tasks[tid] = None
+                        continue  # no foreign-UID stat, cwd, fd, environment or maps reads
+                    check_time()
+                    original, state, flags = task_stat(task)
+                    if state != "Z" and not flags & 0x00200000:
                         try:
-                            excluded = opaque_class(task, uid)
-                        except OSError as metadata_error:
-                            # Missing classification metadata is not proof of
-                            # exit. Only a vanished task stat permits skipping.
-                            if metadata_error.errno in (errno.ENOENT, errno.ESRCH):
-                                if identity(task) != original:
-                                    raise RuntimeError("pid_generation_changed")
-                            raise exc
-                        if excluded is None:
+                            for name in ("cwd", "root", "exe"):
+                                check_time()
+                                value = os.readlink(task + "/" + name)
+                                if name == "cwd":
+                                    cwd = value
+                                check_time()
+                                if reference(value) or inode_reference(task + "/" + name):
+                                    return "BUSY process_" + name
+                            check_time()
+                            fds = os.listdir(task + "/fd")
+                            for fd in fds:
+                                check_time()
+                                try:
+                                    check_time()
+                                    held = reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd)
+                                except OSError as closed:
+                                    if closed.errno != errno.ENOENT:
+                                        raise
+                                    continue  # closed after listdir(fd/); keep scanning
+                                if held:
+                                    return "BUSY process_fd"
+                            check_time()
+                            environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
+                            if len(environ) > 8 * 1024 * 1024:
+                                raise RuntimeError("environment_limit")
+                            for value in environ.split(b"\0"):
+                                for token in re.split(r"[=:\s]", os.fsdecode(value)):
+                                    if reference(token):
+                                        return "BUSY process_env"
+                            check_time()
+                            if argv_reference(task, cwd):
+                                return "BUSY process_argv"
+                            check_time()
+                            with open(task + "/maps") as maps:
+                                for line in maps:
+                                    check_time()
+                                    fields = line.split(None, 5)
+                                    device = fields[3].split(":") if len(fields) >= 5 else []
+                                    mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
+                                    if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
+                                        return "BUSY process_maps"
+                        except OSError as exc:
+                            if exc.errno not in (errno.EACCES, errno.EPERM):
+                                raise
+                            try:
+                                check_time()
+                                excluded = opaque_class(task, uid)
+                            except OSError as metadata_error:
+                                # Missing classification metadata is not proof of
+                                # exit. Only a vanished task stat permits skipping.
+                                if metadata_error.errno in (errno.ENOENT, errno.ESRCH):
+                                    check_time()
+                                    if identity(task) != original:
+                                        raise RuntimeError("pid_generation_changed")
+                                raise exc
+                            if excluded is None:
+                                raise
+                            # Exclusions do not bypass the task-generation fence.
+                            check_time()
+                            if identity(task) != original:
+                                raise RuntimeError("pid_generation_changed")
+                            if len(writer_excluded) >= 256:
+                                raise RuntimeError("exclusion_limit")
+                            writer_excluded.append(excluded)
+                    check_time()
+                    if identity(task) != original:
+                        raise RuntimeError("pid_generation_changed")
+                    seen_tasks[tid] = original
+                except OSError as exc:
+                    # A missing proc facet alone does not prove exit. Recheck
+                    # the generation and terminal state after the failed read.
+                    if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                        raise
+                    try:
+                        check_time()
+                        current = identity(task)
+                        if current == original:
+                            check_time()
+                            current, state, flags = task_stat(task)
+                            if current == original and state in ("Z", "X"):
+                                seen_tasks[tid] = original
+                                continue
+                    except OSError as gone:
+                        if gone.errno not in (errno.ENOENT, errno.ESRCH):
                             raise
-                        # Exclusions do not bypass the task-generation fence.
-                        if identity(task) != original:
-                            raise RuntimeError("pid_generation_changed")
-                        if len(writer_excluded) >= 256:
-                            raise RuntimeError("exclusion_limit")
-                        writer_excluded.append(excluded)
-                if identity(task) != original:
+                        # Remember the exited task rather than retrying its
+                        # stale directory entry. A reused TID still fences.
+                        seen_tasks[tid] = original if original is not None else ""
+                        continue
+                    raise RuntimeError("unreadable_census" if current == original else "pid_generation_changed")
+            if before is None:
+                if any(value != "" for value in seen_tasks.values()):
+                    raise RuntimeError("unreadable_census")
+                continue
+            check_time()
+            try:
+                if identity(base) != before:
                     raise RuntimeError("pid_generation_changed")
             except OSError as exc:
-                # Only a vanished task stat proves exit. A proc entry that
-                # vanished while the stat remains is a malfunction, not a skip.
                 if exc.errno not in (errno.ENOENT, errno.ESRCH):
                     raise
-                try:
-                    current = identity(task)
-                except OSError as gone:
-                    if gone.errno not in (errno.ENOENT, errno.ESRCH):
-                        raise
-                    continue
-                raise RuntimeError("unreadable_census" if current == original else "pid_generation_changed")
-        try:
-            if set(os.listdir(base + "/task")) - tasks:
-                raise RuntimeError("pid_generation_changed")
-        except OSError as exc:
-            if exc.errno not in (errno.ENOENT, errno.ESRCH):
-                raise
-    if {n for n in os.listdir(proc_root) if n.isdigit()} - pids:
-        raise RuntimeError("partial_census")
+    result = census_deltas(pids, scan, scanned, True)
+    if result:
+        return result
     # No own-UID reference observed; the foreign-UID domain is still unknown.
     return "UNKNOWN privileged_census_unavailable"
 def census():
@@ -2666,22 +2796,27 @@ def census():
     if not privileged:
         return own_uid_census()
     # hidepid can omit PIDs altogether; unreadable entries are not absence.
+    check_time()
     mounts = open(proc_root + "/self/mountinfo").read()
     if not any(" - proc " in line and line.split()[4] == proc_root and
                not re.search(r"hidepid=(?!0(?:,|\s|$))", line) for line in mounts.splitlines()):
         raise RuntimeError("proc_view_unverified")
+    check_time()
     pids = {n for n in os.listdir(proc_root) if n.isdigit()}
     if not pids:
         raise RuntimeError("empty_census")
     # Path-only FD checks miss an open alias that was subsequently unlinked.
     # Inventory only the exact deletion paths, never a sibling sandbox.
     for path in paths:
+        check_time()
         if not os.path.lexists(path):
             continue
+        check_time()
         info = os.lstat(path)
         protected_inodes.add((info.st_dev, info.st_ino))
         if not stat.S_ISDIR(info.st_mode):
             continue  # a sync stamp is a single file, not a directory census
+        check_time()
         for parent, dirs, files in os.walk(path, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
             check_time()
             for name in [None, *dirs, *files]:
@@ -2691,63 +2826,124 @@ def census():
                 if len(protected_inodes) > 200000:
                     raise RuntimeError("inventory_limit")
     unfenced_readers = False
-    for pid in sorted(pids):
-        check_time()
-        if int(pid) == os.getpid():
-            continue  # this read-only helper never opens a deletion target
-        base = proc_root + "/" + pid
-        before = identity(base)
-        tasks = set(os.listdir(base + "/task"))
-        if not tasks:
-            raise RuntimeError("partial_census")
-        for tid in sorted(tasks):
+    scanned = {}
+    def scan(pids, additions=None):
+        nonlocal unfenced_readers
+        for pid in sorted(pids):
             check_time()
-            task = base + "/task/" + tid
-            original, state, flags = task_stat(task)
-            # Zombies and kernel threads have no user address space or files.
-            if state != "Z" and not flags & 0x00200000:
-                # Stable PID/task generations do not freeze CWD/FD/env/maps.
-                # Arbitrary readers have not joined the native key/lease locks.
-                unfenced_readers = True
-                for name in ("cwd", "root", "exe"):
-                    value = os.readlink(task + "/" + name)
-                    if name == "cwd":
-                        cwd = value
-                    if reference(value) or inode_reference(task + "/" + name):
-                        return "BUSY process_" + name
-                fds = os.listdir(task + "/fd")
-                for fd in fds:
+            if int(pid) == os.getpid():
+                continue  # this read-only helper never opens a deletion target
+            base = proc_root + "/" + pid
+            check_time()
+            before = identity(base)
+            check_time()
+            tasks = set(os.listdir(base + "/task"))
+            if not tasks:
+                raise RuntimeError("partial_census")
+            key = (pid, before)
+            if additions is not None:
+                if key not in additions:
+                    raise RuntimeError("pid_generation_changed")
+                if additions[key] is not None:
+                    tasks = additions[key]
+            seen_tasks = scanned.setdefault(key, {})
+            for tid in sorted(tasks):
+                check_time()
+                task = base + "/task/" + tid
+                original = None
+                try:
                     check_time()
-                    if reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd):
-                        return "BUSY process_fd"
-                environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
-                if len(environ) > 8 * 1024 * 1024:
-                    raise RuntimeError("environment_limit")
-                for value in environ.split(b"\0"):
-                    for token in re.split(r"[=:\s]", os.fsdecode(value)):
-                        if reference(token):
-                            return "BUSY process_env"
-                if argv_reference(task, cwd):
-                    return "BUSY process_argv"
-                with open(task + "/maps") as maps:
-                    for line in maps:
+                    original, state, flags = task_stat(task)
+                    # Zombies and kernel threads have no user address space or files.
+                    if state != "Z" and not flags & 0x00200000:
+                        # Stable PID/task generations do not freeze CWD/FD/env/maps.
+                        # Arbitrary readers have not joined the native key/lease locks.
+                        unfenced_readers = True
+                        for name in ("cwd", "root", "exe"):
+                            check_time()
+                            value = os.readlink(task + "/" + name)
+                            if name == "cwd":
+                                cwd = value
+                            check_time()
+                            if reference(value) or inode_reference(task + "/" + name):
+                                return "BUSY process_" + name
                         check_time()
-                        fields = line.split(None, 5)
-                        device = fields[3].split(":") if len(fields) >= 5 else []
-                        mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
-                        if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
-                            return "BUSY process_maps"
-            if identity(task) != original:
-                raise RuntimeError("pid_generation_changed")
-        if identity(base) != before or set(os.listdir(base + "/task")) != tasks:
-            raise RuntimeError("pid_generation_changed")
-    if {n for n in os.listdir(proc_root) if n.isdigit()} != pids:
-        raise RuntimeError("partial_census")
+                        fds = os.listdir(task + "/fd")
+                        for fd in fds:
+                            check_time()
+                            if reference(os.readlink(task + "/fd/" + fd)) or inode_reference(task + "/fd/" + fd):
+                                return "BUSY process_fd"
+                        check_time()
+                        environ = open(task + "/environ", "rb").read(8 * 1024 * 1024 + 1)
+                        if len(environ) > 8 * 1024 * 1024:
+                            raise RuntimeError("environment_limit")
+                        for value in environ.split(b"\0"):
+                            for token in re.split(r"[=:\s]", os.fsdecode(value)):
+                                if reference(token):
+                                    return "BUSY process_env"
+                        check_time()
+                        if argv_reference(task, cwd):
+                            return "BUSY process_argv"
+                        check_time()
+                        with open(task + "/maps") as maps:
+                            for line in maps:
+                                check_time()
+                                fields = line.split(None, 5)
+                                device = fields[3].split(":") if len(fields) >= 5 else []
+                                mapped_inode = (os.makedev(int(device[0], 16), int(device[1], 16)), int(fields[4])) if len(device) == 2 else None
+                                if mapped_inode in protected_inodes or (len(fields) == 6 and reference(fields[5].rstrip("\n"))):
+                                    return "BUSY process_maps"
+                    check_time()
+                    if identity(task) != original:
+                        raise RuntimeError("pid_generation_changed")
+                    seen_tasks[tid] = original
+                except OSError as exc:
+                    # Preserve failures before the initial task generation read.
+                    if original is None or exc.errno not in (2, 3):
+                        raise
+                    # A vanished privileged task stat retains the terminal
+                    # OSError policy; only a present terminal state proves this
+                    # mid-scan exit without changing the disappearance policy.
+                    check_time()
+                    current = identity(task)
+                    if current == original:
+                        check_time()
+                        current, state, flags = task_stat(task)
+                        if current == original and state in ("Z", "X"):
+                            seen_tasks[tid] = original
+                            continue
+                    raise RuntimeError("unreadable_census" if current == original else "pid_generation_changed")
+            check_time()
+            try:
+                check_time()
+                if identity(base) != before:
+                    raise RuntimeError("pid_generation_changed")
+            except OSError as exc:
+                # All tasks have been scanned; an exited PID holds no reference.
+                if exc.errno not in (2, 3):
+                    raise
+    result = census_deltas(pids, scan, scanned, False)
+    if result:
+        return result
     return "UNKNOWN reader_acquisition_unfenced" if unfenced_readers else "IDLE"
-try:
-    print(census())
-except (OSError, ValueError, IndexError, RuntimeError) as exc:
-    print("UNKNOWN " + (str(exc) if isinstance(exc, RuntimeError) else "unreadable_census"))
+# Each call rebuilds its PID snapshot, scanned/seen maps and unfenced-reader
+# flag. Reset the two mutable module-level accumulators as well: an incomplete
+# attempt cannot supply evidence to the next one. The input deadline is shared.
+for attempt in range(3):
+    protected_inodes = set()
+    writer_excluded = []
+    try:
+        check_time()
+        verdict = census()
+    except (OSError, ValueError, IndexError, RuntimeError) as exc:
+        reason = str(exc) if isinstance(exc, RuntimeError) else "unreadable_census"
+        if isinstance(exc, RuntimeError) and reason in (
+            "partial_census", "unreadable_census", "pid_generation_changed"
+        ) and attempt < 2:
+            continue
+        verdict = "UNKNOWN " + reason
+    print(verdict)
+    break
 if writer_excluded:
     print("WRITER_EXCLUDED " + json.dumps(writer_excluded, separators=(",", ":")))
 """

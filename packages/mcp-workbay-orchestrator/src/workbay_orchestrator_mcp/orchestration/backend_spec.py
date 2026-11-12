@@ -385,6 +385,7 @@ class _AgentSpecBuildContext:
     requested_routing: RoutingQuad
     prompt: str | None
     coordination_bridge: CoordinationBridgeConfig | None
+    workspace_root: Path | str | None = None
 
 
 @dataclass(frozen=True)
@@ -521,13 +522,17 @@ def _codex_remote_argv(
     effort: str | None,
     service_tier: str | None = None,
     coordination_bridge: CoordinationBridgeConfig | None = None,
+    workspace_root: Path | str | None = None,
 ) -> list[str]:
     # Absolute import: offload_flock.sh executes this file as a script
     # (`python backend_spec.py defaults`), where a relative import has no
     # parent package and raises ImportError.
     from workbay_orchestrator_mcp.orchestration.codex_capabilities import resolve_codex_invocation
 
-    invocation = resolve_codex_invocation(model, effort=effort, service_tier=service_tier)
+    invocation = resolve_codex_invocation(
+        model, effort=effort, service_tier=service_tier,
+        **({"workspace_root": workspace_root} if workspace_root is not None else {}),
+    )
     argv = _codex_cli_argv(model=invocation.model, effort=invocation.effort, service_tier=invocation.service_tier)
     from workbay_orchestrator_mcp.orchestration.codex_lane_config import (
         EXECUTION_PERMISSION_PROFILE,
@@ -617,7 +622,10 @@ def _build_codex_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
     # Absolute import: this module also runs as a script via offload_flock.sh.
     from workbay_orchestrator_mcp.orchestration.codex_capabilities import resolve_codex_invocation
 
-    invocation = resolve_codex_invocation(context.model, effort=context.effort, service_tier=service_tier)
+    invocation = resolve_codex_invocation(
+        context.model, effort=context.effort, service_tier=service_tier,
+        **({"workspace_root": context.workspace_root} if context.workspace_root is not None else {}),
+    )
     effort = invocation.effort
     operator_effort = effort or ""
     return _seal_agent_spec(
@@ -632,6 +640,7 @@ def _build_codex_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
                 effort=effort,
                 service_tier=service_tier,
                 coordination_bridge=context.coordination_bridge,
+                **({"workspace_root": context.workspace_root} if context.workspace_root is not None else {}),
             ),
             # Compatibility carrier retained for one release. Its shape is fixed
             # even when no service tier was requested; typed routing is the new
@@ -1192,6 +1201,7 @@ def build_agent_spec(
     test_cmd: str | None = None,
     out_dir: str | None = None,
     coordination_bridge: CoordinationBridgeConfig | None = None,
+    workspace_root: Path | str | None = None,
 ) -> AgentSpec:
     """Build a v2 AgentSpec for a BACKENDS-registered invocation backend."""
     del test_cmd, out_dir  # reserved for later wiring
@@ -1277,6 +1287,7 @@ def build_agent_spec(
         requested_routing=requested_routing,
         prompt=prompt,
         coordination_bridge=coordination_bridge,
+        workspace_root=workspace_root,
     )
     return recipe.spec_builder(context)
 

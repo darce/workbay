@@ -6726,6 +6726,39 @@ def _sandbox_attestation_flags(argv: Sequence[str]) -> list[str]:
     return flags
 
 
+def _uses_native_boundary_write_authority(backend_id: str, argv: Sequence[str]) -> bool:
+    """Only one exact native recipe can defer host write authorization."""
+    if backend_id != "codex-remote":
+        return False
+    expected = writable_roots_preflight_argv()
+    flags = _sandbox_attestation_flags(argv)
+    if sorted(zip(flags[::2], flags[1::2])) != sorted(zip(expected[::2], expected[1::2])):
+        return False
+    # The fingerprint helper covers ordinary -c pairs. Reject competing CLI
+    # spellings and whitespace/quoted keys too, rather than missing an override
+    # that the CLI may accept after the exact recipe.
+    for index, arg in enumerate(argv):
+        if arg in {"-s", "--sandbox"} or arg.startswith(("--sandbox=", "-s=")):
+            return False
+        value = None
+        if arg in {"-c", "--config"}:
+            if index + 1 == len(argv):
+                return False
+            value = argv[index + 1]
+        elif arg.startswith("--config="):
+            value = arg.split("=", 1)[1]
+        elif arg.startswith("-c") and arg != "-c":
+            value = arg[2:].removeprefix("=")
+        elif arg.startswith("-s") and not arg.startswith("--"):
+            return False
+        if value is not None:
+            key = value.split("=", 1)[0].strip().strip("\"'")
+            if key.startswith(("permissions", "default_permissions", "sandbox_")):
+                if arg != "-c" or value not in expected[1::2]:
+                    return False
+    return True
+
+
 ProbeReason = Literal[
     "committed",
     "timeout",
@@ -7707,6 +7740,116 @@ def _preflight_probe_env(env: Mapping[str, str], *, backend_id: str = "codex-rem
     return result
 
 
+def _local_transport_parse_check(
+    executable: str | None,
+    *,
+    cwd: Path | str,
+    timeout: float,
+    started: float,
+    live_probe_count: int | None = 0,
+    source: bytes | None = None,
+) -> WritableRootsProbe | None:
+    """Host-local ``bash -n`` of the transport before any contact; None means parseable.
+
+    ``source`` parses admitted bytes on stdin, so the check reads exactly what
+    would run rather than a pathname that can change between check and use.
+    """
+    try:
+        if source is None:
+            precheck = subprocess.run(
+                ["bash", "-n", executable],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        else:
+            precheck = subprocess.run(
+                ["bash", "-n"],
+                input=source,
+                cwd=str(cwd),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+    except subprocess.TimeoutExpired as exc:
+        return WritableRootsProbe(
+            False,
+            "timeout",
+            time.monotonic() - started,
+            live_probe_count=live_probe_count,
+            stderr_head=str(exc)[:512],
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return WritableRootsProbe(
+            False,
+            "local_exec_failed",
+            time.monotonic() - started,
+            live_probe_count=live_probe_count,
+            stderr_head=str(exc)[:512],
+        )
+    if getattr(precheck, "returncode", 1) != 0:
+        output = getattr(precheck, "stderr", "") or getattr(precheck, "stdout", "") or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return WritableRootsProbe(
+            False,
+            "script_unparseable",
+            time.monotonic() - started,
+            live_probe_count=live_probe_count,
+            stderr_head=str(output)[:512],
+        )
+    return None
+
+
+def _native_transport_parse_refusal(
+    probe: WritableRootsProbe, *, backend_id: str, model: str, effort: str | None
+) -> BackendResult:
+    """Refuse a native-recipe pass whose admitted transport failed the local parse check.
+
+    Classification matches the legacy preflight refusal for the same probe
+    reason: a parse or local exec failure is local configuration, a timeout is
+    retryable UNKNOWN. No gate verdict is recorded; nothing was observed. [SECD-05]
+    """
+    local_configuration = probe.reason in {"script_unparseable", "local_exec_failed"}
+    evidence: dict[str, Any] = {
+        "native_transport_parse_check": True,
+        "probe_reason": probe.reason,
+        "writable_roots_probe": asdict(probe),
+        "failure_class": "configuration" if local_configuration else "transport",
+        "retryable": not local_configuration,
+        "preflight_probe_live_count": probe.live_probe_count,
+    }
+    if probe.stderr_head:
+        evidence["probe_stderr_head"] = probe.stderr_head[:512]
+    if probe.verdict == "unknown" and probe.reason in _RETRYABLE_UNKNOWN_PROBE_REASONS:
+        evidence["admission_deferred"] = True
+        evidence["defer_reason"] = "residual_timeout_writable_roots_probe"
+    blocker = (
+        f"native transport parse check (host-local bash -n before contact) failed: reason={probe.reason}, "
+        f"elapsed_s={probe.elapsed_s:.3f}"
+        + (f", stderr_head={probe.stderr_head[:512]}" if probe.stderr_head else "")
+        + "; "
+        + (
+            "fix the transport script; this is local configuration, not a sandbox verdict"
+            if local_configuration
+            else "the parse check is UNKNOWN; retry"
+        )
+        + " [FM-08]"
+    )
+    return _capability_gate_result(
+        backend_id=backend_id,
+        model=model,
+        effort=effort,
+        reason=preflight_attestation.CAPABILITY_MISSING_REASON,
+        blockers=[blocker],
+        evidence=evidence,
+        summary_override=f"{backend_id} refused: native transport parse check failed before contact",
+        worktree_local=local_configuration,
+    )
+
+
 def _request_vm_probe(
     kind: Literal["writable-roots-probe", "workspace-write-probe"],
     worktree: Path,
@@ -7763,22 +7906,6 @@ def _request_vm_probe(
                 if authenticated_transport is not None
                 else str(script)
             )
-            precheck = subprocess.run(
-                ["bash", "-n", executable],
-                cwd=str(worktree),
-                capture_output=True,
-                text=True,
-                timeout=min(5.0, precheck_remaining if shared_deadline else max(0.1, precheck_remaining)),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return WritableRootsProbe(
-                False,
-                "timeout",
-                time.monotonic() - started,
-                live_probe_count=lease.live_probe_count,
-                stderr_head=str(exc)[:512],
-            )
         except (OSError, subprocess.SubprocessError) as exc:
             return WritableRootsProbe(
                 False,
@@ -7787,15 +7914,15 @@ def _request_vm_probe(
                 live_probe_count=lease.live_probe_count,
                 stderr_head=str(exc)[:512],
             )
-        if getattr(precheck, "returncode", 1) != 0:
-            stderr_head = str(getattr(precheck, "stderr", "") or getattr(precheck, "stdout", "") or "")[:512]
-            return WritableRootsProbe(
-                False,
-                "script_unparseable",
-                time.monotonic() - started,
-                live_probe_count=lease.live_probe_count,
-                stderr_head=stderr_head,
-            )
+        parse_refusal = _local_transport_parse_check(
+            executable,
+            cwd=worktree,
+            timeout=min(5.0, precheck_remaining if shared_deadline else max(0.1, precheck_remaining)),
+            started=started,
+            live_probe_count=lease.live_probe_count,
+        )
+        if parse_refusal is not None:
+            return parse_refusal
         remaining = deadline - time.monotonic()
         # The shell accepts whole seconds. Never round an exhausted remainder
         # up into a fresh lease; leave fractional time for return/serialization.
@@ -8992,6 +9119,7 @@ class RemoteExecAdapter(BackendAdapter):
         phase_budget = kwargs.get("remote_phase_budget")
         phase_budget_receipt: dict[str, Any] | None = None
         transport_binding_evidence: dict[str, Any] = {}
+        preflight_authority: str | None = None
         transport_owner = ExitStack()
         preflight_transport = None
         preflight_source = None
@@ -9302,6 +9430,14 @@ class RemoteExecAdapter(BackendAdapter):
                     attestation["predecessor_receipt_id"] = predecessor
                 raw["attestation"] = attestation
                 stamped = replace(stamped, raw_payload=raw)
+            if preflight_authority is not None:
+                stamped = replace(
+                    stamped,
+                    raw_payload={
+                        **(stamped.raw_payload or {}),
+                        "preflight_authority": preflight_authority,
+                    },
+                )
             if test_cmd:
                 capture = _read_off_box_self_verify_once()
                 raw = dict(stamped.raw_payload or {})
@@ -10148,6 +10284,12 @@ class RemoteExecAdapter(BackendAdapter):
             live_preflight_required = (
                 bool(agent_spec.requires_live_sandbox_preflight) and carrier_state != MODEL_CLOCK_CARRIER_MALFORMED
             )
+            native_boundary_authority = _uses_native_boundary_write_authority(agent_spec.backend_id, agent_spec.argv)
+            if native_boundary_authority and admitted_source is None:
+                return _envelope(
+                    _source_binding_failure("selected_source_unreadable_or_changed"), constructor_refusal=True
+                )
+            live_preflight_required = live_preflight_required and not native_boundary_authority
 
             attestation_store = (
                 Path(kwargs["orchestrator_root"])
@@ -10539,7 +10681,7 @@ class RemoteExecAdapter(BackendAdapter):
                             operation, artifacts, outcome="committed" if commits else "staged", commits=commits
                         )
                 commit_landed = bool(before and after) and after != before
-                if agent_spec.requires_live_sandbox_preflight and commit_landed:
+                if agent_spec.requires_live_sandbox_preflight and not native_boundary_authority and commit_landed:
                     _record_attestation(
                         "vm_commit",
                         workspace_write=True,
@@ -10589,6 +10731,135 @@ class RemoteExecAdapter(BackendAdapter):
                             completion_error = f"{completion_error or ''}; temporary completion cleanup failed: {exc}"
                 if completion_error is not None:
                     logger.warning("Could not write remote-exec completion record in %s: %s", tmp, completion_error)
+
+            if native_boundary_authority and admitted_source is not None:
+                # [AGT-08] The skipped historical probe used to host this
+                # precondition; the caller still parses the admitted bytes
+                # locally before any contact or native deferral.
+                parse_started = time.monotonic()
+                parse_allowance = 5.0
+                if phase_budget is not None:
+                    parse_allowance = min(parse_allowance, phase_budget.remaining_seconds())
+                if parse_allowance <= 0:
+                    native_parse_refusal = WritableRootsProbe(False, "timeout", 0.0, live_probe_count=0)
+                else:
+                    native_parse_refusal = _local_transport_parse_check(
+                        str(script),
+                        cwd=worktree_path,
+                        timeout=parse_allowance,
+                        started=parse_started,
+                        source=admitted_source[0].data,
+                    )
+                if native_parse_refusal is not None and phase_budget is not None:
+                    # A budgeted refusal re-checks the owned snapshot of the
+                    # admitted bytes, as the legacy probe did, and retains that
+                    # custody so settlement can join the refusal to it. A
+                    # parseable pass takes no extra snapshot.
+                    parse_source = {"transport_path": str(script), "transport_digest": transport.transport_digest}
+                    parse_transport = None
+                    try:
+                        parse_transport = transport_owner.enter_context(
+                            remote_job_runner._authenticated_transport(
+                                [str(script)], parse_source, admitted_source=admitted_source
+                            )
+                        )
+                        snapshot_allowance = min(5.0, phase_budget.remaining_seconds())
+                        native_parse_refusal = (
+                            _local_transport_parse_check(
+                                remote_job_runner._execution_command(parse_transport)[0],
+                                cwd=worktree_path,
+                                timeout=snapshot_allowance,
+                                started=parse_started,
+                            )
+                            if snapshot_allowance > 0
+                            else None
+                        ) or native_parse_refusal
+                    except remote_job_runner._TransportBindingRefused as exc:
+                        transport_binding_evidence["selected_source"] = dict(parse_source)
+                        if getattr(exc, "cleanup_diagnostic", None) is not None:
+                            transport_binding_evidence["transport_cleanup"] = dict(exc.cleanup_diagnostic)
+                        return _envelope(_source_binding_failure(str(exc)), constructor_refusal=True)
+                    finally:
+                        if parse_transport is not None:
+                            transport_binding_evidence["preflight_source"] = {
+                                "selected_source": dict(parse_source),
+                                "consumed_source": dict(parse_transport.receipt) if parse_transport.consumed else None,
+                            }
+                            if parse_transport.cleanup_diagnostic is not None:
+                                transport_binding_evidence["preflight_source"]["transport_cleanup"] = dict(
+                                    parse_transport.cleanup_diagnostic,
+                                )
+                if native_parse_refusal is not None:
+                    return _envelope(
+                        _native_transport_parse_refusal(
+                            native_parse_refusal,
+                            backend_id=self.backend_id,
+                            model=effective_model,
+                            effort=applied_effort,
+                        ),
+                        constructor_refusal=True,
+                    )
+            if native_boundary_authority:
+                # UNKNOWN historical diagnostics have no write authority, but
+                # a same-identity negative still stops the dispatch before spawn.
+                try:
+                    native_read_kwargs: dict[str, Any] = {
+                        **attestation_identity,
+                        "env": {**run_env, preflight_attestation.VERDICT_RECORDS_ENV: "1"},
+                    }
+                    if task_ref:
+                        native_read_kwargs.update(lane_id=lane_id or None, worktree_path=worktree_path)
+                    native_cached = preflight_attestation.read_attestation(attestation_store, **native_read_kwargs)
+                except (OSError, RuntimeError):
+                    native_cached = {}
+                if any(_attestation_gate_negative(native_cached.get(gate)) for gate in preflight_attestation.REQUIRED_WRITE_GATES):
+                    # Keep cached denials and their typed refusal diagnostics;
+                    # neither negative gate needs another historical probe.
+                    native_negative_evidence: dict[str, Any] = {"failure_class": "configuration", "retryable": False}
+                    native_workspace_negative = _attestation_gate_negative(native_cached.get("workspace_write"))
+                    native_roots_negative = _attestation_gate_negative(native_cached.get("writable_roots"))
+                    if native_workspace_negative:
+                        native_negative_evidence["workspace_write_preflight_required"] = True
+                    if native_roots_negative:
+                        native_negative_evidence["writable_roots_preflight_required"] = True
+                        native_negative_evidence["writable_roots_probe"] = asdict(
+                            WritableRootsProbe(False, "sandbox_denied", 0.0, verdict="negative")
+                        )
+                    return _envelope(
+                        _capability_gate_result(
+                            backend_id=self.backend_id,
+                            model=effective_model,
+                            effort=applied_effort,
+                            reason=(
+                                preflight_attestation.CAPABILITY_MISSING_REASON
+                                if native_workspace_negative
+                                else preflight_attestation.CAPABILITY_NEGATIVE_REASON
+                            ),
+                            blockers=["cached sandbox capability negative [FM-08]"],
+                            evidence=native_negative_evidence,
+                        ),
+                        constructor_refusal=True,
+                    )
+                else:
+                    if managed_remote_dispatch:
+                        try:
+                            kwargs["capability_receipt_id"] = preflight_attestation.record_native_boundary_deferral(
+                                attestation_store,
+                                kwargs["capability_receipt_id"],
+                                expected_identity=capability_identity,
+                            )
+                        except (OSError, RuntimeError, ValueError):
+                            return _envelope(
+                                _capability_gate_result(
+                                    backend_id=self.backend_id,
+                                    model=effective_model,
+                                    effort=applied_effort,
+                                    reason=preflight_attestation.STALE_CAPABILITY_RECEIPT_REASON,
+                                    blockers=["native boundary deferral could not be recorded"],
+                                ),
+                                constructor_refusal=True,
+                            )
+                    preflight_authority = preflight_attestation.NATIVE_BOUNDARY_AUTHORITY
 
             if live_preflight_required:
                 try:
@@ -11096,14 +11367,18 @@ class RemoteExecAdapter(BackendAdapter):
                         shaping=self._shaping,
                         grok=self._grok,
                         identity_holder=managed_attempt_auth,
-                        require_complete_capability=bool(agent_spec.requires_live_sandbox_preflight),
+                        require_complete_capability=(
+                            bool(agent_spec.requires_live_sandbox_preflight) and not native_boundary_authority
+                        ),
                     )
                     if capability_validation is not None:
                         capability_identity = managed_attempt_auth.get("identity", capability_identity)
                         recomputed_config_digest = managed_attempt_auth.get("config_digest", recomputed_config_digest)
                         capability_validation = dict(
                             _authorize_or_remint(
-                                require_complete_capability=bool(agent_spec.requires_live_sandbox_preflight)
+                                require_complete_capability=(
+                                    bool(agent_spec.requires_live_sandbox_preflight) and not native_boundary_authority
+                                )
                             )
                         )
                         if not capability_validation.get("ok"):

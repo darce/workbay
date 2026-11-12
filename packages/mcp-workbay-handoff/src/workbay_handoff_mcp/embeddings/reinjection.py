@@ -12,6 +12,7 @@ from typing import Literal, TypedDict, cast
 
 import numpy as np
 
+from ..lanes_recording import is_reclaim_candidate_decision_id
 from .ranking import ScoredConceptVector, compose_anchor, rank_candidate_vectors_by_anchor
 from .store import SupportsEmbed, text_hash
 
@@ -280,6 +281,8 @@ def resolve_concept_sources(
             (entity_id, task_ref),
         ).fetchone()
         if row is None:
+            continue
+        if table == "decisions" and is_reclaim_candidate_decision_id(str(row[1])):
             continue
         raw_text = row[0]
         if raw_text is None or not str(raw_text).strip():

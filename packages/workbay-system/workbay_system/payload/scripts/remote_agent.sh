@@ -384,23 +384,32 @@ _boundary_runtime_preamble() {
 repo_root="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 repo_slug="$(basename "$repo_root")"
 
-_review_cycle_resolve_python() {
-    # Cache the importing command (including uv arguments) in this shell.
-    if [ -n "${_review_cycle_python_status:-}" ]; then
-        return "$_review_cycle_python_status"
-    fi
-    _review_cycle_python_status=1
-    local _root="$1" _rung _rungs="" _err="no interpreter found"
-    # Same order as the doctor ladder (S5-M-02). A payload install has no
-    # in-tree project, so uv must not attempt to resolve or install one.
-    for _rung in WORKBAY_PYTHON .venv uv python3; do
+# One host ladder for the review bridge, doctor auth and production context.
+# Checkout commands keep their source/PYTHONPATH contract. Installed commands
+# use the declared boundary runtime and its unchanged isolated version probe.
+_host_workbay_resolve_python() {
+    local _root="$1" _probe="$2" _mode="$3" _rung _out _errf _resolved _module
+    shift 3
+    local _environment=("$@")
+    _host_workbay_python=()
+    _host_workbay_output=''
+    _host_workbay_rungs=''
+    _host_workbay_refusal='boundary_runtime_missing error_type=ImportError module=workbay_orchestrator_mcp'
+    _host_workbay_error='no interpreter found'
+    _module=workbay_orchestrator_mcp.orchestration.review_cycle_dispatch
+    [ "$_mode" != render ] || _module=workbay_orchestrator_mcp.orchestration.backend_registry
+    _errf=$(mktemp "${TMPDIR:-/tmp}/wb-host-py.XXXXXX" 2>/dev/null) || {
+        _host_workbay_refusal='boundary_runtime_missing error_type=OSError module=temporary_file'
+        return 1
+    }
+    for _rung in WORKBAY_PYTHON .venv uv declared; do
         case "$_rung" in
             WORKBAY_PYTHON)
                 [ -n "${WORKBAY_PYTHON:-}" ] || continue
                 set -- "$WORKBAY_PYTHON"
                 ;;
             .venv)
-                [ -x "$_root/.venv/bin/python" ] || continue
+                [ -d "$_root/packages" ] && [ -x "$_root/.venv/bin/python" ] || continue
                 set -- "$_root/.venv/bin/python"
                 ;;
             uv)
@@ -408,21 +417,71 @@ _review_cycle_resolve_python() {
                 command -v uv >/dev/null 2>&1 || continue
                 set -- uv run --frozen --no-sync --project "$_root/packages/mcp-workbay-orchestrator" python
                 ;;
-            python3)
-                command -v python3 >/dev/null 2>&1 || continue
-                set -- python3
+            declared)
+                _rung=uv_tool
+                [ -z "${WORKBAY_BOUNDARY_PYTHON:-}" ] || _rung=WORKBAY_BOUNDARY_PYTHON
+                _host_workbay_rungs="${_host_workbay_rungs:+$_host_workbay_rungs,}$_rung"
+                # Run the VM resolver verbatim in a child shell. The doctor's
+                # env -i prefix also applies to this probe, keeping host secrets
+                # out of every interpreter it starts. Arguments carry only the
+                # declared runtime configuration through that clean environment.
+                if _resolved="$(${_environment[@]+"${_environment[@]}"} "$BASH" --noprofile --norc -c '
+_BOUNDARY_RUNTIME_VERSION=$1
+WORKBAY_BOUNDARY_PYTHON=$2
+UV_TOOL_DIR=$3
+XDG_DATA_HOME=$4
+eval "$5"
+if _boundary_runtime_resolve 2>/dev/null; then
+    printf "%s" "$_boundary_runtime_python"
+else
+    printf "%s" "$_boundary_runtime_refusal"
+    exit 1
+fi
+' host-runtime "$_BOUNDARY_RUNTIME_VERSION" "${WORKBAY_BOUNDARY_PYTHON:-}" \
+                    "${UV_TOOL_DIR:-}" "${XDG_DATA_HOME:-}" "$_boundary_runtime_sh")"; then
+                    set -- "$_resolved" -I
+                else
+                    case "$_resolved" in
+                        boundary_runtime_missing\ *|boundary_runtime_version_mismatch\ *)
+                            _host_workbay_refusal="$_resolved" ;;
+                        *) _host_workbay_refusal='boundary_runtime_missing error_type=resolver_failed module=python' ;;
+                    esac
+                    rm -f "$_errf"
+                    return 1
+                fi
                 ;;
         esac
-        _rungs="${_rungs:+$_rungs,}$_rung"
-        if _err="$("$@" -c 'import workbay_orchestrator_mcp.orchestration.review_cycle_dispatch' 2>&1 >/dev/null)"; then
-            _review_cycle_python=("$@")
-            _review_cycle_python_status=0
+        if [ "$_rung" != uv_tool ] && [ "$_rung" != WORKBAY_BOUNDARY_PYTHON ]; then
+            _host_workbay_rungs="${_host_workbay_rungs:+$_host_workbay_rungs,}$_rung"
+        fi
+        if _out="$(${_environment[@]+"${_environment[@]}"} "$@" -c "$_probe" 2>"$_errf")" \
+            && { [ "$_mode" != render ] || [ -n "$_out" ]; }; then
+            _host_workbay_python=(${_environment[@]+"${_environment[@]}"} "$@")
+            _host_workbay_output=$_out
+            rm -f "$_errf"
             return 0
         fi
-        _err="${_err%%$'\n'*}"
-        [ -n "$_err" ] || _err="$1: import failed"
+        _host_workbay_error="$(head -n 1 "$_errf")"
+        [ -n "$_host_workbay_error" ] || _host_workbay_error="$1: probe failed or rendered nothing"
+        _host_workbay_refusal="boundary_runtime_missing error_type=ImportError module=$_module probe=$_mode"
     done
-    printf 'review-cycle bridge: no interpreter can import workbay_orchestrator_mcp (tried: %s; last error: %s); set WORKBAY_PYTHON\n' "${_rungs:-none}" "$_err" >&2
+    rm -f "$_errf"
+    return 1
+}
+
+_review_cycle_resolve_python() {
+    # Cache the importing command (including uv arguments) in this shell.
+    if [ -n "${_review_cycle_python_status:-}" ]; then
+        return "$_review_cycle_python_status"
+    fi
+    _review_cycle_python_status=1
+    if _host_workbay_resolve_python "$1" 'import workbay_orchestrator_mcp.orchestration.review_cycle_dispatch' import; then
+        _review_cycle_python=("${_host_workbay_python[@]}")
+        _review_cycle_python_status=0
+        return 0
+    fi
+    printf 'review-cycle bridge: no interpreter can import workbay_orchestrator_mcp (%s; tried: %s; last error: %s); set WORKBAY_PYTHON or WORKBAY_BOUNDARY_PYTHON\n' \
+        "$_host_workbay_refusal" "${_host_workbay_rungs:-none}" "$_host_workbay_error" >&2
     return 1
 }
 
@@ -763,6 +822,7 @@ fi
 case "$LANE_VENV_CAP" in *[!0-9]*|"") echo "remote_agent: MAX_LANE_VENVS must be a non-negative integer (0=keep all)" >&2; exit 2 ;; esac
 case "$DISPATCH_TTL_SEC" in *[!0-9]*|"") echo "remote_agent: DISPATCH_TTL_SEC must be a non-negative integer (0=disable)" >&2; exit 2 ;; esac
 case "$SANDBOX_TTL_SEC" in *[!0-9]*|"") echo "remote_agent: SANDBOX_TTL_SEC must be a non-negative integer (0=disable)" >&2; exit 2 ;; esac
+# Host-side digits-only proof for the single-quoted remote interpolation.
 case "$SANDBOX_IDLE_SEC" in *[!0-9]*|"") echo "remote_agent: SANDBOX_IDLE_SEC must be a non-negative integer" >&2; exit 2 ;; esac
 case "$SWEEP_MIN_INTERVAL_SEC" in *[!0-9]*|"") echo "remote_agent: SWEEP_MIN_INTERVAL_SEC must be a non-negative integer" >&2; exit 2 ;; esac
 case "$SANDBOX_REAP_BUDGET_SEC" in *[!0-9]*|"") echo "remote_agent: SANDBOX_REAP_BUDGET_SEC must be a non-negative integer" >&2; exit 2 ;; esac
@@ -2294,6 +2354,8 @@ _remote_inventory() {
     # subprocesses; its escalation applies solely to these inventory probes.
     PYTHONDONTWRITEBYTECODE=1 python3 - <<'INVENTORY_PY'
 import datetime
+import errno
+import math
 import json
 import os
 from pathlib import Path
@@ -2369,8 +2431,132 @@ def pressure(axis):
         return None
 
 
+def opaque_class(task, uid):
+    # Only readable metadata can authorize an opaque-task exclusion. Cgroup
+    # membership is the authority; comm and argv narrow the exact unit match.
+    status = open(task + "/status").read()
+    owners = next((line.split()[1:3] for line in status.splitlines()
+                   if line.startswith("Uid:")), [])
+    if owners != [str(uid), str(uid)]:
+        return None
+    cgroups = open(task + "/cgroup").read().splitlines()
+    comm = open(task + "/comm").read().removesuffix("\n")
+    argv = open(task + "/cmdline", "rb").read(65537)
+    if len(cgroups) != 1 or not cgroups[0].startswith("0::") or len(argv) > 65536:
+        return None
+    cgroup = cgroups[0][3:]
+    argv = argv.removesuffix(b"\0").split(b"\0")
+    command = os.path.basename(argv[0])
+    user = "/user.slice/user-" + str(uid) + ".slice/"
+    manager = user + "user@" + str(uid) + ".service/"
+    kind = None
+    if cgroup == manager + "init.scope":
+        if (comm == "systemd" and command == b"systemd" and b"--user" in argv) or (
+            comm == "(sd-pam)" and argv[0] == b"(sd-pam)"
+        ):
+            kind = "user_manager"
+    elif cgroup == manager + "app.slice/gpg-agent.service":
+        if comm == "gpg-agent" and command == b"gpg-agent" and not any(
+            arg == b"--homedir" or arg.startswith(b"--homedir=") for arg in argv
+        ):
+            kind = "gpg_agent"
+    elif re.fullmatch(re.escape(user) + r"session-[A-Za-z0-9_-]+\.scope", cgroup):
+        if (comm == "tailscaled" and command == b"tailscaled" and argv[1:3] == [b"be-child", b"ssh"]) or (
+            comm == "sshd" and argv[0].startswith(b"sshd:")
+        ):
+            kind = "ssh_session_daemon"
+    return {"pid": int(task.rsplit("/", 1)[1]), "comm": comm, "class": kind} if kind else None
+def process_identity(task):
+    # /proc stat field 22, after the final comm delimiter, is starttime.
+    fields = read(Path(task) / "stat").rsplit(") ", 1)[1].split()
+    return fields[19]
+
+
+def receipt_time(value):
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("receipt timestamp needs a UTC offset")
+    return parsed.timestamp()
+
+
+def receipt_integer(value):
+    return type(value) is int and value >= 0
+
+
+def receipt_finite(value):
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(receipt_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return all(receipt_finite(v) for v in value)
+    return True
+
+
+def reclaim_receipt():
+    source = "~/.local/state/workbay/vm-reclaim/last-run.json"
+    try:
+        descriptor = os.open(Path.home() / ".local/state/workbay/vm-reclaim/last-run.json",
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {"state": "unknown", "reason": "last_run_missing"}
+    except OSError:
+        return {"state": "unknown", "reason": "invalid_receipt"}
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                raise ValueError("receipt must be a regular file of at most 64 KiB")
+            data = stream.read(65536)
+        value = json.loads(data)
+        if (
+            not isinstance(value, dict)
+            or type(value.get("schema")) is not int or value["schema"] != 1
+            or value.get("outcome") not in ("ok", "degraded", "error")
+            or value.get("trigger") not in ("timer", "headroom", "manual")
+            or not isinstance(value.get("counts"), dict)
+            or any(not isinstance(k, str) or not receipt_integer(v) for k, v in value["counts"].items())
+            or any(not receipt_integer(value.get(key)) for key in ("reclaimed", "recovered", "bytes_freed"))
+            or not isinstance(value.get("recover_failed", []), list)
+            or any(not isinstance(name, str) for name in value.get("recover_failed", []))
+            or any(key not in value or (value[key] is not None and not receipt_integer(value[key]))
+                   for key in ("df_free_before", "df_free_after"))
+            or (value.get("outcome") in ("ok", "degraded") and value.get("error", True) is not None)
+            or (value.get("outcome") == "error" and (
+                not isinstance(value.get("error"), dict)
+                or not isinstance(value["error"].get("type"), str)
+                or not isinstance(value["error"].get("message"), str)))
+            or not receipt_finite(value)
+        ):
+            raise ValueError("invalid last-run receipt")
+        receipt_time(value["started_at"])
+        age = time.time() - receipt_time(value["finished_at"])
+        if age < 0:
+            return {"state": "unknown", "reason": "future_finished_at"}
+        alarms = []
+        if age > 5400:
+            alarms.append("reaper_stale")
+        if value["outcome"] == "error":
+            alarms.append("last_run_error")
+        if value.get("recover_failed"):
+            alarms.append("recover_failed")
+        if value.get("dependency_census"):
+            alarms.append("census_exhausted")
+        starved = value.get("starved")
+        if not isinstance(starved, dict):
+            starved = None
+        if starved:
+            alarms.append("reclaim_starved")
+        return {"state": "known", "reason": None, "source": source,
+                **{key: value[key] for key in ("outcome", "trigger", "started_at", "finished_at",
+                    "reclaimed", "recovered", "bytes_freed", "df_free_before", "df_free_after", "counts")},
+                "age_seconds": age, "starved": starved, "alarms": alarms, "alarms_scope": "last_run_receipt"}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return {"state": "unknown", "reason": "invalid_receipt"}
+
+
 def holder_alive(pid):
-    if pid is None:
+    if pid is None or pid in foreign_process_ids:
         return "unknown"
     directory = proc / str(pid)
     try:
@@ -2405,6 +2591,19 @@ doc = {"schema_version": 1,
        "psi": {axis: pressure(axis) for axis in ("cpu", "memory", "io")},
        "processes": [], "processes_state": "known", "sandboxes": [],
        "sandboxes_state": "known"}
+uid = os.geteuid()
+census = {"scope": "own_uid", "uid": uid, "own_uid_tasks": 0, "cwd_known": 0,
+          "excluded": {}, "unclassified_opaque": 0, "exited_during_scan": 0,
+          "foreign_uid_tasks": 0, "foreign_uid_domain": "not_observed", "sandbox_root": None}
+try:
+    info = os.lstat(root)
+    census["sandbox_root"] = {"mode": format(stat.S_IMODE(info.st_mode), "04o"), "owner_uid": info.st_uid}
+except OSError:
+    pass
+doc["process_census"] = census
+doc["reclaim"] = reclaim_receipt()
+if doc["reclaim"]["state"] == "unknown":
+    unknowns.add("reclaim")
 try:
     match = re.search(r"^MemAvailable:\s+(\d+) kB$", read(proc / "meminfo"), re.M)
     if not match:
@@ -2467,6 +2666,8 @@ except OSError:
 # One exact-PID metadata snapshot. Membership is by cwd boundary or the PGID
 # of a directly attributed process; command text is never used for selection.
 processes = []
+observed_process_ids = set()
+foreign_process_ids = set()
 ps = probe(["ps", "-eo", "pid,ppid,pgid,lstart,rss,comm"])
 if ps is None:
     doc["processes_state"] = "unknown"
@@ -2487,14 +2688,61 @@ else:
         except (ValueError, IndexError):
             doc["processes_state"] = "unknown"
             continue
+        observed_process_ids.add(pid)
+        task = str(proc / str(pid))
+        owners = None
         try:
-            item["cwd"] = os.readlink(proc / str(pid) / "cwd")
+            status = read(Path(task) / "status")
+            fields = next((line.split()[1:3] for line in status.splitlines()
+                           if line.startswith("Uid:")), [])
+            if len(fields) != 2:
+                raise ValueError("unreadable task ownership")
+            owners = [int(value) for value in fields]
+            if uid not in owners:
+                census["foreign_uid_tasks"] += 1
+                foreign_process_ids.add(pid)
+                continue  # no foreign stat, cwd, argv, cgroup, fd or environment reads
+        except (OSError, ValueError):
+            pass
+        try:
+            item["cwd"] = os.readlink(Path(task) / "cwd")
             item["cwd_state"] = "known"
-        except OSError:
-            doc["processes_state"] = "unknown"
+            if owners is None:
+                census["unclassified_opaque"] += 1
+                doc["processes_state"] = "unknown"
+            else:
+                census["cwd_known"] += 1
+        except OSError as failure:
+            exited = False
+            if failure.errno in (errno.ENOENT, errno.ESRCH):
+                try:
+                    os.stat(Path(task) / "stat")
+                except OSError as stat_error:
+                    exited = stat_error.errno in (errno.ENOENT, errno.ESRCH)
+            if exited:
+                census["exited_during_scan"] += 1
+                continue
+            excluded = None
+            if failure.errno in (errno.EACCES, errno.EPERM) and owners is not None:
+                try:
+                    original = process_identity(task)
+                    excluded = opaque_class(task, uid)
+                    if process_identity(task) != original or remaining() < 5:
+                        excluded = None
+                except (OSError, ValueError, IndexError):
+                    excluded = None
+            if excluded is not None:
+                kind = excluded["class"]
+                item.update(cwd_state="excluded", excluded_class=kind)
+                census["excluded"][kind] = census["excluded"].get(kind, 0) + 1
+            else:
+                census["unclassified_opaque"] += 1
+                doc["processes_state"] = "unknown"
+        if owners is not None:
+            census["own_uid_tasks"] += 1
         processes.append(item)
 
-process_ids = {item["pid"] for item in processes}
+process_ids = observed_process_ids
 for path in paths:
     if remaining() < 5:
         truncate("deadline")
@@ -3285,49 +3533,15 @@ DOCTOR_RECLAIM_EOF
     # The checkout that holds THIS script (a linked worktree's toplevel, not the
     # git-common-dir root) so the registry matches the script version.
     _doc_root="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$repo_root")"
-    # Interpreter ladder (S5-M-02): WORKBAY_PYTHON, the checkout's .venv, uv
-    # against the in-tree orchestrator project (only when that tree exists —
-    # a payload install has no packages/ dir), then a PATH python3 that can
-    # import the package. Each rung is tried until one renders; the FIRST
-    # stderr line of the last failure is surfaced so a skip is never silent.
+    # Use the same host resolver as dispatch, with the doctor's clean env
+    # applied to every probe and to the renderer itself.
     _doc_render='from workbay_orchestrator_mcp.orchestration.backend_registry import render_doctor_auth_script; print(render_doctor_auth_script(), end="")'
-    _doc_script=""
-    _doc_err=""
-    _doc_try() {
-        local _out _errf
-        _errf=$(mktemp "${TMPDIR:-/tmp}/wb-doctor-py.XXXXXX") || _errf=""
-        _out="$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-}" ${UV_CACHE_DIR:+UV_CACHE_DIR="$UV_CACHE_DIR"} \
-            "$@" -c "$_doc_render" 2>"${_errf:-/dev/null}")" || _out=""
-        if [ -n "$_out" ]; then
-            _doc_script="$_out"
-        else
-            _doc_err="$(head -n 1 "${_errf:-/dev/null}" 2>/dev/null || true)"
-            [ -n "$_doc_err" ] || _doc_err="$1: rendered nothing"
-        fi
-        [ -n "$_errf" ] && rm -f "$_errf"
-        [ -n "$_doc_script" ]
-    }
-    _doc_rungs="none"
-    if [ -n "${WORKBAY_PYTHON:-}" ]; then
-        _doc_rungs="WORKBAY_PYTHON"
-        _doc_try "$WORKBAY_PYTHON" || true
-    fi
-    if [ -z "$_doc_script" ] && [ -x "$_doc_root/.venv/bin/python" ]; then
-        _doc_rungs="$_doc_rungs,.venv"
-        _doc_try "$_doc_root/.venv/bin/python" || true
-    fi
-    if [ -z "$_doc_script" ] && [ -d "$_doc_root/packages/mcp-workbay-orchestrator" ] && command -v uv >/dev/null 2>&1; then
-        _doc_rungs="$_doc_rungs,uv"
-        _doc_try uv run --frozen --no-sync --project "$_doc_root/packages/mcp-workbay-orchestrator" python || true
-    fi
-    if [ -z "$_doc_script" ] && command -v python3 >/dev/null 2>&1; then
-        _doc_rungs="$_doc_rungs,python3"
-        _doc_try python3 || true
-    fi
-    if [ -n "$_doc_script" ]; then
-        printf '%s\n' "$_doc_script" | "${SSH[@]}" 'bash -s'
+    if _host_workbay_resolve_python "$_doc_root" "$_doc_render" render \
+        env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-}" ${UV_CACHE_DIR:+UV_CACHE_DIR="$UV_CACHE_DIR"}; then
+        printf '%s\n' "$_host_workbay_output" | "${SSH[@]}" 'bash -s'
     else
-        echo "auth    : registry unavailable on this host (tried: $_doc_rungs; last error: ${_doc_err:-no interpreter found}); set WORKBAY_PYTHON or install the orchestrator package; per-port auth lines skipped" >&2
+        printf 'auth    : registry unavailable on this host (%s; tried: %s; last error: %s); set WORKBAY_PYTHON or WORKBAY_BOUNDARY_PYTHON; per-port auth lines skipped\n' \
+            "$_host_workbay_refusal" "${_host_workbay_rungs:-none}" "$_host_workbay_error" >&2
     fi
     ;;
 reap)
@@ -4636,6 +4850,20 @@ _lane_stop_processes() {
 }
 
 _lane_reap_deleted_cwd_orphans() {
+    local _orphan_deadline _orphan_now
+    _orphan_deadline="${_LANE_STOP_DEADLINE:-${_DISPATCH_SWEEP_DEADLINE:-${reap_deadline:-}}}"
+    case "$_orphan_deadline" in
+        ''|*[!0-9]*) ;;
+        *)
+            printf -v _orphan_now '%(%s)T' -1 2>/dev/null || _orphan_now=$(date +%s)
+            if [ "$_orphan_now" -ge "$_orphan_deadline" ]; then
+                _PROC_CWD_PROBE_REASON=deadline
+                echo "remote_agent: deleted-cwd occupancy probe unknown (deadline); orphan cleanup deferred" >&2
+                printf '%s' 0
+                return 0
+            fi
+            ;;
+    esac
     _lane_proc_root_available || {
         echo "remote_agent: deleted-cwd occupancy probe unknown (${_PROC_CWD_PROBE_REASON:-proc_probe_failed}); orphan cleanup deferred" >&2
         printf '%s' 0
@@ -4905,12 +5133,42 @@ _snapshot_proc_cwds() {
         local _deadline _now
         _deadline="${_LANE_STOP_DEADLINE:-${_DISPATCH_SWEEP_DEADLINE:-${reap_deadline:-}}}"
         case "$_deadline" in ''|*[!0-9]*) return 1 ;; esac
-        _now=$(date +%s)
+        # Bash >= 4.2 reads the clock without forking once per PID.
+        printf -v _now '%(%s)T' -1 2>/dev/null || _now=$(date +%s)
         if [ "$_now" -ge "$_deadline" ]; then
             _PROC_CWD_PROBE_REASON=deadline
             return 0
         fi
         return 1
+    }
+    # Both UID passes share the remaining-deadline bound. The initial batch
+    # preserves stat without timeout(1); missing-row recovery requires it.
+    _proc_cwd_uid_stat() {
+        local _missing_timeout_policy="$1" _uid_timeout= _uid_now
+        shift
+        local -a _uid_stat_args
+        case "$_probe_deadline" in
+            ''|*[!0-9]*) ;;
+            *)
+                printf -v _uid_now '%(%s)T' -1 2>/dev/null || _uid_now=$(date +%s)
+                _uid_timeout=$((_probe_deadline - _uid_now))
+                [ "$_uid_timeout" -gt 0 ] || return 124
+                if ! command -v timeout >/dev/null 2>&1; then
+                    [ "$_missing_timeout_policy" = allow ] || return 124
+                    _uid_timeout=
+                fi
+                ;;
+        esac
+        if [ "$_stat_uid_mode" = gnu ]; then
+            _uid_stat_args=(-c %u --)
+        else
+            _uid_stat_args=(-f %u)
+        fi
+        if [ -n "$_uid_timeout" ]; then
+            timeout "$_uid_timeout" stat "${_uid_stat_args[@]}" "$@"
+        else
+            stat "${_uid_stat_args[@]}" "$@"
+        fi
     }
     _proc_cwd_identity_uid() {
         local _uid_deadline _uid_timeout
@@ -4947,9 +5205,17 @@ _snapshot_proc_cwds() {
     if [ -n "$_probe_deadline" ]; then
         _probe_seconds=$((SECONDS + _probe_deadline - $(date +%s)))
     fi
+    if _proc_cwd_deadline_expired; then
+        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+        return 1
+    fi
     _dirs=()
     _n_dirs=0
     for _pid_dir in "$_pr"/[0-9]*; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [ -d "$_pid_dir" ] || continue
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _dirs+=("$_pid_dir")
@@ -4959,6 +5225,10 @@ _snapshot_proc_cwds() {
     _comms=()
     _i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _pid="${BASH_REMATCH[1]}"
         if _proc_cwd_pid_stat "$_pid"; then
@@ -4996,15 +5266,24 @@ _snapshot_proc_cwds() {
             return $?
         fi
         _stat_rc=0
-        if [ "$_stat_uid_mode" = gnu ]; then
-            _output=$(stat -c %u -- "${_dirs[@]}" 2>&1) || _stat_rc=$?
-        else
-            _output=$(stat -f %u "${_dirs[@]}" 2>&1) || _stat_rc=$?
+        _output=$(_proc_cwd_uid_stat allow "${_dirs[@]}" 2>&1) || _stat_rc=$?
+        if [ "$_stat_rc" -eq 124 ] || [ "$_stat_rc" -eq 137 ]; then
+            _PROC_CWD_PROBE_REASON=deadline
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
         fi
         _uids=()
         _n_uids=0
         _stat_errors=
         while IFS= read -r _stat_line || [ -n "$_stat_line" ]; do
+            if _proc_cwd_deadline_expired; then
+                [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                return 1
+            fi
             case "$_stat_line" in
                 '' ) ;;
                 *[!0-9]*) _stat_errors="${_stat_errors}${_stat_line}"$'\n' ;;
@@ -5026,6 +5305,10 @@ _snapshot_proc_cwds() {
             _live_rows=0
             _error_rows=0
             for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [ -d "$_pid_dir" ] || continue
                 _live_rows=$((_live_rows + 1))
                 case "$_stat_errors" in
@@ -5041,6 +5324,10 @@ _snapshot_proc_cwds() {
                 _output_index=0
                 _i=0
                 for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+                    if _proc_cwd_deadline_expired; then
+                        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                        return 1
+                    fi
                     if [ ! -d "$_pid_dir" ]; then
                         _uids+=("")
                     else
@@ -5062,6 +5349,10 @@ _snapshot_proc_cwds() {
             else
                 _i=0
                 for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+                    if _proc_cwd_deadline_expired; then
+                        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                        return 1
+                    fi
                     _uids+=("")
                     if [ -d "$_pid_dir" ]; then
                         _uncertain_dirs+=("$_pid_dir")
@@ -5095,29 +5386,7 @@ _snapshot_proc_cwds() {
                 done
                 [ "$_fallback_count" -gt 0 ] || continue
                 _fallback_rc=0
-                _fallback_timeout=
-                case "$_probe_deadline" in
-                    ''|*[!0-9]*) ;;
-                    *)
-                        _fallback_timeout=$((_probe_deadline - $(date +%s)))
-                        [ "$_fallback_timeout" -gt 1 ] || _fallback_timeout=1
-                        ;;
-                esac
-                if [ "$_stat_uid_mode" = gnu ]; then
-                    _fallback_stat_args=(-c %u --)
-                else
-                    _fallback_stat_args=(-f %u)
-                fi
-                if [ -n "$_fallback_timeout" ]; then
-                    if ! command -v timeout >/dev/null 2>&1; then
-                        _PROC_CWD_PROBE_REASON=deadline
-                        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
-                        return 1
-                    fi
-                    _output=$(timeout "$_fallback_timeout" stat ${_fallback_stat_args[@]+"${_fallback_stat_args[@]}"} ${_fallback_dirs[@]+"${_fallback_dirs[@]}"} 2>&1) || _fallback_rc=$?
-                else
-                    _output=$(stat ${_fallback_stat_args[@]+"${_fallback_stat_args[@]}"} ${_fallback_dirs[@]+"${_fallback_dirs[@]}"} 2>&1) || _fallback_rc=$?
-                fi
+                _output=$(_proc_cwd_uid_stat require "${_fallback_dirs[@]}" 2>&1) || _fallback_rc=$?
                 if [ "$_fallback_rc" -eq 124 ] || [ "$_fallback_rc" -eq 137 ]; then
                     _PROC_CWD_PROBE_REASON=deadline
                     [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
@@ -5127,6 +5396,10 @@ _snapshot_proc_cwds() {
                 _fallback_uid_count=0
                 _fallback_errors=
                 while IFS= read -r _fallback_line || [ -n "$_fallback_line" ]; do
+                    if _proc_cwd_deadline_expired; then
+                        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                        return 1
+                    fi
                     case "$_fallback_line" in
                         '' ) ;;
                         *[!0-9]*) _fallback_errors="${_fallback_errors}${_fallback_line}"$'\n' ;;
@@ -5140,6 +5413,10 @@ _snapshot_proc_cwds() {
                 _fallback_pid=unknown
                 _fallback_error_pid=unknown
                 for _pid_dir in ${_fallback_dirs[@]+"${_fallback_dirs[@]}"}; do
+                    if _proc_cwd_deadline_expired; then
+                        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                        return 1
+                    fi
                     if [ -d "$_pid_dir" ]; then
                         _live_rows=$((_live_rows + 1))
                         if [[ "$_pid_dir" =~ /([0-9]+)$ ]]; then
@@ -5155,6 +5432,10 @@ _snapshot_proc_cwds() {
                     [ -z "$_fallback_errors" ]; then
                     _i=0
                     for _pid_dir in ${_fallback_dirs[@]+"${_fallback_dirs[@]}"}; do
+                        if _proc_cwd_deadline_expired; then
+                            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                            return 1
+                        fi
                         _uids[${_fallback_indices[$_i]}]="${_fallback_uids[$_i]}"
                         _i=$((_i + 1))
                     done
@@ -5178,6 +5459,10 @@ _snapshot_proc_cwds() {
     _n_owned=0
     _i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         _uid="${_uids[$_i]:-}"
         _i=$((_i + 1))
         [ -d "$_pid_dir" ] || continue
@@ -5253,6 +5538,10 @@ _snapshot_proc_cwds() {
     _i=0
     _owned_i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _pid="${BASH_REMATCH[1]}"
         _uid="${_uids[$_i]:-}"
@@ -5277,6 +5566,10 @@ _snapshot_proc_cwds() {
     # identity verification pass so those reads are bound to the same snapshot.
     _i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _pid="${BASH_REMATCH[1]}"
         _uid="${_uids[$_i]:-}"
@@ -5306,6 +5599,10 @@ _snapshot_proc_cwds() {
     # A reused PID discards both rows and is sampled once as a new process.
     _i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _pid="${BASH_REMATCH[1]}"
         if [ ! -d "$_pid_dir" ]; then
@@ -5524,6 +5821,10 @@ _snapshot_proc_cwds() {
 
     _i=0
     for _pid_dir in ${_dirs[@]+"${_dirs[@]}"}; do
+        if _proc_cwd_deadline_expired; then
+            [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+            return 1
+        fi
         [[ "$_pid_dir" =~ /([0-9]+)$ ]] || continue
         _pid="${BASH_REMATCH[1]}"
         _PROC_CWD_EXAMINED=$((_PROC_CWD_EXAMINED + 1))
@@ -5591,6 +5892,10 @@ _snapshot_proc_cwds() {
         return $?
     fi
     echo "remote_agent: proc cwd examined=${_PROC_CWD_EXAMINED} own_uid=${_PROC_CWD_OWN_UID} foreign_uid_unreadable=${_PROC_CWD_FOREIGN_UNREADABLE} root_unreadable=${_PROC_CWD_ROOT_UNREADABLE} session_infra_unreadable=${_PROC_CWD_SESSION_INFRA_UNREADABLE} vanished=${_PROC_CWD_VANISHED} zombie=${_PROC_CWD_ZOMBIE}" >&2
+    if _proc_cwd_deadline_expired; then
+        [ "$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+        return 1
+    fi
     _PROC_CWD_SNAPSHOT_READY=1
     if [ "$_retry_root" -eq 1 ]; then
         unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
@@ -6996,6 +7301,11 @@ submit|build)
             *) die "unknown arg: $1" ;;
         esac
     done
+    # Same closed set as review_cycle_ledger.KINDS, before metadata or transport.
+    case "$REVIEW_KIND" in
+        implement|gate|analysis) ;;
+        *) die "review_kind_invalid: --review-kind must be implement, gate, or analysis" ;;
+    esac
     if [ "$cmd" = submit ]; then
         [ -n "$JOB_ID" ] || die "--job-id required"
         if ! [[ "$JOB_ID" =~ ^j[0-9a-f]{20}$ ]]; then
@@ -8332,7 +8642,12 @@ REMOTE_EOF
     # BEGIN REMOTE_PRODUCTION_CONTEXT
     # Resolve the admission through the public store before worker access. A
     # missing runtime/store/root is the legacy path, never an empty admission.
-    _production_context_b64="$(python3 - "$BRANCH" "$SOURCE_COMMIT" <<'PRODUCTION_CONTEXT_PY'
+    _production_context_b64=''
+    _production_src="$(cd "$(dirname "$0")/.." && pwd)/packages"
+    if PYTHONPATH="${_production_src}/mcp-workbay-orchestrator/src:${_production_src}/mcp-workbay-handoff/src:${_production_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
+        _review_cycle_resolve_python "${_production_src%/packages}" 2>/dev/null; then
+        _production_context_b64="$(PYTHONPATH="${_production_src}/mcp-workbay-orchestrator/src:${_production_src}/mcp-workbay-handoff/src:${_production_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "${_review_cycle_python[@]}" - "$BRANCH" "$SOURCE_COMMIT" <<'PRODUCTION_CONTEXT_PY'
 import base64
 import json
 from pathlib import Path
@@ -8346,7 +8661,9 @@ try:
     from workbay_handoff_mcp.lane_completion_production import (
         ProductionRefusal, RefusalCode, get_lane_production_admission, get_lane_production_history,
     )
-except ImportError:
+except ImportError as exc:
+    print("remote_agent: production_context_runtime_missing module="
+          + (exc.name or "workbay_handoff_mcp") + "; using legacy path", file=sys.stderr)
     raise SystemExit(0)
 try:
     config = RuntimeConfig.for_repo(Path.cwd())
@@ -8389,6 +8706,9 @@ except Exception as exc:
     print("remote_agent: production_history_unavailable: " + type(exc).__name__, file=sys.stderr)
 PRODUCTION_CONTEXT_PY
 )"
+    else
+        printf '%s\n' 'remote_agent: production_context_runtime_missing module=workbay_handoff_mcp; using legacy path' >&2
+    fi
     # END REMOTE_PRODUCTION_CONTEXT
     _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
         "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" "$_production_context_b64" || exit 76
@@ -9963,6 +10283,20 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             _lane_terminate_pid_list "\$_dir" \$_pids
         }
         _lane_reap_deleted_cwd_orphans() {
+            local _orphan_deadline _orphan_now
+            _orphan_deadline="\${_LANE_STOP_DEADLINE:-\${_DISPATCH_SWEEP_DEADLINE:-\${reap_deadline:-}}}"
+            case "\$_orphan_deadline" in
+                ''|*[!0-9]*) ;;
+                *)
+                    printf -v _orphan_now '%(%s)T' -1 2>/dev/null || _orphan_now=\$(date +%s)
+                    if [ "\$_orphan_now" -ge "\$_orphan_deadline" ]; then
+                        _PROC_CWD_PROBE_REASON=deadline
+                        echo "remote_agent: deleted-cwd occupancy probe unknown (deadline); orphan cleanup deferred" >&2
+                        printf '%s' 0
+                        return 0
+                    fi
+                    ;;
+            esac
             _records="\$(_lane_collect_matching_pids deleted_root)" || {
                 echo "remote_agent: deleted-cwd occupancy probe unknown (\${_PROC_CWD_PROBE_REASON:-proc_probe_failed}); orphan cleanup deferred" >&2
                 printf '%s' 0
@@ -10225,12 +10559,42 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                 local _deadline _now
                 _deadline="\${_LANE_STOP_DEADLINE:-\${_DISPATCH_SWEEP_DEADLINE:-\${reap_deadline:-}}}"
                 case "\$_deadline" in ''|*[!0-9]*) return 1 ;; esac
-                _now=\$(date +%s)
+                # Bash >= 4.2 reads the clock without forking once per PID.
+                printf -v _now '%(%s)T' -1 2>/dev/null || _now=\$(date +%s)
                 if [ "\$_now" -ge "\$_deadline" ]; then
                     _PROC_CWD_PROBE_REASON=deadline
                     return 0
                 fi
                 return 1
+            }
+            # Both UID passes share the remaining-deadline bound. The initial batch
+            # preserves stat without timeout(1); missing-row recovery requires it.
+            _proc_cwd_uid_stat() {
+                local _missing_timeout_policy="\$1" _uid_timeout= _uid_now
+                shift
+                local -a _uid_stat_args
+                case "\$_probe_deadline" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        printf -v _uid_now '%(%s)T' -1 2>/dev/null || _uid_now=\$(date +%s)
+                        _uid_timeout=\$((_probe_deadline - _uid_now))
+                        [ "\$_uid_timeout" -gt 0 ] || return 124
+                        if ! command -v timeout >/dev/null 2>&1; then
+                            [ "\$_missing_timeout_policy" = allow ] || return 124
+                            _uid_timeout=
+                        fi
+                        ;;
+                esac
+                if [ "\$_stat_uid_mode" = gnu ]; then
+                    _uid_stat_args=(-c %u --)
+                else
+                    _uid_stat_args=(-f %u)
+                fi
+                if [ -n "\$_uid_timeout" ]; then
+                    timeout "\$_uid_timeout" stat "\${_uid_stat_args[@]}" "\$@"
+                else
+                    stat "\${_uid_stat_args[@]}" "\$@"
+                fi
             }
             _proc_cwd_identity_uid() {
                 local _uid_deadline _uid_timeout
@@ -10267,9 +10631,17 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             if [ -n "\$_probe_deadline" ]; then
                 _probe_seconds=\$((SECONDS + _probe_deadline - \$(date +%s)))
             fi
+            if _proc_cwd_deadline_expired; then
+                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                return 1
+            fi
             _dirs=()
             _n_dirs=0
             for _pid_dir in "\$_pr"/[0-9]*; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [ -d "\$_pid_dir" ] || continue
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _dirs+=("\$_pid_dir")
@@ -10278,6 +10650,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             _starts=()
             _i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _pid="\${BASH_REMATCH[1]}"
                 if _proc_cwd_pid_stat "\$_pid"; then
@@ -10310,15 +10686,24 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                     return \$?
                 fi
                 _stat_rc=0
-                if [ "\$_stat_uid_mode" = gnu ]; then
-                    _output=\$(stat -c %u -- "\${_dirs[@]}" 2>&1) || _stat_rc=\$?
-                else
-                    _output=\$(stat -f %u "\${_dirs[@]}" 2>&1) || _stat_rc=\$?
+                _output=\$(_proc_cwd_uid_stat allow "\${_dirs[@]}" 2>&1) || _stat_rc=\$?
+                if [ "\$_stat_rc" -eq 124 ] || [ "\$_stat_rc" -eq 137 ]; then
+                    _PROC_CWD_PROBE_REASON=deadline
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
                 fi
                 _uids=()
                 _n_uids=0
                 _stat_errors=
                 while IFS= read -r _stat_line || [ -n "\$_stat_line" ]; do
+                    if _proc_cwd_deadline_expired; then
+                        [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                        return 1
+                    fi
                     case "\$_stat_line" in
                         '' ) ;;
                         *[!0-9]*) _stat_errors="\${_stat_errors}\${_stat_line}"\$'\n' ;;
@@ -10340,6 +10725,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                     _live_rows=0
                     _error_rows=0
                     for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                        if _proc_cwd_deadline_expired; then
+                            [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                            return 1
+                        fi
                         [ -d "\$_pid_dir" ] || continue
                         _live_rows=\$((_live_rows + 1))
                         case "\$_stat_errors" in
@@ -10355,6 +10744,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                         _output_index=0
                         _i=0
                         for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                            if _proc_cwd_deadline_expired; then
+                                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                                return 1
+                            fi
                             if [ ! -d "\$_pid_dir" ]; then
                                 _uids+=("")
                             else
@@ -10376,6 +10769,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                     else
                         _i=0
                         for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                            if _proc_cwd_deadline_expired; then
+                                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                                return 1
+                            fi
                             _uids+=("")
                             if [ -d "\$_pid_dir" ]; then
                                 _uncertain_dirs+=("\$_pid_dir")
@@ -10409,29 +10806,7 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                         done
                         [ "\$_fallback_count" -gt 0 ] || continue
                         _fallback_rc=0
-                        _fallback_timeout=
-                        case "\$_probe_deadline" in
-                            ''|*[!0-9]*) ;;
-                            *)
-                                _fallback_timeout=\$((\$_probe_deadline - \$(date +%s)))
-                                [ "\$_fallback_timeout" -gt 1 ] || _fallback_timeout=1
-                                ;;
-                        esac
-                        if [ "\$_stat_uid_mode" = gnu ]; then
-                            _fallback_stat_args=(-c %u --)
-                        else
-                            _fallback_stat_args=(-f %u)
-                        fi
-                        if [ -n "\$_fallback_timeout" ]; then
-                            if ! command -v timeout >/dev/null 2>&1; then
-                                _PROC_CWD_PROBE_REASON=deadline
-                                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
-                                return 1
-                            fi
-                            _output=\$(timeout "\$_fallback_timeout" stat \${_fallback_stat_args[@]+"\${_fallback_stat_args[@]}"} \${_fallback_dirs[@]+"\${_fallback_dirs[@]}"} 2>&1) || _fallback_rc=\$?
-                        else
-                            _output=\$(stat \${_fallback_stat_args[@]+"\${_fallback_stat_args[@]}"} \${_fallback_dirs[@]+"\${_fallback_dirs[@]}"} 2>&1) || _fallback_rc=\$?
-                        fi
+                        _output=\$(_proc_cwd_uid_stat require "\${_fallback_dirs[@]}" 2>&1) || _fallback_rc=\$?
                         if [ "\$_fallback_rc" -eq 124 ] || [ "\$_fallback_rc" -eq 137 ]; then
                             _PROC_CWD_PROBE_REASON=deadline
                             [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
@@ -10441,6 +10816,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                         _fallback_uid_count=0
                         _fallback_errors=
                         while IFS= read -r _fallback_line || [ -n "\$_fallback_line" ]; do
+                            if _proc_cwd_deadline_expired; then
+                                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                                return 1
+                            fi
                             case "\$_fallback_line" in
                                 '' ) ;;
                                 *[!0-9]*) _fallback_errors="\${_fallback_errors}\${_fallback_line}"\$'\n' ;;
@@ -10454,6 +10833,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                         _fallback_pid=unknown
                         _fallback_error_pid=unknown
                         for _pid_dir in \${_fallback_dirs[@]+"\${_fallback_dirs[@]}"}; do
+                            if _proc_cwd_deadline_expired; then
+                                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                                return 1
+                            fi
                             if [ -d "\$_pid_dir" ]; then
                                 _live_rows=\$((_live_rows + 1))
                                 if [[ "\$_pid_dir" =~ /([0-9]+)\$ ]]; then
@@ -10469,6 +10852,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                             [ -z "\$_fallback_errors" ]; then
                             _i=0
                             for _pid_dir in \${_fallback_dirs[@]+"\${_fallback_dirs[@]}"}; do
+                                if _proc_cwd_deadline_expired; then
+                                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                                    return 1
+                                fi
                                 _uids[\${_fallback_indices[\$_i]}]="\${_fallback_uids[\$_i]}"
                                 _i=\$((_i + 1))
                             done
@@ -10496,6 +10883,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             _n_owned=0
             _i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 _uid="\${_uids[\$_i]:-}"
                 _i=\$((_i + 1))
                 [ -d "\$_pid_dir" ] || continue
@@ -10580,6 +10971,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             _i=0
             _owned_i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _pid="\${BASH_REMATCH[1]}"
                 _uid="\${_uids[\$_i]:-}"
@@ -10604,6 +10999,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             # identity verification pass so those reads are bound to the same snapshot.
             _i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _pid="\${BASH_REMATCH[1]}"
                 _uid="\${_uids[\$_i]:-}"
@@ -10633,6 +11032,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             # A reused PID discards both rows and is sampled once as a new process.
             _i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _pid="\${BASH_REMATCH[1]}"
                 if [ ! -d "\$_pid_dir" ]; then
@@ -10902,6 +11305,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
 
             _i=0
             for _pid_dir in \${_dirs[@]+"\${_dirs[@]}"}; do
+                if _proc_cwd_deadline_expired; then
+                    [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                    return 1
+                fi
                 [[ "\$_pid_dir" =~ /([0-9]+)\$ ]] || continue
                 _pid="\${BASH_REMATCH[1]}"
                 _PROC_CWD_EXAMINED=\$((_PROC_CWD_EXAMINED + 1))
@@ -10980,6 +11387,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                 return \$?
             fi
             echo "remote_agent: proc cwd examined=\${_PROC_CWD_EXAMINED} own_uid=\${_PROC_CWD_OWN_UID} foreign_uid_unreadable=\${_PROC_CWD_FOREIGN_UNREADABLE} root_unreadable=\${_PROC_CWD_ROOT_UNREADABLE} session_infra_unreadable=\${_PROC_CWD_SESSION_INFRA_UNREADABLE} vanished=\${_PROC_CWD_VANISHED} zombie=\${_PROC_CWD_ZOMBIE}" >&2
+            if _proc_cwd_deadline_expired; then
+                [ "\$_retry_root" -eq 0 ] || unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
+                return 1
+            fi
             _PROC_CWD_SNAPSHOT_READY=1
             if [ "\$_retry_root" -eq 1 ]; then
                 unset _PROC_CWD_RETRY_ACTIVE _PROC_CWD_RETRY_COUNT
@@ -13686,28 +14097,50 @@ _lane_scope_select() {
     while [ "\$_sel_n" -le 9 ]; do
         _sel_cand="workbay-lane-\${_lane_scope_key}-r\${_sel_n}.scope"
         _sel_cand_sv="workbay-lane-\${_lane_scope_key}-r\${_sel_n}-sv.scope"
-        _sel_cand_state=not_found
-        if _lane_scope_loaded "\$_sel_cand"; then
-            _sel_cand_state=loaded
-        else
-            _sel_cand_rc=\$?
-            if [ "\$_sel_cand_rc" -eq 2 ]; then
-                _lane_scope_defer_unknown "\$_sel_cand" "\$_LANE_SCOPE_PROBE_REASON"
+        # Failed transient scopes persist with default CollectMode=inactive
+        # (systemd.unit(5)); RuntimeMaxSec can fail scopes (systemd.scope(5)).
+        # Reset only a confirmed failed candidate, then re-probe under the lane
+        # lock. A failed reset or a live/unknown re-probe never permits reuse.
+        for _sel_attempt in 1 2; do
+            _sel_cand_state=not_found
+            if _lane_scope_loaded "\$_sel_cand"; then
+                _sel_cand_state=loaded
+                if [ "\$_lsl_active" = failed ] && [ "\$_sel_attempt" -eq 1 ]; then
+                    systemctl --user reset-failed "workbay-lane-\${_lane_scope_key}-r\${_sel_n}.scope" 2>/dev/null || true
+                    continue
+                fi
+            else
+                _sel_cand_rc=\$?
+                if [ "\$_sel_cand_rc" -eq 2 ]; then
+                    _lane_scope_defer_unknown "\$_sel_cand" "\$_LANE_SCOPE_PROBE_REASON"
+                fi
             fi
-        fi
+            break
+        done
         if [ "\$_sel_cand_state" = loaded ]; then
             _sel_n=\$((_sel_n + 1))
             continue
         fi
-        _sel_cand_sv_state=not_found
-        if _lane_scope_loaded "\$_sel_cand_sv"; then
-            _sel_cand_sv_state=loaded
-        else
-            _sel_cand_sv_rc=\$?
-            if [ "\$_sel_cand_sv_rc" -eq 2 ]; then
-                _lane_scope_defer_unknown "\$_sel_cand_sv" "\$_LANE_SCOPE_PROBE_REASON"
+        # Failed transient scopes persist with default CollectMode=inactive
+        # (systemd.unit(5)); RuntimeMaxSec can fail scopes (systemd.scope(5)).
+        # Reset only a confirmed failed candidate, then re-probe under the lane
+        # lock. A failed reset or a live/unknown re-probe never permits reuse.
+        for _sel_attempt in 1 2; do
+            _sel_cand_sv_state=not_found
+            if _lane_scope_loaded "\$_sel_cand_sv"; then
+                _sel_cand_sv_state=loaded
+                if [ "\$_lsl_active" = failed ] && [ "\$_sel_attempt" -eq 1 ]; then
+                    systemctl --user reset-failed "workbay-lane-\${_lane_scope_key}-r\${_sel_n}-sv.scope" 2>/dev/null || true
+                    continue
+                fi
+            else
+                _sel_cand_sv_rc=\$?
+                if [ "\$_sel_cand_sv_rc" -eq 2 ]; then
+                    _lane_scope_defer_unknown "\$_sel_cand_sv" "\$_LANE_SCOPE_PROBE_REASON"
+                fi
             fi
-        fi
+            break
+        done
         if [ "\$_sel_cand_sv_state" = loaded ]; then
             _sel_n=\$((_sel_n + 1))
             continue

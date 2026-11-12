@@ -1088,8 +1088,9 @@ def _probe_host_memory(repo: Path) -> DoctorHostMemory:
     """internal host-memory admission facet (stdlib mini-probe).
 
     Severity: ``error`` when a heavy dispatch would currently be refused
-    (act-now); ``warning`` when memory pressure is elevated but a heavy spawn
-    would still be admitted; ``ok`` otherwise. Never raises.
+    (act-now); ``warning`` when memory pressure is elevated or swap-volume disk
+    is below its warning threshold but a heavy spawn would still be admitted;
+    ``ok`` otherwise. Never raises.
     """
     snap = host_memory_probe.probe_host_memory()
     if not snap.available:
@@ -1124,6 +1125,11 @@ def _probe_host_memory(repo: Path) -> DoctorHostMemory:
     else:
         severity = "ok"
         note = ""
+    disk_observation = host_memory_probe.swap_volume_disk_observation(snap)
+    if disk_observation:
+        if severity == "ok":
+            severity = "warning"
+        note = f"{note}; {disk_observation}" if note else disk_observation
     return DoctorHostMemory(
         available=True,
         platform=snap.platform,

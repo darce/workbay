@@ -136,7 +136,12 @@ class HostResources:
 
 @dataclass(frozen=True, slots=True)
 class HostMemoryPolicy:
-    """``orchestrator.host_memory`` contract block with enforce defaults."""
+    """``orchestrator.host_memory`` contract block with enforce defaults.
+
+    ``swap_volume_disk_floor_gib`` remains load-compatible and sets only the
+    low-disk observation threshold. Swap-volume disk never refuses admission;
+    critical memory pressure and the swap-free floor still protect memory.
+    """
 
     enforcement: str = "enforce"  # enforce | warn_only | off
     os_reserve_gib: float = 3.0
@@ -183,6 +188,7 @@ class HostMemoryPolicy:
     # changes the reserve or per-worker RSS assumptions.
     available_ram_floor_gib: float = 1.0
     swap_free_floor_mb: int = 512
+    # Warning threshold only; retained for existing host-memory policy files.
     swap_volume_disk_floor_gib: float = 8.0
     slots_full_outcome: str = "defer"  # defer | refuse
     suite_lock_timeout_s: int = 1800
@@ -823,6 +829,9 @@ class AdmissionDecision:
     ``stock_claim`` is an owned context-manager handle retained by the live I/O
     path until the caller's dispatch/probe scope ends. It is omitted from
     :meth:`to_dict`; ``reason_code`` carries the serialisable taxonomy.
+
+    ``reason`` also carries named non-blocking observations; they do not change
+    ``decision`` or its blocking ``reason_code``.
     """
 
     decision: str  # allow | defer | refuse
@@ -1024,16 +1033,6 @@ def _classify_admission(
         return (
             "refuse",
             f"swap free {resources.swap_free / _MIB:.0f}MB below floor {policy.swap_free_floor_mb}MB",
-            "memory",
-        )
-    disk_floor = policy.swap_volume_disk_floor_gib * _GIB
-    # Skip when the volume reading is absent (0) — a narrow read failure must
-    # not refuse every spawn; broad probe failure is handled via pressure=warn.
-    if 0 < resources.swap_volume_free_bytes < disk_floor:
-        return (
-            "refuse",
-            f"swap-volume free disk {resources.swap_volume_free_bytes / _GIB:.1f}GiB "
-            f"below floor {policy.swap_volume_disk_floor_gib}GiB",
             "memory",
         )
     if width == 0:
@@ -1266,6 +1265,22 @@ def _classify_backend_cap(
     )
 
 
+def _with_swap_volume_disk_observation(reason: str, resources: HostResources, policy: HostMemoryPolicy) -> str:
+    """Report measured low swap-volume disk without changing admission.
+
+    Zero keeps the probe's existing absent-reading meaning. Reclaiming space
+    is an operator response, never a prerequisite for this admission verdict.
+    """
+    if 0 < resources.swap_volume_free_bytes < policy.swap_volume_disk_floor_gib * _GIB:
+        return (
+            f"{reason}; observation low_swap_volume_disk: "
+            f"swap-volume free disk {resources.swap_volume_free_bytes / _GIB:.1f}GiB "
+            f"below warning threshold {policy.swap_volume_disk_floor_gib}GiB; "
+            "reclaim swap-volume disk space (non-blocking)"
+        )
+    return reason
+
+
 def _apply_enforcement(
     decision: str,
     reason: str,
@@ -1278,6 +1293,7 @@ def _apply_enforcement(
     *,
     width_source: str = "local_ram",
 ) -> AdmissionDecision:
+    reason = _with_swap_volume_disk_observation(reason, resources, policy)
     if policy.enforcement in ("warn_only", "off") and decision != "allow":
         return AdmissionDecision(
             "allow",
@@ -1344,7 +1360,7 @@ def evaluate_admission(
     if policy.enforcement == "off":
         return AdmissionDecision(
             "allow",
-            "enforcement=off",
+            _with_swap_volume_disk_observation("enforcement=off", resources, policy),
             cost_class,
             width,
             held_slots,
@@ -1387,7 +1403,7 @@ def evaluate_admission(
             reason = f"{reason}; {_stock_admission_counts(stock, lane_kind, ceiling)}"
         return AdmissionDecision(
             "allow",
-            reason,
+            _with_swap_volume_disk_observation(reason, resources, policy),
             cost_class,
             width,
             held_slots,

@@ -690,7 +690,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
             supplied = None
             try:
-                rendered = build_agent_spec(args.backend, model=args.model, effort=args.effort, speed=args.speed)
+                rendered = build_agent_spec(
+                    args.backend, model=args.model, effort=args.effort, speed=args.speed, workspace_root=root
+                )
                 spec = rendered.to_json_dict()
             except (ValueError, RuntimeError) as exc:
                 raise ProbeError("spec_render_failed") from exc
@@ -748,9 +750,20 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     argv.extend(("--timeout", str(args.timeout), "--review-subject-branch", subject))
                     if args.review_kind:
                         argv.extend(("--review-kind", args.review_kind))
+                    job_env = dict(env)
+                    job_env.setdefault("WORKBAY_ALLOW_NONCONFORMING_BRANCH_PUSH", "1")
+                    job_env.setdefault(
+                        "WORKBAY_ALLOW_NONCONFORMING_BRANCH_PUSH_REASON",
+                        f"workbay provider-probe transient ref {subject}",
+                    )
                     decisions = []
+                    branch_guard_length = None
 
                     def job_stderr(line, facts=facts, decisions=decisions):
+                        nonlocal branch_guard_length
+                        # scripts/hooks/check_branch_naming.py:_format_pre_push_block
+                        if line.startswith("BLOCKED: Cannot push '"):
+                            branch_guard_length = len(line.rstrip("\r\n"))
                         if (decision := _decision(line)) is not None:
                             decisions.append(decision)
                         facts.feed_stderr(line)
@@ -758,7 +771,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     rc = _execute(
                         argv,
                         root=root,
-                        env=env,
+                        env=job_env,
                         timeout=args.timeout + 60,
                         stdout=lambda line: None,
                         stderr=job_stderr,
@@ -772,6 +785,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                         arm.update(review_subject_branch=subject, ledger=ledger)
                         return arm
 
+                    if branch_guard_length is not None:
+                        arm = job_arm()
+                        arm.update(
+                            classification="job_arm_refused:branch_guard",
+                            message=None, message_redacted=True, message_length=branch_guard_length,
+                        )
+                        raise ProbeError("job_arm_refused:branch_guard", arms=[*arms, arm])
                     if reserve is None:
                         arm = job_arm(ledger={"reserve": None, "settle": None})
                         raise ProbeError("job_arm_refused:reserve_unavailable", arms=[*arms, arm])

@@ -112,7 +112,7 @@ def _binding(repo, task_ref, lane_id, branch, worktree, *, incarnation=False):
             row=lane,
             task_ref=task_ref,
             lane_id=lane_id,
-            repo=repo,
+            repo=config.workspace_root,
         )
         _require(detail is None, "nonexecution_constructor_source_unavailable")
         binding["source_base_sha"] = base
@@ -234,6 +234,12 @@ def constructor_result(repo, *, pass_id, task_ref, lane_id, request, result, inv
     branch = _git(repo, "symbolic-ref", "--short", "HEAD")
     config, binding = _binding(repo, task_ref, lane_id, branch, repo, incarnation=True)
     retained = _json(regular_bytes(_pass_path(config.state_dir, pass_id)))
+    frozen = retained.get("lane_cycle_binding")
+    if isinstance(frozen, dict):
+        _require(
+            frozen.get("source_base_sha") == binding["source_base_sha"],
+            "nonexecution_constructor_source_mismatch",
+        )
     _require(
         retained.get("invocation_token") == invocation_token
         and (retained.get("task_ref"), retained.get("lane_id")) == (task_ref, lane_id),

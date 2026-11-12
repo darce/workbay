@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.86] — 2026-11-12
+
+### Changed
+- Pin the v0.1.91 member tuple: native-boundary write authority for managed codex-remote passes (FM-08), the owned macOS host disk-pressure reclaimer, host admission on RAM pressure only, and the Fleet VM inventory census.
+
 ## [0.3.84] — 2026-11-11
 
 ### Changed

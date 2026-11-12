@@ -1,4 +1,4 @@
-"""The ``workbay fleet`` plugin: bounded host and VM observations, JSON or text."""
+"""The ``workbay fleet`` plugin: graphical observatory or explicit finite output."""
 
 from __future__ import annotations
 
@@ -89,11 +89,15 @@ def _tree_command(argv) -> int:
 
 def _text(snapshot):
     admission = snapshot.get("admission", {})
+    admission_reason = admission.get("reason") or "unknown"
+    admission_dimension = admission.get("reason_code")
     lines = [
         f"Fleet {snapshot.get('state', 'unknown').upper()} partial={snapshot.get('partial', True)} "
         f"observed_at={snapshot.get('observed_at', 'UNKNOWN')}",
         f"Admission {admission.get('decision', 'unknown').upper()} "
-        f"held={admission.get('held_slots')} stock={admission.get('stock', 'not_evaluated')}",
+        f"held={admission.get('held_slots')} stock={admission.get('stock', 'not_evaluated')} "
+        f"reason={admission_reason}"
+        + (f" dimension={admission_dimension}" if admission_dimension else ""),
         "TASK  LANE  PASS  STATUS  LINK  PHASES",
     ]
     seen = set()
@@ -148,8 +152,33 @@ def _text(snapshot):
         f"mounts={measured(vm.get('df'))} source=df -P -B1"
     )
     processes = vm.get("processes", [])
-    process_count = None if vm.get("processes_quantity", "unknown") == "unknown" else len(processes)
-    lines.append(f"  Processes={measured(process_count)} {vm.get('processes_quantity', 'unknown')}")
+    census = vm.get("process_census")
+    process_count = (census.get("cwd_known") if census else
+                     None if vm.get("processes_quantity", "unknown") == "unknown" else len(processes))
+    process_line = f"  Processes={measured(process_count)} {vm.get('processes_quantity', 'unknown')}"
+    if census:
+        excluded = ",".join(f"{kind}:{census['excluded'][kind]}" for kind in (
+            "user_manager", "ssh_session_daemon", "gpg_agent") if kind in census["excluded"])
+        process_line += (f" scope=own_uid excluded={excluded or 'none'} "
+                         f"exited={measured(census.get('exited_during_scan'))} "
+                         f"foreign_uid_not_observed={measured(census.get('foreign_uid_tasks'))}")
+    lines.append(process_line)
+    reclaim = vm.get("reclaim") or {"state": "unknown", "reason": "not_reported"}
+    if reclaim.get("state") != "known":
+        lines.append(f"  Reclaimer UNKNOWN reason={reclaim.get('reason', 'UNKNOWN')}")
+    else:
+        age = reclaim.get("age_seconds")
+        age_text = "UNKNOWN" if age is None else f"{int(age // 60)}m"
+        counts = reclaim.get("counts") or {}
+        held_counts = [count for kind, count in counts.items() if kind.startswith("hold_")]
+        held = sum(held_counts) if held_counts and all(v is not None for v in held_counts) else None
+        lines.append(
+            f"  Reclaimer KNOWN outcome={reclaim.get('outcome') or 'UNKNOWN'} "
+            f"finished_at={reclaim.get('finished_at') or 'UNKNOWN'} age={age_text} "
+            f"freed={measured(reclaim.get('bytes_freed'))} reclaimed={measured(reclaim.get('reclaimed'))} "
+            f"reclaimable={measured(counts.get('reclaimable'))} held={measured(held)} "
+            f"alarms={','.join(reclaim.get('alarms') or []) or 'none'}"
+        )
     for row in vm.get("sandboxes", []):
         lines.append(
             f"  {row['path']}: bytes={measured(row.get('bytes'))} "
@@ -295,11 +324,12 @@ def workbay_front_door(argv=None) -> int:
         return _checklist_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="workbay fleet",
-        description="Bounded fleet snapshot with optional read-only VM inventory; 'tree' shows read-only lineage.",
+        description="Launch graphical Fleet with read-only VM inventory; use --json or --text for finite output.",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true")
-    mode.add_argument("--text", action="store_true", help="text table (default)")
+    mode.add_argument("--text", action="store_true", help="finite text table")
+    mode.add_argument("--serve", action="store_true", help="Refresh and launch Fleet (the default).")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--hours", type=_positive, default=24)
     parser.add_argument("--census-days", type=_positive, default=7)
@@ -311,8 +341,7 @@ def workbay_front_door(argv=None) -> int:
         default=True,
         help="observe VM inventory (default on); --no-vm skips SSH",
     )
-    parser.add_argument("--serve", action="store_true", help="Refresh and launch the separate Fleet web surface.")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=0, help="Web port (default: 0, a free port).")
     browser = parser.add_mutually_exclusive_group()
     browser.add_argument("--open", dest="open_browser", action="store_true")
     browser.add_argument("--no-open", dest="open_browser", action="store_false")
@@ -320,6 +349,7 @@ def workbay_front_door(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.serve and (args.cached or args.no_cache):
         parser.error("--serve requires a refreshed, written snapshot")
+    serve = not (args.json or args.text or args.cached or args.no_cache)
     try:
         snapshot = (
             read_snapshot_cache(args.root)
@@ -333,19 +363,20 @@ def workbay_front_door(argv=None) -> int:
             snapshot = dict(snapshot, vm=_vm_unknown(), host_only=True)
         if not args.cached and not args.no_cache:
             write_snapshot_cache(args.root, snapshot)
-        if args.serve:
+        if serve:
+            launch = ["--workspace-root", str(args.root), "--port", str(args.port)]
+            if args.open_browser is not None:
+                launch.append("--open" if args.open_browser else "--no-open")
             try:
                 from workbay_canvas_mcp.cli import serve_fleet
+
+                return serve_fleet(launch)
             except ImportError:
                 print(
                     "workbay fleet --serve needs Studio; from a checkout run: bash scripts/install-workbay-studio.sh <checkout>",
                     file=sys.stderr,
                 )
                 return 2
-            launch = ["--workspace-root", str(args.root), "--port", str(args.port)]
-            if args.open_browser is not None:
-                launch.append("--open" if args.open_browser else "--no-open")
-            return serve_fleet(launch)
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False) if args.json else _text(snapshot))
         return 0  # An explicit UNKNOWN/partial observation is a valid report, not admission authorization.
     except (OSError, ValueError, RuntimeError) as exc:

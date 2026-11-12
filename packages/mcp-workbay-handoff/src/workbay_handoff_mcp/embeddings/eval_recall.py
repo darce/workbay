@@ -39,6 +39,7 @@ from typing import Hashable, Sequence, TypeVar
 import numpy as np
 
 from .ranking import rank_concepts_by_anchor
+from .store import source_row_eligibility_sql
 
 ConceptRef = tuple[str, str]  # (entity_kind, entity_id)
 # Record-level unit for implementation note: (record_type, record_id). record_id is the
@@ -121,7 +122,12 @@ def select_current_recency(
     """
     if top_k <= 0:
         return []
-    sql = "SELECT entity_kind, entity_id FROM concept_embeddings WHERE task_ref = ?"
+    sql = (
+        "SELECT c.entity_kind, c.entity_id FROM concept_embeddings c LEFT JOIN decisions d "
+        "ON c.entity_kind IN ('decision.title', 'decision.rationale') "
+        "AND d.id = c.entity_id AND d.task_ref = c.task_ref WHERE c.task_ref = ? AND "
+        + source_row_eligibility_sql(conn, "decisions", alias="d")
+    )
     params: list[object] = [task_ref]
     if model_id is not None:
         sql += " AND model_id = ?"
@@ -130,7 +136,7 @@ def select_current_recency(
         placeholders = ",".join("?" for _ in entity_kinds)
         sql += f" AND entity_kind IN ({placeholders})"
         params.extend(entity_kinds)
-    sql += " ORDER BY created_at DESC, entity_kind DESC, entity_id DESC LIMIT ?"
+    sql += " ORDER BY c.created_at DESC, c.entity_kind DESC, c.entity_id DESC LIMIT ?"
     params.append(top_k)
     return [(str(row[0]), str(row[1])) for row in conn.execute(sql, params).fetchall()]
 

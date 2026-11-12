@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Literal, cast
@@ -438,13 +439,31 @@ def _load_compaction_contract_at_path(contract_path: Path) -> CompactionContract
     )
 
 
+@lru_cache(maxsize=32)
+def _cached_compaction_contract(contract_path: Path, mtime_ns: int, size: int, inode: int) -> CompactionContract:
+    """Cache successful parses by resolved path and file identity, bounded per process."""
+    return _load_compaction_contract_at_path(contract_path)
+
+
 def load_compaction_contract(workspace_root: str | Path) -> CompactionContract:
+    """Return a private deep copy of the file-identity-cached contract.
+
+    Resolve the path and stat the file on every call. An edit is seen on the
+    next call unless it keeps size, mtime (nanoseconds), and inode identical.
+    Environment-dependent harness/threshold resolution is never cached here.
+    Nested models, dictionaries, and lists are copied so callers cannot mutate
+    the cached value. Failed loads are not cached.
+    """
     root_path = Path(workspace_root).expanduser().resolve()
     contract_path = _resolve_contract_path(root_path)
     if contract_path is None:
         raise FileNotFoundError(f"No compaction contract found under {root_path}")
 
-    return _load_compaction_contract_at_path(contract_path)
+    contract_path = contract_path.resolve()
+    identity = contract_path.stat()
+    return _cached_compaction_contract(
+        contract_path, identity.st_mtime_ns, identity.st_size, identity.st_ino
+    ).model_copy(deep=True)
 
 
 def build_contract_source_report(

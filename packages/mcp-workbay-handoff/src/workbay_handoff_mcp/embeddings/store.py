@@ -51,6 +51,7 @@ from workbay_handoff_mcp.embeddings.vector_codec import (
     serialize_vector,
     text_hash,
 )
+from workbay_handoff_mcp.lanes_recording import is_reclaim_candidate_decision_id
 from workbay_handoff_mcp.shared_schema import (
     _get_db_connection,
     _transfer_interned_embedding_payload,
@@ -833,6 +834,25 @@ def store_compaction_anchor_best_effort(
 # --- backfill --------------------------------------------------------------
 
 
+def source_row_eligibility_sql(conn: sqlite3.Connection, table: str, *, alias: str | None = None) -> str:
+    """SQL eligibility for a source table, shared by gather and read-only probes.
+
+    Table and alias are trusted schema identifiers, never user input. Older
+    stores without this contract exclude no source rows. Registering the UDF
+    changes only connection-local state; it does not write the database.
+    """
+    if table != "decisions":
+        return "1"
+    conn.create_function(
+        "workbay_is_reclaim_candidate",
+        1,
+        lambda decision: is_reclaim_candidate_decision_id(str(decision)),
+        deterministic=True,
+    )
+    column = f"{alias}.decision" if alias else "decision"
+    return f"NOT workbay_is_reclaim_candidate({column})"
+
+
 def _gather_concepts(conn: sqlite3.Connection, task_ref: str | None) -> list[tuple[str, str, str, str | None]]:
     """Collect every embeddable concept as ``(entity_kind, entity_id, task_ref, text)``.
 
@@ -844,7 +864,12 @@ def _gather_concepts(conn: sqlite3.Connection, task_ref: str | None) -> list[tup
     clause = " WHERE task_ref = ?" if task_ref else ""
     params: tuple[object, ...] = (task_ref,) if task_ref else ()
     out: list[tuple[str, str, str, str | None]] = []
-    for row in conn.execute("SELECT id, task_ref, decision, rationale FROM decisions" + clause, params).fetchall():
+    decision_clause = " WHERE " + source_row_eligibility_sql(conn, "decisions")
+    if task_ref:
+        decision_clause += " AND task_ref = ?"
+    for row in conn.execute(
+        "SELECT id, task_ref, decision, rationale FROM decisions" + decision_clause, params
+    ).fetchall():
         out.append(("decision.title", str(row[0]), str(row[1]), row[2]))
         out.append(("decision.rationale", str(row[0]), str(row[1]), row[3]))
     for row in conn.execute(
@@ -1007,7 +1032,8 @@ def reconciliation_candidates(
                   AND e.text_hash = workbay_concept_hash(s.{column}))
             ORDER BY s.updated_at DESC, s.{key} DESC LIMIT ?"""
         return conn.execute(sql, (changed_since, entity_kind, model_id, limit)).fetchall()
-    bounds = ""
+    # Apply before LIMIT so bookkeeping cannot starve eligible prose.
+    bounds = " AND " + source_row_eligibility_sql(conn, table, alias="s")
     params: list[object] = []
     if above is not None:
         bounds += f" AND s.{key} > ?"

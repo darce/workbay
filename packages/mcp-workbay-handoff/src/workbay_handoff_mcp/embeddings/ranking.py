@@ -16,6 +16,7 @@ from typing import cast
 
 import numpy as np
 
+from ..lanes_recording import is_reclaim_candidate_decision_id
 from .store import (
     SupportsEmbed,
     deserialize_vector,
@@ -93,7 +94,12 @@ def rank_candidate_vectors_by_anchor(
         return []
     anchor = anchor / norm
 
-    sql = "SELECT entity_kind, entity_id, vector, model_id, text_hash FROM concept_embeddings WHERE task_ref = ?"
+    sql = (
+        "SELECT c.entity_kind, c.entity_id, c.vector, c.model_id, c.text_hash, d.decision "
+        "FROM concept_embeddings c LEFT JOIN decisions d "
+        "ON c.entity_kind IN ('decision.title', 'decision.rationale') "
+        "AND d.id = c.entity_id AND d.task_ref = c.task_ref WHERE c.task_ref = ?"
+    )
     params: list[object] = [task_ref]
     if entity_kinds:
         placeholders = ",".join("?" for _ in entity_kinds)
@@ -106,6 +112,8 @@ def rank_candidate_vectors_by_anchor(
     owned_cache = prefetch_owned_vector_blobs(conn, intern_keys)
     for row in rows:
         entity_kind, entity_id, vector_blob, row_model_id = row[0], row[1], row[2], row[3]
+        if row[5] is not None and is_reclaim_candidate_decision_id(str(row[5])):
+            continue
         if model_id is not None and str(row_model_id) != model_id:
             continue
         blob = resolve_vector_blob(conn, vector_blob, str(row[4]), str(row_model_id), owned_cache=owned_cache)

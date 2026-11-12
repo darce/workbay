@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 
 Finding = dict[str, str]
@@ -46,6 +47,7 @@ class StoreBackfillContract:
     classify: Callable[
         [object, tuple[str, str] | None, str | None], tuple[str, str | None]
     ]
+    source_row_eligibility_sql: Callable[..., str] | None = None
 
 
 # Extra runtimes whose absence is "instrument unavailable", not a broken store.
@@ -79,12 +81,18 @@ def _load_store_backfill_contract() -> tuple[StoreBackfillContract | None, str |
     That is why subcommands historically said "do not import that module".
     """
     try:
+        # This predicate was added after the required contract. Its absence
+        # means an older store, whose source rows have no exclusions. Resolve
+        # that exact module, rather than a cached parent-package attribute.
+        store = import_module("workbay_handoff_mcp.embeddings.store")
         from workbay_handoff_mcp.embeddings.store import (
             CONCEPT_BACKFILL_SOURCES,
             CONCEPT_ENTITY_KINDS,
             classify_coverage_row,
             gather_concepts,
         )
+
+        eligibility = getattr(store, "source_row_eligibility_sql", None)
     except ModuleNotFoundError as exc:
         missing = (getattr(exc, "name", None) or "").split(".", 1)[0]
         if missing in _EMBEDDINGS_EXTRA_RUNTIMES:
@@ -107,6 +115,7 @@ def _load_store_backfill_contract() -> tuple[StoreBackfillContract | None, str |
             sources=tuple(CONCEPT_BACKFILL_SOURCES),
             gather=gather_concepts,
             classify=classify_coverage_row,
+            source_row_eligibility_sql=eligibility,
         ),
         None,
     )
@@ -269,6 +278,7 @@ def _iter_present_concepts(
     conn: object,
     tables: set[str],
     sources: tuple[tuple[str, str, str, str], ...],
+    source_row_eligibility_sql: Callable[..., str] | None = None,
 ) -> list[tuple[str, str, object]] | BackfillGapOutcome:
     """One SELECT per present source table (review_findings read once)."""
     import sqlite3
@@ -287,6 +297,8 @@ def _iter_present_concepts(
                 + ", ".join(text_cols)
                 + f" FROM {table}"
             )
+            if source_row_eligibility_sql is not None:
+                sql += " WHERE " + source_row_eligibility_sql(conn, table)
             for row in conn.execute(sql).fetchall():  # type: ignore[attr-defined]
                 entity_id = str(row[0])
                 for (kind, _text_col), text in zip(kind_cols, row[1:], strict=True):
@@ -303,8 +315,9 @@ def _source_tables_nonempty(
     conn: object,
     tables: set[str],
     sources: tuple[tuple[str, str, str, str], ...],
+    source_row_eligibility_sql: Callable[..., str] | None = None,
 ) -> bool | BackfillGapOutcome:
-    """True when any CONCEPT_BACKFILL_SOURCES table present here has a row."""
+    """True when any present source table has an eligible row."""
     import sqlite3
 
     seen: set[str] = set()
@@ -313,8 +326,13 @@ def _source_tables_nonempty(
             if table not in tables or table in seen:
                 continue
             seen.add(table)
+            predicate = (
+                source_row_eligibility_sql(conn, table)
+                if source_row_eligibility_sql is not None
+                else "1"
+            )
             row = conn.execute(  # type: ignore[attr-defined]
-                f"SELECT 1 FROM {table} LIMIT 1"
+                f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1"
             ).fetchone()
             if row is not None:
                 return True
@@ -348,7 +366,9 @@ def _collect_concepts(
             for kind, entity_id, _tref, text in gathered
         ]
         if not collected:
-            nonempty = _source_tables_nonempty(conn, tables, contract.sources)
+            nonempty = _source_tables_nonempty(
+                conn, tables, contract.sources, contract.source_row_eligibility_sql
+            )
             if isinstance(nonempty, BackfillGapOutcome):
                 return nonempty
             if nonempty:
@@ -360,7 +380,9 @@ def _collect_concepts(
                     ),
                 )
         return collected
-    return _iter_present_concepts(conn, tables, contract.sources)
+    return _iter_present_concepts(
+        conn, tables, contract.sources, contract.source_row_eligibility_sql
+    )
 
 
 def _gap_findings_for_concepts(

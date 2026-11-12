@@ -620,6 +620,8 @@ def _vm_unknown(reason="not_observed"):
         rows_emitted=None,
         sandboxes_state="unknown",
         processes_state="unknown",
+        process_census=None,
+        reclaim=dict(state="unknown", reason=reason),
         truncated=None,
         quantity="unknown",
         processes_quantity="unknown",
@@ -714,6 +716,86 @@ def _vm_document(doc, rc, *, cached=False):
     ):
         raise ValueError("invalid inventory row identity/count")
     unknowns = set(doc["unknowns"])
+
+    def integer(value):
+        return type(value) is int and value >= 0
+
+    def all_finite(value):
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, dict):
+            return all(all_finite(v) for v in value.values())
+        if isinstance(value, list):
+            return all(all_finite(v) for v in value)
+        return True
+
+    def valid_census(value):
+        if not isinstance(value, dict) or not all_finite(value):
+            return False
+        root = value.get("sandbox_root")
+        excluded = value.get("excluded")
+        return (
+            value.get("scope") == "own_uid" and value.get("foreign_uid_domain") == "not_observed"
+            and all(integer(value.get(key)) for key in (
+                "uid", "own_uid_tasks", "cwd_known", "unclassified_opaque", "exited_during_scan", "foreign_uid_tasks"))
+            and isinstance(excluded, dict)
+            and all(key in ("user_manager", "ssh_session_daemon", "gpg_agent") and integer(count)
+                    for key, count in excluded.items())
+            and "sandbox_root" in value
+            and (root is None or (isinstance(root, dict) and integer(root.get("owner_uid"))
+                 and isinstance(root.get("mode"), str) and len(root["mode"]) == 4
+                 and all(c in "01234567" for c in root["mode"])))
+        )
+
+    def receipt_timestamp(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.timestamp() if parsed.tzinfo is not None else None
+        except (ValueError, OverflowError):
+            return None
+
+    def valid_reclaim(value):
+        if not isinstance(value, dict) or not all_finite(value):
+            return False
+        if value.get("state") == "unknown":
+            return isinstance(value.get("reason"), str) and bool(value["reason"])
+        counts, alarms = value.get("counts"), value.get("alarms")
+        return (
+            value.get("state") == "known" and "reason" in value and value["reason"] is None
+            and value.get("source") == "~/.local/state/workbay/vm-reclaim/last-run.json"
+            and value.get("outcome") in ("ok", "degraded", "error")
+            and value.get("trigger") in ("timer", "headroom", "manual")
+            and all(receipt_timestamp(value.get(key)) is not None for key in ("started_at", "finished_at"))
+            and receipt_timestamp(value["finished_at"]) <= time.time()
+            and _number(value.get("age_seconds"))
+            and all(integer(value.get(key)) for key in ("reclaimed", "recovered", "bytes_freed"))
+            and all(key in value and (value[key] is None or integer(value[key]))
+                    for key in ("df_free_before", "df_free_after"))
+            and isinstance(counts, dict) and all(isinstance(k, str) and integer(v) for k, v in counts.items())
+            and "starved" in value and (value["starved"] is None or isinstance(value["starved"], dict))
+            and isinstance(alarms, list) and all(isinstance(alarm, str) and alarm in (
+                "reaper_stale", "last_run_error", "recover_failed", "reclaim_starved", "census_exhausted")
+                for alarm in alarms)
+            and value.get("alarms_scope") == "last_run_receipt"
+        )
+
+    if doc.get("process_census") is None:
+        doc["process_census"] = None
+    elif not valid_census(doc["process_census"]):
+        doc["process_census"] = None
+        doc["processes_state"] = "unknown"
+        unknowns.add("processes")
+    elif doc["process_census"]["unclassified_opaque"]:
+        doc["processes_state"] = "unknown"
+        unknowns.add("processes")
+    if "reclaim" not in doc:
+        doc["reclaim"] = dict(state="unknown", reason="not_reported")
+    elif not valid_reclaim(doc["reclaim"]):
+        doc["reclaim"] = dict(state="unknown", reason="invalid_reclaim")
+    if doc["reclaim"]["state"] == "unknown":
+        unknowns.add("reclaim")
     for row in doc["processes"]:
         if not _number(row.get("rss_kib")):
             row["rss_kib"] = None
@@ -873,6 +955,28 @@ def _start_vm_observer(root, runner, deadline):
     return done, result
 
 
+def _apply_vm_headline(snapshot):
+    """Reconcile the headline with the normalized VM; shared by live and cached reads."""
+    if snapshot.get("host_only") is True:
+        return snapshot  # --no-vm: the VM is out of scope, as in build_snapshot(vm=False).
+    observation = snapshot["vm"]
+    vm_state = observation["state"]
+    reasons = (
+        {"vm:unknown:" + facet for facet in observation.get("unknowns", [])}
+        if vm_state in ("fresh", "partial")
+        else set()
+    )
+    if vm_state != "fresh":
+        reasons.add("vm:" + (observation.get("reason") or vm_state or "unknown"))
+    if reasons:
+        # Named facet gaps do not erase the VM's measured fresh evidence.
+        # An unavailable/aged VM or failed host collection still stays UNKNOWN.
+        state = "partial" if vm_state in ("fresh", "partial") else "unknown"
+        snapshot.update(partial=True, state=state if snapshot["state"] == "fresh" else snapshot["state"])
+        snapshot["limits_hit"] = sorted(set(snapshot.get("limits_hit", [])) | reasons)
+    return snapshot
+
+
 def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.run) -> dict:
     """Join the configured handoff ledger and bounded pass/spool observations.
 
@@ -953,11 +1057,7 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
         done, result = vm_observer
         done.wait(max(0, deadline - time.monotonic()))
         snapshot["vm"] = result["vm"] if done.is_set() else _vm_unknown("timeout")
-        if snapshot["vm"]["state"] != "fresh" or snapshot["vm"].get("unknowns"):
-            snapshot.update(partial=True, state="unknown")
-            snapshot["limits_hit"] = sorted(
-                set(snapshot["limits_hit"]) | {"vm:" + snapshot["vm"].get("reason", snapshot["vm"]["state"])}
-            )
+        _apply_vm_headline(snapshot)
     else:
         snapshot["vm"] = _vm_unknown()
     snapshot["elapsed_s"] = time.monotonic() - started
@@ -985,7 +1085,7 @@ def read_snapshot_cache(root):
             payload["vm"] = _vm_unknown("bad_json")
     else:
         payload["vm"] = _vm_unknown()
-    return dict(payload, state=state, cache_state=cache_state, cache_observed_at=_iso())
+    return _apply_vm_headline(dict(payload, state=state, cache_state=cache_state, cache_observed_at=_iso()))
 
 
 def write_snapshot_cache(root, snapshot):

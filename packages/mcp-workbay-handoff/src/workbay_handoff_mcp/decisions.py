@@ -25,6 +25,7 @@ from workbay_protocol.review_impact import is_blocking
 from .concept_embed_hook import embed_concept_on_write
 from .current_task_rendering import _collect_task_snapshot
 from .enums import ActionStatus, BlockerStatus, FindingStatus
+from .lanes_recording import is_reclaim_candidate_decision_id
 from .projection_event_dedupe import (
     claim_projection_event,
     complete_projection_event,
@@ -231,7 +232,11 @@ def record_decision(
     # Embed the rationale actually persisted on the row, not the caller's
     # argument: COALESCE / blank-as-absent can leave the stored value while
     # the argument is None or blank (PLAN0181-S2GATE2-EMBED-STALE-RATIONALE-01).
-    if result.get("ok") and mutation.get("operation") in {"insert", "update"}:
+    if (
+        result.get("ok")
+        and mutation.get("operation") in {"insert", "update"}
+        and not is_reclaim_candidate_decision_id(decision)
+    ):
         if deadline is not None:
             result.setdefault("warnings", []).append("embedding_deferred: deadline-bounded decision; use backfill")
             return result

@@ -949,6 +949,31 @@ def _completion_requires_live_probe(backend: Any) -> bool:
         return True
 
 
+def _completion_requires_complete_capability(
+    root: Path, capability_receipt_id: Any, backend: Any, identity: dict[str, Any]
+) -> bool:
+    """Keep the backend's probe-complete check unless the named receipt defers.
+
+    Only a receipt that itself carries the typed native-boundary deferral is
+    validated for identity without positive probe gates; negatives still refuse.
+    """
+    if not _completion_requires_live_probe(backend):
+        return False
+    from workbay_orchestrator_mcp.orchestration import preflight_attestation  # noqa: PLC0415
+
+    record = preflight_attestation.capability_receipt_record(
+        root,
+        capability_receipt_id,
+        task_ref=identity.get("task_ref"),
+        lane_id=identity.get("lane_id"),
+        worktree_path=identity.get("worktree_path"),
+    )
+    return not (
+        isinstance(record, dict)
+        and record.get("preflight_authority") == preflight_attestation.NATIVE_BOUNDARY_AUTHORITY
+    )
+
+
 def _merge_completion_identity(
     pass_id: str,
     previous: dict[str, Any],
@@ -994,7 +1019,12 @@ def _merge_completion_identity(
                 worktree_path=identity.get("worktree_path"),
                 config_digest=config.get("capability_config_digest"),
                 require_complete_identity=False,
-                require_complete_capability=_completion_requires_live_probe(config.get("backend")),
+                require_complete_capability=_completion_requires_complete_capability(
+                    Path(root),
+                    candidate.get("capability_receipt_id") or frozen.get("capability_receipt_id"),
+                    config.get("backend"),
+                    identity,
+                ),
             ),
             timeout_seconds=min(0.5, _completion_remaining()),
             timeout_message="completion identity validation timed out",

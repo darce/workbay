@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ..lanes_recording import is_reclaim_candidate_decision_id
 from .store import (
     SupportsEmbed,
     concept_embedding_coverage,
@@ -321,7 +322,12 @@ def _rank_against_store(
     scored: list[tuple[float, str, str, str, str]] = []  # score, kind, eid, task_ref, model_id
 
     needs_join = include_plan_paths is not None or include_statuses is not None
-    sql = "SELECT c.entity_kind, c.entity_id, c.task_ref, c.vector, c.model_id, c.text_hash, c.dim FROM concept_embeddings c"
+    sql = (
+        "SELECT c.entity_kind, c.entity_id, c.task_ref, c.vector, c.model_id, c.text_hash, c.dim, d.decision "
+        "FROM concept_embeddings c LEFT JOIN decisions d "
+        "ON c.entity_kind IN ('decision.title', 'decision.rationale') "
+        "AND d.id = c.entity_id AND d.task_ref = c.task_ref"
+    )
     params: list[object] = []
     if needs_join:
         # Live handoff_state wins via COALESCE. Join archives on task_ref
@@ -360,6 +366,8 @@ def _rank_against_store(
     intern_keys = [(str(row[5]), str(row[4])) for row in rows if not bytes(row[3] or b"")]
     owned_cache = prefetch_owned_vector_blobs(conn, intern_keys)
     for row in rows:
+        if row[7] is not None and is_reclaim_candidate_decision_id(str(row[7])):
+            continue
         entity_kind = str(row[0])
         entity_id = str(row[1])
         row_task_ref = str(row[2])

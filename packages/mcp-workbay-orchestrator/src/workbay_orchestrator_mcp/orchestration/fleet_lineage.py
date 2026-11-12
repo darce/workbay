@@ -46,9 +46,11 @@ def _source_issues(source):
 
 
 def _quality_state(state, issues):
-    if state not in ("fresh", "stale") or {"source_unknown", "source_partial"} & issues:
+    if state not in ("fresh", "partial", "stale") or "source_unknown" in issues:
         return "unknown"
-    return "stale" if "source_stale" in issues else state
+    if state == "stale" or "source_stale" in issues:
+        return "stale"
+    return "partial" if state == "partial" or "source_partial" in issues else state
 
 
 def read_lineage_snapshot(root, *, runtime=None) -> dict:

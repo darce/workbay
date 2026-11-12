@@ -194,11 +194,15 @@ def _read_remote_catalogue(host: str) -> dict[str, Any]:
         raise CodexCapabilityError(f"catalogue_unavailable: {exc}", kind="catalogue_unavailable") from exc
 
 
-def remote_catalogue(*, refresh: bool = False) -> dict[str, Any]:
+def remote_catalogue(
+    *, refresh: bool = False, workspace_root: Any = None
+) -> dict[str, Any]:
     """Bounded single-flight observation; no cached failure or stale fallback."""
     from .offload_model_discovery import resolve_probe_gate_host
 
-    host = resolve_probe_gate_host("codex-remote")
+    host = resolve_probe_gate_host(
+        "codex-remote", **({"workspace_root": workspace_root} if workspace_root is not None else {})
+    )
     if not host:
         raise CodexCapabilityError(
             "catalogue_unavailable: remote gate host is not configured",
@@ -215,7 +219,9 @@ def remote_catalogue(*, refresh: bool = False) -> dict[str, Any]:
         return value
 
 
-def _observed_model(model: str, snapshot: dict[str, Any] | None = None):
+def _observed_model(
+    model: str, snapshot: dict[str, Any] | None = None, *, workspace_root: Any = None
+):
     from .codex_lane_config import CODEX_MODEL_TIERS
 
     prefix = f"Refusing codex-remote dispatch with model {model!r}: "
@@ -228,7 +234,9 @@ def _observed_model(model: str, snapshot: dict[str, Any] | None = None):
             kind="tier_not_entitled",
         )
     try:
-        observed = snapshot if snapshot is not None else remote_catalogue()
+        observed = snapshot if snapshot is not None else remote_catalogue(
+            **({"workspace_root": workspace_root} if workspace_root is not None else {})
+        )
     except CodexCapabilityError as exc:
         raise CodexCapabilityError(
             prefix + str(exc),
@@ -258,9 +266,12 @@ def resolve_codex_invocation(
     effort: str | None = None,
     service_tier: str | None = None,
     snapshot: dict[str, Any] | None = None,
+    workspace_root: Any = None,
 ) -> CodexInvocation:
     """Admit provider capabilities; curated policy supplies routing defaults."""
-    row, policy, observed = _observed_model(model, snapshot)
+    row, policy, observed = _observed_model(
+        model, snapshot, **({"workspace_root": workspace_root} if workspace_root is not None else {})
+    )
     prefix = f"Refusing codex-remote dispatch with model {model!r}: "
     efforts = {x.get("reasoningEffort") for x in (row.get("supportedReasoningEfforts") or []) if isinstance(x, dict)}
     advertised_efforts = sorted(e for e in efforts if e)

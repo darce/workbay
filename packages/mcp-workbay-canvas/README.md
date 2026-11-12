@@ -189,12 +189,21 @@ built with staged web assets, or pass `--web-dist` to a built web directory that
 contains `index.html`. After install, launch the SPA and `/api` on one loopback origin:
 
 ```bash
-workbay-canvas-mcp local [--workspace-root PATH] [--db-path PATH] [--host 127.0.0.1] [--port 8765] [--allow-origin URL]... [--web-dist PATH]
+workbay-canvas-mcp local [--workspace-root PATH] [--db-path PATH] [--host 127.0.0.1] [--port N] [--allow-origin URL]... [--web-dist PATH] [--open|--no-open]
 ```
 
-`--port 0` binds a free port. The process prints one stdout JSON line `{"url": ...}`. Remote bind is refused (loopback literals and `localhost` only).
+Omitting `--port` now binds 0 (a free port) instead of fixed port 8765. Each
+launch serves its selected workspace on a fresh listener. Explicit ports are
+unchanged; an occupied port returns `port_in_use` without touching that server.
+The process prints one stdout JSON line `{"url": ...}`. The browser opens when
+stdout is a TTY; use `--no-open` to suppress it or `--open` to force it without a
+TTY. Remote bind is refused (loopback literals and `localhost` only).
 
-`workbay canvas` is the front door: when this package is installed, `workbay` dispatches `canvas` to the same CLI (`local` when argv is empty or flags-only).
+`workbay studio` is the front door: bare or flags-only launches use cwd unless
+`--workspace-root PATH` is supplied. `flows`, `library`, and `lab` select their
+existing destinations. `workbay canvas` is an alias with a stderr rename notice.
+These graphical launches share `local`'s free-port and browser policy. The
+standalone MCP `serve` command retains its stdio default and HTTP port 8765.
 
 Vite dev pairing (API-only, guarded):
 

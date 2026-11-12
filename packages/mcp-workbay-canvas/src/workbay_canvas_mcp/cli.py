@@ -84,7 +84,8 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
-def _add_serve_args(parser: argparse.ArgumentParser) -> None:
+def _add_serve_args(parser: argparse.ArgumentParser, *, default_port: int = 8765) -> None:
+    parser.set_defaults(default_port=default_port)
     parser.add_argument(
         "--db-path",
         default=None,
@@ -110,8 +111,8 @@ def _add_serve_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=8765,
-        help="Port to bind when --transport http. Defaults to 8765.",
+        default=None,
+        help=f"HTTP port. Defaults to {default_port}" + (" (a free port)." if default_port == 0 else "."),
     )
     parser.add_argument(
         "--allow-origin",
@@ -189,6 +190,14 @@ def _add_bundle_args(parser: argparse.ArgumentParser, *, map_ref_required: bool)
     )
 
 
+def _resolve_serve_port(args: argparse.Namespace) -> argparse.Namespace:
+    if hasattr(args, "port"):
+        args.port_explicit = args.port is not None
+        if args.port is None:
+            args.port = args.default_port
+    return args
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Parse argv with backward-compatible default serve when no subcommand."""
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -202,7 +211,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         _add_serve_args(parser)
         ns = parser.parse_args(raw)
         ns.command = "serve"
-        return ns
+        return _resolve_serve_port(ns)
 
     parser = argparse.ArgumentParser(
         prog="canvas-mcp",
@@ -214,7 +223,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     _add_serve_args(serve_p)
 
     local_p = sub.add_parser("local", help="Launch the local loopback canvas web app.")
-    _add_serve_args(local_p)
+    _add_serve_args(local_p, default_port=0)
     local_p.add_argument(
         "--web-dist",
         default=None,
@@ -345,7 +354,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Session id for handoff emit (default canvas-refresh).",
     )
 
-    return parser.parse_args(raw)
+    return _resolve_serve_port(parser.parse_args(raw))
 
 
 def _load_map_from_ns(ns: argparse.Namespace):
@@ -364,6 +373,7 @@ def _launch_kwargs(args: argparse.Namespace) -> dict:
         "db_path": Path(args.db_path) if args.db_path else None,
         "host": args.host,
         "port": args.port,
+        "port_explicit": args.port_explicit,
         "allow_origins": tuple(args.allow_origin or ()),
     }
 

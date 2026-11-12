@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import http.client
+import io
 import ipaddress
 import json
 import re
 import socket
 import sys
+import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 from starlette.middleware import Middleware
@@ -49,6 +52,8 @@ _LAUNCH_MESSAGES = {
     "bind_failed": "Bind failed. Try --host 127.0.0.1.",
 }
 _PORT_IN_USE_HINT = "use --port 0 for a free port"
+_HOLDER_PROBE_SECONDS = 1.0
+_HOLDER_PROBE_BYTES = 1024 * 1024
 
 
 class LaunchError(Exception):
@@ -123,7 +128,67 @@ def _require_web_index(web_dist: Path) -> None:
         raise LaunchError("web_assets_missing")
 
 
-def _prebind(host: str, port: int) -> socket.socket:
+def _probe_existing_server(host: str, port: int) -> dict[str, Any] | None:
+    """One read-only snapshot GET, with a total deadline and no redirects/proxy.
+
+    Read raw bytes under the deadline before parsing HTTP in memory, so even
+    trickled headers/body cannot extend the timeout. Never resolve a hostname.
+    """
+    if not ipaddress.ip_address(host).is_loopback or not port:
+        return None
+    url = launch_url(host, port)
+    authority = urllib.parse.urlsplit(url).netloc
+    deadline = time.monotonic() + _HOLDER_PROBE_SECONDS
+    try:
+        with socket.create_connection((host, port), timeout=_HOLDER_PROBE_SECONDS) as connection:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            connection.settimeout(remaining)
+            connection.sendall(
+                f"GET /api/fleet/snapshot HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n".encode("ascii")
+            )
+            wire = bytearray()
+            while len(wire) <= _HOLDER_PROBE_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                connection.settimeout(remaining)
+                chunk = connection.recv(min(65536, _HOLDER_PROBE_BYTES + 1 - len(wire)))
+                if not chunk:
+                    break
+                wire.extend(chunk)
+            if len(wire) > _HOLDER_PROBE_BYTES:
+                return None
+
+        class BufferedSocket:
+            def makefile(self, _mode: str) -> io.BytesIO:
+                return io.BytesIO(wire)
+
+        # HTTPResponse only needs makefile; no second socket is opened here.
+        with http.client.HTTPResponse(cast(socket.socket, BufferedSocket())) as response:
+            response.begin()
+            if response.status != 200:
+                return None
+            document = json.loads(response.read(_HOLDER_PROBE_BYTES + 1))
+        if (
+            not isinstance(document, dict)
+            or type(document.get("schema_version")) is not int
+            or document["schema_version"] != 1
+            or document.get("state") not in ("fresh", "partial", "stale", "unknown")
+            or not isinstance(document.get("lanes"), list)
+            or not isinstance(document.get("passes"), list)
+        ):
+            return None
+        existing = {"url": url + "#/fleet", "kind": "fleet"}
+        if isinstance(document.get("root"), str):
+            existing["root"] = document["root"]
+        return existing
+    except (OSError, ValueError, http.client.HTTPException, RecursionError):
+        return None
+
+
+def _prebind(host: str, port: int, *, port_explicit: bool = True) -> socket.socket:
     family = socket.AF_INET6 if ipaddress.ip_address(host).version == 6 else socket.AF_INET
     sock: socket.socket | None = None
     try:
@@ -142,7 +207,8 @@ def _prebind(host: str, port: int) -> socket.socket:
             with contextlib.suppress(OSError):
                 sock.close()
         if exc.errno == errno.EADDRINUSE:
-            raise LaunchError("port_in_use") from exc
+            existing = _probe_existing_server(host, port) if port_explicit and port else None
+            raise LaunchError("port_in_use", details={"existing_server": existing}) from exc
         symbol = errno.errorcode.get(exc.errno or 0, f"errno {exc.errno}")
         raise LaunchError(
             "bind_failed",
@@ -308,6 +374,7 @@ def run_local(
     host: str,
     port: int,
     web_dist: str | Path | None,
+    port_explicit: bool = True,
     allow_origins: tuple[str, ...] | list[str] = (),
     pin_workspace_db: bool = False,
     view: str | None = None,
@@ -329,7 +396,11 @@ def run_local(
         else:
             dist = Path(web_dist)
             _require_web_index(dist)
-        sock = _prebind(bind_host, port)
+        # Port zero has no holder to identify; retain the two-argument free-port
+        # bind hook while forwarding the policy for ports that can have a holder.
+        sock = (
+            _prebind(bind_host, port, port_explicit=port_explicit) if port else _prebind(bind_host, port)
+        )
         try:
             bound_port = int(sock.getsockname()[1])
             app = build_local_http_app(
@@ -357,7 +428,13 @@ def run_local(
         return 0
     except LaunchError as exc:
         if exc.code == "port_in_use":
-            sys.stderr.write(_PORT_IN_USE_HINT + "\n")
+            existing = exc.details.get("existing_server")
+            hint = (
+                f"already serving at {existing['url']}; open it, stop that process, or pass --port 0"
+                if existing
+                else _PORT_IN_USE_HINT
+            )
+            sys.stderr.write(hint + "\n")
         sys.stdout.write(
             json.dumps({"error": {"code": exc.code, "message": exc.message, "details": exc.details}}) + "\n"
         )

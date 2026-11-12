@@ -623,6 +623,20 @@ cmd_preflight() {
         return 1
     fi
 
+    log "preflight: consumer-layout rehearsal"
+    local consumer_logfile="$RUN_LOG_DIR/preflight-consumer-rehearsal.log"
+    if ! run_logged \
+        "preflight: consumer-layout rehearsal" \
+        "$consumer_logfile" \
+        "PYTHONNOUSERSITE=1 PATH='/usr/bin:/bin' '$(command -v python)' -s scripts/release_consumer_rehearsal.py"; then
+        LAST_FAILURE_LOG="$consumer_logfile"
+        warn "consumer-layout rehearsal failed — see $consumer_logfile"
+        if [[ $started_run -eq 1 ]]; then
+            write_release_summary_artifacts "preflight" "" "failed" "$LAST_FAILURE_LOG"
+        fi
+        return 1
+    fi
+
     log "preflight: pyproject.toml VCS-dep scan"
     if grep -RnE "^\s*['\"]?[a-zA-Z0-9_-]+\s*@\s*git\+" packages/*/pyproject.toml; then
         warn "found direct VCS dependency in a pyproject.toml — replace with a version range before release."

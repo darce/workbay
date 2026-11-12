@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.29] — 2026-11-11
+
+### Fixed
+- Handoff writes cost less: the compaction contract is cached per file identity, and reclaim-candidate bookkeeping stays out of the semantic index.
+- The recall evaluation counts only eligible source rows.
+
+### Changed
+- Raise the protocol floor to 0.3.14 and the `lifecycle` extra's orchestrator floor to 0.3.35 for the WorkBay v0.1.91 tuple.
+
 ## [0.3.28] — 2026-11-11
 
 ### Changed

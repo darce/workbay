@@ -3,6 +3,18 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.31] — 2026-11-11
+
+### Added
+- An owned macOS host disk-pressure reclaimer, `scripts/host/workbay_host_reclaim.py`, installed as a per-user LaunchAgent by `scripts/host/install_host_reclaim.sh`.
+
+### Fixed
+- `remote_agent.sh` resolves host-side WorkBay imports through the declared boundary runtime.
+- `remote_agent.sh` bounds the proc census identity pass and its first UID batch by the sweep deadline.
+- `remote_agent.sh` validates the host-expanded review kind and the idle clock before it builds the remote body.
+- `remote_agent.sh` reports a VM inventory census for `workbay fleet`.
+- The doctor's host-memory probe admits on RAM pressure only and reports low swap-volume disk as a warning.
+
 ## [0.4.30] — 2026-11-11
 
 ### Fixed

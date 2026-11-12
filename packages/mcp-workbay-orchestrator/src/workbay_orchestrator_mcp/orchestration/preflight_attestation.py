@@ -1543,6 +1543,54 @@ def _record_attestation_locked(
     return record["capability_receipt_id"]
 
 
+NATIVE_BOUNDARY_AUTHORITY = "native_boundary"
+
+
+def record_native_boundary_deferral(
+    root: Path, capability_receipt_id: str, *, expected_identity: Mapping[str, Any]
+) -> str:
+    """Bind a non-positive authority deferral without changing observed gates.
+
+    Preserve timestamps, probe outcomes and the same-pass receipt chain. This
+    annotation is not capability evidence; ordinary receipt readers still
+    require the same identity and reject negative gates.
+    """
+    path = Path(root) / STATE_FILE
+    with _attestation_file_lock(path):
+        _version, lanes, error = _parse_attestation_document(_read(path))
+        if error is not None or lanes is None:
+            raise ValueError(error or UNSUPPORTED_ATTESTATION_SCHEMA_REASON)
+        record, _legacy = _record_for_scope(
+            lanes,
+            task_ref=expected_identity.get("task_ref"),
+            lane_id=expected_identity.get("lane_id"),
+            worktree_path=expected_identity.get("worktree_path"),
+        )
+        if (
+            not isinstance(record, dict)
+            or not _receipt_hash_matches(record)
+            or not _receipt_matches_record(record, capability_receipt_id)
+            or _identity_mismatches(record, expected_identity)
+        ):
+            raise ValueError(STALE_CAPABILITY_RECEIPT_REASON)
+        if record.get("preflight_authority") == NATIVE_BOUNDARY_AUTHORITY:
+            return record["capability_receipt_id"]
+        annotated = {**record, "preflight_authority": NATIVE_BOUNDARY_AUTHORITY}
+        predecessors = _remint_predecessors(record, annotated)
+        if predecessors:
+            annotated["predecessor_receipt_ids"] = predecessors
+            annotated["predecessor_receipt_id"] = predecessors[-1]
+        annotated["capability_receipt_id"] = _receipt_id(annotated)
+        lane_key = _lane_store_key(
+            record.get("lane_id"),
+            record.get("worktree_path"),
+            record.get("task_ref"),
+        )
+        lanes[lane_key] = annotated
+        _write_attestation_document(path, lanes)
+        return annotated["capability_receipt_id"]
+
+
 def capability_receipt_record(
     root: Path,
     capability_receipt_id: str | None,

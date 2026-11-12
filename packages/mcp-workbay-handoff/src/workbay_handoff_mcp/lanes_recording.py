@@ -9,7 +9,7 @@ import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from .enums import TERMINAL_LANE_STATUSES
 from .lane_resource_producer import LaneResourceConflict, execute_lane_change, prepare_lane_binding, replay_receipt
@@ -1259,6 +1259,22 @@ def branch_reclaim_candidate_decision_id(*, task_ref: str, lane_id: str) -> str:
         f"{_encode_reclaim_id_component(task_ref.strip())}_"
         f"{_encode_reclaim_id_component(lane_id.strip())}"
     )
+
+
+def is_reclaim_candidate_decision_id(decision: str) -> bool:
+    """Recognize only canonical, nonempty reclaim ledger ids from either builder."""
+    for builder in (reclaim_candidate_decision_id, branch_reclaim_candidate_decision_id):
+        # Empty components expose the builder's prefix plus the join separator.
+        prefix = builder(task_ref="", lane_id="")[:-1]
+        if not decision.startswith(prefix):
+            continue
+        components = decision[len(prefix) :].split("_")
+        if len(components) != 2 or not all(components):
+            continue
+        task_ref, lane_id = (unquote(component) for component in components)
+        if builder(task_ref=task_ref, lane_id=lane_id) == decision:
+            return True
+    return False
 
 
 def _latest_reclaim_candidate(

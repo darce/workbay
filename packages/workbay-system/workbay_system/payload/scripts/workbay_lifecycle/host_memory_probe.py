@@ -25,7 +25,7 @@ _OS_RESERVE_GIB = 3.0
 _RSS_PER_HEAVY_GIB = 2.5
 _MAX_WIDTH = 4
 _SWAP_FREE_FLOOR_MB = 512
-_SWAP_VOLUME_DISK_FLOOR_GIB = 8.0
+_SWAP_VOLUME_DISK_FLOOR_GIB = 8.0  # Warning threshold only; never a refusal.
 
 
 @dataclass(frozen=True)
@@ -241,13 +241,23 @@ def count_held_heavy_slots(locks_root: Path, width: int) -> int:
 
 
 def would_refuse_heavy(snap: HostMemorySnapshot, width: int) -> bool:
-    """Mirror the D2 refuse dimensions (pressure / swap floor / disk floor / width 0)."""
+    """Mirror the D2 RAM refuse dimensions (pressure / swap floor / width 0)."""
     if not snap.available:
         return False
     if snap.pressure == "critical":
         return True
     if snap.swap_total > 0 and snap.swap_free < _SWAP_FREE_FLOOR_MB * _MIB:
         return True
-    if 0 < snap.swap_volume_free_bytes < _SWAP_VOLUME_DISK_FLOOR_GIB * _GIB:
-        return True
     return width == 0
+
+
+def swap_volume_disk_observation(snap: HostMemorySnapshot) -> str:
+    """Name low measured disk and its response; zero is an absent reading."""
+    if 0 < snap.swap_volume_free_bytes < _SWAP_VOLUME_DISK_FLOOR_GIB * _GIB:
+        return (
+            "observation low_swap_volume_disk: "
+            f"swap-volume free disk {snap.swap_volume_free_bytes / _GIB:.1f}GiB "
+            f"below warning threshold {_SWAP_VOLUME_DISK_FLOOR_GIB}GiB; "
+            "reclaim swap-volume disk space (non-blocking)"
+        )
+    return ""

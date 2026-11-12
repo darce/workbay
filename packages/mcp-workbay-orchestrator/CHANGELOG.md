@@ -3,6 +3,18 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.36] — 2026-11-12
+
+### Fixed
+- Managed codex-remote passes are no longer refused before the model starts when the VM sandbox probe can only answer unknown.
+- Host admission admits on RAM pressure only.
+- The sandbox release census converges over bounded delta rounds under PID churn, skips tasks that exit mid-scan, and retries race-held censuses within its deadline.
+- The constructor receipt seals its source base from the primary-worktree authority.
+- The provider probe pushes under the transport's guard authorization and renders the default spec against the probe's own root.
+
+### Added
+- `workbay fleet` reads a VM inventory census and a reclaimer facet.
+
 ## [0.3.34] — 2026-11-11
 
 ### Fixed
