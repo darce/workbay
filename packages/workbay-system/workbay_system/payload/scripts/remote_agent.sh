@@ -266,7 +266,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.33
+_BOUNDARY_RUNTIME_VERSION=0.3.37
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -277,6 +277,47 @@ _BOUNDARY_RUNTIME_VERSION=0.3.33
 # newline; remove exactly that one below.
 _boundary_runtime_sh=
 IFS= read -r -d '' _boundary_runtime_sh <<'BOUNDARY_RUNTIME_SH' || [ -n "$_boundary_runtime_sh" ]
+# Bound the isolated probe even on hosts without coreutils. Keep this helper
+# in the rendered text: the host ladder and doctor eval the same resolver.
+_boundary_runtime_probe() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 5 60 "$@"
+        return $?
+    fi
+    local _probe_pid _watchdog_pid _probe_rc=0 _watchdog_rc=0
+    "$@" &
+    _probe_pid=$!
+    # A fresh shell closes Bash's saved redirection descriptors on exec as
+    # well as redirecting fd 1/2, so it cannot retain the capture pipe.
+    "$BASH" --noprofile --norc -c '
+        _probe_pid=$1 _expired=0
+        # wait is interruptible in Bash 3.2. Cancel AND reap the active sleep
+        # before exiting, including when the candidate answers immediately.
+        _cancel_sleep() {
+            if [ -n "${!:-}" ]; then
+                kill "$!" 2>/dev/null || :
+                wait "$!" 2>/dev/null || :
+            fi
+            exit "$_expired"
+        }
+        trap _cancel_sleep TERM
+        sleep 60 &
+        wait "$!" || :
+        _expired=124
+        kill -TERM "$_probe_pid" 2>/dev/null || :
+        sleep 5 &
+        wait "$!" || :
+        kill -KILL "$_probe_pid" 2>/dev/null || :
+        exit 124
+    ' boundary-runtime-watchdog "$_probe_pid" >/dev/null 2>&1 &
+    _watchdog_pid=$!
+    wait "$_probe_pid" || _probe_rc=$?
+    kill -TERM "$_watchdog_pid" 2>/dev/null || :
+    wait "$_watchdog_pid" || _watchdog_rc=$?
+    [ "$_watchdog_rc" -ne 124 ] || return 124
+    return "$_probe_rc"
+}
+
 # _boundary_runtime_resolve [LANE_PYTHON LANE_PYPROJECT]
 # A sandbox that carries the orchestrator source runs it from its
 # origin-verified lane venv, because the native handshake refuses any other
@@ -303,7 +344,7 @@ _boundary_runtime_resolve() {
     if [ ! -x "$_candidate" ]; then
         _out="boundary_runtime_missing error_type=FileNotFoundError module=python"
     else
-        _out=$(timeout -k 5 60 "$_candidate" -I -c '
+        _out=$(_boundary_runtime_probe "$_candidate" -I -c '
 import importlib
 import importlib.metadata
 import sys

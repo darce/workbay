@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-protocol"
-version = "0.3.14"
+version = "0.3.15"
 description = "Typed cross-repo contracts for the WorkBay system: handoff state, MCP I/O, hook events, skill manifests, bootstrap install manifest."
 readme = "README.md"
 requires-python = ">=3.11"

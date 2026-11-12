@@ -157,6 +157,9 @@ def _collect_dashboard_rows(
 ) -> list[DashboardTaskRow]:
     """Collect compact cross-task dashboard rows for CURRENT_TASK.json and dashboard view."""
 
+    from .lanes_recording import is_reclaim_candidate_decision_id
+
+    conn.create_function("is_reclaim_candidate_decision_id", 1, is_reclaim_candidate_decision_id, deterministic=True)
     limit = max(1, limit)
     archive_union = (
         "UNION ALL SELECT task_ref, archived_at AS updated_at FROM task_archives" if include_archived else ""
@@ -187,6 +190,7 @@ def _collect_dashboard_rows(
             SELECT task_ref, updated_at FROM handoff_state
             UNION ALL
             SELECT task_ref, created_at AS updated_at FROM decisions
+            WHERE NOT is_reclaim_candidate_decision_id(decision)
             UNION ALL
             SELECT task_ref, created_at AS updated_at FROM blockers
             UNION ALL

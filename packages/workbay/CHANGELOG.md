@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.88] — 2026-11-12
+
+### Changed
+- Pin the v0.1.92 member tuple: the boundary runtime pin follows the orchestrator release and releases refuse a stale pin (CAR-00), the boundary runtime probe stays bounded on macOS without GNU `timeout`, installs keep the handoff `[embeddings]` extra and skip bytecode, and the release smoke no longer reinstalls the shared uv tools.
+
 ## [0.3.86] — 2026-11-12
 
 ### Changed

@@ -2138,6 +2138,22 @@ def _gitonly_tool_embeddings_mode(target: Path, embeddings_mode: str) -> str:
         return "disabled"
     if _load_existing_manifest_str(target, "embeddings_mode") == "verified":
         return "verified"
+    from workbay_bootstrap.gitonly_closure import default_uv_tools_root
+
+    receipt_path = default_uv_tools_root() / "mcp-workbay-handoff" / "uv-receipt.toml"
+    try:
+        receipt = tomllib.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return embeddings_mode
+    tool = receipt.get("tool")
+    requirements = tool.get("requirements") if isinstance(tool, dict) else None
+    if isinstance(requirements, list):
+        for requirement in requirements:
+            if not isinstance(requirement, dict) or requirement.get("name") != "mcp-workbay-handoff":
+                continue
+            extras = requirement.get("extras")
+            if isinstance(extras, list) and "embeddings" in extras:
+                return "verified"
     return embeddings_mode
 
 
@@ -2697,6 +2713,10 @@ def _existing_surface_sources(target: Path) -> dict[str, str]:
     return sources
 
 
+# Bytecode is interpreter-owned state, never part of an installed payload.
+_COPY_IGNORE_BYTECODE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+
+
 def _copy_surface_entry(
     src: Path,
     dest: Path,
@@ -2732,7 +2752,7 @@ def _copy_surface_entry(
             dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.is_dir():
-        shutil.copytree(src, dest)
+        shutil.copytree(src, dest, ignore=_COPY_IGNORE_BYTECODE)
     else:
         shutil.copy2(src, dest)
     return {"path": rel, "source": "shared"}
@@ -3471,7 +3491,7 @@ def _install_lifecycle_profile(target: Path, clone: Path) -> list[dict[str, str]
             entries.append({"path": dest_rel, "source": "lifecycle"})
             continue
         if src.is_dir():
-            shutil.copytree(src, dest, dirs_exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True, ignore=_COPY_IGNORE_BYTECODE)
         else:
             shutil.copy2(src, dest)
         entries.append({"path": dest_rel, "source": "lifecycle"})

@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-workbay-orchestrator"
-version = "0.3.36"
+version = "0.3.37"
 description = "MCP server for orchestration, lane management, worker daemons, and turn metrics."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.4,<4",
-    "mcp-workbay-handoff>=0.3.29,<0.4.0",
-    "workbay-protocol>=0.3.14,<0.4.0",
+    "mcp-workbay-handoff>=0.3.30,<0.4.0",
+    "workbay-protocol>=0.3.15,<0.4.0",
 ]
 
 [project.scripts]
@@ -41,7 +41,7 @@ Issues = "https://github.com/darce/workbay/issues"
 # `availability_state="declared_not_installed"` rather than silently claiming it
 # is available.
 bridge = [
-    "workbay-codex-bridge>=0.3.7,<0.4.0",
+    "workbay-codex-bridge>=0.3.8,<0.4.0",
 ]
 test = [
     "hypothesis>=6.0.0",

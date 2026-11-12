@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -54,6 +55,47 @@ def _observe(completed) -> str:
     return output
 
 
+def _reserve(boundary, consumer) -> None:
+    """Run the live host resolver/bridge and reserve call in a consumer layout.
+
+    Like the worker fixture, the imported module is a UNIT substitute. The
+    interpreter selection and isolated version check are the real transport.
+    """
+    module = boundary.site_packages(consumer.tool) / "workbay_orchestrator_mcp/orchestration/review_cycle_dispatch.py"
+    module.write_text(
+        "import sys\nfrom ._unit_log import log\n"
+        "def shell_entry():\n"
+        "    assert sys.argv[1:] == ['reserve', 'unit-reserve', 'unit', 'analysis', 'unit-spec', '']\n"
+        "    log('host_reserve')\n"
+        "def shell_collect():\n    raise AssertionError('unexpected collect')\n"
+    )
+    source = consumer.script.read_text()
+    # Include the stored pin, VM resolver, host ladder, and bridge unchanged.
+    helpers = "_BOUNDARY_RUNTIME_VERSION=" + source.split("\n_BOUNDARY_RUNTIME_VERSION=", 1)[1].split(
+        "\n# Read the consumer cadence", 1
+    )[0]
+    reserve = next(line for line in source.splitlines()
+                   if line.strip().startswith('_review_cycle_bridge reserve "$JOB_ID"'))
+    script = consumer.tmp / "scripts/unit-host-reserve.sh"
+    script.parent.mkdir()
+    script.write_text(
+        "set -euo pipefail\n" + helpers + "\n"
+        "JOB_ID=unit-reserve REVIEW_SUBJECT_BRANCH=unit REVIEW_KIND=analysis AGENT_SPEC=unit-spec CANON_PROPOSAL_PATH=\n"
+        + reserve + "\n"
+    )
+    completed = subprocess.run(
+        ["bash", str(script)], cwd=consumer.sbx, capture_output=True, text=True, timeout=30,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(consumer.home),
+             "PYTHONNOUSERSITE": "1", "UNIT_SITE_LOG": str(consumer.site_log)},
+    )
+    output = _observe(completed)
+    if completed.returncode != 0:
+        raise Refused("host_reserve_failed", output)
+    if ["host_reserve", str(consumer.tool / "bin/python"), 1] not in consumer.sites():
+        raise Refused("host_reserve_not_observed", output)
+    print(f"host reserve: ok interpreter={consumer.tool}/bin/python review_kind=analysis", file=sys.stderr)
+
+
 def _rehearse(tmp: Path, state: dict) -> None:
     boundary = _load_fixture()
     consumer = boundary.Consumer(tmp / "consumer", ROOT / "scripts/remote_agent.sh")
@@ -74,6 +116,9 @@ def _rehearse(tmp: Path, state: dict) -> None:
     expected = f"boundary: ok interpreter={doctor_tool}/bin/python version={boundary.RELEASE}"
     if doctor.returncode != 0 or not doctor.stdout.splitlines() or doctor.stdout.splitlines()[0] != expected:
         raise Refused("doctor_boundary_failed", output)
+
+    state["step"] = "host_reserve"
+    _reserve(boundary, consumer)
 
     state["step"] = "turn"
     turn = consumer.turn()

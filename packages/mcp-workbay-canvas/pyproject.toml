@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-workbay-canvas"
-version = "0.1.21"
+version = "0.1.22"
 description = "Portable MCP server for a shared visual/spatial planning surface."
 requires-python = ">=3.12"
 # README carries internal ticket refs that hatchling would otherwise bake verbatim
@@ -15,8 +15,8 @@ dynamic = ["readme"]
 dependencies = [
     "fastmcp>=3.4,<4",
     "pydantic>=2.6.0,<3.0.0",
-    "mcp-workbay-handoff>=0.3.29,<0.4.0",
-    "mcp-workbay-orchestrator>=0.3.35,<0.4.0",
+    "mcp-workbay-handoff>=0.3.30,<0.4.0",
+    "mcp-workbay-orchestrator>=0.3.37,<0.4.0",
 ]
 
 [project.scripts]

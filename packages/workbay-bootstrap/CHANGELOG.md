@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.32] — 2026-11-12
+
+### Fixed
+- Install never copies `__pycache__` directories or `.pyc` files into a consumer.
+- A plain reinstall keeps an installed `mcp-workbay-handoff[embeddings]` extra, read from the handoff tool's uv receipt, instead of dropping it.
+
 ## [0.4.31] — 2026-11-11
 
 ### Fixed

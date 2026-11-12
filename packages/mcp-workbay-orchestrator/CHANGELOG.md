@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.37] — 2026-11-12
+
+### Fixed
+- `lane-land` logs an absent task manifest as one warning line instead of a traceback, and still skips the advisory landed marker.
+
 ## [0.3.36] — 2026-11-12
 
 ### Fixed

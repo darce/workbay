@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-codex-bridge"
-version = "0.3.7"
+version = "0.3.8"
 description = "Optional Codex app-server bridge for daemon subagent execution."
 readme = "README.md"
 requires-python = ">=3.11"

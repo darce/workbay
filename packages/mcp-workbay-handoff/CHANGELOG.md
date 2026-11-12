@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.30] — 2026-11-12
+
+### Fixed
+- Reclaim-candidate ledger decisions no longer count as task activity, so a reclaim sweep does not refresh an idle task's last-activity time on the dashboard.
+
+### Changed
+- Raise the protocol floor to 0.3.15 and the `lifecycle` extra's orchestrator floor to 0.3.37 for the WorkBay v0.1.92 tuple.
+
 ## [0.3.29] — 2026-11-11
 
 ### Fixed

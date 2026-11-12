@@ -1001,8 +1001,10 @@ smoke: ## One-shot smoke install of the latest monorepo tag into /tmp
 	test -n "$$latest" || { echo "no v* monorepo tag found"; exit 1; }; \
 	dir=/tmp/workbay-smoke-$$$$-$$(date +%s); \
 	echo "==> smoke testing $$latest in $$dir"; \
+	echo "    UV_TOOL_DIR=$$dir/uv-tools UV_TOOL_BIN_DIR=$$dir/uv-bin"; \
 	mkdir -p "$$dir" && cd "$$dir" && git init -q && \
 	R="git+https://github.com/darce/workbay.git@$$latest" && \
+	UV_TOOL_DIR="$$dir/uv-tools" UV_TOOL_BIN_DIR="$$dir/uv-bin" PATH="$$dir/uv-bin:$$PATH" \
 	uvx --no-sources \
 	    --with "$$R#subdirectory=packages/workbay-protocol" \
 	    --with "$$R#subdirectory=packages/workbay-system" \

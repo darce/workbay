@@ -72,6 +72,24 @@ try those names first and then accept `.grok-result.json` and `.grok-phases.json
 outboxes. Keep the legacy fallback until all outboxes created before neutral writes have
 expired; then remove the `.grok-*` result and phase fallback names from readers.
 
+### Boundary runtime on the VM
+
+The VM gate user's orchestrator runtime must match the released version.
+Codex and analysis turns refuse `boundary_runtime_version_mismatch` when it differs.
+`scripts/remote_agent.sh` in `doctor` mode reports
+`boundary: ok interpreter=... version=...` or `boundary: REFUSED <refusal>`.
+Run the git-only install as the gate user, with the same release tag as the transport:
+
+```bash
+REF=v0.1.92
+R="git+https://github.com/darce/workbay.git@$REF"
+uv tool install --no-sources --force \
+  --with "$R#subdirectory=packages/workbay-protocol" \
+  --with "$R#subdirectory=packages/mcp-workbay-handoff" \
+  --from "$R#subdirectory=packages/mcp-workbay-orchestrator" \
+  mcp-workbay-orchestrator
+```
+
 ## Gating under `remote_only`: the remote gate is the gate
 
 Under `execution_mode: remote_only` (`workbay-bootstrap install --with-remote`),

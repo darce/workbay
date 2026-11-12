@@ -8,6 +8,8 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
+from check_boundary_runtime_pin import PIN_LINE
+
 # Sibling module (scripts/ is on sys.path[0] when run as a script). Guards
 # managed MCP-server uvx pins against silent drift — see its docstring and
 # check_release_bump() below.
@@ -121,6 +123,30 @@ def update_dependency_floors(
             continue
         updated_files.append((pyproject_path, updated))
 
+    return updated_files
+
+
+def update_boundary_runtime_pins(package_name: str, new_version: str) -> list[tuple[Path, str]]:
+    """Regenerate both consumer pins in the same dry-run/write preparation pass."""
+    if package_name != "mcp-workbay-orchestrator":
+        return []
+    updated_files: list[tuple[Path, str]] = []
+    for name in (
+        "scripts/remote_agent.sh",
+        "packages/workbay-system/workbay_system/payload/scripts/remote_agent.sh",
+    ):
+        path = REPO_ROOT / name
+        with path.open(encoding="utf-8", newline="") as stream:
+            lines = stream.read().splitlines(keepends=True)
+        matches = [(index, match) for index, line in enumerate(lines)
+                   if (match := PIN_LINE.fullmatch(line.rstrip("\r\n")))]
+        if len(matches) != 1:
+            raise SystemExit(f"expected exactly one boundary runtime pin in {name}; found {len(matches)}")
+        index, match = matches[0]
+        group = next(number for number in range(1, 4) if match.group(number) is not None)
+        start, end = match.span(group)
+        lines[index] = lines[index][:start] + new_version + lines[index][end:]
+        updated_files.append((path, "".join(lines)))
     return updated_files
 
 
@@ -253,25 +279,27 @@ def main() -> int:
         new_version,
     )
 
+    updated_files = updated_dependency_files + update_boundary_runtime_pins(args.package, new_version)
+
     relative_pyproject = pyproject_path.relative_to(REPO_ROOT)
     relative_changelog = changelog_path.relative_to(REPO_ROOT)
     if args.dry_run:
         print(f"Would bump {args.package}: {current_version} -> {new_version}")
         print(f"Would update {relative_pyproject}")
         print(f"Would update {relative_changelog}")
-        for dependency_path, _ in updated_dependency_files:
+        for dependency_path, _ in updated_files:
             print(f"Would update {dependency_path.relative_to(REPO_ROOT)}")
         return 0
 
     pyproject_path.write_text(updated_pyproject, encoding="utf-8")
     changelog_path.write_text(updated_changelog, encoding="utf-8")
-    for dependency_path, updated_source in updated_dependency_files:
+    for dependency_path, updated_source in updated_files:
         dependency_path.write_text(updated_source, encoding="utf-8")
 
     print(f"Prepared {args.package}: {current_version} -> {new_version}")
     print(f"Updated {relative_pyproject}")
     print(f"Updated {relative_changelog}")
-    for dependency_path, _ in updated_dependency_files:
+    for dependency_path, _ in updated_files:
         print(f"Updated {dependency_path.relative_to(REPO_ROOT)}")
 
     # Keep root uv.lock in sync with rewritten workspace pins. Below the

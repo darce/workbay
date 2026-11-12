@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.33] — 2026-11-12
+
+### Fixed
+- `remote_agent.sh` keeps the boundary runtime probe's 60 s bound on a host without GNU `timeout`: stock macOS no longer refuses a present runtime as `boundary_runtime_missing error_type=probe_exit_127`, which blocked the v0.1.92 release consumer rehearsal.
+- `remote_agent.sh` declares boundary runtime 0.3.37, the orchestrator version it ships with.
+
+### Added
+- The offload-remote playbook documents how `doctor` reports the VM boundary runtime and how to install the gate user's orchestrator runtime at the release tag.
+- ADR-005 (consolidation-loop rules from history) and ADR-006 (one capability authority and consumer-first contract retirement).
+
 ## [0.4.31] — 2026-11-11
 
 ### Added

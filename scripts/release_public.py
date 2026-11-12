@@ -1025,6 +1025,28 @@ def _run_export_and_install_check(report: dict[str, object]) -> int:
         shutil.rmtree(export_dir, ignore_errors=True)
 
 
+def _run_release_gates(report: dict[str, object]) -> int:
+    """Bounded checks on the release path, before export or publication effects."""
+    gates = report.setdefault("release_gates", [])
+    for name, flags in (("check_boundary_runtime_pin", ["-I"]),
+                        ("release_consumer_rehearsal", ["-s"])):
+        command = [sys.executable, *flags, str(REPO_ROOT / "scripts" / f"{name}.py")]
+        gate = dict(check=name, command=command, verdict="pending")
+        gates.append(gate)
+        try:
+            output = _run_text(command, timeout_s=120)
+        except subprocess.TimeoutExpired as exc:
+            gate.update(verdict="fail", output=str(exc))
+            return _abort_local_script_timeout(report, operation=name, exc=exc)
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            gate.update(verdict="fail", returncode=exc.returncode, output=output)
+            sys.stderr.write(f"[release-public] ABORT: {name} failed (rc={exc.returncode}): {output.strip()}\n")
+            return 1
+        gate.update(verdict="pass", returncode=0, output=output)
+    return 0
+
+
 def _execute(report: dict[str, object], *, publish: bool = True) -> int:
     """Prepare once, retain the checked Git subject, then attempt guarded effect.
 
@@ -1050,6 +1072,9 @@ def _execute(report: dict[str, object], *, publish: bool = True) -> int:
         )
         for package in drifted:
             sys.stderr.write(f"    {package}\n")
+        return 1
+
+    if publish and _run_release_gates(report) != 0:
         return 1
 
     remote = os.environ.get("RELEASE_PUBLIC_REMOTE", PUBLIC_GIT_REMOTE)
@@ -1190,6 +1215,13 @@ def _effect_prepared(report: dict, plan_id: str) -> int:
         report["mode"] = "execute"
         report["prepared"] = dict(plan_id=plan_id, subject=subject,
                                   path=str(publication.store(REPO_ROOT) / plan_id))
+        # Dry-run preparation does not run release gates. A retained plan from
+        # that path must pass them before its first publication effect.
+        checked = {gate.get("check") for gate in frozen.get("release_gates", [])
+                   if gate.get("verdict") == "pass" and gate.get("returncode") == 0}
+        if checked != {"check_boundary_runtime_pin", "release_consumer_rehearsal"}:
+            if _run_release_gates(report) != 0:
+                return 1
         source_tag = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", f"refs/tags/{subject['release']['monorepo_tag']}^{{commit}}"],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT_S,

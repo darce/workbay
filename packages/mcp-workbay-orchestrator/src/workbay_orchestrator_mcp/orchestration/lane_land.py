@@ -380,6 +380,11 @@ def _mark_manifest_landed(
                         lane.pop("landed", None)
 
                 lane_manifest.atomic_update_manifest(path, withdraw)
+    except FileNotFoundError as exc:
+        logging.getLogger(__name__).warning(
+            "Skipping advisory landed marker for task %s lane %s: missing manifest (%s)", task_ref, lane_id, exc
+        )
+        return marker_status, []
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         logging.getLogger(__name__).warning(
             "Skipping advisory landed marker for task %s lane %s", task_ref, lane_id, exc_info=True
