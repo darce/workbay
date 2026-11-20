@@ -14,10 +14,12 @@ import json
 import re
 from dataclasses import dataclass
 
-MODEL_ID = "gte-base-en-v1.5"
+from workbay_protocol import reasoning_effort as model_routing
+
+MODEL_ID = model_routing.ModelId.EMBEDDING
 EMBEDDING_DIM = 768
 
-SOURCE_REPO = "Alibaba-NLP/gte-base-en-v1.5"
+SOURCE_REPO = f"Alibaba-NLP/{MODEL_ID}"
 SOURCE_REVISION = "a829fd0e060bb84554da0dfd354d0de0f7712b7f"
 
 MODEL_FILENAME = "onnx/model_int8.onnx"

@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StrictInt
 
+from workbay_handoff_mcp.coordination_declaration import ExecutionDomain
+
 from .api_contract_shared import ActorParam, TaskRefParam, dump_actor
 from .lanes_recording import branch_reclaim_candidate_decision_id as _branch_reclaim_candidate_decision_id
 from .lanes_recording import close_lane as _close_lane
@@ -34,6 +36,9 @@ CloseLaneStatus = Literal["closed", "merged"]
 
 class LanesOpenOp(BaseModel):
     operation: Literal["open"]
+    execution_domain: ExecutionDomain | None = None
+    coordination_owner_proof: dict | None = None
+    event_id: str | None = None
     lane_id: Annotated[str, Field(description="Stable lane identifier within the task.")]
     worktree_path: Annotated[str, Field(description="Absolute path to the lane worktree.")]
     branch: Annotated[str, Field(description="Git branch checked out in the lane worktree.")]
@@ -129,6 +134,15 @@ def dispatch_lanes(payload: LanesOp) -> dict:
     actor = dump_actor(payload.actor) if hasattr(payload, "actor") else None
     if isinstance(payload, LanesOpenOp):
         return _open_lane(
+            **(
+                {
+                    "execution_domain": payload.execution_domain,
+                    "coordination_owner_proof": payload.coordination_owner_proof,
+                }
+                if payload.execution_domain is not None
+                else {}
+            ),
+            **({"event_id": payload.event_id} if payload.event_id is not None else {}),
             lane_id=payload.lane_id,
             worktree_path=payload.worktree_path,
             branch=payload.branch,

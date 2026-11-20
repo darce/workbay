@@ -22,17 +22,19 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from workbay_handoff_mcp import api
 from workbay_handoff_mcp.config import RuntimeConfig
 from workbay_handoff_mcp.runtime import RuntimeNotConfiguredError, get_runtime_config
+from workbay_protocol import reasoning_effort as model_routing
 
 from .adapters import remote_job_runner
 from .backend_spec import build_agent_spec, write_agent_spec
 from .execution_preflight import analysis_argv
 from .lane_lifecycle_contracts import RemoteJobIdentity, RemoteJobSpec, lane_key_for_branch
-from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError
+from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError, plan_review_failure
 
 # Exit statuses belong to this driver; native rc remains in the error receipt.
 FAILURES = {
@@ -394,7 +396,7 @@ def _parameters(args: Any, subject: dict) -> dict:
         )
     route = {
         "backend": getattr(args, "review_route", "codex-remote"),
-        "model": getattr(args, "model", "gpt-6.1-sol"),
+        "model": getattr(args, "model", model_routing.MODEL_ROUTING_DEFAULTS["plan_review"]),
         "effort": getattr(args, "effort", "high"),
         "speed": getattr(args, "speed", "standard"),
     }
@@ -609,10 +611,65 @@ def _record_findings(task: str, session: str, run_id: str, findings: list[dict])
     return ids
 
 
+def _transport_failure_detail(
+    completed: subprocess.CompletedProcess[str],
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    directory: Path,
+    job_id: str,
+    deadline: float,
+    collection_attempted: bool,
+) -> dict:
+    rc = completed.returncode
+    detail: dict[str, Any] = {
+        "stderr": (completed.stderr or "")[-1500:],
+        "transport_rc": rc,
+        "native_state": "unknown",
+    }
+    # A direct collect has one operation. A compound receive identifies the
+    # failing child in its argv, including when the two children exit alike.
+    operation = completed.args[1] if len(completed.args) > 1 else None
+    if collection_attempted or operation == "collect":
+        detail["collection_rc"] = rc
+    elif operation == "status":
+        detail["status_rc"] = rc
+    else:
+        return detail
+    # A failed receive can still have an immutable, verifiable native exit.
+    try:
+        with TemporaryDirectory(prefix="terminal-evidence-", dir=directory) as stage:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return detail
+            staged = remote_job_runner.materialize_only(command, cwd=cwd, env=env, timeout=remaining, stage_dir=stage)
+            if staged.returncode != 0:
+                return detail
+            raw = (Path(stage) / "done.json").read_bytes()
+            done = json.loads(raw)
+    except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+        return detail
+    if (
+        not isinstance(done, dict)
+        or type(done.get("schema_version")) is not int
+        or done["schema_version"] != 1
+        or done.get("job_id") != job_id
+        or type(done.get("rc")) is not int
+        or not 0 <= done["rc"] <= 255
+    ):
+        return detail
+    detail.update(native_state="done", job_id=job_id, native_rc=done["rc"], done_sha256=_sha(raw))
+    if isinstance(done.get("reason"), str):
+        detail["reason"] = done["reason"]
+    return detail
+
+
 def _execute(repo: Path, directory: Path, subject: dict, packet: dict, args: Any, *, recovering: bool = False) -> dict:
     from workbay_protocol.remote_probe import resolve_remote_gate_host
 
     from .adapters.remote_exec import _parse_remote_gate_env_line, _source_provenance_from_json, resolve_transport
+    from .offload_pass import PassStateUnreadable, read_pass_state
 
     route = packet["binding"]["model_route"]
     try:
@@ -763,13 +820,29 @@ def _execute(repo: Path, directory: Path, subject: dict, packet: dict, args: Any
         )
         if brief.read_bytes() != _json(packet).encode("utf-8"):
             raise ReviewFailure("review_identity_conflict", "native brief changed")
+        if old:
+            read_pass_state(get_runtime_config().state_dir, identity.pass_id, strict=True)
+            if (failure := plan_review_failure(old)) is not None:
+                raise ReviewFailure("review_transport_failed", failure)
         selected = {"transport_path": str(transport.path), "transport_digest": transport.digest}
         with remote_job_runner._authenticated_transport(command, selected) as authenticated:
+            deadline = time.monotonic() + timeout
             completed = run(authenticated, cwd=str(delivery), env=env, timeout=timeout)
-        if completed.returncode != 0:
-            raise ReviewFailure(
-                "review_transport_failed", {"native_rc": completed.returncode, "stderr": completed.stderr[-1500:]}
-            )
+            if completed.returncode != 0:
+                detail = _transport_failure_detail(
+                    completed,
+                    authenticated,
+                    cwd=str(delivery),
+                    env=env,
+                    directory=directory,
+                    job_id=identity.job_id,
+                    deadline=deadline,
+                    collection_attempted=run is remote_job_runner.collect_only,
+                )
+                if detail.get("native_state") == "done":
+                    # Bind this attempt to the native exit. The ledger retains its first observation for replay.
+                    ledger.mark_done(identity.job_id, detail["native_rc"], native_failure=detail)
+                raise ReviewFailure("review_transport_failed", detail)
         ledger.mark_done(identity.job_id, 0)
         proof, error = _source_provenance_from_json(
             directory / "provenance.json",
@@ -785,6 +858,8 @@ def _execute(repo: Path, directory: Path, subject: dict, packet: dict, args: Any
         value = _read_analysis_result(result, schema)
         _validate_result(value, packet["binding"])
         return value
+    except PassStateUnreadable as exc:
+        raise ReviewFailure("review_transport_failed", exc.hold(identity.job_id)) from exc
     except ReviewFailure:
         raise
     except RemoteJobLedgerError as exc:

@@ -9,6 +9,7 @@ from typing import Any, Optional
 PLAN_ID_RE = re.compile(r"<!--\s*plan-id:\s*([A-Za-z0-9._:-]+)\s*-->")
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.*\S)\s*$")
 CHECKLIST_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s+(.*\S)\s*$")
+PLAN_DISPATCH_RE = re.compile(r"\[plan-dispatch\]")
 LANE_TAG_RE = re.compile(r"\[lane:([A-Za-z0-9._-]+)\]")
 
 
@@ -20,6 +21,7 @@ class ParsedPlanItem:
     line_start: int
     ordinal: int
     explicit_plan_id: Optional[str] = None
+    dispatch_designated: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ def parse_task_plan(path: str | Path) -> list[ParsedPlanItem]:
                     line_start=line_no,
                     ordinal=ordinal,
                     explicit_plan_id=pending_plan_id,
+                    dispatch_designated=PLAN_DISPATCH_RE.search(text) is not None,
                 )
             )
             pending_plan_id = None
@@ -98,7 +101,7 @@ def derive_plan_item_id(item: ParsedPlanItem) -> str:
 def normalize_plan_item(item: ParsedPlanItem) -> DerivedSlice:
     explicit_lane_match = LANE_TAG_RE.search(item.text)
     explicit_lane: Optional[str] = explicit_lane_match.group(1).strip() if explicit_lane_match else None
-    summary = _strip_lane_tags(item.text)
+    summary = _strip_lane_tags(PLAN_DISPATCH_RE.sub("", item.text))
     return DerivedSlice(
         plan_item_id=derive_plan_item_id(item),
         summary=summary,

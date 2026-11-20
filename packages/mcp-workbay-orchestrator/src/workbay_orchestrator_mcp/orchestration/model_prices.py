@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from workbay_protocol import reasoning_effort as model_routing
+
 
 @dataclass(frozen=True, slots=True)
 class ModelPrice:
@@ -25,18 +27,18 @@ class ModelPrice:
 #: ``backend::model`` → USD rates. Keep keys exact against producer labels.
 PRICES: dict[str, ModelPrice] = {
     # xAI grok-cli retired pin; approximate public rates.
-    "grok-cli::grok-4.5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
+    f"grok-cli::{model_routing.ModelId.GROK_RETIRED}": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     # xAI grok-cli default pin (DEFAULT_GROK_MODEL); approximate public rates.
-    "grok-cli::grok-4.6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "grok-cli::grok-4": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
+    f"grok-cli::{model_routing.ModelId.GROK_CURRENT}": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
+    f"grok-cli::{model_routing.ModelId.GROK_LEGACY}": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     # Codex CLI / OpenAI family (common offload backends).
-    "codex-cli::gpt-5.4": ModelPrice(input_per_mtok=2.5, output_per_mtok=10.0),
-    "codex-cli::gpt-5": ModelPrice(input_per_mtok=2.5, output_per_mtok=10.0),
-    "codex-cli::o3": ModelPrice(input_per_mtok=10.0, output_per_mtok=40.0),
-    "codex-cli::o4-mini": ModelPrice(input_per_mtok=1.1, output_per_mtok=4.4),
+    f"codex-cli::{model_routing.ModelId.CODEX_GPT_54}": ModelPrice(input_per_mtok=2.5, output_per_mtok=10.0),
+    f"codex-cli::{model_routing.ModelId.CODEX_GPT_5}": ModelPrice(input_per_mtok=2.5, output_per_mtok=10.0),
+    f"codex-cli::{model_routing.ModelId.CODEX_O3}": ModelPrice(input_per_mtok=10.0, output_per_mtok=40.0),
+    f"codex-cli::{model_routing.ModelId.CODEX_O4_MINI}": ModelPrice(input_per_mtok=1.1, output_per_mtok=4.4),
     # Claude Code host backends.
-    "claude-code::claude-sonnet-4": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-code::claude-opus-4": ModelPrice(input_per_mtok=15.0, output_per_mtok=75.0),
+    f"claude-code::{model_routing.ModelId.CLAUDE_SONNET_4}": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
+    f"claude-code::{model_routing.ModelId.CLAUDE_OPUS_4}": ModelPrice(input_per_mtok=15.0, output_per_mtok=75.0),
 }
 
 

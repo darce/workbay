@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import inspect
 import logging
-import math
 import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+from workbay_handoff_mcp.bounded_call import validate_timeout_seconds
 
 PROBE_TIMEOUT_ENV = "WORKBAY_BACKEND_PROBE_TIMEOUT_S"
 PROBE_AGGREGATE_TIMEOUT_ENV = "WORKBAY_BACKEND_PROBE_AGGREGATE_TIMEOUT_S"
@@ -37,21 +38,12 @@ _inflight: dict[tuple[str, Callable[..., dict[str, Any]]], tuple[threading.Event
 def probe_deadline_from_env(env_var: str, default: float) -> float:
     """Read a finite, positive float deadline (seconds) from ``env_var``.
 
-    Only finite values strictly greater than zero are valid; anything else —
-    unset, empty, unparseable, ``"0"``, negative, ``inf``/``nan`` — falls back
-    to ``default``. In particular ``"0"`` is invalid (it would disable the
-    bound, not tighten it) and ``inf`` is rejected because it would
-    reintroduce the unbounded wait these deadlines exist to remove.
+    Unset and empty settings use the default. An explicitly configured value
+    must be numeric, finite and positive; invalid configuration is reported
+    instead of silently changing the budget.
     """
     raw = os.environ.get(env_var)
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return default
-        if math.isfinite(value) and value > 0:
-            return value
-    return default
+    return validate_timeout_seconds(raw if raw else default, name=env_var)
 
 
 def _fmt_deadline_s(value: float) -> str:
@@ -145,6 +137,8 @@ def _completed_result(
         outcome = {"error": TypeError(f"probe for {name!r} returned {type(bad_result).__name__}, expected a mapping")}
     if "error" in outcome:
         probe_exc = outcome["error"]
+        if isinstance(probe_exc, BaseException) and not isinstance(probe_exc, Exception):
+            raise probe_exc
         # up0824-ppd-r2-f02: a dead/erroring probe must not fail open silently
         # — only _expired_result logged before this fix, so a raised-exception
         # (or now, a non-mapping) probe result was invisible to operators.
@@ -214,7 +208,7 @@ def _start_or_join_probe(
         def _run_probe() -> None:
             try:
                 outcome["result"] = _invoke_probe(name, probe=probe, workspace_root=workspace_root)
-            except BaseException as exc:  # degrade a failed probe; never raise from its daemon thread
+            except BaseException as exc:  # deliver exceptions to waiting callers
                 outcome["error"] = exc
             finally:
                 done.set()
@@ -238,6 +232,7 @@ def bounded_probe(
     resolved_deadline = (
         probe_deadline_from_env(PROBE_TIMEOUT_ENV, DEFAULT_PROBE_TIMEOUT_S) if deadline_s is None else deadline_s
     )
+    resolved_deadline = validate_timeout_seconds(resolved_deadline, name="deadline_s")
     started = time.monotonic()
     done, outcome = _start_or_join_probe(name, probe=probe, workspace_root=workspace_root)
     if not done.wait(resolved_deadline):
@@ -273,6 +268,8 @@ def bounded_probe_many(
         if aggregate_s is None
         else aggregate_s
     )
+    resolved_per_probe = validate_timeout_seconds(resolved_per_probe, name="per_probe_s")
+    resolved_aggregate = validate_timeout_seconds(resolved_aggregate, name="aggregate_s")
     slots: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
     started = time.monotonic()
 

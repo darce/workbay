@@ -31,14 +31,23 @@ _PACKAGED_COLLECTOR = Path(__file__).resolve().parents[1] / "collector_dist" / _
 NODE_MISSING_MESSAGE = (
     "node not found: install Node.js >=20 or set WORKBAY_NODE; viewing needs no Node, only Refresh collects sources"
 )
+# A toolchain root reaches a copyable shell command only as a plain relative path
+# that no shell or npm option parser can reinterpret.
+_SHELL_SAFE_ROOT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+_MAX_REMEDY_ROOT_CHARS = 200
 
 
 class InventoryCollectError(RuntimeError):
     """Collector spawn, timeout, or payload error."""
 
-    def __init__(self, message: str, *, reason: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, reason: str | None = None,
+        remedy: str | None = None, dependency_root: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason = reason
+        self.remedy = remedy
+        self.dependency_root = dependency_root
 
 
 @dataclass(frozen=True)
@@ -160,6 +169,8 @@ def run_collector(config: DesignSources, *, workspace_root: Path, collector: Pat
         "max_css_bytes": MAX_CSS_BYTES,
         "max_asset_file_bytes": MAX_ASSET_FILE_BYTES,
     }
+    if config.toolchain_root is not None:
+        request["toolchain_root"] = config.toolchain_root
     env_node = os.environ.get("WORKBAY_NODE")
     node = env_node or shutil.which("node")
     if not node:
@@ -187,9 +198,12 @@ def run_collector(config: DesignSources, *, workspace_root: Path, collector: Pat
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         if proc.returncode == 4:
+            remedy, dependency_root = _stderr_dependency_remedy(stderr, config.toolchain_root)
             raise InventoryCollectError(
-                f"inventory collector deps missing: {_stderr_code(stderr)}",
+                "inventory collector deps missing: deps_missing",
                 reason="deps_missing",
+                remedy=remedy,
+                dependency_root=dependency_root,
             )
         code = _stderr_diagnostic_code(stderr)
         raise InventoryCollectError(
@@ -226,22 +240,35 @@ def run_collector(config: DesignSources, *, workspace_root: Path, collector: Pat
     return raw
 
 
-def _stderr_code(stderr: str) -> str:
-    last = ""
-    for line in stderr.splitlines():
-        stripped = line.strip()
-        if stripped:
-            last = stripped
-    if not last:
-        return "deps_missing"
+def _dependency_remedy(toolchain_root: str | None) -> str | None:
+    if (
+        toolchain_root is None
+        or len(toolchain_root) > _MAX_REMEDY_ROOT_CHARS
+        or _SHELL_SAFE_ROOT_RE.fullmatch(toolchain_root) is None
+    ):
+        return None
+    return f"npm --prefix {toolchain_root} ci"
+
+
+def _stderr_dependency_remedy(stderr: str, toolchain_root: str | None) -> tuple[str | None, str | None]:
+    """Project only the configured root's own repair pair, never diagnostic prose."""
+    remedy = _dependency_remedy(toolchain_root)
+    if remedy is None:
+        return None, None
+    last = next((line.strip() for line in reversed(stderr.splitlines()) if line.strip()), "")
     try:
         payload = json.loads(last)
     except json.JSONDecodeError:
-        return "deps_missing"
-    code = payload.get("code") if isinstance(payload, dict) else None
-    if isinstance(code, str) and code and "/" not in code and "\\" not in code:
-        return code
-    return "deps_missing"
+        return None, None
+    if (
+        isinstance(payload, dict)
+        and payload.keys() <= {"code", "message", "remedy", "dependency_root"}
+        and payload.get("code") == "deps_missing"
+        and payload.get("remedy") == remedy
+        and payload.get("dependency_root") == toolchain_root
+    ):
+        return remedy, toolchain_root
+    return None, None
 
 
 def _stderr_diagnostic_code(stderr: str) -> str | None:

@@ -19,6 +19,7 @@ from . import artifact_index as artifact_index
 from . import read_budget as read_budget_module
 from . import read_profiles as read_profiles_module
 from .compaction import build_context_refresh_packet
+from .continuation import _PhaseTimer
 from .current_task_rendering import (  # noqa: F401
     _build_current_task_state_from_snapshot,
     _collect_all_deferred_findings,
@@ -932,10 +933,7 @@ def _peek_continuation_packet_id(task_ref: str | None) -> str | None:
 
     config = get_runtime_config()
     wanted_label = continuation_source_label(None)
-    try:
-        conn = artifact_index.get_artifact_db_connection(config.artifact_db_path)
-    except RuntimeError:
-        return None
+    conn = artifact_index.get_artifact_db_connection(config.artifact_db_path)
     try:
         row = conn.execute(
             """
@@ -1025,6 +1023,13 @@ def load_session(
     ``get_handoff_state`` so routine compound reads omit the ~13KB
     ``limits.write.tools`` registry unless the caller opts in.
     """
+    timer = _PhaseTimer()
+
+    def timed_failure(result: dict, phase: str) -> dict:
+        timer.mark(phase)
+        result.setdefault("data", {})["phase_timings_ns"] = timer.snapshot()
+        return result
+
     # [DATA-14] bare-call default budget (no profile + no explicit budget +
     # no explicit sections= shape; S10-A-02 exemption).
     response_budget_bytes, budget_policy, _bare_budget_applied = read_budget_module.apply_bare_call_budget_defaults(
@@ -1044,17 +1049,20 @@ def load_session(
             top_n_touched_files=top_n_touched_files,
         )
     except read_profiles_module.UnknownProfileError as exc:
-        return _envelope(
-            ok=False,
-            tool="load_session",
-            task_ref=task_ref,
-            data={
-                "error": (
-                    f"Unknown read_profile {exc.name!r}. "
-                    f"Valid profiles: {list(read_profiles_module.VALID_PROFILE_NAMES)}."
-                ),
-                "valid_profiles": list(read_profiles_module.VALID_PROFILE_NAMES),
-            },
+        return timed_failure(
+            _envelope(
+                ok=False,
+                tool="load_session",
+                task_ref=task_ref,
+                data={
+                    "error": (
+                        f"Unknown read_profile {exc.name!r}. "
+                        f"Valid profiles: {list(read_profiles_module.VALID_PROFILE_NAMES)}."
+                    ),
+                    "valid_profiles": list(read_profiles_module.VALID_PROFILE_NAMES),
+                },
+            ),
+            "planning",
         )
 
     # internal: compound budget planning. We resolve the state
@@ -1074,17 +1082,20 @@ def load_session(
             top_n_findings=top_n_findings,
         )
     except read_profiles_module.UnknownProfileError as exc:
-        return _envelope(
-            ok=False,
-            tool="load_session",
-            task_ref=task_ref,
-            data={
-                "error": (
-                    f"Unknown read_profile {exc.name!r}. "
-                    f"Valid profiles: {list(read_profiles_module.VALID_PROFILE_NAMES)}."
-                ),
-                "valid_profiles": list(read_profiles_module.VALID_PROFILE_NAMES),
-            },
+        return timed_failure(
+            _envelope(
+                ok=False,
+                tool="load_session",
+                task_ref=task_ref,
+                data={
+                    "error": (
+                        f"Unknown read_profile {exc.name!r}. "
+                        f"Valid profiles: {list(read_profiles_module.VALID_PROFILE_NAMES)}."
+                    ),
+                    "valid_profiles": list(read_profiles_module.VALID_PROFILE_NAMES),
+                },
+            ),
+            "planning",
         )
 
     try:
@@ -1092,16 +1103,19 @@ def load_session(
             response_budget_bytes=response_budget_bytes, budget_policy=budget_policy
         )
     except read_budget_module.UnknownBudgetPolicyError as exc:
-        return _envelope(
-            ok=False,
-            tool="load_session",
-            task_ref=task_ref,
-            data={
-                "error": (
-                    f"Unknown budget_policy {exc.policy!r}. Valid policies: {list(read_budget_module.VALID_POLICIES)}."
-                ),
-                "valid_policies": list(read_budget_module.VALID_POLICIES),
-            },
+        return timed_failure(
+            _envelope(
+                ok=False,
+                tool="load_session",
+                task_ref=task_ref,
+                data={
+                    "error": (
+                        f"Unknown budget_policy {exc.policy!r}. Valid policies: {list(read_budget_module.VALID_POLICIES)}."
+                    ),
+                    "valid_policies": list(read_budget_module.VALID_POLICIES),
+                },
+            ),
+            "planning",
         )
 
     planned_state_shape, planned_add_on, budget_plan = read_budget_module.plan_session_read(
@@ -1111,19 +1125,22 @@ def load_session(
         budget_policy=effective_policy,
     )
     if budget_plan.fail_now:
-        return _envelope(
-            ok=False,
-            tool="load_session",
-            task_ref=task_ref,
-            data={
-                "error": (
-                    f"response_budget_bytes={response_budget_bytes} cannot fit requested compound shape "
-                    f"(estimated {budget_plan.estimated_initial_bytes} bytes). "
-                    "Retry with the suggested narrower profile or budget_policy='auto_summary'."
-                ),
-                "read_budget": read_budget_module.budget_payload(budget_plan),
-                "completion_attention": _session_completion_attention(task_ref, limit=0),
-            },
+        return timed_failure(
+            _envelope(
+                ok=False,
+                tool="load_session",
+                task_ref=task_ref,
+                data={
+                    "error": (
+                        f"response_budget_bytes={response_budget_bytes} cannot fit requested compound shape "
+                        f"(estimated {budget_plan.estimated_initial_bytes} bytes). "
+                        "Retry with the suggested narrower profile or budget_policy='auto_summary'."
+                    ),
+                    "read_budget": read_budget_module.budget_payload(budget_plan),
+                    "completion_attention": _session_completion_attention(task_ref, limit=0),
+                },
+            ),
+            "planning",
         )
     add_on = planned_add_on
 
@@ -1146,6 +1163,7 @@ def load_session(
     else:
         forwarded_sections = planned_state_shape.sections
 
+    timer.mark("planning")
     # Suppress the boundary around the delegated state read so the compound
     # ``load_session`` records exactly one ``load_session`` row rather than
     # double-counting a nested ``get_handoff_state`` row. The boundary (set by
@@ -1174,7 +1192,8 @@ def load_session(
         )
     if not state_envelope.get("ok"):
         state_envelope.setdefault("data", {})["completion_attention"] = _session_completion_attention(task_ref, limit=0)
-        return state_envelope
+        return timed_failure(state_envelope, "state")
+    timer.mark("state")
     state_data = state_envelope.get("data", {}) or {}
     resolved_task_ref = state_envelope.get("scope", {}).get("task_ref")
     record_orientation_read_once(
@@ -1244,17 +1263,7 @@ def load_session(
             if key == "compaction_advisory" or not key.startswith("compaction_"):
                 continue
             data[key] = value
-    if include_context_refresh:
-        advisory = data.get("compaction_advisory")
-        from .compaction import extract_visible_texts_for_semantic_reinjection
-
-        visible_texts = extract_visible_texts_for_semantic_reinjection(state_data)
-        data["context_refresh"] = build_context_refresh_packet(
-            task_ref=resolved_task_ref,
-            last_injected_compaction_id=last_injected_compaction_id,
-            advisory=advisory if isinstance(advisory, dict) else None,
-            visible_texts=visible_texts,
-        )
+    timer.mark("add_ons")
 
     # internal: auto-attach newest continuation packet (add-on).
     # Budget planner may list "continuation" in omitted_sections (zero/omit
@@ -1265,7 +1274,17 @@ def load_session(
     # scoped continuation load cannot silently bind a newer packet.
     continuation_omitted = "continuation" in budget_plan.omitted_sections
     resolved_for_cont = str(resolved_task_ref) if resolved_task_ref is not None else task_ref
-    packet_id = _peek_continuation_packet_id(resolved_for_cont)
+    continuation_lookup_failed = False
+    try:
+        packet_id = _peek_continuation_packet_id(resolved_for_cont)
+    except Exception as exc:  # noqa: BLE001 — do not mistake an unavailable store for an empty one
+        packet_id = None
+        continuation_lookup_failed = True
+        data["continuation_status"] = {
+            "status": "unavailable",
+            "code": "continuation_load_failed",
+            "error": str(exc) or type(exc).__name__,
+        }
     # The planner's omission is a pre-fetch ESTIMATE (worst-case caps); the
     # documented contract is that load_session auto-attaches the newest
     # packet. If the ACTUAL probe envelope plus reserve fits the budget,
@@ -1279,7 +1298,9 @@ def load_session(
             + read_budget_module.TRANSPORT_TRUNCATION_RESERVE_BYTES
             < response_budget_bytes
         )
-    if continuation_omitted and not _probe_fits:
+    if continuation_lookup_failed:
+        pass
+    elif continuation_omitted and not _probe_fits:
         if "continuation" not in omitted_sections:
             omitted_sections.append("continuation")
     elif continuation_omitted and _probe_fits:
@@ -1329,6 +1350,22 @@ def load_session(
             data["continuation"] = continuation_payload
             packet_id = continuation_payload.get("packet_id") or packet_id
 
+    timer.mark("continuation")
+    # Assemble the baseline first. Optional semantic work is bounded and runs
+    # on its own connection, so it cannot hold the continuation hostage.
+    if include_context_refresh:
+        advisory = data.get("compaction_advisory")
+        from .compaction import extract_visible_texts_for_semantic_reinjection
+
+        visible_texts = extract_visible_texts_for_semantic_reinjection(state_data)
+        data["context_refresh"] = build_context_refresh_packet(
+            task_ref=resolved_task_ref,
+            last_injected_compaction_id=last_injected_compaction_id,
+            advisory=advisory if isinstance(advisory, dict) else None,
+            visible_texts=visible_texts,
+        )
+        timer.mark("context_refresh")
+
     # Attach read_shape only when the caller requested a profile. The
     # state-side shape is mirrored from get_handoff_state; the session
     # add-on shape is rendered here.
@@ -1342,6 +1379,7 @@ def load_session(
     # supplied a budget or the planner applied any compound reductions.
     if response_budget_bytes is not None or budget_plan.applied_reductions:
         data["read_budget"] = read_budget_module.budget_payload(budget_plan)
+    data["phase_timings_ns"] = timer.snapshot()
     envelope = _envelope(ok=True, tool="load_session", data=data, task_ref=resolved_task_ref)
     # Final serializer byte check AFTER continuation/add-ons, only when a
     # budget is in effect (bare-call default or explicit). Explicit sections=
@@ -1422,6 +1460,7 @@ def load_session(
             ),
             "scoped_fetch": scoped_fetch,
             "completion_attention": _session_completion_attention(resolved_task_ref, limit=0),
+            "phase_timings_ns": timer.snapshot(),
         },
     )
     _reconcile_continuation_metadata(failure)

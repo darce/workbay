@@ -10,7 +10,16 @@ import time
 from pathlib import Path
 
 from . import fleet_lineage
-from .fleet_snapshot import _vm_unknown, build_lineage_tree, build_snapshot, read_snapshot_cache, write_snapshot_cache
+from .fleet_snapshot import (
+    NATIVE_RETIRE_FAILED_EXIT,
+    _vm_unknown,
+    build_lineage_tree,
+    build_snapshot,
+    read_snapshot_cache,
+    retire_native_groups,
+    retire_native_groups_on_sigterm,
+    write_snapshot_cache,
+)
 
 
 def _positive(value):
@@ -188,6 +197,41 @@ def _text(snapshot):
         )
     if snapshot.get("limits_hit"):
         lines.append("Partial reasons: " + ", ".join(snapshot["limits_hit"]))
+    if "plan" in snapshot:
+        lines.append(_plan_checklist_text(snapshot["plan"]))
+    return "\n".join(lines)
+
+
+def _plan_checklist_text(plan):
+    """Ordinary plan observations; harness evidence has its own renderer."""
+    lines = [f"Plan {plan.get('state', 'unknown').upper()} partial={plan.get('partial', True)}"]
+    for task in plan.get("tasks", []):
+        source = task.get("source") or {}
+        graph_state = task.get("graph_state", "unknown")
+        graph_label = "no plan graph" if graph_state == "no_plan_graph" else graph_state
+        lines.append(f"  {task['task_ref']}: {graph_label} source={source.get('state', 'unknown')} "
+                     f"{task.get('reason') or source.get('reason') or ''}")
+        for node in task.get("nodes", []):
+            lines.append(f"    {node['plan_item_id']} {node.get('title', '')}: {node['display_status']} "
+                         f"lane={node['lane_id']} cursor={node.get('cursor_state')} "
+                         f"lane_status={node.get('lane_status')} binding={node.get('cursor_binding')} "
+                         f"cursor_ids={node.get('cursor_ids', [])}")
+            for field in ("blockers", "waiting_on", "inconsistency_reasons", "unknown_reasons"):
+                if node.get(field):
+                    lines.append(f"      {field}: {', '.join(node[field])}")
+            if node.get("cursor_binding") == "ambiguous" or len(node.get("lanes", [])) > 1:
+                lines.append("      raw cursors=" + json.dumps(node.get("cursors", []), sort_keys=True)
+                             + " lanes=" + json.dumps(node.get("lanes", []), sort_keys=True))
+            for worker in node.get("workers", []):
+                age = worker.get("age_seconds")
+                lines.append(f"      worker job={worker.get('job_id')} pid={worker.get('pid')} "
+                             f"pids={worker.get('pids', [])} attempt={worker.get('attempt')} "
+                             f"{worker.get('presence_kind', 'unknown')} via={worker.get('attribution')} "
+                             f"age={'unknown' if age is None else f'{age:g}s'} "
+                             f"age_kind={worker.get('age_kind', 'unknown')} started_at={worker.get('started_at')} "
+                             f"quality={worker.get('quality', 'unknown')} reason={worker.get('reason')}")
+    if plan.get("limits_hit"):
+        lines.append("  Plan partial reasons: " + ", ".join(plan["limits_hit"]))
     return "\n".join(lines)
 
 
@@ -376,6 +420,7 @@ def workbay_front_door(argv=None) -> int:
                     "workbay fleet --serve needs Studio; from a checkout run: bash scripts/install-workbay-studio.sh <checkout>",
                     file=sys.stderr,
                 )
+                print("Or run: make dogfood DOGFOOD_SOURCE=worktree DOGFOOD_STUDIO=1", file=sys.stderr)
                 return 2
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False) if args.json else _text(snapshot))
         return 0  # An explicit UNKNOWN/partial observation is a valid report, not admission authorization.
@@ -384,5 +429,21 @@ def workbay_front_door(argv=None) -> int:
         return 2
 
 
+def _main() -> int:
+    """``python -m``: the collector FleetRefresher runs and stops with SIGTERM.
+
+    The native groups it started (separate sessions) die with it, on that
+    signal and on any exit, even while their timeout owner is still running.
+    """
+    retire_native_groups_on_sigterm()
+    try:
+        status = workbay_front_door()
+    finally:
+        leaked = retire_native_groups()
+        for failure in leaked:
+            print(f"workbay fleet: exit: {failure}", file=sys.stderr)
+    return NATIVE_RETIRE_FAILED_EXIT if leaked else status
+
+
 if __name__ == "__main__":
-    raise SystemExit(workbay_front_door())
+    raise SystemExit(_main())

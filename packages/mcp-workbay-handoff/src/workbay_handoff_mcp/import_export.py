@@ -14,7 +14,9 @@ import re
 import sqlite3
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -55,7 +57,9 @@ from .shared_schema import (
     REVIEW_FINDINGS_MIRRORED_COLUMNS,
     _get_db_connection,
     _open_bounded_roster_read_connection,
+    _retained_registration_store,
     archive_terminal_review_findings,
+    review_history_unavailable,
 )
 from .shared_write_context import (
     ResolvedWriteContext,
@@ -373,6 +377,63 @@ def _supersede_open_findings_for_archive(conn: sqlite3.Connection, task_ref: str
     return int(cast(int, result.get("migrated_findings") or 0))
 
 
+def _registration_id(row: dict, task_ref: str) -> int:
+    if (
+        not isinstance(row, dict)
+        or type(row.get("id")) is not int
+        or row["id"] <= 0
+        or row.get("task_ref") != task_ref
+        or (row.get("identity_seq") is not None and type(row["identity_seq"]) is not int)
+        or not all(isinstance(row.get(key), str) for key in ("lane_id", "branch", "worktree_path", "status"))
+    ):
+        raise ValueError("invalid retained lane registration")
+    return row["id"]
+
+
+def _registration_json(encoded: str):
+    try:
+        return json.loads(encoded)
+    except RecursionError as exc:
+        raise ValueError("unreadable lane registration history") from exc
+
+
+def _archive_registrations(task_ref: str, snapshot: dict, *, require_lanes: bool = True) -> dict[int, dict]:
+    if not isinstance(snapshot, dict) or (require_lanes and "worktree_lanes" not in snapshot):
+        raise ValueError("archived lane registrations unavailable")
+    rows = _parse_import_snapshot(snapshot).lanes
+    by_id = {_registration_id(row, task_ref): row for row in rows}
+    if len(by_id) != len(rows):
+        raise ValueError("duplicate archived lane registration")
+    return by_id
+
+
+def registration_history(conn: sqlite3.Connection, task_ref: str | None = None) -> list[dict]:
+    """Resolve current lane state by local row identity in the caller's read transaction."""
+    if not conn.in_transaction:
+        raise ValueError("registration history requires a transaction")
+    where = " WHERE task_ref = ?" if task_ref is not None else ""
+    args = (task_ref,) if task_ref is not None else ()
+    rows = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM worktree_lanes" + where, args)}
+
+    def include(row: dict):
+        existing = rows.get(row["id"])
+        if existing is None:
+            rows[row["id"]] = dict(row, _archived=True)
+        elif (existing["task_ref"], existing["lane_id"]) != (row["task_ref"], row["lane_id"]):
+            raise ValueError("conflicting retained lane registration")
+
+    # The row at removal supersedes a snapshot taken while it was still live.
+    tables = ["task_archives"]
+    if _retained_registration_store(conn):
+        tables.insert(0, "retained_registration_snapshots")
+    for table in tables:
+        for task, encoded in conn.execute(f"SELECT task_ref, snapshot_json FROM {table}" + where, args):
+            snapshot = _registration_json(encoded)
+            for row in _archive_registrations(task, snapshot, require_lanes=task_ref is None).values():
+                include(row)
+    return [rows[row_id] for row_id in sorted(rows)]
+
+
 def _persist_task_archive_snapshot(
     conn: sqlite3.Connection,
     *,
@@ -381,6 +442,19 @@ def _persist_task_archive_snapshot(
     ctx: ResolvedWriteContext,
     notes: str,
 ) -> None:
+    previous = conn.execute("SELECT snapshot_json FROM task_archives WHERE task_ref=?", (task_ref,)).fetchone()
+    if previous is not None and "worktree_lanes" in snapshot:
+        earlier = _registration_json(previous[0])
+        retained = _archive_registrations(task_ref, earlier, require_lanes=False)
+        if "worktree_lanes" not in earlier:
+            _retain_registration_snapshot(conn, task_ref, {})
+
+        for row in cast(list[dict], snapshot["worktree_lanes"]):
+            row_id = _registration_id(row, task_ref)
+            if row_id in retained and retained[row_id]["lane_id"] != row["lane_id"]:
+                raise ValueError("conflicting archived lane registration")
+            retained[row_id] = row
+        snapshot = dict(snapshot, worktree_lanes=list(retained.values()))
     conn.execute(
         """
         INSERT INTO task_archives (task_ref, archived_at, archived_by, archived_branch, archived_commit_sha, notes, snapshot_json)
@@ -428,6 +502,23 @@ def _load_test_trace_map(conn: sqlite3.Connection, test_ids: list[int]) -> dict[
     return trace_map
 
 
+# Portable identities. SQLite row IDs and generated columns belong to the destination.
+_REVIEW_HISTORY_KEYS = {
+    "review_runs": ("review_run_id",),
+    "branch_review_judgments": ("run_id", "task_ref", "branch", "commit_sha"),
+    "dispatch_attempts": ("subject_key", "ordinal", "lane_id"),
+}
+
+
+def _history_scope(table: str) -> str:
+    return "subject_key" if table == "dispatch_attempts" else "task_ref"
+
+
+def _history_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    # table_info omits generated columns. Only schema-owned names enter SQL.
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})") if row["name"] != "id"]
+
+
 def _snapshot_with_test_traces(
     conn: sqlite3.Connection, snapshot: TaskSnapshot | Mapping[str, object]
 ) -> dict[str, object]:
@@ -439,6 +530,17 @@ def _snapshot_with_test_traces(
             (snapshot["task_ref"],),
         ).fetchall()
     ]
+    task_ref = snapshot["task_ref"]
+    for table, key in _REVIEW_HISTORY_KEYS.items():
+        columns = ", ".join(_history_columns(conn, table))
+        payload[table] = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT {columns} FROM {table} WHERE {_history_scope(table)} = ? ORDER BY {', '.join(key)}",
+                (task_ref,),
+            )
+        ]
+    payload["review_history_state"] = "unavailable" if review_history_unavailable(conn, task_ref) else "available"
     raw_tests = payload.get("verified_tests")
     if not isinstance(raw_tests, list):
         return payload
@@ -454,6 +556,7 @@ def export_handoff_state(
     task_ref: str | None = None, output_path: str | None = None, include_markdown: bool = False
 ) -> dict:
     with _get_db_connection() as conn:
+        conn.execute("BEGIN")  # Pin the findings, their runs and the attempt history to one read snapshot.
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         snapshot = _snapshot_with_test_traces(conn, _collect_task_snapshot(conn, resolved_task_ref))
     payload: dict[str, object] = {
@@ -736,7 +839,7 @@ def _parse_import_snapshot(snapshot: dict) -> SnapshotImportData:
         raw = snapshot.get(snapshot_key, [])
         if not isinstance(raw, list):
             raise ValueError(f"snapshot field '{snapshot_key}' must be a list, got {type(raw).__name__}")
-        extracted[attr_name] = raw
+        extracted[attr_name] = list(raw)
     roster = snapshot.get("task_tool_roster")
     if roster is not None and not isinstance(roster, dict):
         raise ValueError(f"snapshot field 'task_tool_roster' must be an object or null, got {type(roster).__name__}")
@@ -769,11 +872,20 @@ def _import_review_finding_rows(
     fallback_agent: str,
     fallback_branch: str,
     fallback_commit: str | None,
+    reconcile: bool = False,
 ) -> None:
     table = "review_findings_archive" if archived else "review_findings"
     columns = [column for column in REVIEW_FINDINGS_MIRRORED_COLUMNS if column != "id"]
+    resident_occurrences: Counter[tuple] = Counter()
     if archived:
-        columns.extend(("id", "archived_at"))
+        columns.append("archived_at")
+        if reconcile and findings:
+            # Archive IDs are local and several occurrences can share a timestamp.
+            # Count portable row values before inserting anything into the archive.
+            resident = conn.execute(
+                f"SELECT {', '.join(columns)} FROM review_findings_archive WHERE task_ref = ?", (task_ref,)
+            )
+            resident_occurrences.update(map(tuple, resident))
     for row in findings:
         agent, harness, branch, commit_sha, _model, _model_label, _reasoning_level = _resolve_import_actor_values(
             row,
@@ -795,11 +907,22 @@ def _import_review_finding_rows(
             harness=harness,
             branch=branch,
             commit_sha=commit_sha,
-            reopen_count=int(row.get("reopen_count") or 0),
+            reopen_count=0 if archived else int(row.get("reopen_count") or 0),
             created_at=_row_created_at(row, now),
             updated_at=_row_updated_at(row, now, fallback_keys=("resolved_at",)),
         )
         if archived:
+            # Archive exports carry the stored values, including explicit nulls.
+            # Keep defaults only for absent fields and bind the task to the import scope.
+            values["archived_at"] = now
+            for column in columns:
+                if column != "task_ref" and column in row:
+                    values[column] = row[column]
+            if resident_occurrences:
+                occurrence = tuple(values[column] for column in columns)
+                if resident_occurrences[occurrence] > 0:
+                    resident_occurrences[occurrence] -= 1
+                    continue
             # Retention copies hot IDs into the cold table. Allocate from both
             # tables and advance the hot sequence so later retention cannot
             # collide with IDs allocated by this import.
@@ -807,11 +930,17 @@ def _import_review_finding_rows(
                 "SELECT MAX(id) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS id FROM review_findings "
                 "UNION ALL SELECT COALESCE(MAX(id), 0) FROM review_findings_archive)"
             ).fetchone()[0]
-            values["archived_at"] = row.get("archived_at") or now
-        placeholders = ", ".join("?" for _ in columns)
+        elif reconcile:
+            existing = conn.execute(
+                "SELECT * FROM review_findings WHERE task_ref=:task_ref AND finding_id=:finding_id", values
+            ).fetchone()
+            if existing is not None:
+                _fill_missing_review_values(conn, table, values, existing, "id=?", (existing["id"],))
+                continue
+        placeholders = ", ".join("?" for _ in values)
         conn.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-            tuple(values[column] for column in columns),
+            f"INSERT INTO {table} ({', '.join(values)}) VALUES ({placeholders})",
+            tuple(values.values()),
         )
         if archived:
             conn.execute(
@@ -1115,12 +1244,232 @@ def _check_native_import(
             raise _NativeImportRefusal("replace_task cannot discard an existing native validation hold.")
 
 
+def _retain_registration_snapshot(conn: sqlite3.Connection, task_ref: str, snapshot: dict) -> None:
+    _retained_registration_store(conn, create=True)
+    conn.execute(
+        "INSERT INTO retained_registration_snapshots(task_ref, snapshot_json) VALUES (?, ?)",
+        (task_ref, json.dumps(snapshot, sort_keys=True)),
+    )
+
+
+def _retain_displaced_lanes(conn: sqlite3.Connection, task_ref: str, incoming: list[dict]) -> set[tuple]:
+    """Keep matching local registrations in place. Retain each displaced row before deleting it."""
+    # Only the local row can supply native identity and lifecycle facts. An
+    # imported namesake with different facts cannot retire that registration.
+    issuer_fields = ("task_ref", "lane_id", "worktree_path", "branch", "status", "identity_seq")
+    imported = {row["id"]: row for row in incoming if type(row.get("id")) is int}
+    kept = set()
+    displaced = []
+    for row in conn.execute("SELECT * FROM worktree_lanes WHERE task_ref=?", (task_ref,)):
+        candidate = imported.get(row["id"])
+        if candidate is not None and all(row[key] == candidate.get(key) for key in issuer_fields):
+            kept.add((row["id"], task_ref, row["lane_id"]))
+        else:
+            displaced.append(dict(row))
+    if displaced:
+        _retain_registration_snapshot(conn, task_ref, {"worktree_lanes": displaced})
+        conn.executemany("DELETE FROM worktree_lanes WHERE id=?", [(row["id"],) for row in displaced])
+    return kept
+
+
 def _native_import_refusal(task_ref: str, exc: _NativeImportRefusal) -> dict:
     return _envelope(
         ok=False,
         tool="import_handoff_state",
         task_ref=task_ref,
         data={"error": str(exc), "error_kind": "native_validation_required"},
+    )
+
+
+class _ReviewHistoryRefusal(ValueError):
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+
+
+def _merge_review_history_rows(conn: sqlite3.Connection, task_ref: str, table: str, rows: list[dict]) -> None:
+    key = _REVIEW_HISTORY_KEYS[table]
+    scope = _history_scope(table)
+    columns = _history_columns(conn, table)
+    where = " AND ".join(f"{name} = ?" for name in key)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise _ReviewHistoryRefusal("invalid_review_history", f"{table} must be an array of objects")
+    for row in rows:
+        if table == "dispatch_attempts" and type(row.get("ordinal")) is not int:
+            raise _ReviewHistoryRefusal("invalid_review_history", "dispatch_attempts ordinal must be an integer")
+        if row.get(scope) != task_ref or any(row.get(name) is None for name in key) or row.keys() - set(columns):
+            raise _ReviewHistoryRefusal("invalid_review_history", f"Invalid {table} identity or columns")
+        if table == "branch_review_judgments":
+            for field, kind in (("sources_json", dict), ("judge_pin_json", dict), ("blocking_ids", list)):
+                value = row.get(field)
+                if value is not None:
+                    try:
+                        valid = isinstance(json.loads(value), kind)
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid:
+                        raise _ReviewHistoryRefusal("invalid_review_history", f"Invalid judgment {field}")
+        identity = tuple(row[name] for name in key)
+        current = conn.execute(f"SELECT * FROM {table} WHERE {where}", identity).fetchone()
+        if current is None:
+            names = [name for name in columns if name in row]
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                tuple(row[name] for name in names),
+            )
+            if table != "review_runs":
+                continue
+            # The branch projection trigger can populate cycle and model on insert.
+            # Reconcile the observed row under the same conflict rules as a replay.
+            current = conn.execute(f"SELECT * FROM {table} WHERE {where}", identity).fetchone()
+        _fill_missing_review_values(conn, table, row, current, where, identity)
+
+
+def _merge_review_metadata(stored: dict, incoming: dict) -> dict:
+    merged = dict(stored)
+    for key, value in incoming.items():
+        old = merged.get(key)
+        if isinstance(old, dict) and isinstance(value, dict):
+            merged[key] = _merge_review_metadata(old, value)
+        elif old is None:
+            merged[key] = value
+        elif value is not None and old != value:
+            raise _ReviewHistoryRefusal("review_history_conflict", f"Conflicting review metadata: {key}")
+    return merged
+
+
+def _fill_missing_review_values(conn, table, values, current, where, identity):
+    updates = {}
+    for name, value in values.items():
+        if value is None or value == current[name]:
+            continue
+        if name in ("judge_pin_json", "sources_json") and current[name] is not None:
+            try:
+                stored, incoming = json.loads(current[name]), json.loads(value)
+                if not isinstance(stored, dict) or not isinstance(incoming, dict):
+                    raise ValueError("expected an object")
+                had_unavailable = name == "judge_pin_json" and (
+                    "unavailable_fields" in stored or "unavailable_fields" in incoming
+                )
+                if had_unavailable:
+                    unavailable = stored.pop("unavailable_fields", []) + incoming.pop("unavailable_fields", [])
+                merged = _merge_review_metadata(stored, incoming)
+                if had_unavailable:
+                    observed = dict(current) | {k: v for k, v in values.items() if v is not None} | merged
+                    merged["unavailable_fields"] = [k for k in dict.fromkeys(unavailable) if observed.get(k) is None]
+                if merged != json.loads(current[name]):
+                    updates[name] = json.dumps(merged, sort_keys=True)
+            except _ReviewHistoryRefusal:
+                raise
+            except (ValueError, TypeError) as exc:
+                raise _ReviewHistoryRefusal("invalid_review_history", f"Invalid {name}: {exc}") from exc
+            continue
+        if current[name] is not None:
+            code = "dispatch_attempt_evidence_conflict" if table == "dispatch_attempts" else "review_history_conflict"
+            raise _ReviewHistoryRefusal(code, f"{table} {identity!r} has conflicting {name}")
+        updates[name] = value
+    if updates:
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        conn.execute(f"UPDATE {table} SET {assignments} WHERE {where}", (*updates.values(), *identity))
+
+
+# The other legacy sections have their own conflict keys or replay checks.
+_APPEND_ONLY_SECTIONS = (
+    "blockers",
+    "next_actions",
+    "verified_tests",
+    "worktree_lanes",
+    "worker_reports",
+    "lane_messages",
+    "plan_cursors",
+    "turn_metrics",
+    "active",
+)
+
+
+def _legacy_section_digest(conn, task_ref, section):
+    tables = ("handoff_state",) if section == "active" else (section,)
+    if section == "verified_tests":
+        tables += ("test_traces",)
+    digest = hashlib.sha256()
+    for table in tables:
+        for row in conn.execute(f"SELECT * FROM {table} WHERE task_ref=? ORDER BY rowid", (task_ref,)):
+            digest.update(_import_digest(list(row)).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _restore_review_history(
+    conn, task_ref, snapshot, data, mode, set_active, allow_destructive_clear, production_imports
+):
+    """Reconcile review evidence inside the caller's transaction, including on exact replay."""
+    sections = _REVIEW_HISTORY_KEYS.keys() & snapshot.keys()
+    state = snapshot.get("review_history_state", "unavailable")
+    if sections or "review_history_state" in snapshot:
+        if sections != _REVIEW_HISTORY_KEYS.keys() or snapshot.get("review_history_state") not in (
+            "available",
+            "unavailable",
+        ):
+            raise _ReviewHistoryRefusal("invalid_review_history", "Incomplete review history sections or state")
+    previous = conn.execute("SELECT * FROM review_snapshot_history WHERE task_ref=?", (task_ref,)).fetchone()
+    known_local = previous is not None and previous["state"] == "available"
+    # A complete snapshot participates in reconciliation even when all three arrays are empty.
+    reconcile = bool(sections)
+    for table in _REVIEW_HISTORY_KEYS:
+        scope = _history_scope(table)
+        exists = conn.execute(f"SELECT 1 FROM {table} WHERE {scope}=? LIMIT 1", (task_ref,)).fetchone()
+        if exists is not None:
+            reconcile = True
+            if previous is None and table == "dispatch_attempts":
+                known_local = True
+        if table not in sections:
+            continue  # Absent optional sections never delete local evidence.
+        rows = snapshot[table]
+        if mode == "replace_task":
+            if exists is not None and not rows and not allow_destructive_clear:
+                raise _ReviewHistoryRefusal("destructive_clear_required", f"replace_task would clear {table}")
+            conn.execute(f"DELETE FROM {table} WHERE {scope}=?", (task_ref,))
+    for table in _REVIEW_HISTORY_KEYS:
+        if table not in sections:
+            continue
+        rows = snapshot[table]
+        try:
+            _merge_review_history_rows(conn, task_ref, table, rows)
+        except (sqlite3.IntegrityError, sqlite3.ProgrammingError, OverflowError) as exc:
+            raise _ReviewHistoryRefusal("invalid_review_history", f"{table}: {exc}") from exc
+
+    if known_local and (mode == "merge" or not sections):
+        state = "available"
+    # The legacy importer appends rows that have no portable key. Only skip
+    # a replay when both its input and the resident section still match.
+    try:
+        previous_digests = json.loads(previous["legacy_sections_json"]) if previous else {}
+        if not isinstance(previous_digests, dict):
+            raise ValueError("expected a mapping")
+    except (TypeError, ValueError) as exc:
+        raise _ReviewHistoryRefusal("review_history_unavailable", "Unreadable legacy import receipt") from exc
+    inputs = {}
+    for name, attr in (*_SNAPSHOT_LIST_FIELDS, ("active", "active")):
+        if name not in _APPEND_ONLY_SECTIONS or not snapshot.get(name):
+            continue
+        if (name == "active" and not set_active) or (name == "worker_reports" and production_imports):
+            continue
+        inputs[name] = _import_digest(snapshot[name])
+        if reconcile and mode == "merge" and name in previous_digests:
+            if previous_digests[name] == [inputs[name], _legacy_section_digest(conn, task_ref, name)]:
+                if name == "active":
+                    data.active = None
+                else:
+                    getattr(data, attr).clear()
+    return reconcile, state, inputs
+
+
+def _finish_review_history_import(conn, task_ref, state, inputs):
+    digests = {name: [value, _legacy_section_digest(conn, task_ref, name)] for name, value in inputs.items()}
+    conn.execute(
+        """INSERT INTO review_snapshot_history(task_ref, state, legacy_sections_json)
+           VALUES (?, ?, ?) ON CONFLICT(task_ref) DO UPDATE SET state=excluded.state,
+           legacy_sections_json=excluded.legacy_sections_json""",
+        (task_ref, state, json.dumps(digests, sort_keys=True)),
     )
 
 
@@ -1131,6 +1480,7 @@ def _import_snapshot(
     mode: str,
     set_active: bool,
     production_imports: dict[int, _ReportImport] | None = None,
+    allow_destructive_clear: bool = False,
 ) -> dict[str, int]:
     _check_native_import(snapshot)
     data = _parse_import_snapshot(snapshot)
@@ -1168,10 +1518,12 @@ def _import_snapshot(
                 retained = _find_imported_report(conn, prepared)
                 if retained is not None:
                     prepared.report_id = retained["id"]
+    retained_live: set[tuple] = set()
     if mode == "replace_task":
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
         _check_native_import(snapshot, conn, task_ref, mode)
+        retained_live = _retain_displaced_lanes(conn, task_ref, lanes)
         for table in (
             "blockers",
             "next_actions",
@@ -1179,7 +1531,6 @@ def _import_snapshot(
             "test_traces",
             "verified_tests",
             "review_findings",
-            "worktree_lanes",
             "worker_reports",
             "lane_messages",
             "task_tool_roster",
@@ -1190,6 +1541,11 @@ def _import_snapshot(
             conn.execute(f"DELETE FROM {table} WHERE task_ref = ?", (task_ref,))
     if mode == "replace_task" and "review_findings_archive" in snapshot:
         conn.execute("DELETE FROM review_findings_archive WHERE task_ref = ?", (task_ref,))
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    reconcile_findings, history_state, legacy_inputs = _restore_review_history(
+        conn, task_ref, snapshot, data, mode, set_active, allow_destructive_clear, production_imports
+    )
     for row in repo_instances:
         conn.execute(
             """
@@ -1316,12 +1672,29 @@ def _import_snapshot(
             task_ref,
             rows,
             archived=archived,
+            reconcile=reconcile_findings,
             now=now,
             fallback_agent=fallback_agent,
             fallback_branch=fallback_branch,
             fallback_commit=fallback_commit,
         )
     for row in lanes:
+        row_id = row.get("id")
+        identity = (row_id, row.get("task_ref"), row.get("lane_id"))
+        if type(row_id) is int and identity in retained_live:
+            conn.execute(
+                """UPDATE worktree_lanes SET title=?, objective=?, owner_agent=?, notes=?, updated_at=? WHERE id=?""",
+                (
+                    row.get("title"),
+                    row.get("objective"),
+                    row.get("owner_agent"),
+                    row.get("notes"),
+                    _row_updated_at(row, now),
+                    row_id,
+                ),
+            )
+            retained_live.remove(identity)
+            continue
         conn.execute(
             "INSERT INTO worktree_lanes (task_ref, lane_id, title, objective, worktree_path, branch, owner_agent, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -1463,11 +1836,12 @@ def _import_snapshot(
         )
     _import_plan_cursors(conn, task_ref, plan_cursors, now)
     _import_turn_metrics(conn, task_ref, turn_metrics, now)
-    if set_active and isinstance(active, dict):
+    if set_active and isinstance(data.active, dict):
         if production_imports:
             _set_import_active_state(conn, task_ref, active, git_context=(git_branch, git_commit))
         else:
             _set_import_active_state(conn, task_ref, active)
+    _finish_review_history_import(conn, task_ref, history_state, legacy_inputs)
     return {
         "blockers": len(blockers),
         "next_actions": len(actions),
@@ -1617,7 +1991,12 @@ def import_handoff_state(
                 mode=mode,
                 set_active=set_active,
                 production_imports=production_imports,
+                allow_destructive_clear=allow_destructive_clear,
             )
+    except _ReviewHistoryRefusal as exc:
+        return _envelope(
+            ok=False, tool="import_handoff_state", task_ref=task_ref, data={"error": str(exc), "error_kind": exc.code}
+        )
     except _NativeImportRefusal as exc:
         return _native_import_refusal(task_ref, exc)
     except Exception:
@@ -1784,21 +2163,27 @@ def gc_system_decisions(
     the task's archive lifetime ([RES-07]), not the default 180-day
     system-decision horizon. Both arms match the origin-stamp trigger so a
     namespaced form stamped ``system`` is never reclaimed while the prefix
-    form survives. When ``apply=True`` and at least one row is pruned,
-    inserts a summary decision (``tasks_gc_system_decisions_prune_<UTC stamp>``)
-    whose origin is stamped ``system`` by the S3a insert trigger. FTS cleanup
+    form survives. Immutable coordination facts (dispatch observations,
+    terminal authorizations, launch reservations, observation epochs) are
+    likewise never eligible: they are remote-obligation evidence, and their
+    protection trigger would otherwise abort the whole reclaim. When
+    ``apply=True`` and at least one row is pruned, inserts a summary
+    decision (``tasks_gc_system_decisions_prune_<UTC stamp>``) whose origin is stamped ``system`` by the S3a insert trigger. FTS cleanup
     is free via the existing ``decisions_fts_delete`` AFTER-DELETE trigger.
     """
     if cutoff_days < 1:
         cutoff_days = DEFAULT_SYSTEM_DECISION_GC_DAYS
 
+    from .coordination_declaration import immutable_fact_condition  # noqa: PLC0415
+
     age_sql = f"-{int(cutoff_days)} days"
     eligible = conn.execute(
-        """
+        f"""
         SELECT id FROM decisions
         WHERE decision_origin = 'system'
           AND decision NOT GLOB 'lane_landed_*'
           AND decision NOT GLOB '*_lane_landed_*'
+          AND NOT {immutable_fact_condition()}
           AND datetime(created_at) < datetime('now', ?)
         """,
         (age_sql,),
@@ -2379,6 +2764,183 @@ def _stale_maint_on_main_closeable(
     return True, f"stale MAINT-on-main row older than {days} days with no open findings"
 
 
+def planning_completion_hold_reason(
+    *, workspace_root: Path, task_ref: str, branch: str, source_tip: str, integration_ref: str
+) -> str | None:
+    """Prove accepted bytes using existing task-scoped producer events, read-only.
+
+    This fallback is for explicit completion only. Every path touched by unique
+    source history (including reverted changes) needs authoritative custody;
+    matching trees or a producer's success banner are insufficient.
+    """
+    import hashlib
+
+    from workbay_protocol.branch_naming import extract_plan_id
+
+    from .config import RuntimeConfig
+    from .shared_schema import connect_handoff_db
+
+    def hold(
+        code: str,
+        commit: str = source_tip,
+        path: str = "-",
+        remedy: str = "restore readable source and accepted-event authority",
+    ) -> str:
+        return f"{code}: commit={commit} file={path} remedy={remedy}"
+
+    def git(*args: str) -> bytes:
+        result = subprocess.run(
+            ["git", "-C", str(workspace_root), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            raise ValueError("git_read_failed")
+        return result.stdout
+
+    def ancestor(older: str, newer: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(workspace_root), "merge-base", "--is-ancestor", older, newer],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode not in {0, 1}:
+            raise ValueError("git_ancestry_unreadable")
+        return result.returncode == 0
+
+    try:
+        integration = git("rev-parse", "--verify", integration_ref + "^{commit}").decode("ascii").strip()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return hold("planning_integration_unreadable", remedy="restore the named integration ref")
+    path, commit = "-", source_tip
+    try:
+        if not re.fullmatch(r"[0-9a-f]{40}", source_tip):
+            return hold("planning_evidence_unreadable")
+        source_ref = "refs/heads/" + branch
+        if git("rev-parse", "--verify", source_ref + "^{commit}").decode("ascii").strip() != source_tip:
+            return hold("planning_source_changed", remedy="reselect the current source tip")
+        commits = (
+            git("rev-list", "--topo-order", "--max-count=129", integration + ".." + source_tip)
+            .decode("ascii")
+            .splitlines()
+        )
+        if not commits or len(commits) > 128:
+            return hold("planning_unmerged_source_commit", remedy="integrate or split the bounded source history")
+        paths: dict[str, list[str]] = {}
+        for commit in commits:
+            names = git(
+                "diff-tree", "--root", "-m", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", commit
+            )
+            for name in names.split(b"\0"):
+                if name:
+                    paths.setdefault(name.decode("utf-8"), []).append(commit)
+                    if len(paths) > 256:
+                        return hold(
+                            "planning_unmerged_source_commit", remedy="integrate or split oversized source history"
+                        )
+        if not paths:
+            return hold("planning_unmerged_source_commit", remedy="integrate empty source history")
+        db = RuntimeConfig.for_repo(workspace_root).db_path
+        with closing(connect_handoff_db(db, read_only=True)) as conn:
+            for path, changes in sorted(paths.items()):
+                commit = changes[0]
+                source = git("show", source_tip + ":" + path)
+                try:
+                    integrated_bytes = git("show", integration + ":" + path)
+                except ValueError:
+                    integrated_bytes = None
+                digest = hashlib.sha256(source).hexdigest()
+                candidates = [branch]
+                # Mirror only the producer's numbered-plan relink: the same plan
+                # id (protocol extract_plan_id: basename, any digit count) and
+                # plan_accept._pre_relink_branch peel, bounded to 16 segments.
+                # Each file peels to its OWN plan segment, not an arbitrary suffix.
+                plan_id = extract_plan_id(path)
+                name = branch
+                for _ in range(16) if plan_id else ():
+                    prefix, separator, digits = name.rpartition("-plan")
+                    if not separator or not prefix or not digits.isdigit():
+                        break
+                    if separator + digits == "-plan" + plan_id:
+                        candidates.append(prefix)
+                        break
+                    name = prefix
+                accepted = False
+                for original in candidates:
+                    key = dict(task_ref=task_ref, source_branch=original, path=path, raw_sha256=digest)
+                    prefix = (
+                        "plan_accept_applied:"
+                        + hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+                        + ":"
+                    )
+                    rows = conn.execute(
+                        "SELECT decision,rationale FROM decisions WHERE task_ref=? AND session='plan-accept' "
+                        "AND substr(decision,1,?)=? LIMIT 201",
+                        (task_ref, len(prefix), prefix),
+                    ).fetchall()
+                    if len(rows) > 200:
+                        return hold(
+                            "planning_evidence_unreadable", commit, path, "split oversized accepted-event evidence"
+                        )
+                    for row in rows:
+                        record = json.loads(row[1])
+                        if not isinstance(record, dict) or any(record.get(k) != v for k, v in key.items()):
+                            return hold("planning_receipt_invalid", commit, path)
+                        tip, applied = record.get("source_tip"), record.get("applied_commit")
+                        if (
+                            not isinstance(tip, str)
+                            or not isinstance(applied, str)
+                            or not re.fullmatch(r"[0-9a-f]{40}", tip)
+                            or not re.fullmatch(r"[0-9a-f]{40}", applied)
+                            or row[0] != prefix + tip + ":" + applied
+                        ):
+                            return hold("planning_receipt_invalid", commit, path)
+                        # Cover every unmerged change, even incomparable merge parents
+                        # and edit/revert sequences whose final bytes are unchanged.
+                        if not ancestor(tip, source_tip) or not all(ancestor(change, tip) for change in changes):
+                            continue
+                        if not ancestor(applied, integration):
+                            return hold(
+                                "planning_applied_commit_unmerged",
+                                applied,
+                                path,
+                                "restore accepted integration history",
+                            )
+                        if git("show", tip + ":" + path) != source or git("show", applied + ":" + path) != source:
+                            return hold("planning_receipt_invalid", commit, path)
+                        accepted = True
+                        break
+                    if accepted:
+                        break
+                if not accepted:
+                    if integrated_bytes is None:
+                        return hold(
+                            "planning_unmerged_source_commit", commit, path, "integrate the unaccepted changed file"
+                        )
+                    return hold(
+                        "planning_receipt_missing",
+                        commit,
+                        path,
+                        "publish original accepted custody; already_accepted is insufficient",
+                    )
+                if integrated_bytes != source:
+                    return hold(
+                        "planning_file_drift",
+                        commit,
+                        path,
+                        "reconcile missing or drifted integration bytes and accept again",
+                    )
+        if git("rev-parse", "--verify", integration_ref + "^{commit}").decode("ascii").strip() != integration:
+            return hold("planning_integration_changed", remedy="requalify the named integration tip")
+        if git("rev-parse", "--verify", source_ref + "^{commit}").decode("ascii").strip() != source_tip:
+            return hold("planning_source_changed", remedy="reselect the current source tip")
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, sqlite3.Error, subprocess.TimeoutExpired):
+        return hold("planning_evidence_unreadable", commit, path)
+    return None
+
+
 def task_completion_hold_reason(
     *,
     task_ref: str,
@@ -2471,8 +3033,12 @@ def task_completion_hold_reason(
             # Explicit completion retains the existing single-patch squash /
             # rebase proof, against the named integration ref rather than the
             # actor's HEAD. Probe failures and incomplete equivalence hold.
-            if not explicit_completion or landed.returncode != 1:
+            # Non-explicit callers keep the legacy hold text; only explicit
+            # completion reports the typed planning code.
+            if not explicit_completion:
                 return "target source unmerged or integration unreadable"
+            if landed.returncode != 1:
+                return f"planning_integration_unreadable: commit={tip.stdout.strip()} file=- remedy=restore named integration ref"
             cherry = probe(root, "cherry", integration_ref, tip.stdout.strip())
             patches = cherry.stdout.splitlines()
             if (
@@ -2480,7 +3046,13 @@ def task_completion_hold_reason(
                 or not patches
                 or not all(re.fullmatch(r"- [0-9a-f]{40}", patch) for patch in patches)
             ):
-                return "target source unmerged or integration unreadable"
+                return planning_completion_hold_reason(
+                    workspace_root=root,
+                    task_ref=task_ref,
+                    branch=branch,
+                    source_tip=tip.stdout.strip(),
+                    integration_ref=integration_ref,
+                )
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         return "target probe unavailable"
 
@@ -2898,9 +3470,26 @@ def _expire_plan_cursor_cas(
     probed_updated_at: str | None,
     summary: str,
     note: str,
+    terminal_identity: Mapping[str, object] | None = None,
 ) -> bool:
     """CAS-expire a cursor: only if still dispatched with probed updated_at."""
     new_summary = f"{summary} [{note}]" if note not in summary else summary
+    identity_guard = ""
+    identity_args: tuple[object, ...] = ()
+    if terminal_identity is not None:
+        # The terminal operation adds identity and lane-status guards. Existing
+        # age-reaper callers keep their original CAS and conservative policy.
+        identity_guard = """
+          AND task_ref = ? AND plan_item_id = ? AND lane_id IS ?
+          AND dispatched_at IS ? AND created_at IS ?
+          AND EXISTS (SELECT 1 FROM worktree_lanes AS lane
+                      WHERE lane.task_ref = plan_cursors.task_ref
+                        AND lane.lane_id = plan_cursors.lane_id
+                        AND lane.status IN ('merged', 'closed'))
+        """
+        identity_args = tuple(
+            terminal_identity[key] for key in ("task_ref", "plan_item_id", "lane_id", "dispatched_at", "created_at")
+        )
     cur = conn.execute(
         """
         UPDATE plan_cursors
@@ -2911,7 +3500,8 @@ def _expire_plan_cursor_cas(
         WHERE id = ?
           AND state = ?
           AND ((updated_at IS NULL AND ? IS NULL) OR updated_at = ?)
-        """,
+        """
+        + identity_guard,
         (
             _PLAN_CURSOR_EXPIRED,
             new_summary,
@@ -2919,9 +3509,112 @@ def _expire_plan_cursor_cas(
             _PLAN_CURSOR_DISPATCHED,
             probed_updated_at,
             probed_updated_at,
-        ),
+        )
+        + identity_args,
     )
     return int(cur.rowcount or 0) == 1
+
+
+def expire_terminal_plan_cursors(
+    *,
+    task_ref: str,
+    apply: bool = False,
+    max_batch: int = DEFAULT_PLAN_CURSOR_REAP_BATCH,
+) -> dict:
+    """Dispose only this task's dispatched cursors on merged or closed lanes.
+
+    No age criterion or worktree probe. Default is a dry run. Apply re-reads
+    cursor identity and lane status in the writer transaction, then CAS-expires
+    that exact identity. A race is a successful no-op, safe to retry.
+    """
+    data: dict[str, object] = {
+        "task_ref": task_ref,
+        "applied": apply,
+        "would_expire": [],
+        "expired": [],
+        "raced": [],
+        "failed": [],
+    }
+    would_expire: list[dict] = []
+    expired: list[dict] = []
+    raced: list[dict] = []
+    failed: list[dict] = []
+    data.update(would_expire=would_expire, expired=expired, raced=raced, failed=failed)
+    try:
+        if not isinstance(task_ref, str) or not task_ref.strip():
+            raise ValueError("task_ref is required")
+        batch = min(500, max(1, int(max_batch)))
+        data["max_batch"] = batch
+        connection = (
+            _get_db_connection(begin_immediate=True)
+            if apply
+            else closing(_open_bounded_roster_read_connection(get_runtime_config().db_path, busy_timeout_ms=1000))
+        )
+        with connection as conn:
+            rows = conn.execute(
+                """SELECT cursor.* FROM plan_cursors AS cursor
+                   WHERE cursor.task_ref = ? AND cursor.state = 'dispatched'
+                     AND EXISTS (SELECT 1 FROM worktree_lanes AS lane
+                                 WHERE lane.task_ref = cursor.task_ref
+                                   AND lane.lane_id = cursor.lane_id
+                                   AND lane.status IN ('merged', 'closed'))
+                   ORDER BY cursor.id LIMIT ?""",
+                (task_ref, batch),
+            ).fetchall()
+            for row in rows:
+                entry = _plan_cursor_entry(row, reason="lane is merged or closed")
+                would_expire.append(entry)
+                if not apply:
+                    continue
+                try:
+                    current = conn.execute(
+                        """SELECT cursor.*, lane.status AS lane_status
+                           FROM plan_cursors AS cursor
+                           JOIN worktree_lanes AS lane
+                             ON lane.task_ref = cursor.task_ref AND lane.lane_id = cursor.lane_id
+                           WHERE cursor.id = ?""",
+                        (row["id"],),
+                    ).fetchone()
+                    identity = (
+                        "id",
+                        "task_ref",
+                        "plan_item_id",
+                        "lane_id",
+                        "state",
+                        "updated_at",
+                        "dispatched_at",
+                        "created_at",
+                    )
+                    if (
+                        current is None
+                        or any(current[key] != row[key] for key in identity)
+                        or current["state"] != "dispatched"
+                        or current["lane_status"] not in {"merged", "closed"}
+                    ):
+                        raced.append({**entry, "reason": "cursor identity or lane status changed before expiry"})
+                        continue
+                    reason = f"lane {current['lane_id']} is {current['lane_status']}"
+                    entry = {**entry, "reason": reason}
+                    changed = _expire_plan_cursor_cas(
+                        conn,
+                        cursor_id=int(current["id"]),
+                        probed_updated_at=current["updated_at"],
+                        summary=str(current["summary"] or ""),
+                        note=f"expired by terminal plan-cursor disposition: {reason}",
+                        terminal_identity=dict(current),
+                    )
+                    if changed:
+                        expired.append({**entry, "state": _PLAN_CURSOR_EXPIRED})
+                    else:
+                        raced.append({**entry, "reason": "CAS miss: cursor identity or lane status changed"})
+                except sqlite3.Error as exc:
+                    failed.append({**entry, "reason": "cursor expiry failed", "error": str(exc)[:500]})
+    except Exception as exc:
+        # An operation/commit failure cannot claim that its rolled-back writes succeeded.
+        expired.clear()
+        data["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        return _envelope(ok=False, tool="expire_terminal_plan_cursors", task_ref=task_ref, data=data)
+    return _envelope(ok=not failed, tool="expire_terminal_plan_cursors", task_ref=task_ref, data=data)
 
 
 def reap_stale_plan_cursors(
@@ -3252,8 +3945,8 @@ def archives_retention_gc(
     """Prune ``task_archives`` rows older than ``older_than_days``.
 
     Dry-run by default; pass ``apply=True`` to delete stale archive rows.
-    Only touches ``task_archives`` — live ``handoff_state`` rows are never
-    mutated.
+    Archives with registrations absent from the live roster, or unreadable
+    registration history, remain available to issuer resolution.
     """
     if older_than_days < 1:
         return _envelope(
@@ -3265,7 +3958,9 @@ def archives_retention_gc(
     would_prune: list[dict[str, object]] = []
     pruned: list[str] = []
 
-    with _get_db_connection() as conn:
+    with _get_db_connection(begin_immediate=apply) as conn:
+        if not apply:
+            conn.execute("BEGIN")
         rows = conn.execute(
             """
             SELECT task_ref, archived_at
@@ -3277,6 +3972,22 @@ def archives_retention_gc(
         ).fetchall()
         for row in rows:
             ref = str(row["task_ref"])
+            # GC cannot discard the only copy of a registration (or turn an
+            # unreadable inventory into an apparently complete one).
+            (encoded,) = conn.execute("SELECT snapshot_json FROM task_archives WHERE task_ref=?", (ref,)).fetchone()
+            try:
+                snapshot = _registration_json(encoded)
+                archived = _archive_registrations(ref, snapshot, require_lanes=False)
+            except (TypeError, ValueError):
+                continue
+            if archived:
+                live = dict(conn.execute("SELECT id, lane_id FROM worktree_lanes WHERE task_ref=?", (ref,)))
+                if any(live.get(key) != lane["lane_id"] for key, lane in archived.items()):
+                    continue
+            if apply and "worktree_lanes" not in snapshot:
+                # Old task-only snapshots never asserted an empty roster. GC
+                # may retire the task while preserving that missing evidence.
+                _retain_registration_snapshot(conn, ref, {})
             would_prune.append(
                 {
                     "task_ref": ref,
@@ -3543,14 +4254,23 @@ def archive_task_state(
             active_cleared = deleted.rowcount > 0
         pruned = False
         if prune_working_rows:
+            from .coordination_declaration import immutable_fact_condition  # noqa: PLC0415
+
+            # Immutable coordination facts outlive the task: they carry remote
+            # obligations that a later declaration/cleanup must still see.
+            conn.execute(
+                f"DELETE FROM decisions WHERE task_ref = ? AND NOT {immutable_fact_condition()}",
+                (resolved_task_ref,),
+            )
+            # A task-finish annotation can replace the task archive after this
+            # commit. Keep the state at removal independently of that snapshot.
+            _retain_displaced_lanes(conn, resolved_task_ref, [])
             for table in (
-                "decisions",
                 "blockers",
                 "next_actions",
                 "test_traces",
                 "verified_tests",
                 "review_findings",
-                "worktree_lanes",
                 "worker_reports",
                 "lane_messages",
                 "task_tool_roster",

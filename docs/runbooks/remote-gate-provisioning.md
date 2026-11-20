@@ -480,8 +480,14 @@ lands on stdout; with `--json` the JSONL event stream fails result parsing
 ## Codex CLI upgrades
 
 The remote binary and the host adapter must agree on
-`codex_lane_config.CODEX_CLI_VERSION`, currently **0.159.2**. Update both
+`codex_lane_config.CODEX_CLI_VERSION`, currently **0.170.0**. Update both
 together: the availability probe deliberately refuses version drift.
+On 2026-11-18 at 04:33Z the lane VM binary
+(`~/.local/lib/node_modules/@openai/codex`) was upgraded to 0.170.0;
+preflight refused every codex-remote lane with rc 7
+`executable_version_mismatch` until this pin landed. gpt-6.2-astra requires
+CLI 0.170.0 or later.
+
 On 2026-09-30 at 22:49Z the lane VM binary
 (`~/.local/lib/node_modules/@openai/codex`) was upgraded to 0.159.2; the
 0.155.1 measurements below remain historical, and live sandbox/auth
@@ -512,7 +518,7 @@ or token-cost measurement; the older timing fixtures remain historical.
 Install the measured version as the gate user:
 
 ```bash
-npm install --global --prefix "$HOME/.local" @openai/codex@0.159.2
+npm install --global --prefix "$HOME/.local" @openai/codex@0.170.0
 "$HOME/.local/bin/codex" --version
 "$HOME/.local/bin/codex" login status
 ```

@@ -120,7 +120,9 @@ REVIEW_MODES = frozenset(mode.value for mode in ReviewMode)
 REVIEW_KINDS = frozenset(kind.value for kind in ReviewKind)
 REVIEW_SCOPE_SOURCES = frozenset(source.value for source in ReviewScopeSource)
 LANE_STATUSES = frozenset(status.value for status in LaneStatus)
-CLOSEABLE_LANE_STATUSES = frozenset({LaneStatus.MERGED.value, LaneStatus.CLOSED.value})
+# Internal reapers may write this terminal; public operator closes may not.
+REAPER_ONLY_LANE_STATUS = LaneStatus.CLOSED_STALE.value
+CLOSEABLE_LANE_STATUSES = TERMINAL_LANE_STATUSES - {REAPER_ONLY_LANE_STATUS}
 REPORT_STATUSES = frozenset(status.value for status in ReportStatus)
 MESSAGE_STATUSES = frozenset(status.value for status in MessageStatus)
 LANE_MESSAGE_DIRECTIONS = frozenset(direction.value for direction in LaneMessageDirection)

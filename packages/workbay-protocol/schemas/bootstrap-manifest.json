@@ -200,6 +200,33 @@
       "title": "OverlaySurface",
       "type": "object"
     },
+    "RemoteExecModePolicy": {
+      "additionalProperties": false,
+      "description": "Strict repository defaults for remote execution; absence keeps attached.",
+      "properties": {
+        "default": {
+          "enum": [
+            "attached",
+            "detached"
+          ],
+          "title": "Default",
+          "type": "string"
+        },
+        "per_backend": {
+          "additionalProperties": {
+            "enum": [
+              "attached",
+              "detached"
+            ],
+            "type": "string"
+          },
+          "title": "Per Backend",
+          "type": "object"
+        }
+      },
+      "title": "RemoteExecModePolicy",
+      "type": "object"
+    },
     "StackSource": {
       "additionalProperties": false,
       "description": "Install-ledger source provenance for the package stack.\n\n``resolved_from`` is required. ``ref`` / ``sha`` are recorded only when\nknown: an unattested git claim (``{\"resolved_from\": \"git\"}``) is a legal\nderive-path output and must round-trip.",
@@ -357,6 +384,11 @@
       "default": null,
       "description": "Optional explicit plugin override root recorded by bootstrap so later doctor/update/repair runs can reuse a non-default internal override location.",
       "title": "Plugin Overrides Path"
+    },
+    "remote_exec_mode": {
+      "$ref": "#/$defs/RemoteExecModePolicy",
+      "description": "Repository remote execution policy. Absent means no policy (built-in attached); an explicit null is refused.",
+      "title": "Remote Exec Mode"
     },
     "remote_ref": {
       "anyOf": [

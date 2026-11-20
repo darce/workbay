@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from workbay_protocol import reasoning_effort as model_routing
 from workbay_protocol.remote_probe import probe_remote_gate, resolve_remote_gate_host
 
 from workbay_orchestrator_mcp.orchestration.backend_adapter import BackendAdapter
@@ -444,11 +445,11 @@ class BackendSpec:
 
 _CLAUDE_REMOTE_ALLOWED_MODELS = frozenset(
     {
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-        "claude-fable-5-1",
-        "claude-haiku-4-5-20251001",
-        "claude-haiku-5-5",
+        model_routing.ModelId.CLAUDE_OPUS,
+        model_routing.ModelId.CLAUDE_SONNET,
+        model_routing.ModelId.CLAUDE_FABLE,
+        model_routing.ModelId.CLAUDE_LEGACY_HAIKU,
+        model_routing.ModelId.CLAUDE_HAIKU,
     }
 )
 
@@ -806,9 +807,9 @@ BACKENDS: dict[str, BackendSpec] = {
         description=("Ship a Claude Code turn to the remote OCI VM via remote_agent.sh --agent-spec."),
         shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.claude_code.ClaudeCodeAdapter",
         availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_claude_remote",
-        allowed_model="claude-sonnet-5-5",
+        allowed_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         allowed_models=_CLAUDE_REMOTE_ALLOWED_MODELS,
-        tracked_model="claude-sonnet-5-5",
+        tracked_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         default_effort="xhigh",
         auth=AuthPort(
             kind="env_file",
@@ -856,9 +857,9 @@ BACKENDS: dict[str, BackendSpec] = {
         ),
         shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.claude_code.ClaudeCodeAdapter",
         availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_claude_api_remote",
-        allowed_model="claude-sonnet-5-5",
+        allowed_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         allowed_models=_CLAUDE_REMOTE_ALLOWED_MODELS,
-        tracked_model="claude-sonnet-5-5",
+        tracked_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         default_effort="xhigh",
         auth=AuthPort(
             kind="env_file",
@@ -907,9 +908,9 @@ BACKENDS: dict[str, BackendSpec] = {
         description=("Ship a Muse Code turn to the remote OCI VM via remote_agent.sh --agent-spec."),
         shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.muse_code.MuseCodeAdapter",
         availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_muse_remote",
-        allowed_model="muse-wonder-1.0",
-        allowed_models=frozenset({"muse-wonder-1.0"}),
-        tracked_model="muse-wonder-1.0",
+        allowed_model=model_routing.MODEL_ROUTING_DEFAULTS["muse"],
+        allowed_models=frozenset({model_routing.ModelId.MUSE}),
+        tracked_model=model_routing.MODEL_ROUTING_DEFAULTS["muse"],
         auth=AuthPort(
             kind="device_login",
             artifact="~/.config/muse/auth.json",

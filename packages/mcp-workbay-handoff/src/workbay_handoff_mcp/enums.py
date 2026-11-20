@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 
+from workbay_protocol import reasoning_effort as model_routing
+
 _MODEL_LABEL_PATTERNS = (
     (
         # Claude model IDs have two minor-version conventions:
@@ -54,7 +56,7 @@ _MODEL_LABEL_PATTERNS = (
     (
         # grok-build -> "Grok Build" so any Composer-only contamination that
         # reaches an audit trail is legible rather than a raw slug.
-        re.compile(r"^grok-build(?:[-_].*)?$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(model_routing.ModelId.GROK_BUILD)}(?:[-_].*)?$", re.IGNORECASE),
         lambda _match: "Grok Build",
     ),
 )
@@ -208,6 +210,7 @@ class WorkerEventName(StrEnum):
     EXEC_SPAWNED = "exec_spawned"
     EXEC_HEARTBEAT = "exec_heartbeat"
     SUBAGENT_TURN_OBSERVED = "subagent_turn_observed"
+    TOKEN_METRIC_REFUSED = "token_metric_refused"
     SUBAGENT_TURN_COMPLETE = "subagent_turn_complete"
     EXEC_START = "exec_start"
     EXEC_FAILED = "exec_failed"

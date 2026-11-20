@@ -868,9 +868,9 @@ def _checkout_refusal(
             )
         elif identity_row_missing:
             registration = (
-                f'make maint-start TASK={task_ref} OBJECTIVE="<objective>"'
-                if resolver.current_branch(repo) in {"main", "master"}
-                else f'make task-start TASK={task_ref} OBJECTIVE="<objective>"'
+                f'make maint-start TASK={shlex.quote(task_ref)} OBJECTIVE="<objective>"'
+                if resolver.current_branch(repo) in {"main", "master"} and task_ref.startswith("MAINT-")
+                else f'make task-start TASK={shlex.quote(task_ref)} OBJECTIVE="<objective>"'
             )
             detail = (
                 f"The handoff has no state row for task {task_ref}. Register the task "

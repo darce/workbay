@@ -154,8 +154,36 @@
 # non-blocking lane lock and the loser defers with exit 75. It is never correct for
 # one lane to wipe another's live sandbox (internal).
 set -euo pipefail
+# The host owns the probe deadline and the elapsed field in its final receipt.
+_preflight_clock_ms() {
+    local stamp fraction LC_ALL=C
+    if [ -r /proc/uptime ]; then
+        read -r stamp _ < /proc/uptime
+        _probe_clock=boottime
+    else
+        # Bash 3.2 has no fractional epoch clock. date supplies whole seconds.
+        if [ "${BASH_VERSINFO[0]}" -ge 5 ]; then stamp=$EPOCHREALTIME; else stamp=$(date +%s); fi
+        _probe_clock=realtime
+    fi
+    fraction=${stamp#*.}000
+    [ "$stamp" != "${stamp%.*}" ] || fraction=000
+    _probe_now_ms=$((10#${stamp%.*} * 1000 + 10#${fraction:0:3}))
+}
+case "${1:-}" in
+    workspace-write-probe|writable-roots-probe)
+        _preflight_clock_ms
+        _probe_started_ms=$_probe_now_ms ;;
+esac
 
-# Shared by explicit and dispatch sandbox reap; absent/oversized configs are no-ops.
+_load_probe_trust_pruner() {
+
+# Shared by explicit and dispatch sandbox reap. ROOT is the provisioned sandbox
+# root; HOME supplies the legacy root, and CODEX_HOME selects the user config.
+# The embedded pruner takes CONFIG followed by one or more owned ROOT paths.
+# It only removes dead trust-only project tables strictly below those roots.
+# Bash 3.2 scans a heredoc inside $(...) for single quotes, so the body below
+# has none besides its PROBE_TRUST_PY delimiter: Python spells the quote
+# characters by code point and its comments carry no apostrophes.
 _probe_trust_remote_sh=$(cat <<'PROBE_TRUST_SH'
 _prune_probe_trust() {
     local _prune_rc=0
@@ -163,32 +191,130 @@ _prune_probe_trust() {
         echo "remote_agent: probe_trust_prune_skipped: timeout unavailable" >&2
         return 1
     fi
-    timeout -k 1 10 python3 - "${CODEX_HOME:-$HOME/.codex}/config.toml" "$ROOT/.workbay-preflight-probes" <<'PROBE_TRUST_PY' || _prune_rc=$?
+    timeout -k 1 10 python3 - "${CODEX_HOME:-$HOME/.codex}/config.toml" "$ROOT" "$HOME/grok-sandbox" <<'PROBE_TRUST_PY' || _prune_rc=$?
 import copy
+import errno
 import os
 from pathlib import Path
 import re
+import stat
+import sys
 import tempfile
+
+MAX_CONFIG_BYTES = 8 * 1024 * 1024  # More than six times the 2026-11-17 VM census.
+DOUBLE_QUOTE = chr(34)
+SINGLE_QUOTE = chr(39)
+
+
+def skipped(reason):
+    print("remote_agent: codex_trust_prune_skipped: " + reason, file=sys.stderr)
+
+
+def dead_owned_path(path, roots):
+    # Judge only canonical keys, exactly as written: the execution-context
+    # projection binds every non-canonical key (a trailing slash, a doubled
+    # slash, a dot segment, a leading //) for every lane, so removing one
+    # changes each live lane context. A dot-dot segment or a symlink below an
+    # owned root can also name a tree owned by another tenant.
+    if not os.path.isabs(path) or os.path.normpath(path) != path or path.startswith("//"):
+        return False
+    matching = [root for root in roots if path.startswith(root + os.sep)]
+    if not matching:
+        return False
+    root = max(matching, key=len)
+    try:
+        os.lstat(path)  # Includes dangling symlinks.
+        return False
+    except FileNotFoundError:
+        pass
+    parent = os.path.dirname(path)
+    while parent != root:
+        try:
+            if stat.S_ISLNK(os.lstat(parent).st_mode):
+                return False
+        except FileNotFoundError:
+            pass
+        parent = os.path.dirname(parent)
+    return True
+
+
+def inline_comment(line):
+    # Keep an inline TOML comment even when its table header or field is gone.
+    # Quoted paths and values may themselves contain a hash sign.
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote == DOUBLE_QUOTE:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == SINGLE_QUOTE:
+            if char == quote:
+                quote = None
+        elif char in (DOUBLE_QUOTE, SINGLE_QUOTE):
+            quote = char
+        elif char == "#":
+            while index and line[index - 1] in " \t":
+                index -= 1
+            return line[index:]
+    return ""
+
 
 try:
     import tomllib
-    config = Path(__import__("sys").argv[1])
-    slots = os.path.abspath(__import__("sys").argv[2])
-    if config.is_symlink() or not config.is_file():
+    config = Path(sys.argv[1])
+    roots = tuple(os.path.normpath(root) for root in sys.argv[2:])
+    if not roots or any(not os.path.isabs(root) or root == os.sep for root in roots):
+        skipped("invalid_owned_root")
         raise SystemExit(0)
-    before = config.stat()
-    if before.st_size > 1024 * 1024:
+    # A configured sandbox pointer must not claim a shared directory itself (or
+    # an ancestor), including through a symlink. Those trees contain tenants
+    # whose trust entries WorkBay must never reclaim.
+    shared_dirs = tuple(os.path.realpath(path) for path in ("/tmp", "/var/tmp", os.path.expanduser("~")))
+    if any(os.path.commonpath((os.path.realpath(root), shared)) == os.path.realpath(root)
+           for root in roots for shared in shared_dirs):
+        skipped("unsafe_shared_owned_root")
         raise SystemExit(0)
-    with config.open("rb") as stream:
-        raw = stream.read(1024 * 1024 + 1)
-    if len(raw) > 1024 * 1024:
+    if not hasattr(os, "O_NOFOLLOW"):
+        skipped("no_nofollow_support")
         raise SystemExit(0)
-    text = raw.decode("utf-8")
-    parsed = tomllib.loads(text)
+    try:
+        config_fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise SystemExit(0)  # A user who has no config has nothing to reclaim.
+    except OSError as exc:
+        skipped("unsafe_config_symlink" if exc.errno == errno.ELOOP else "config_open_io_error")
+        raise SystemExit(0)
+    with os.fdopen(config_fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
+            skipped("unsafe_config_type_or_owner")
+            raise SystemExit(0)
+        if not before.st_mode & stat.S_IWUSR:
+            skipped("config_read_only")
+            raise SystemExit(0)
+        if before.st_size > MAX_CONFIG_BYTES:
+            skipped("size_bound")
+            raise SystemExit(0)
+        raw = stream.read(MAX_CONFIG_BYTES + 1)
+    if len(raw) > MAX_CONFIG_BYTES:
+        skipped("size_bound")
+        raise SystemExit(0)
+    try:
+        text = raw.decode("utf-8")
+        parsed = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        skipped("parse_error")
+        raise SystemExit(0)
     expected = copy.deepcopy(parsed)
     # Only complete, standalone project trust tables. Preserve all other bytes.
-    headers = list(re.finditer(r"(?m)^\s*\[[^\n]+\][ \t]*(?:#[^\n]*)?\n", text))
+    headers = list(re.finditer(r"(?m)^[ \t]*\[[^\r\n]+\][ \t]*(?:#[^\r\n]*)?\r?\n", text))
     pieces = []
+    removed_paths = []
+    unsupported = 0
     cursor = 0
     for index, header in enumerate(headers):
         end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
@@ -198,33 +324,49 @@ try:
         except tomllib.TOMLDecodeError:
             continue
         projects = table.get("projects", {})
-        if set(table) != {"projects"} or len(projects) != 1:
+        if set(table) != {"projects"} or not isinstance(projects, dict) or len(projects) != 1:
             continue
         path, entry = next(iter(projects.items()))
         if not isinstance(entry, dict) or set(entry) != {"trust_level"}:
             continue
-        normalized = os.path.abspath(path)
-        if not os.path.isabs(path) or not normalized.startswith(slots + os.sep):
+        if not dead_owned_path(path, roots):
             continue
-        # lstat preserves dangling symlinks; any uncertainty preserves the entry.
-        try:
-            os.lstat(path)
-            continue
-        except FileNotFoundError:
-            pass
         if expected.get("projects", {}).get(path) != entry:
+            continue
+        lines = block.splitlines(keepends=True)
+        assignments = [i for i, line in enumerate(lines[1:], 1)
+                       if line.strip() and not line.lstrip().startswith("#")]
+        if (len(assignments) != 1
+                or not re.match(r"^[ \t]*(?:trust_level|\x22trust_level\x22|\x27trust_level\x27)[ \t]*=", lines[assignments[0]])
+                or DOUBLE_QUOTE * 3 in lines[assignments[0]] or SINGLE_QUOTE * 3 in lines[assignments[0]]):
+            unsupported += 1
             continue
         del expected["projects"][path]
         pieces.append(text[cursor:header.start()])
+        for i, line in enumerate(lines):
+            pieces.append(inline_comment(line) if i in (0, assignments[0]) else line)
+        removed_paths.append(path)
         cursor = end
+    if unsupported:
+        skipped("unsupported_trust_format count=" + str(unsupported))
     if not pieces:
         raise SystemExit(0)
     pieces.append(text[cursor:])
     updated = "".join(pieces)
-    actual = tomllib.loads(updated)
-    if not expected.get("projects"):
+    try:
+        actual = tomllib.loads(updated)
+    except tomllib.TOMLDecodeError:
+        skipped("parse_validation_failed")
+        raise SystemExit(0)
+    if actual != expected and expected.get("projects") == {}:
         expected.pop("projects", None)
     if actual != expected:
+        skipped("parse_validation_mismatch")
+        raise SystemExit(0)
+    # A lane may have appeared while the snapshot was parsed. Preserve the
+    # whole snapshot if any proposed deletion is no longer demonstrably dead.
+    if any(not dead_owned_path(path, roots) for path in removed_paths):
+        skipped("concurrent_path_changed")
         raise SystemExit(0)
     # Atomic replacement, retaining permissions; abandon if a writer changed it.
     def config_identity(status):
@@ -244,13 +386,19 @@ try:
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), before.st_mode & 0o777)
             stream.write(updated.encode("utf-8"))
-        if config_identity(config.stat()) == config_identity(before) and not config.is_symlink():
+        try:
+            current = config.lstat()
+        except FileNotFoundError:
+            current = None
+        if current is not None and stat.S_ISREG(current.st_mode) and config_identity(current) == config_identity(before):
             os.replace(temporary, config)
+        else:
+            skipped("concurrent_config_changed")
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-except (OSError, ValueError, ImportError):
-    pass
+except (OSError, ValueError, ImportError) as exc:
+    skipped("io_or_runtime_error " + type(exc).__name__)
 PROBE_TRUST_PY
     if [ "$_prune_rc" -eq 124 ] || [ "$_prune_rc" -eq 137 ]; then
         echo "remote_agent: probe_trust_prune_timeout: status=$_prune_rc; prune skipped" >&2
@@ -263,10 +411,11 @@ PROBE_TRUST_PY
 }
 PROBE_TRUST_SH
 )
+}
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.37
+_BOUNDARY_RUNTIME_VERSION=0.3.38
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -422,8 +571,6 @@ _boundary_runtime_preamble() {
 }
 
 
-repo_root="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-repo_slug="$(basename "$repo_root")"
 
 # One host ladder for the review bridge, doctor auth and production context.
 # Checkout commands keep their source/PYTHONPATH contract. Installed commands
@@ -537,36 +684,116 @@ _review_cycle_bridge() {
 }
 
 
-# Read the consumer cadence from the unit that is installed with the queue.
-# A missing or malformed timer leaves freshness unknown and therefore stale.
-_queue_timer_file="$(dirname "${BASH_SOURCE[0]}")/vm/workbay-lane-queue.timer"
-_host_reservation_file="$(dirname "${BASH_SOURCE[0]}")/vm/host_reservation.py"
-
-_remote_agent_check_companions() {
-    # These local files are part of the installed transport contract. A broken
-    # install cannot recover through retryable VM admission (exit 75).
-    local _companion _companion_rc=0
-    for _companion in "$_host_reservation_file" "$_queue_timer_file"; do
-        if [ ! -f "$_companion" ] || [ ! -r "$_companion" ] || [ ! -s "$_companion" ]; then
-            printf 'remote_agent: config_missing scripts/vm/%s\n' "${_companion##*/}" >&2
-            _companion_rc=78
-        fi
-    done
-    return "$_companion_rc"
+# Only the probe driver invokes this reader, after starting its deadline.
+_preflight_read_model() {
+    local _root _src
+    _root="$(cd "$(dirname "$1")/.." && pwd)" || return 1
+    _src="$_root/packages/workbay-protocol/src"
+    if [ -f "$_src/workbay_protocol/reasoning_effort.py" ]; then
+        python3 -I -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["MODEL_ROUTING_DEFAULTS"]["preflight_probe"])' \
+            "$_src/workbay_protocol/reasoning_effort.py" 2>/dev/null && return 0
+    fi
+    PYTHONPATH="$_src${PYTHONPATH:+:$PYTHONPATH}" _host_workbay_resolve_python "$_root" \
+        'from workbay_protocol.reasoning_effort import MODEL_ROUTING_DEFAULTS; print(MODEL_ROUTING_DEFAULTS["preflight_probe"])' render || return 1
+    printf '%s\n' "$_host_workbay_output"
 }
 
-# Validate before any dispatch rendering or transport. Other commands can still
-# inspect or clean up remote jobs when a local install needs repair.
-case "${1:-}" in
-    build|submit)
-        _remote_agent_check_companions || exit "$?"
-        _boundary_runtime_preamble >/dev/null || exit 2
-        ;;
-esac
+_preflight_file_host() {
+    local common REMOTE_GATE_HOST=
+    common=$(git rev-parse --path-format=absolute --git-common-dir) || return 1
+    _remote_gate_env_load "${common%/*}/.workbay/remote-gate.env" REMOTE_GATE_HOST
+    printf '%s' "$REMOTE_GATE_HOST"
+}
 
-QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
-case "$QUEUE_TICK_INTERVAL_S" in ''|*[!0-9]*|0) QUEUE_TICK_INTERVAL_S="" ;; esac
+_preflight_bounded() {
+    _preflight_clock_ms
+    # Leave TERM-to-KILL escalation inside the same absolute deadline.
+    [ "$_probe_now_ms" -ge "$_probe_started_ms" ] || _probe_now_ms=$_probe_started_ms
+    local term_ms=$((_probe_deadline_ms - _probe_now_ms - 250)) term_s
+    [ "$term_ms" -gt 0 ] || return 124
+    printf -v term_s '%d.%03d' "$((term_ms / 1000))" "$((term_ms % 1000))"
+    timeout -k 0.25 "$term_s" "$@"
+}
 
+_preflight_refuse() {
+    local _probe_reason=$1 _probe_ms
+    _preflight_clock_ms
+    _probe_ms=$((_probe_now_ms - _probe_started_ms))
+    [ "$_probe_ms" -ge 0 ] || _probe_ms=0
+    printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"%s","cleanup_status":"unknown","retryable":false,"elapsed_s":%d.%03d,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' "$_probe_kind" "$_probe_reason" "$((_probe_ms / 1000))" "$((_probe_ms % 1000))" "$_probe_model" "$_probe_nonce"
+    exit 0
+}
+
+# The caller's timestamp is monotonic. Linux boottime also counts suspend,
+# so it gives a lower bound on the time left while we sample the exact offset.
+_preflight_apply_caller_deadline() {
+    local caller=$1 sample_s=0.25 clock_rc=0 whole fraction safe_ms
+    _preflight_clock_ms
+    if [ "$_probe_clock" = boottime ] && [[ "$caller" =~ ^([0-9]{1,10})([.]([0-9]+))?$ ]]; then
+        whole=${BASH_REMATCH[1]}
+        fraction=${BASH_REMATCH[3]:-}000
+        safe_ms=$((10#$whole * 1000 + 10#${fraction:0:3}))
+        # The entire CLI window fits even in the conservative estimate.
+        [ "$_probe_deadline_ms" -gt "$safe_ms" ] || return 0
+        safe_ms=$((safe_ms - _probe_now_ms))
+        if [ "$safe_ms" -gt 250 ]; then
+            printf -v sample_s '%d.%03d' "$((safe_ms / 1000))" "$((safe_ms % 1000))"
+        fi
+    fi
+    # Without a positive lower bound, give clock acquisition only the
+    # cancellation margin. The sample cannot delay a tighter caller indefinitely.
+    _probe_deadline_ms=$(timeout -s KILL "$sample_s" python3 -IS -c '
+import sys, time
+clock, deadline, cli = sys.argv[1:]
+now = time.clock_gettime(time.CLOCK_BOOTTIME) if clock == "boottime" else time.time()
+print(min(int(cli), int(1000 * (now + float(deadline) - time.monotonic()))))
+' "$_probe_clock" "$caller" "$_probe_deadline_ms") || clock_rc=$?
+    case "$clock_rc" in
+        0) ;;
+        124|137) _preflight_refuse timeout ;;
+        *) _preflight_refuse transport_failure ;;
+    esac
+}
+
+_prepare_direct_probe() {
+    exec </dev/null
+    _probe_kind=$1
+    shift
+    _preflight_settings
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                [ "$#" -ge 2 ] || { echo "remote_agent: probe timeout must be positive" >&2; exit 2; }
+                _probe_timeout=$2
+                shift 2 ;;
+            *) echo "remote_agent: unknown preflight probe arg: $1" >&2; exit 2 ;;
+        esac
+    done
+    case "$_probe_timeout" in *[!0-9]*|""|0) echo "remote_agent: probe timeout must be positive" >&2; exit 2 ;; esac
+    REMOTE_HOST=${WORKBAY_REMOTE_GATE_HOST:-}
+    [ -n "$REMOTE_HOST" ] || _probe_nonce=${WORKBAY_PROBE_NONCE:-}
+    if ! command -v timeout >/dev/null || ! command -v flock >/dev/null; then
+        _preflight_refuse transport_failure
+    fi
+    _probe_deadline_ms=$((_probe_started_ms + 10#$_probe_timeout * 1000))
+    if [ -n "${WORKBAY_PREFLIGHT_HOST_DEADLINE:-}" ]; then
+        _preflight_apply_caller_deadline "$WORKBAY_PREFLIGHT_HOST_DEADLINE"
+    fi
+    if [ -z "$REMOTE_HOST" ]; then
+        # File-only hosts use the same literal reader and Git common directory
+        # as dispatch. Bound both Git and the file read, including their children.
+        REMOTE_HOST=$(_preflight_bounded "$BASH" -c "$(declare -f _remote_gate_env_load _remote_gate_env_unquote _preflight_file_host)
+_preflight_file_host") || _preflight_refuse transport_failure
+        [ -n "$REMOTE_HOST" ] || _preflight_refuse transport_failure
+        _probe_nonce=${WORKBAY_PROBE_NONCE:-workbay-probe-$$}
+    fi
+    if [ "$_probe_cap" -le 0 ] 2>/dev/null; then
+        _preflight_refuse probe_capacity
+    fi
+    AGENT_ROOT=${WORKBAY_REMOTE_AGENT_ROOT-workbay-sandbox}
+}
+
+_remote_agent_configure() {
 # Literal KEY=VALUE reader for .workbay/remote-gate.env. Never source/execute
 # the file (SECD-02). Optional export, single/double-quoted or bare literals,
 # # comments, blank lines. No expansion, command substitution, or continuation.
@@ -658,6 +885,25 @@ _remote_gate_env_load() {
 # silently zero the floor when the operator set a valid value in the env).
 # Gate-file values are read only after these process snapshots are captured;
 # HOST/DIR and the three documented TTL/idle knobs may fall back to that file.
+_preflight_settings() {
+    _probe_model="${WORKBAY_PREFLIGHT_PROBE_MODEL:-}"
+    _probe_timeout="${WORKBAY_PREFLIGHT_PROBE_TIMEOUT_S:-180}"
+    _probe_cap="${WORKBAY_PREFLIGHT_MAX_LIVE_PROBES:-2}"
+    _probe_slot_wait="${WORKBAY_PREFLIGHT_VM_SLOT_WAIT_S:-60}"
+    _probe_nonce="${WORKBAY_PROBE_NONCE:-workbay-probe-$$}"
+    case "$_probe_model" in *[!A-Za-z0-9._:/-]*) echo "remote_agent: WORKBAY_PREFLIGHT_PROBE_MODEL contains unsupported characters" >&2; exit 2 ;; esac
+    case "$_probe_timeout" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_PROBE_TIMEOUT_S must be a positive integer" >&2; exit 2 ;; esac
+    case "$_probe_cap" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_MAX_LIVE_PROBES must be a non-negative integer" >&2; exit 2 ;; esac
+    case "$_probe_slot_wait" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_VM_SLOT_WAIT_S must be a non-negative integer" >&2; exit 2 ;; esac
+    case "$_probe_nonce" in ""|*[!A-Za-z0-9._:-]*) echo "remote_agent: WORKBAY_PROBE_NONCE contains unsupported characters" >&2; exit 2 ;; esac
+}
+
+
+case "${1:-}" in
+writable-roots-probe|workspace-write-probe)
+    _prepare_direct_probe "$@"
+    ;;
+*)
 _env_host="${WORKBAY_REMOTE_GATE_HOST:-}"
 _env_dir="${WORKBAY_REMOTE_GATE_DIR:-}"
 _env_agent_root_set=0
@@ -683,11 +929,6 @@ _env_reap_legacy="${WORKBAY_REMOTE_AGENT_REAP_LEGACY_REFS:-}"
 _env_sweep_min_interval="${WORKBAY_REMOTE_AGENT_SWEEP_MIN_INTERVAL_SEC:-${SWEEP_MIN_INTERVAL_SEC:-}}"
 _env_sandbox_reap_budget="${WORKBAY_REMOTE_AGENT_SANDBOX_REAP_BUDGET_SEC:-${SANDBOX_REAP_BUDGET_SEC:-}}"
 _env_unbounded_ceiling="${WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S:-}"
-_env_probe_model="${WORKBAY_PREFLIGHT_PROBE_MODEL:-}"
-_env_probe_timeout="${WORKBAY_PREFLIGHT_PROBE_TIMEOUT_S:-}"
-_env_probe_max_live="${WORKBAY_PREFLIGHT_MAX_LIVE_PROBES:-}"
-_env_probe_slot_wait="${WORKBAY_PREFLIGHT_VM_SLOT_WAIT_S:-}"
-_env_probe_nonce="${WORKBAY_PROBE_NONCE:-}"
 REMOTE_GATE_HOST="" REMOTE_GATE_DIR=""
 config_file="$repo_root/.workbay/remote-gate.env"
 _remote_gate_env_load "$config_file" \
@@ -703,11 +944,6 @@ _remote_gate_env_load "$config_file" \
 # BEGIN ADAPTER_HOST_GUARD
 REMOTE_HOST="${_env_host:-${REMOTE_GATE_HOST:-}}"
 if [ -z "$REMOTE_HOST" ]; then
-    if [ "${1:-}" = "writable-roots-probe" ] || [ "${1:-}" = "workspace-write-probe" ]; then
-        printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"transport_failure","elapsed_s":0,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' \
-            "${1}" "${WORKBAY_PREFLIGHT_PROBE_MODEL:-gpt-5.6-sol}" "${WORKBAY_PROBE_NONCE:-}"
-        exit 0
-    fi
     echo "remote_agent: host not configured — set WORKBAY_REMOTE_GATE_HOST or" \
          "REMOTE_GATE_HOST in .workbay/remote-gate.env (e.g. gate@<your-host>)" >&2
     exit 78
@@ -728,11 +964,6 @@ CPU_QUOTA="${_env_cpu_quota:-200%}"
 # Read from the pre-parse env snapshot only — never re-read WORKBAY_* after
 # parsing remote-gate.env ([REF-10] process env wins over file).
 WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S="${_env_unbounded_ceiling:-21600}"
-PREFLIGHT_PROBE_MODEL="${_env_probe_model:-gpt-5.6-sol}"
-PREFLIGHT_PROBE_TIMEOUT_S="${_env_probe_timeout:-180}"
-PREFLIGHT_PROBE_MAX_LIVE="${_env_probe_max_live:-2}"
-PREFLIGHT_PROBE_SLOT_WAIT_S="${_env_probe_slot_wait:-60}"
-PREFLIGHT_PROBE_NONCE="${_env_probe_nonce:-workbay-probe-$$}"
 # VM MemAvailable floor (MiB): defer the lane when the VM is below this, reserving
 # headroom for ALL non-lane work on the box (co-resident mission-critical procs).
 MEM_FLOOR_MB="${_env_mem_floor:-2048}"
@@ -869,11 +1100,7 @@ case "$SWEEP_MIN_INTERVAL_SEC" in *[!0-9]*|"") echo "remote_agent: SWEEP_MIN_INT
 case "$SANDBOX_REAP_BUDGET_SEC" in *[!0-9]*|"") echo "remote_agent: SANDBOX_REAP_BUDGET_SEC must be a non-negative integer" >&2; exit 2 ;; esac
 case "$UV_CACHE_CAP_MB" in *[!0-9]*|"") echo "remote_agent: UV_CACHE_CAP_MB must be a non-negative integer" >&2; exit 2 ;; esac
 case "$WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S" in *[!0-9]*|"") echo "remote_agent: WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S must be an integer >= 1 (0 cannot bound anything; refuse at admission, not exit 75)" >&2; exit 2 ;; esac
-case "$PREFLIGHT_PROBE_MODEL" in ""|*[!A-Za-z0-9._:/-]*) echo "remote_agent: WORKBAY_PREFLIGHT_PROBE_MODEL contains unsupported characters" >&2; exit 2 ;; esac
-case "$PREFLIGHT_PROBE_TIMEOUT_S" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_PROBE_TIMEOUT_S must be a positive integer" >&2; exit 2 ;; esac
-case "$PREFLIGHT_PROBE_MAX_LIVE" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_MAX_LIVE_PROBES must be a non-negative integer" >&2; exit 2 ;; esac
-case "$PREFLIGHT_PROBE_SLOT_WAIT_S" in *[!0-9]*|"") echo "remote_agent: WORKBAY_PREFLIGHT_VM_SLOT_WAIT_S must be a non-negative integer" >&2; exit 2 ;; esac
-case "$PREFLIGHT_PROBE_NONCE" in ""|*[!A-Za-z0-9._:-]*) echo "remote_agent: WORKBAY_PROBE_NONCE contains unsupported characters" >&2; exit 2 ;; esac
+_preflight_settings
 case "$KEEP_REFS" in *[!A-Za-z0-9/_.\ -]*) echo "remote_agent: KEEP_REFS may only contain letters, digits, / _ . - and spaces" >&2; exit 2 ;; esac
 case "$REAP_LEGACY_REFS" in 0|1) ;; *) echo "remote_agent: REAP_LEGACY_REFS must be 0 or 1" >&2; exit 2 ;; esac
 if [ -n "$MAX_LANES" ] && [ "$MAX_LANES" -lt 1 ]; then
@@ -889,7 +1116,11 @@ if [ "$WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S" -lt 1 ]; then
     exit 2
 fi
 
+    ;;
+esac
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 "$REMOTE_HOST")
+}
+
 die() { echo "remote_agent: $*" >&2; exit 2; }
 
 # BEGIN REMOTE_SUBMIT_JOB
@@ -2396,6 +2627,7 @@ _remote_inventory() {
     PYTHONDONTWRITEBYTECODE=1 python3 - <<'INVENTORY_PY'
 import datetime
 import errno
+import importlib.util
 import math
 import json
 import os
@@ -2444,7 +2676,7 @@ def probe(args, *, git=False):
     if budget <= 0:
         truncate("deadline")
         return None
-    env = dict(os.environ, LC_ALL="C")
+    env = dict(os.environ, LC_ALL="C", TZ="UTC")
     if git:
         env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
@@ -2625,6 +2857,89 @@ def holder_alive(pid):
         return "unknown"
 
 
+def job_observations():
+    # Read only native job metadata, never body/env/stdout or a remote process
+    # command. Each component is opened no-follow; FIFOs cannot block a scan.
+    # One unreadable or unsafe job keeps its exact ID and makes the facet unknown.
+    rows = []
+    state, reason, truncated = "known", None, False
+    jobs_fd = None
+    try:
+        jobs_fd = os.open(root / ".jobs", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        with os.scandir(jobs_fd) as entries:
+            for index, entry in enumerate(entries):
+                if remaining() < 5 or index >= limit:
+                    state, reason, truncated = "unknown", "deadline" if remaining() < 5 else "limit", True
+                    truncate("jobs_" + reason)
+                    break
+                job_id = entry.name
+                if not re.fullmatch(r"j[0-9a-f]{20}", job_id):
+                    state, reason = "unknown", reason or "invalid_job_name"
+                    continue
+                row = {"job_id": job_id, "path": str(root / ".jobs" / job_id),
+                       "identity_state": "unknown", "lane_key": None, "unit": None,
+                       "state": None, "done": None, "started_at": None, "reason": None}
+                rows.append(row)
+                job_fd = None
+                try:
+                    job_fd = os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=jobs_fd)
+                    metadata_fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=job_fd)
+                    with os.fdopen(metadata_fd, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                            raise ValueError("unsafe_job_metadata")
+                        raw = stream.read(65537)
+                        if len(raw) > 65536:
+                            raise ValueError("job_metadata_limit")
+                        metadata = json.loads(raw)
+                    if not isinstance(metadata, dict):
+                        raise ValueError("invalid_job_metadata")
+                    unit = metadata.get("unit")
+                    if not isinstance(unit, str):
+                        raise ValueError("invalid_job_unit")
+                    match = re.fullmatch(r"workbay-lane-([A-Za-z0-9][A-Za-z0-9_.-]*)-job-" + re.escape(job_id) + r"\.service", unit)
+                    if not match or match[1] in (".", ".."):
+                        raise ValueError("job_unit_identity_mismatch")
+                    markers = {}
+                    for name in ("done.json", "started"):
+                        try:
+                            info = os.stat(name, dir_fd=job_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            raise ValueError("unsafe_job_marker")
+                        markers[name] = info
+                    raw_state = metadata.get("state")
+                    row.update(unit=unit, lane_key=match[1], identity_state="known", done="done.json" in markers,
+                               state=raw_state if isinstance(raw_state, str) and len(raw_state) <= 64 else None)
+                    if "started" in markers:
+                        row["started_at"] = datetime.datetime.fromtimestamp(
+                            markers["started"].st_mtime, datetime.timezone.utc).isoformat()
+                except (OSError, ValueError, TypeError) as exc:
+                    row.update(identity_state="unknown",
+                               reason=str(exc) if isinstance(exc, ValueError) else "job_metadata_" + type(exc).__name__)
+                    state, reason = "unknown", reason or row["reason"]
+                finally:
+                    if job_fd is not None:
+                        os.close(job_fd)
+    except FileNotFoundError:
+        # No job directory yet is a complete observation only below a real root.
+        try:
+            if not stat.S_ISDIR(os.lstat(root).st_mode):
+                state, reason = "unknown", "jobs_root_unavailable"
+        except OSError:
+            state, reason = "unknown", "jobs_root_unavailable"
+    except OSError as exc:
+        state, reason = "unknown", "jobs_" + type(exc).__name__
+    finally:
+        if jobs_fd is not None:
+            os.close(jobs_fd)
+    if state == "unknown":
+        unknowns.add("jobs")
+    return {"jobs": sorted(rows, key=lambda r: r["job_id"]), "jobs_state": state, "jobs_reason": reason,
+            "jobs_emitted": len(rows), "jobs_truncated": truncated, "jobs_truncation_reason": reason}
+
+
 doc = {"schema_version": 1,
        "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
        "deadline_seconds": deadline_seconds, "limit": limit,
@@ -2642,9 +2957,26 @@ try:
 except OSError:
     pass
 doc["process_census"] = census
+doc.update(job_observations())
 doc["reclaim"] = reclaim_receipt()
 if doc["reclaim"]["state"] == "unknown":
     unknowns.add("reclaim")
+# Load the installed reclaimer without bytecode writes. It owns hold policy;
+# inventory supplies only a deadline and a row cap, never an apply/release call.
+try:
+    helper_path = Path.home() / ".local/lib/workbay/workbay_vm_reclaim.py"
+    helper_spec = importlib.util.spec_from_file_location("workbay_vm_reclaim", helper_path)
+    helper = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(helper)
+    doc.update(helper.inventory_held_jobs(deadline=deadline - 5, limit=100))
+except (OSError, ImportError, AttributeError, ValueError):
+    doc.update(held_job_dirs=[], held_job_dirs_count=None, held_job_dirs_emitted=0,
+               held_job_dirs_count_quality="unknown", held_job_dirs_state="unknown",
+               held_job_dirs_truncated=True, held_job_dirs_truncation_reason="classifier_unavailable")
+if doc["held_job_dirs_state"] == "unknown":
+    unknowns.add("held_job_dirs")
+if doc["held_job_dirs_truncated"] and doc["held_job_dirs_truncation_reason"] != "classifier_unavailable":
+    truncate("held_job_dirs_" + doc["held_job_dirs_truncation_reason"])
 try:
     match = re.search(r"^MemAvailable:\s+(\d+) kB$", read(proc / "meminfo"), re.M)
     if not match:
@@ -2791,6 +3123,21 @@ for path in paths:
     row = {"path": str(path), "bytes": None, "bytes_state": "unknown",
            "marker_age_seconds": None, "lock_holder_pid": None,
            "lock_holder_alive": "unknown", "git_dirty": "unknown"}
+    row["identity_sources"] = {}
+    for name in (".workbay-lane-sandbox", "spec.json"):
+        try:
+            raw = read(path / name)
+            metadata = (dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+                        if name == ".workbay-lane-sandbox" else json.loads(raw))
+            if not isinstance(metadata, dict):
+                continue
+            for key in ("job_id", "task_ref", "lane_id", "branch", "repository", "repository_path",
+                        "repository_root", "repository_identity", "repo_root"):
+                if key not in row and isinstance(metadata.get(key), str) and metadata[key].strip():
+                    row[key] = metadata[key]
+                    row["identity_sources"][key] = name + ":" + key
+        except (OSError, ValueError):
+            pass
     try:
         row["marker_age_seconds"] = max(0, time.time() - (path / ".workbay-lane-sandbox").stat().st_mtime)
     except OSError:
@@ -2831,15 +3178,39 @@ for row in doc["sandboxes"]:
         cwd = (item["cwd"] or "").removesuffix(" (deleted)")
         if cwd == path or cwd.startswith(path + "/") or item["pid"] == row["lock_holder_pid"]:
             pgids.setdefault(item["pgid"], set()).add(path)
+# Native job-directory membership is exact, independent of branch/cwd lane
+# spelling. PGID propagation retains every candidate if groups collide.
+job_pgids = {}
+doc["job_processes"] = []
+for item in processes:
+    if remaining() < 0.25:
+        truncate("deadline")
+        doc["processes_state"] = "unknown"
+        break
+    cwd = (item["cwd"] or "").removesuffix(" (deleted)")
+    for job in doc["jobs"]:
+        if cwd == job["path"] or cwd.startswith(job["path"] + "/"):
+            job_pgids.setdefault(item["pgid"], set()).add(job["job_id"])
 for item in processes:
     if remaining() < 0.25:
         truncate("deadline")
         doc["processes_state"] = "unknown"
         break
     members = sorted(pgids.get(item["pgid"], ()))
+    job_ids = sorted(job_pgids.get(item["pgid"], ()))
+    item["sandboxes"] = members
+    item["job_ids"] = job_ids
     if members:
-        item["sandboxes"] = members
         doc["processes"].append(item)
+    if job_ids:
+        if len(doc["job_processes"]) < limit:
+            doc["job_processes"].append(item)
+        else:
+            doc.update(jobs_truncated=True, jobs_truncation_reason="process_limit", jobs_state="unknown",
+                       jobs_reason=doc["jobs_reason"] or "process_limit")
+            unknowns.add("jobs")
+            truncate("jobs_process_limit")
+doc["job_processes_state"] = "unknown" if doc["jobs_truncated"] or doc["jobs_state"] != "known" else doc["processes_state"]
 if doc["processes_state"] == "unknown":
     unknowns.add("processes")
 doc.update(truncated=truncation_reason is not None, truncation_reason=truncation_reason,
@@ -2851,88 +3222,25 @@ INVENTORY_PY
 }
 # END REMOTE_INVENTORY
 
-cmd="${1:-}"; [ "$#" -gt 0 ] && shift
-
-case "$cmd" in
-inventory)
-    # B1 is an observer: no dispatch, reap, flock, cache, or remote file writes.
-    exec </dev/null
-    _inventory_json=0
-    _inventory_deadline=20
-    _inventory_limit=200
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --json) _inventory_json=1; shift ;;
-            --deadline-seconds|--limit)
-                _inventory_option="$1"
-                [ "$#" -ge 2 ] || die "missing value for $_inventory_option"
-                [[ "$2" =~ ^[1-9][0-9]{0,8}$ ]] || die "invalid $_inventory_option: need a positive integer"
-                if [ "$_inventory_option" = --deadline-seconds ]; then
-                    [ "$2" -le 60 ] || die "--deadline-seconds maximum is 60"
-                    _inventory_deadline="$2"
-                else
-                    _inventory_limit="$2"
-                fi
-                shift 2
-                ;;
-            *) die "unknown inventory arg: $1" ;;
-        esac
-    done
-    [ "$_inventory_json" = 1 ] || die "inventory requires --json"
-    # Quote exports on stdin: SSH joins argv for a remote shell, so paths and
-    # bounds must not become command text there. One SSH, including all probes.
-    _inventory_exports="$(printf 'export %q\n' \
-        "AGENT_ROOT=$AGENT_ROOT" \
-        "INVENTORY_DEADLINE_SECONDS=$_inventory_deadline" \
-        "INVENTORY_LIMIT=$_inventory_limit" \
-        "WORKBAY_REMOTE_AGENT_PROC_ROOT=${WORKBAY_REMOTE_AGENT_PROC_ROOT:-/proc}")"
-    _inventory_src="$(declare -f _remote_inventory)"
-    _inventory_rc=0
-    "${SSH[@]}" bash -s <<INVENTORY_EOF || _inventory_rc=$?
-set -euo pipefail
-${_inventory_exports}
-${_inventory_src}
-_remote_inventory
-INVENTORY_EOF
-    exit "$_inventory_rc"
-    ;;
+case "${1:-}" in
 writable-roots-probe|workspace-write-probe)
     # These arms execute on the VM, where the sandbox actually exists. They
     # deliberately return one complete typed receipt on every path; an SSH or
     # host-side timeout is UNKNOWN and never a bare boolean/refusal.
-    exec </dev/null
-    _probe_kind="$cmd"
-    _probe_timeout="$PREFLIGHT_PROBE_TIMEOUT_S"
-    _probe_model="$PREFLIGHT_PROBE_MODEL"
-    _probe_nonce="$PREFLIGHT_PROBE_NONCE"
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --timeout) _probe_timeout="${2:-}"; shift 2 ;;
-            *) echo "remote_agent: unknown preflight probe arg: $1" >&2; exit 2 ;;
-        esac
-    done
-    case "$_probe_timeout" in *[!0-9]*|""|0) echo "remote_agent: probe timeout must be positive" >&2; exit 2 ;; esac
-    _probe_cap="$PREFLIGHT_PROBE_MAX_LIVE"
-    if ! command -v timeout >/dev/null 2>&1; then
-        printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"transport_failure","elapsed_s":0,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' "$_probe_kind" "$_probe_model" "$_probe_nonce"
-        exit 0
-    fi
-    if ! command -v flock >/dev/null 2>&1; then
-        printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"transport_failure","elapsed_s":0,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' "$_probe_kind" "$_probe_model" "$_probe_nonce"
-        exit 0
-    fi
-    if [ "$_probe_cap" -le 0 ] 2>/dev/null; then
-        printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"probe_capacity","elapsed_s":0,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' "$_probe_kind" "$_probe_model" "$_probe_nonce"
-        exit 0
-    fi
-    _probe_started=$SECONDS
-    _probe_rc=0
+    _remote_agent_configure "$@"
     # The remote arm owns its lifetime. The command-level timeout remains in
     # force even if this SSH caller vanishes immediately after spawn.
     # Script delivery is opaque; stdin carries only the causal grant.
     _run_preflight_transport() {
     local _preflight_driver
-    _preflight_driver=$(cat <<'PREFLIGHT_DRIVER_EOF'
+    if [ -z "$_probe_model" ]; then
+        # Run the checkout read and the entire installed-runtime ladder in one
+        # cancellable process group. Pass shell code and paths separately.
+        export _probe_lookup_sh="$(declare -f _preflight_read_model _host_workbay_resolve_python)"
+        export _probe_script="${BASH_SOURCE[0]}"
+        export _probe_bash="$BASH" _BOUNDARY_RUNTIME_VERSION _boundary_runtime_sh
+    fi
+    { IFS= read -r -d '' _preflight_driver || [ -n "$_preflight_driver" ]; } <<'PREFLIGHT_DRIVER_EOF'
 import base64
 import json
 import os
@@ -2945,16 +3253,66 @@ import time
 
 # Bounds assume rate-compatible monotonic clocks, timely scheduling and a
 # healthy kernel. A missing terminal reply never proves remote disappearance.
-budget = float(sys.argv[2])
-deadline = time.monotonic() + budget
+# Translate the shell deadline once. All subsequent waits use the host
+# monotonic clock, including when an enclosing caller supplies a tighter cap.
+sample = time.clock_gettime(time.CLOCK_BOOTTIME) if os.environ["_probe_clock"] == "boottime" else time.time()
+offset = time.monotonic() - sample
+started = int(os.environ["_probe_started_ms"]) / 1000 + offset
+deadline = int(os.environ["_probe_deadline_ms"]) / 1000 + offset
 host_deadline = os.environ.get("WORKBAY_PREFLIGHT_HOST_DEADLINE")
 if host_deadline is not None:
     deadline = min(deadline, float(host_deadline))
-budget = min(budget, deadline - time.monotonic())
-if budget <= 0.5:
-    sys.exit(124)
-body = sys.stdin.read()
 args = sys.argv[1:11]
+
+def remaining_io():
+    # Reserve host cancellation and reaping time inside the probe deadline.
+    return deadline - time.monotonic() - 0.5
+
+def refuse(reason):
+    print(json.dumps(dict(schema="workbay.preflight.v1", probe=args[0], ok=False,
+                          verdict="unknown", reason=reason, elapsed_s=round(max(0, time.monotonic() - started), 3),
+                          cleanup_status="unknown", retryable=False, live_probe_count=0,
+                          head="", model=args[2], nonce=args[5], sandbox_flags="workspace-write")))
+    sys.exit(0)
+
+if not args[2]:
+    import re
+    import tempfile
+
+    if remaining_io() <= 0:
+        refuse("timeout")
+    # The interpreter ladder creates diagnostic files. Reclaim them even
+    # when the watchdog interrupts a rung before its own cleanup.
+    with tempfile.TemporaryDirectory() as scratch:
+        lookup = subprocess.Popen(
+            [os.environ["_probe_bash"], "-c", os.environ["_probe_lookup_sh"] + '\n_preflight_read_model "$1"',
+             "probe-model", os.environ["_probe_script"]],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, start_new_session=True,
+            env=dict(os.environ, TMPDIR=scratch))
+        def cancel_lookup(*_):
+            raise TimeoutError("host cancelled model lookup")
+
+        previous_handler = signal.signal(signal.SIGTERM, cancel_lookup)
+        try:
+            model, _ = lookup.communicate(timeout=max(0, remaining_io()))
+        except (TimeoutError, subprocess.TimeoutExpired):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.killpg(lookup.pid, signal.SIGKILL)
+            lookup.wait(timeout=0.25)
+            refuse("timeout")
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+    if remaining_io() <= 0:
+        refuse("timeout")
+    model = model.rstrip(b"\n")
+    if lookup.returncode or not re.fullmatch(rb"[A-Za-z0-9._:/-]+", model):
+        refuse("routing_source_unavailable")
+    args[2] = model.decode("ascii")
+    args[1] = str(deadline - time.monotonic())
+budget = deadline - time.monotonic()
+if budget <= 0.5:
+    refuse("timeout")
+body = sys.stdin.read()
 ownership = None
 if os.environ.get("WORKBAY_PROBE_LAUNCH_PATH"):
     ownership = {key: os.environ["WORKBAY_PROBE_" + key.upper()] for key in
@@ -3072,12 +3430,16 @@ if ownership is not None:
 ssh_argv = list(sys.argv[11:])
 if ownership is not None:
     ssh_argv[1:1] = ['-o', 'StrictHostKeyChecking=yes']
-proc = subprocess.Popen([*ssh_argv, 'bash', '-c', shlex.quote(command)],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        start_new_session=True)
+try:
+    proc = subprocess.Popen([*ssh_argv, 'bash', '-c', shlex.quote(command)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            start_new_session=True)
+except OSError:
+    refuse("transport_failure")
 selector = selectors.DefaultSelector()
 selector.register(proc.stdout, selectors.EVENT_READ)
 output = bytearray()
+ready = None
 granted = False
 def cancel_host_transport(*_):
     raise TimeoutError("host cancelled preflight transport")
@@ -3085,7 +3447,7 @@ def cancel_host_transport(*_):
 signal.signal(signal.SIGTERM, cancel_host_transport)
 try:
     while True:
-        remaining = deadline - time.monotonic() - 0.5
+        remaining = remaining_io()
         if remaining <= 0 or not selector.select(remaining):
             raise TimeoutError
         chunk = os.read(proc.stdout.fileno(), 65536)
@@ -3114,7 +3476,7 @@ try:
                     # until this succeeds; a lost grant leaves UNKNOWN work.
                 elif len(ready) != 2:
                     raise ValueError('unexpected ownership frame')
-                remaining = deadline - time.monotonic() - 0.5
+                remaining = remaining_io()
                 if remaining <= 0:
                     raise TimeoutError
                 proc.stdin.write(('WORKBAY_GRANT ' + json.dumps([nonce, challenge, remaining]) + '\n').encode())
@@ -3123,16 +3485,20 @@ try:
                 output = bytearray(tail)
         if len(output) > 65536:
             raise ValueError('oversized receipt')
-    rc = proc.wait(timeout=max(0.001, deadline - time.monotonic() - 0.5))
+    rc = proc.wait(timeout=max(0.001, remaining_io()))
     if rc == 0:
         if not granted:
             raise ValueError("receipt without READY/GRANT")
-        sys.stdout.buffer.write(output)
-    sys.exit(rc if rc >= 0 else 124)
+        receipt = json.loads(output)
+        if (not isinstance(receipt, dict) or receipt.get("schema") != "workbay.preflight.v1"
+                or (receipt.get("probe"), receipt.get("model"), receipt.get("nonce")) != (args[0], args[2], args[5])):
+            raise ValueError("invalid probe receipt")
+        receipt["elapsed_s"] = round(max(0, time.monotonic() - started), 3)
+        print(json.dumps(receipt))
 except (TimeoutError, subprocess.TimeoutExpired):
-    sys.exit(124)
+    rc = 124
 except (ValueError, OSError):
-    sys.exit(1)
+    rc = 1
 finally:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if proc.poll() is None:
@@ -3142,262 +3508,142 @@ finally:
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=0.25)
+if rc:
+    timed_out = rc in (124, 137) or rc < 0
+    refuse("timeout" if ready is not None and timed_out else "transport_failure")
 PREFLIGHT_DRIVER_EOF
-)
-    python3 -c "$_preflight_driver" "$_probe_kind" "$_probe_timeout" "$_probe_model" "$_probe_cap" "$AGENT_ROOT" "$_probe_nonce" "${WORKBAY_PREFLIGHT_PROBE_EFFORT:-low}" "${WORKBAY_PREFLIGHT_PROBE_BINARY:-.local/bin/codex}" "${WORKBAY_PREFLIGHT_PROBE_PATH:-.local/bin}" "$PREFLIGHT_PROBE_SLOT_WAIT_S" "${SSH[@]}" <<'REMOTE_PREFLIGHT_BODY_EOF'
+    export _probe_clock _probe_started_ms _probe_deadline_ms
+    # A watchdog can report its own timeout even when the driver handles TERM
+    # and exits successfully. Frame that success in the same process as the
+    # receipt so escalation cannot leave a separate status reporter behind.
+    _preflight_bounded python3 -c '
+import sys
+try:
+    exec(sys.argv.pop(1))
+except SystemExit as stop:
+    if stop.code not in (None, 0):
+        raise
+print("WORKBAY_DRIVER_OK", flush=True)
+' "$_preflight_driver" "$_probe_kind" "$_probe_timeout" "$_probe_model" "$_probe_cap" "$AGENT_ROOT" "$_probe_nonce" "${WORKBAY_PREFLIGHT_PROBE_EFFORT:-low}" "${WORKBAY_PREFLIGHT_PROBE_BINARY:-.local/bin/codex}" "${WORKBAY_PREFLIGHT_PROBE_PATH:-.local/bin}" "$_probe_slot_wait" "${SSH[@]}" <<'REMOTE_PREFLIGHT_BODY_EOF'
 set -u
-kind="${1:-}"
-bound="${2:-}"
-model="${3:-}"
-cap="${4:-2}"
-agent_root="${5:-workbay-sandbox}"
-nonce="${6:-workbay-probe-${BASHPID:-$$}}"
-effort="${7:-low}"
-slot_wait="${10:-0}"
-body_budget="${11:-}"
-export WORKBAY_PROBE_NONCE="$nonce"
-started="$(date +%s)"
-waited_s=0
-wait_budget=0
-budget_whole=0
-if [[ "$slot_wait" =~ ^[0-9]+$ ]] && [[ "$body_budget" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    # Compare decimal magnitudes before arithmetic: an accepted wait may be
-    # larger than a signed shell integer, including after leading zeroes.
-    slot_wait_decimal="${slot_wait#"${slot_wait%%[!0]*}"}"
-    slot_wait_decimal="${slot_wait_decimal:-0}"
-    budget_decimal="${body_budget%%.*}"
-    budget_decimal="${budget_decimal#"${budget_decimal%%[!0]*}"}"
-    budget_decimal="${budget_decimal:-0}"
-    # The absolute deadline must fit too, including the current clock value.
-    budget_max=$((9223372036854775807 - started))
-    if [[ "${#budget_decimal}" -lt "${#budget_max}" ]] ||
-       { [[ "${#budget_decimal}" -eq "${#budget_max}" ]] && [[ "$budget_decimal" < "$budget_max" || "$budget_decimal" = "$budget_max" ]]; }; then
-        budget_whole=$((10#$budget_decimal))
-        budget_half=$((budget_whole / 2))
-        wait_budget="$budget_half"
-        if [ "${#slot_wait_decimal}" -lt "${#budget_half}" ] ||
-           { [ "${#slot_wait_decimal}" -eq "${#budget_half}" ] && [[ "$slot_wait_decimal" < "$budget_half" ]]; }; then
-            wait_budget=$((10#$slot_wait_decimal))
-        fi
-    else
-        echo 'remote_agent: probe body budget exceeds the shell integer range; refusing lock waits' >&2
-    fi
-fi
-# Both locks share half the supervisor's effective budget. Setup consumes the
-# absolute deadline, which reserves a clock tick and receipt time before timeout.
-# A caller without a valid body budget keeps non-blocking acquisition only.
-wait_deadline=$((started + budget_whole - 1))
-case "$agent_root" in /*) slot_root="$agent_root/.workbay-preflight-probes" ;; *) slot_root="$HOME/$agent_root/.workbay-preflight-probes" ;; esac
-mkdir -p -- "$slot_root" 2>/dev/null || true
+body_started=$SECONDS
 emit() {
-    _ok="$1"; _verdict="$2"; _reason="$3"; _head="${4:-}"; _now="$(date +%s)"
-    _elapsed=$((_now - started))
-    _waited="${waited_s:-0}"
-    if [ "$_waited" -gt "$_elapsed" ]; then _waited="$_elapsed"; fi
-    printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":%s,"verdict":"%s","reason":"%s","elapsed_s":%s,"waited_s":%s,"live_probe_count":%s,"head":"%s","model":"%s","nonce":"%s","sandbox_flags":"%s"}\n' \
-        "$kind" "$_ok" "$_verdict" "$_reason" "$_elapsed" "$_waited" "${live_count:-0}" "$_head" "$model" "$nonce" "${sandbox_flags:-workspace-write}"
+    printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"sandbox_policy_unavailable","elapsed_s":%d,"waited_s":0,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"%s"}\n' \
+        "$kind" "$((SECONDS - body_started))" "$model" "$nonce" "$sandbox_flags"
 }
-_record_probe_wait() {
-    local _wait_from="$1" _wait_to="$2" _wait_duration
-    _wait_duration=$((_wait_to - _wait_from))
-    if [ "$_wait_duration" -gt 0 ]; then waited_s=$((waited_s + _wait_duration)); fi
-}
-if ! [[ "$cap" =~ ^[0-9]+$ ]] || [ "$cap" -lt 1 ]; then
-    live_count=0; emit false unknown probe_capacity; exit 0
-fi
-# Dynamic redirection closes the descriptor held by the variable; reject any
-# non-numeric value before it reaches that redirection, even though the value
-# is not re-parsed as shell source.
-_close_probe_fd() {
-    _close_fd="${1:-}"
-    case "$_close_fd" in
-        ''|*[!0-9]*) return 0 ;;
-        *) exec {_close_fd}>&- 2>/dev/null || true ;;
-    esac
-}
-slot_fd=''; slot_index=''; live_count=0
-for _slot in $(seq 0 $((cap - 1))); do
-    _slot_path="$slot_root/slot-${_slot}.lock"
-    exec {_fd}>"$_slot_path" 2>/dev/null || continue
-    if flock -n "$_fd"; then
-        slot_fd="$_fd"
-        slot_index="$_slot"
-        live_count=1
-        break
-    fi
-    _close_probe_fd "$_fd"
-done
-if [ -z "$slot_fd" ] && [ "$wait_budget" -gt 0 ]; then
-    _wait_start_slot=0
-    while [ -z "$slot_fd" ]; do
-        _wait_now="$(date +%s)"
-        _wait_left=$((wait_deadline - _wait_now))
-        _wait_allowance=$((wait_budget - waited_s))
-        if [ "$_wait_left" -gt "$_wait_allowance" ]; then _wait_left="$_wait_allowance"; fi
-        if [ "$_wait_left" -le 0 ]; then break; fi
-        _rotation_opened=0
-        for ((_wait_offset = 0; _wait_offset < cap; _wait_offset++)); do
-            _wait_now="$(date +%s)"
-            _wait_left=$((wait_deadline - _wait_now))
-            _wait_allowance=$((wait_budget - waited_s))
-            if [ "$_wait_left" -gt "$_wait_allowance" ]; then _wait_left="$_wait_allowance"; fi
-            if [ "$_wait_left" -le 0 ]; then break; fi
-            _wait_slot=$(((_wait_start_slot + _wait_offset) % cap))
-            _wait_path="$slot_root/slot-${_wait_slot}.lock"
-            exec {_wait_fd}>"$_wait_path" 2>/dev/null || continue
-            _rotation_opened=1
-            _wait_before="$(date +%s)"
-            if [ "$((_wait_before + 1))" -gt "$wait_deadline" ]; then
-                _close_probe_fd "$_wait_fd"
-                break
-            fi
-            if flock -w 1 "$_wait_fd"; then
-                _wait_after="$(date +%s)"
-                _record_probe_wait "$_wait_before" "$_wait_after"
-                slot_fd="$_wait_fd"
-                slot_index="$_wait_slot"
-                live_count=1
-                break
-            fi
-            _wait_after="$(date +%s)"
-            _record_probe_wait "$_wait_before" "$_wait_after"
-            _close_probe_fd "$_wait_fd"
-        done
-        if [ -z "$slot_fd" ]; then
-            if [ "$_rotation_opened" -eq 0 ]; then break; fi
-            _wait_start_slot=$(((_wait_start_slot + 1) % cap))
-        fi
-    done
-fi
-if [ -z "$slot_fd" ]; then
-    # Another slot may have freed while the last blocking attempt used up the
-    # allowance. Exhaustion requires a fresh non-blocking scan of every slot.
-    for _slot in $(seq 0 $((cap - 1))); do
-        _slot_path="$slot_root/slot-${_slot}.lock"
-        exec {_fd}>"$_slot_path" 2>/dev/null || continue
-        if flock -n "$_fd"; then
-            slot_fd="$_fd"
-            slot_index="$_slot"
-            live_count=1
-            break
-        fi
-        _close_probe_fd "$_fd"
-    done
-fi
-if [ -z "$slot_fd" ]; then
-    live_count="$cap"; emit false unknown probe_capacity; exit 0
-fi
-for _count_slot in $(seq 0 $((cap - 1))); do
-    [ "$_count_slot" = "$slot_index" ] && continue
-    _count_path="$slot_root/slot-${_count_slot}.lock"
-    exec {_count_fd}>"$_count_path" 2>/dev/null || continue
-    if flock -n "$_count_fd"; then
-        flock -u "$_count_fd" 2>/dev/null || true
-    else
-        live_count=$((live_count + 1))
-    fi
-    _close_probe_fd "$_count_fd"
-done
-cleanup() {
-    # Keep the stable cwd: Codex may retain its project trust entry.
-    _close_probe_fd "${cwd_fd:-}"
-    # Descendants inherit the lock; do not unlock their shared description.
-    _close_probe_fd "$slot_fd"
-}
-trap cleanup EXIT
-# Keep the group leader alive until timeout's reserved KILL escalation. A
-# model may exit on TERM while its own children ignore it; returning early
-# would cancel timeout's escalation and leave those children behind.
-trap 'sleep 2; exit 124' HUP INT TERM
-configured_binary="${8:-.local/bin/codex}"
-IFS=: read -r -a probe_paths <<< "${9:-.local/bin}"
-for ((i=${#probe_paths[@]}-1; i>=0; i--)); do
-    entry="${probe_paths[$i]}"
-    case "$entry" in /*) ;; *) entry="$HOME/$entry" ;; esac
-    export PATH="$entry:$PATH"
-done
-case "$configured_binary" in
-    /*) codex="$configured_binary" ;;
-    */*) codex="$HOME/$configured_binary" ;;
-    *) codex="$(command -v "$configured_binary" 2>/dev/null || true)" ;;
-esac
-if [ -z "$codex" ] || [ ! -x "$codex" ]; then
-    emit false negative binary_missing
-    exit 0
-fi
-# One cwd for every kind and nonce. Serialize its use, including descendants.
-exec {cwd_fd}>"$slot_root/cwd.lock"
-if ! flock -n "$cwd_fd"; then
-    _wait_now="$(date +%s)"
-    _wait_left=$((wait_deadline - _wait_now))
-    _wait_allowance=$((wait_budget - waited_s))
-    if [ "$_wait_left" -gt "$_wait_allowance" ]; then _wait_left="$_wait_allowance"; fi
-    if [ "$_wait_left" -gt 0 ]; then
-        _wait_before="$_wait_now"
-        if flock -w "$_wait_left" "$cwd_fd"; then
-            _wait_after="$(date +%s)"
-            _record_probe_wait "$_wait_before" "$_wait_after"
-        else
-            _wait_after="$(date +%s)"
-            _record_probe_wait "$_wait_before" "$_wait_after"
-            emit false unknown probe_capacity
-            exit 0
-        fi
-    else
-        emit false unknown probe_capacity
-        exit 0
-    fi
-fi
-probe_root="$slot_root/cwd"
-if [ -L "$probe_root" ] || ! mkdir -p -- "$probe_root"; then
-    emit false unknown spawn_error
-    exit 0
-fi
-# Clear previous evidence before either probe (including an interrupted run).
-if ! find "$probe_root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; then
-    emit false unknown spawn_error
-    exit 0
-fi
-if ! cd -- "$probe_root"; then
-    emit false unknown spawn_error
-    exit 0
-fi
+# Positional ABI: kind bound model cap agent_root nonce effort binary paths
+# slot_wait body_budget. Retired probes only need receipt identity.
+kind="${1:-}"
+model="${3:-}"
+nonce="${6:-workbay-probe-${BASHPID:-$$}}"
 if [ "$kind" = "writable-roots-probe" ]; then
-    if ! git -C "$probe_root" init -b probe >/dev/null 2>&1; then
-        emit false unknown executor_failed
-        exit 0
-    fi
-    printf '%s\n' 'workbay writable roots probe' >"$probe_root/probe.txt"
-    prompt='Create a commit in the current repository containing probe.txt. Do not modify anything outside this repository.'
     sandbox_flags='workspace-write,writable_roots=.git'
-    sandbox_extra='sandbox_workspace_write.writable_roots=[".git"]'
 else
-    prompt='Create the file .workbay-workspace-write-probe with the contents probe. Do not modify anything outside this directory.'
     sandbox_flags='workspace-write'
-    sandbox_extra=''
 fi
 # These historical probes have no exact future lane env/cwd or native policy
 # handle. A paid turn cannot repair that missing capability. Never infer PASS
 # from ordinary host writability or synthesize an unconfigured profile.
-emit false unknown sandbox_policy_unavailable
+emit
 exit 0
 
 REMOTE_PREFLIGHT_BODY_EOF
     }
-    if _probe_output=$(_run_preflight_transport)
-    then
+    if _probe_output=$(_run_preflight_transport); then
         _probe_rc=0
-        printf '%s\n' "$_probe_output"
     else
         _probe_rc=$?
     fi
-    if [ "$_probe_rc" -ne 0 ]; then
-        _probe_reason=transport_failure
-        case "$_probe_rc" in 124|137) _probe_reason=timeout ;; esac
-        _probe_elapsed=$((SECONDS - _probe_started))
-        printf '{"schema":"workbay.preflight.v1","probe":"%s","ok":false,"verdict":"unknown","reason":"%s","cleanup_status":"unknown","retryable":false,"elapsed_s":%s,"live_probe_count":0,"head":"","model":"%s","nonce":"%s","sandbox_flags":"workspace-write"}\n' "$_probe_kind" "$_probe_reason" "$_probe_elapsed" "$_probe_model" "$_probe_nonce"
+    if [[ $_probe_output == *$'\nWORKBAY_DRIVER_OK' ]]; then
+        printf '%s\n' "${_probe_output%$'\nWORKBAY_DRIVER_OK'}"
+        exit 0
     fi
-    exit 0
+    _probe_reason=transport_failure
+    case "$_probe_rc" in 124|137|143) _probe_reason=timeout ;; 127) [ -n "$_probe_model" ] || _probe_reason=routing_source_unavailable ;; esac
+    _preflight_refuse "$_probe_reason"
+    ;;
+esac
+
+_load_probe_trust_pruner
+repo_root="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+repo_slug="$(basename "$repo_root")"
+
+# Read the consumer cadence from the unit that is installed with the queue.
+# A missing or malformed timer leaves freshness unknown and therefore stale.
+_queue_timer_file="$(dirname "${BASH_SOURCE[0]}")/vm/workbay-lane-queue.timer"
+_host_reservation_file="$(dirname "${BASH_SOURCE[0]}")/vm/host_reservation.py"
+
+_remote_agent_check_companions() {
+    # These local files are part of the installed transport contract. A broken
+    # install cannot recover through retryable VM admission (exit 75).
+    local _companion _companion_rc=0
+    for _companion in "$_host_reservation_file" "$_queue_timer_file"; do
+        if [ ! -f "$_companion" ] || [ ! -r "$_companion" ] || [ ! -s "$_companion" ]; then
+            printf 'remote_agent: config_missing scripts/vm/%s\n' "${_companion##*/}" >&2
+            _companion_rc=78
+        fi
+    done
+    return "$_companion_rc"
+}
+
+# Validate before any dispatch rendering or transport. Other commands can still
+# inspect or clean up remote jobs when a local install needs repair.
+case "${1:-}" in
+    build|submit)
+        _remote_agent_check_companions || exit "$?"
+        _boundary_runtime_preamble >/dev/null || exit 2
+        ;;
+esac
+
+QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
+case "$QUEUE_TICK_INTERVAL_S" in ''|*[!0-9]*|0) QUEUE_TICK_INTERVAL_S="" ;; esac
+
+_remote_agent_configure "$@"
+
+cmd="${1:-}"; [ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+inventory)
+    # B1 is an observer: no dispatch, reap, flock, cache, or remote file writes.
+    exec </dev/null
+    _inventory_json=0
+    _inventory_deadline=20
+    _inventory_limit=200
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --json) _inventory_json=1; shift ;;
+            --deadline-seconds|--limit)
+                _inventory_option="$1"
+                [ "$#" -ge 2 ] || die "missing value for $_inventory_option"
+                [[ "$2" =~ ^[1-9][0-9]{0,8}$ ]] || die "invalid $_inventory_option: need a positive integer"
+                if [ "$_inventory_option" = --deadline-seconds ]; then
+                    [ "$2" -le 60 ] || die "--deadline-seconds maximum is 60"
+                    _inventory_deadline="$2"
+                else
+                    _inventory_limit="$2"
+                fi
+                shift 2
+                ;;
+            *) die "unknown inventory arg: $1" ;;
+        esac
+    done
+    [ "$_inventory_json" = 1 ] || die "inventory requires --json"
+    # Quote exports on stdin: SSH joins argv for a remote shell, so paths and
+    # bounds must not become command text there. One SSH, including all probes.
+    _inventory_exports="$(printf 'export %q\n' \
+        "AGENT_ROOT=$AGENT_ROOT" \
+        "INVENTORY_DEADLINE_SECONDS=$_inventory_deadline" \
+        "INVENTORY_LIMIT=$_inventory_limit" \
+        "WORKBAY_REMOTE_AGENT_PROC_ROOT=${WORKBAY_REMOTE_AGENT_PROC_ROOT:-/proc}")"
+    _inventory_src="$(declare -f _remote_inventory)"
+    _inventory_rc=0
+    "${SSH[@]}" bash -s <<INVENTORY_EOF || _inventory_rc=$?
+set -euo pipefail
+${_inventory_exports}
+${_inventory_src}
+_remote_inventory
+INVENTORY_EOF
+    exit "$_inventory_rc"
     ;;
 doctor)
     _remote_agent_check_companions || true
@@ -3417,7 +3663,7 @@ DOCTOR_BOUNDARY_EOF
     else
         echo 'boundary: REFUSED invalid WORKBAY_REMOTE_BOUNDARY_PYTHON'
     fi
-    "${SSH[@]}" 'g="$HOME/.grok/bin/grok"
+    if "${SSH[@]}" 'g="$HOME/.grok/bin/grok"
         [ -x "$g" ] && echo "grok    : $("$g" --version)" || echo "grok    : MISSING (install per runbook)"
         # implementation note: per-backend binary/env paths are AgentSpec data, not doctor
         # hardcodes (vendor-free executor). uv/systemd probes stay host-generic.
@@ -3426,7 +3672,75 @@ DOCTOR_BOUNDARY_EOF
         root='"$AGENT_ROOT"'; case "$root" in /*) ;; *) root="$HOME/$root" ;; esac
         n=$(ls -1d "$root"/.venv-lane-* 2>/dev/null | wc -l | tr -d " ")
         tot=$(du -csh "$root"/.venv-lane-* 2>/dev/null | tail -1 | cut -f1)
-        echo "venvs   : ${n:-0} persisted lane venv(s)${tot:+, ~$tot total} (cap '"$LANE_VENV_CAP"')"'
+        echo "venvs   : ${n:-0} persisted lane venv(s)${tot:+, ~$tot total} (cap '"$LANE_VENV_CAP"')"
+        # Diagnose the actual agent-root parent, not the local checkout or HOME
+        # alone. This is read-only and does not change doctor admission status.
+        enclosing_repo_probe() {
+            if ! command -v git >/dev/null 2>&1; then
+                echo "remote_enclosing_repo: PROBE FAILED (git unavailable)"
+                return
+            fi
+            if [ -d "$root" ]; then
+                resolved=$(cd -P "$root" 2>/dev/null && pwd -P) || {
+                    echo "remote_enclosing_repo: PROBE FAILED (agent root inaccessible)"; return;
+                }
+                parent=$(dirname "$resolved")
+            elif [ -e "$root" ] || [ -L "$root" ]; then
+                echo "remote_enclosing_repo: PROBE FAILED (invalid agent root)"
+                return
+            else
+                parent=$(dirname "$root")
+            fi
+            # The root need not have been created yet; the nearest existing
+            # parent has the same enclosing ancestors as its missing children.
+            while [ ! -d "$parent" ]; do
+                if [ -e "$parent" ] || [ -L "$parent" ]; then
+                    echo "remote_enclosing_repo: PROBE FAILED (invalid parent)"; return
+                fi
+                next=$(dirname "$parent")
+                if [ "$next" = "$parent" ]; then
+                    echo "remote_enclosing_repo: PROBE FAILED (parent unavailable)"; return
+                fi
+                parent=$next
+            done
+            parent=$(cd -P "$parent" 2>/dev/null && pwd -P) || {
+                echo "remote_enclosing_repo: PROBE FAILED (parent inaccessible)"; return;
+            }
+            # Inspect the physical ancestors even if this login has a ceiling
+            # or an explicit Git directory that would mask or redirect discovery.
+            if enclosing=$(
+                unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_CEILING_DIRECTORIES
+                export LC_ALL=C GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+                git -C "$parent" rev-parse --show-toplevel 2>&1
+            ); then
+                case "$enclosing" in
+                    /*)
+                        safe_enclosing=$(printf "%s" "$enclosing" | LC_ALL=C tr -c "[:print:]" "?")
+                        printf "remote_enclosing_repo: ALARM %s (check Git discovery in remote tests and temporary directories)\n" "$safe_enclosing"
+                        ;;
+                    *) echo "remote_enclosing_repo: PROBE FAILED (invalid git result)" ;;
+                esac
+            elif [ "$enclosing" = "fatal: not a git repository (or any of the parent directories): .git" ]; then
+                # Git uses this same error for some broken .git directories.
+                # Do not turn inaccessible or malformed metadata into CLEAR.
+                scan=$parent
+                while :; do
+                    if [ ! -x "$scan" ] || [ -e "$scan/.git" ] || [ -L "$scan/.git" ]; then
+                        echo "remote_enclosing_repo: PROBE FAILED (git metadata unavailable)"; return
+                    fi
+                    [ "$scan" = / ] && break
+                    scan=$(dirname "$scan")
+                done
+                echo "remote_enclosing_repo: CLEAR"
+            else
+                echo "remote_enclosing_repo: PROBE FAILED (git discovery)"
+            fi
+        }
+        enclosing_repo_probe'; then
+        :
+    else
+        printf 'remote_enclosing_repo: PROBE FAILED (ssh; remote probe unavailable)\n'
+    fi
     # The VM owns reclamation; doctor only consumes its read-only status gauge.
     if "${SSH[@]}" 'bash -s' <<'DOCTOR_RECLAIM_EOF'
 reclaim="$HOME/.local/lib/workbay/workbay_vm_reclaim.py"
@@ -8217,7 +8531,7 @@ _admission_scope_snapshot \"\$2\" \"\$3\" \"\$4\"" \
 _admission_top_scopes() {
     local _ats_metric=$1 _ats_deadline_raw _ats_whole _ats_fraction _ats_seconds _ats_millis
     local _ats_budget_ms _ats_now_ms _ats_deadline_ms _ats_cap_raw _ats_candidate_cap
-    local _ats_timeout _ats_status _ats_before _ats_after
+    local _ats_timeout _ats_status _ats_before _ats_after _ats_formatted
     # Fixed containment grace: even TERM-ignoring workers must be killed.
     local _ats_kill_grace_ms=300 _ats_kill_grace
     printf -v _ats_kill_grace '%d.%03d' "$((_ats_kill_grace_ms / 1000))" "$((_ats_kill_grace_ms % 1000))"
@@ -8306,7 +8620,14 @@ _admission_top_scopes() {
         esac
         return 0
     }
-    printf '%s\n%s\n' "$_ats_before" "$_ats_after" | awk -F '|' -v metric="$_ats_metric" '
+    # Formatting is part of the same budget as collection. Capture the whole
+    # result so a failed or killed formatter cannot emit partial attribution.
+    _ats_timeout=$(_admission_remaining_timeout "$_ats_deadline_ms") || {
+        echo 'attribution: unavailable (deadline)'
+        return 0
+    }
+    if _ats_formatted=$(printf '%s\n%s\n' "$_ats_before" "$_ats_after" |
+        timeout -k "$_ats_kill_grace" "$_ats_timeout" awk -F '|' -v metric="$_ats_metric" '
         $1 == "B" {before[$2] = $4; before_count++; next}
         $1 == "A" && !($2 in before) {changed = 1; next}
         $1 == "A" && ($2 in before) && $4 ~ /^[0-9]+$/ {
@@ -8335,7 +8656,19 @@ _admission_top_scopes() {
                 used[best] = 1
             }
             printf "\n"
-        }'
+        }'); then
+        if [ -n "$_ats_formatted" ]; then
+            printf '%s\n' "$_ats_formatted"
+        else
+            echo unavailable:format_failed
+        fi
+    else
+        _ats_status=$?
+        case "$_ats_status" in
+            124|137|143) echo 'attribution: unavailable (deadline)' ;;
+            *) echo unavailable:format_failed ;;
+        esac
+    fi
 }
 _admission_unmeasured() {
     _au_metric=cpu
@@ -15350,8 +15683,8 @@ try:
         if effect_path().exists() or effect_path().is_symlink():
             raise ValueError("native effect channel already exists")
         from workbay_orchestrator_mcp.orchestration.execution_preflight import (
-            ANALYSIS_CAPABILITY, WRITE_CAPABILITY, Refused, check_execution_context, materialize_execution_argv,
-            refusal_marker, refusal_receipt, run_execution_preflight,
+            ANALYSIS_CAPABILITY, WRITE_CAPABILITY, Refused, context_changed_receipt, execution_context_changes,
+            materialize_execution_argv, refusal_marker, refusal_receipt, run_execution_preflight,
         )
 
         # Set by the generated launcher AFTER the author environment fragment.
@@ -15373,6 +15706,20 @@ try:
         write_receipt(receipt_path, payload)
         from workbay_orchestrator_mcp.orchestration.preflight_attestation import validate_execution_preflight
         validation = validate_execution_preflight(proof, capability=capability)
+        if validation["ok"]:
+            if (payload.get("sandbox_base_tree") and proof.get("source", {}).get("tree") != payload["sandbox_base_tree"]):
+                raise ValueError("execution preflight source tree mismatch")
+            try:
+                boundary_changed = hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != binding["boundary_sha256"]
+            except OSError:
+                boundary_changed = True
+            changed_keys = ["boundary_sha256"] if boundary_changed else []
+            changed_keys.extend(execution_context_changes(proof, resolved_agent, agent_argv[1:], cwd=Path.cwd(),
+                                                           output_dir=receipt_path.parent, env=os.environ))
+            if changed_keys:
+                proof = context_changed_receipt(changed_keys, binding=binding, observed=proof)
+                payload["execution_preflight"] = proof
+                validation = {"ok": False, "reason": proof["reason"]}
         if not validation["ok"]:
             if proof.get("status") == "PASS":
                 observed = proof
@@ -15386,13 +15733,6 @@ try:
             write_refusal_effect(proof)
             print("remote_agent: execution_preflight=" + validation["reason"], file=sys.stderr)
             raise SystemExit(7)
-        if (payload.get("sandbox_base_tree") and proof.get("source", {}).get("tree") != payload["sandbox_base_tree"]):
-            raise ValueError("execution preflight source tree mismatch")
-        if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != binding["boundary_sha256"]:
-            raise ValueError("model boundary source changed after native probe")
-        if not check_execution_context(proof, resolved_agent, agent_argv[1:], cwd=Path.cwd(),
-                                       output_dir=receipt_path.parent, env=os.environ):
-            raise ValueError("execution context changed after native probe")
         if not validate_execution_preflight(proof, capability=capability)["ok"]:
             raise ValueError("execution preflight expired during context recheck")
         effect_path(proof)

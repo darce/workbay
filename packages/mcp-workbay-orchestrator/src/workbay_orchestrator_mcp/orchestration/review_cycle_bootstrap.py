@@ -169,25 +169,36 @@ def check(request: dict, *, repo: Path | None = None) -> dict:
         # The source proof stays the incoming identity. Native dispatch charges
         # the retained subject, so the grant and counters are that subject's.
         result.charged_subject, receipt_records = bootstrap_charged_subject(repo, primary, proof, data)
-        _require(result.charged_subject["status"] == "derived", "charged_subject_ambiguous",
+        # A typed hold already names its holders and charges nothing. It is
+        # reported as held, not ambiguous, after the same stability rechecks;
+        # no grant is evaluated for a subject that cannot be charged.
+        held = result.charged_subject["status"] == "held_missing_proof"
+        _require(held or result.charged_subject["status"] == "derived", "charged_subject_ambiguous",
                  "one applicable retained subject; native settlement/release evidence for the other holders")
-        charged = result.charged_subject["subject_branch"]
-        _require((approval["subject_branch"], approval["kind"], approval["round"]) == (charged, "implement", request["round"]),
-                 "grant_mismatch", "original native grant for this exact charged subject/kind/round")
-        consumed = any((r.get("operator_approval") or {}).get("approval_id") == approval["approval_id"]
-                       for r in data["rows"].values())
-        next_round = subject_accounting(data, charged, ledger.policy)["charged_rows"]["implement"] + 1
-        _require(not consumed and next_round == request["round"], "grant_stale_or_consumed",
-                 "unconsumed original native grant for the current exact next round; no refunds or resets")
+        if not held:
+            charged = result.charged_subject["subject_branch"]
+            _require((approval["subject_branch"], approval["kind"], approval["round"]) == (charged, "implement", request["round"]),
+                     "grant_mismatch", "original native grant for this exact charged subject/kind/round")
+            consumed = any((r.get("operator_approval") or {}).get("approval_id") == approval["approval_id"]
+                           for r in data["rows"].values())
+            next_round = subject_accounting(data, charged, ledger.policy)["charged_rows"]["implement"] + 1
+            _require(not consumed and next_round == request["round"], "grant_stale_or_consumed",
+                     "unconsumed original native grant for the current exact next round; no refunds or resets")
+            result.grant = dict(approval_id=approval["approval_id"], sha256=approval_sha, state="unconsumed",
+                                subject_branch=approval["subject_branch"], kind="implement", round=approval["round"])
         result.producer_records[str(approval_path)] = approval_sha
-        result.grant = dict(approval_id=approval["approval_id"], sha256=approval_sha, state="unconsumed",
-                            subject_branch=approval["subject_branch"], kind="implement", round=approval["round"])
-        report = bootstrap_holder_report(repo, primary, config, proof, data)
-        directory = private / "review_cycle_dispatch"
-        _require({p: sha for p, sha in report["producer_records"].items() if Path(p).parent == directory}
-                 == receipt_records, "stale_observation", "unchanged native receipts since charged-subject derivation")
-        result.holders = report["holders"]
-        result.producer_records.update(report["producer_records"])
+        try:
+            report = bootstrap_holder_report(repo, primary, config, proof, data)
+        except EvidenceHold:
+            if not held:
+                raise
+            report = None  # Diagnostic custody only; the typed hold already names every holder.
+        if report is not None:
+            directory = private / "review_cycle_dispatch"
+            _require({p: sha for p, sha in report["producer_records"].items() if Path(p).parent == directory}
+                     == receipt_records, "stale_observation", "unchanged native receipts since charged-subject derivation")
+            result.holders = report["holders"]
+            result.producer_records.update(report["producer_records"])
         _require(_lane(config, request["row_id"]) == row, "native_identity_changed", "unchanged original native lane row")
         _source(repo, request)
         _require(ratchet.source_task_subject_scope(repo, primary, proof) == roots,
@@ -195,6 +206,8 @@ def check(request: dict, *, repo: Path | None = None) -> dict:
         _require(all(_read(Path(p), private if Path(p).is_relative_to(private) else config.state_dir)[1] == sha
                      for p, sha in result.producer_records.items()),
                  "stale_observation", "unchanged canonical ledger, grant, scope and holder producer bytes")
+        _require(not held, "charged_subject_held", "missing proof: %s; next action: %s" % (
+            result.charged_subject.get("missing_proof"), result.charged_subject.get("next_action")))
         _require(not result.holders, "retained_subject_evidence_hold",
                  "original source-time scope/custody and native settlement/landing evidence for each listed holder")
         result.status = "qualified"

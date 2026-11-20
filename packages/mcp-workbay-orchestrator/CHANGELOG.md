@@ -3,6 +3,29 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.38] — 2026-11-20
+
+### Fixed
+- Review cycles resolve subjects before charging, retain lane registrations, and identify the proven issuer on release; archive replay avoids duplicate occurrences.
+- On hosts with GNU timeout, remote routing and driver startup share one bounded deadline (BusyBox timeout hosts are not covered by this bound); write dispatch requires a native boundary.
+- Validation distinguishes completed empty collections from interruptions, and acceptance cases isolate their runs and report late completions as unknown.
+- Detached passes defer unreadable results and consume only their observed input snapshot; startup collects terminal remote jobs once.
+- Branch transactions recheck policy before updating, and snapshot reclaim holds when process visibility is incomplete.
+- State transitions require declared events, and absorbed closes require descent proof.
+- Admission bounds memory and deadlines and records its decisions; token-row write refusals identify the writer boundary.
+- Coordination history before observation coverage remains unknown, and lane close uses the appropriate public and reaper vocabulary.
+- Reaping treats ignored symlinks as pointers and preserves repository boundaries.
+
+### Changed
+- Pin Codex CLI 0.170.0 for remote sessions, including gpt-6.2-astra support.
+- Remote execution uses a visible, stamped mode selection, and review and ACE remain on result collection.
+
+### Added
+- `lane_dag` can inspect advisory graphs and labels them as not executable.
+- Fleet provides timed snapshot refresh, bounded VM inventory, and a rebuildable plan projection.
+- Task start writes a digest-stamped lane manifest; terminal lane queues drain at the end of an engine pass.
+- Offload guidance carries typed resolutions, and environment retries have durable records.
+
 ## [0.3.37] — 2026-11-12
 
 ### Fixed

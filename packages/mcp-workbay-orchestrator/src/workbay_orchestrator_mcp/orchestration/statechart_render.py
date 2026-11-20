@@ -6,6 +6,8 @@
 Mermaid) and ``.mmd`` (both machines) from it, and ``--check`` fails closed when
 either file drifts. Rendering is pure: no timestamps, no environment reads, and
 output is independent of list/key order in the chart.
+Machine-level same-state requests are listed in Markdown; the diagrams show
+the machine's ``transitions`` graph.
 
 Exit codes: 0 in sync / written; 1 drift (stale paths printed); 2 chart
 unreadable or invalid, no ancestor holding the spec anchor (nothing written), or
@@ -112,6 +114,7 @@ def _transition_rows(machine: Mapping[str, Any], gates: Mapping[str, list[str]])
         cells = [
             _code(tid, table=True),
             _code(src, table=True),
+            _code(transition["event"], table=True),
             _codes(targets, table=True),
             _codes(predicates, table=True),
             _codes(classes, table=True),
@@ -138,9 +141,19 @@ def _machine_section(chart: Mapping[str, Any], key: str, gates: Mapping[str, lis
         )
     lines += ["", "### Diagram", "", "```mermaid", render_mermaid(chart, machines=(key,)).rstrip("\n"), "```", ""]
     lines += ["### Transitions", ""]
-    header = ["id", "from", "to", "guard predicate(s)", "evidence class(es)", "gate"]
+    header = ["id", "from", "event", "to", "guard predicate(s)", "evidence class(es)", "gate"]
     lines += _table(header, _transition_rows(machine, gates))
     lines.append("")
+    reentries = machine.get("self_transitions", [])
+    if reentries:
+        lines += [
+            "### Same-state events",
+            "",
+            "These machine-level events leave the state unchanged and are listed separately from the diagram.",
+            "",
+        ]
+        rows = [[_code(entry["state"], table=True), _code(entry["event"], table=True)] for entry in reentries]
+        lines += [*_table(["state", "event"], sorted(rows)), ""]
     if key == "outer":
         projection = machine.get("projection", {})
         rows = [

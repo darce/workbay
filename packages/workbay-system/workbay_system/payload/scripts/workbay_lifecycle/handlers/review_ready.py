@@ -288,16 +288,21 @@ def _query_open_findings(
     # ``handoff_projection="pending"`` with zero counts (regression
     # guarded by ``test_review_ready_workspace_root_precedes_subcommand``;
     # finding BR-internal).
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root", str(workspace),
-        "review-findings",
-        "--operation", "list",
-        "--status", "open",
-    ]
-    if task_ref:
-        argv.extend(["--task-ref", task_ref])
-    proc = _common.run_subprocess(argv)
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root", str(workspace),
+            "review-findings",
+            "--operation", "list",
+            "--status", "open",
+        ]
+        if task_ref:
+            argv.extend(["--task-ref", task_ref])
+        proc = _common.run_subprocess(argv)
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        return dict(ZERO_FINDINGS), False
     if proc.returncode != 0:
         return dict(ZERO_FINDINGS), False
     try:
@@ -404,23 +409,28 @@ def _query_lane_open_findings(
     offset = 0
     for _ in range(_LANE_FINDINGS_MAX_PAGES):
         # --workspace-root precedes the subcommand; see _query_open_findings.
-        argv = [
-            _common.mcp_handoff_bin(),
-            "--workspace-root",
-            str(workspace),
-            "review-findings",
-            "--operation",
-            "list",
-            "--status",
-            "open",
-            "--limit",
-            str(_LANE_FINDINGS_PAGE_SIZE),
-            "--offset",
-            str(offset),
-        ]
-        if task_ref:
-            argv.extend(["--task-ref", task_ref])
-        proc = _common.run_subprocess(argv)
+        try:
+            argv = [
+                _common.mcp_handoff_bin(),
+                "--workspace-root",
+                str(workspace),
+                "review-findings",
+                "--operation",
+                "list",
+                "--status",
+                "open",
+                "--limit",
+                str(_LANE_FINDINGS_PAGE_SIZE),
+                "--offset",
+                str(offset),
+            ]
+            if task_ref:
+                argv.extend(["--task-ref", task_ref])
+            proc = _common.run_subprocess(argv)
+        except ValueError as exc:
+            if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+                raise
+            return dict(ZERO_FINDINGS), False
         if proc.returncode != 0:
             return dict(ZERO_FINDINGS), False
         try:
@@ -472,19 +482,24 @@ def _query_latest_passing_test_sha(
     check.
     """
     workspace = resolver.canonical_workspace_root(repo) or repo
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root", str(workspace),
-        "get-verified-tests",
-        "--passed", "true",
-        "--exclude-never-passed",
-        "--limit", "1",
-    ]
-    if task_ref:
-        argv.extend(["--task-ref", task_ref])
-    if branch is not None:
-        argv.extend(["--branch", branch])
-    proc = _common.run_subprocess(argv)
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root", str(workspace),
+            "get-verified-tests",
+            "--passed", "true",
+            "--exclude-never-passed",
+            "--limit", "1",
+        ]
+        if task_ref:
+            argv.extend(["--task-ref", task_ref])
+        if branch is not None:
+            argv.extend(["--branch", branch])
+        proc = _common.run_subprocess(argv)
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        return None, False
     if proc.returncode != 0:
         return None, False
     try:
@@ -733,14 +748,19 @@ def _query_active_task_identity(
     if not task_ref:
         return None, True
     workspace = resolver.canonical_workspace_root(repo) or repo
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root", str(workspace),
-        "state",
-        "--sections", "identity",
-        task_ref,
-    ]
-    proc = _common.run_subprocess(argv)
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root", str(workspace),
+            "state",
+            "--sections", "identity",
+            task_ref,
+        ]
+        proc = _common.run_subprocess(argv)
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        return None, False
     if proc.returncode != 0:
         return None, False
     try:

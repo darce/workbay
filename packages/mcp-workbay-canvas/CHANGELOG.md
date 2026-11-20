@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.23] — 2026-11-20
+
+### Fixed
+- The installed Studio collector resolves the configured toolchain root, uses the app's dependencies, and explains how to remedy missing dependencies.
+- A missing Studio configuration names the file to create.
+- Stopping the Fleet refresher also closes its VM inventory transport.
+
+### Added
+- The Fleet server refreshes its snapshot on a timer.
+
 ## [0.1.22] — 2026-11-12
 
 ### Changed

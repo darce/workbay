@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,25 @@ from workbay_handoff_mcp.shared_write_context import assert_no_write_lock_held
 from workbay_protocol.review_impact import is_blocking
 
 from . import worktree_root
+
+# Receipt, registry and terminal-recovery predicates may call back into this
+# module. During one dispatch they all ask ancestry of the same immutable tip.
+# Other worktrees and other requests continue to resolve their own source.
+_review_source: ContextVar[tuple[Path, str] | None] = ContextVar("review_source", default=None)
+
+
+@contextmanager
+def at_review_source(repo: Path, head: str):
+    token = _review_source.set((repo, head))
+    try:
+        yield
+    finally:
+        _review_source.reset(token)
+
+
+def review_source_ref(repo: Path) -> str:
+    source = _review_source.get()
+    return source[1] if source is not None and source[0] == repo else "HEAD"
 
 
 class RatchetRefused(ValueError):
@@ -338,7 +359,7 @@ def context_from_receipt(
     prior = identity["tip_sha"]
     if not re.fullmatch("[0-9a-f]{40}", prior) or _git(repo, "rev-parse", f"{prior}^{{commit}}") != prior:
         raise RatchetRefused("review_ratchet_previous_host_tip_unresolvable")
-    tip = _git(repo, "rev-parse", "HEAD")
+    tip = _git(repo, "rev-parse", review_source_ref(repo))
     # Exact current baseline, not a reviewer-declared pass boolean or stale merge base.
     baseline = _git(repo, "rev-parse", "main^{commit}")
     delta = _git(repo, "diff", "--no-ext-diff", "--no-renames", "--unified=0", prior, tip, "--")
@@ -448,7 +469,7 @@ def _bind_original_subject(
             original_tip = own[2].get("tip_sha")
             if own[1] != base:
                 raise RatchetRefused("review_ratchet_subject_base_mismatch")
-            if _resolve_local_branch(repo, branch) != tip or _git(repo, "rev-parse", "HEAD") != tip:
+            if _resolve_local_branch(repo, branch) != tip or _git(repo, "rev-parse", review_source_ref(repo)) != tip:
                 raise RatchetRefused("review_ratchet_subject_tip_mismatch")
             if (not isinstance(original_tip, str) or not re.fullmatch("[0-9a-f]{40}", original_tip)
                     or not _subject_is_ancestor(repo, base, original_tip)
@@ -471,7 +492,7 @@ def _bind_original_subject(
     name, original_base, original_tip = matches[0]
     if original_base != base:
         raise RatchetRefused("review_ratchet_subject_base_mismatch")
-    if _git(repo, "rev-parse", "HEAD") != tip:
+    if _git(repo, "rev-parse", review_source_ref(repo)) != tip:
         raise RatchetRefused("review_ratchet_subject_tip_mismatch")
     if not isinstance(original_tip, str) or not re.fullmatch("[0-9a-f]{40}", original_tip):
         raise RatchetRefused("review_ratchet_subject_unverified")
@@ -1006,7 +1027,7 @@ def _proven_task_subject(repo: Path, orchestrator_root: Path, task_ref: str, *, 
         # Review ranges advance independently; this is the original identity
         # proof, not source_review_scope's current integration-to-tip range.
         or not _binding_holds(repo, orchestrator_root, binding, historical_baseline=historical_baseline)
-        or not _subject_is_ancestor(repo, binding["tip_sha"], "HEAD")
+        or not _subject_is_ancestor(repo, binding["tip_sha"], review_source_ref(repo))
     ):
         return None
     return binding
@@ -1147,7 +1168,7 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
     from .invocation_disposition import _json, regular_bytes
     from .nonexecution_history import authenticated_current_invocation
     from .offload_pass_recovery import EvidenceHold, regular_file_bytes
-    from .review_cycle_dispatch import _model_or_unknown_evidence, authority, trusted_policy
+    from .review_cycle_dispatch import _matches_issuer_binding, _model_or_unknown_evidence, authority, trusted_policy
     from .review_cycle_ledger import ReviewCycleLedger, _Hold, effective_outcome_class, subject_accounting
 
     unavailable = "review_ratchet_superseded_native_history_unavailable"
@@ -1201,8 +1222,10 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
             # A prepared producer is evidence of reserved source, not evidence
             # that execution did or did not occur. Other native producer shapes
             # retain their existing recovery protocol rather than being skipped.
-            if (set(protected) != {"identity", "decision", "token", "state", "settlement_owner",
-                                   "managed_identity", "managed_source"}
+            if (set(protected) - {"source_issuer"} != {"identity", "decision", "token", "state", "settlement_owner",
+                                                       "managed_identity", "managed_source"}
+                    or ("source_issuer" in protected and not _matches_issuer_binding(
+                        protected["source_issuer"], managed["task_ref"], managed["lane_id"]))
                     or protected["state"] != "prepared" or protected["settlement_owner"] != "engine"
                     or not isinstance(protected["token"], str)
                     or not re.fullmatch("[0-9a-f]{48}", protected["token"])
@@ -1602,6 +1625,7 @@ def load_context(
     orchestrator_root: Path | None = None,
     review_subject: tuple[str, str] | None = None,
     configure: bool = True,
+    initial_context: bool = True,
 ) -> ReviewContext | None:
     """Discover only existing canonical engine receipts for this host subject.
 
@@ -1791,8 +1815,10 @@ def load_context(
     def empty_context() -> ReviewContext | None:
         if any(prior["branch"] in subject_branches for prior in retained):
             raise RatchetRefused("review_ratchet_previous_receipt_missing")
-        if current_pass_id is not None:
-            tip = _git(repo, "rev-parse", "HEAD")
+        # A subject lookup only needs to know whether a prior review exists.
+        # Building a first review's diff context also requires an integration tip.
+        if current_pass_id is not None and initial_context:
+            tip = _git(repo, "rev-parse", review_source_ref(repo))
             baseline = _git(repo, "rev-parse", "main^{commit}")
             return ReviewContext((), baseline, tip, baseline, "", (), {}, "", task_ref)
         return None

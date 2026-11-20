@@ -1,14 +1,164 @@
-"""Verified test read surfaces."""
+"""Verified test reads and harness-owned base-result storage."""
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import re
 import sqlite3
+import stat
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, TypeGuard
 
 from .shared_primitives import _envelope, _resolve_task_ref, _row_to_dict
 from .shared_schema import _get_db_connection
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+_BASE_RESULT_SCHEMA = "workbay/base-result-cache@2"
+_BASE_OUTCOMES = frozenset({"passed", "failed", "skipped"})
+
+
+@dataclass(frozen=True)
+class BaseResultLookup:
+    status: str
+    reason: str | None = None
+    outcomes: dict[str, str] | None = None
+
+
+def _record_bytes(document: dict[str, object]) -> bytes:
+    return json.dumps(document, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def lookup_base_result(root: Path, key: str) -> BaseResultLookup:
+    """Read only. The harness pins its verification key outside the record store."""
+    if not re.fullmatch(r"[0-9a-f]{64}", key):
+        raise ValueError("expected a SHA-256 cache key")
+    try:
+        if not stat.S_ISDIR(root.stat().st_mode):
+            raise ValueError("expected cache directory")
+        try:
+            fd = os.open(root / f"{key}.json", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return BaseResultLookup("miss")
+        with os.fdopen(fd, "rb") as stream:
+            record = os.fstat(stream.fileno())
+            if not stat.S_ISREG(record.st_mode) or record.st_size > 8_000_000:
+                raise ValueError("expected regular record")
+            document = json.load(stream)
+        if not isinstance(document, dict) or not _usable_base_outcomes(document.get("outcomes")):
+            raise ValueError("invalid baseline")
+    except (OSError, ValueError, RecursionError):
+        return BaseResultLookup("unknown", "base_result_cache_unreadable")
+
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        return BaseResultLookup("unknown", "base_result_verifier_unavailable")
+    try:
+        if document.get("schema") != _BASE_RESULT_SCHEMA or document.get("key") != key:
+            raise ValueError("unbound record")
+        public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(os.environ["WORKBAY_BASE_RESULT_VERIFY_KEY"]))
+        signature = bytes.fromhex(document.pop("signature"))
+        public.verify(signature, _record_bytes(document))
+    except (InvalidSignature, KeyError, TypeError, ValueError, RecursionError):
+        return BaseResultLookup("unknown", "base_result_writer_unverified")
+    return BaseResultLookup("hit", outcomes=document["outcomes"])
+
+
+def _usable_base_outcomes(outcomes: object) -> TypeGuard[dict[str, str]]:
+    return (
+        isinstance(outcomes, dict)
+        and any(value in ("passed", "failed") for value in outcomes.values())
+        and all(
+            isinstance(node, str) and "::" in node and isinstance(result, str) and result in _BASE_OUTCOMES
+            for node, result in outcomes.items()
+        )
+    )
+
+
+def _publish_base_result(path: Path, key: str, outcomes: dict[str, str], signer: Ed25519PrivateKey) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".base-result-", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            document: dict[str, object] = {"schema": _BASE_RESULT_SCHEMA, "key": key, "outcomes": outcomes}
+            document["signature"] = signer.sign(_record_bytes(document)).hex()
+            stream.write(_record_bytes(document))
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o444)
+            os.fsync(stream.fileno())
+            os.link(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def measure_harness_base_result(
+    root: Path,
+    key: str,
+    measure: Callable[[], dict[str, str] | None],
+    *,
+    lock_timeout: float,
+) -> BaseResultLookup:
+    """Serialize a closure measurement, signing only with the held harness capability.
+
+    The supervisor provides a seekable descriptor containing a raw Ed25519 seed
+    to closure processes alone. Readers receive only the hex public key. The
+    cache directory and the ordinary verified_tests ledger confer no authority.
+    """
+    lookup = lookup_base_result(root, key)
+    if lookup.status != "miss":
+        return lookup
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        fd = int(os.environ["WORKBAY_BASE_RESULT_SIGNING_FD"])
+        if fd < 3:
+            raise ValueError("expected a dedicated signing descriptor")
+        signer = Ed25519PrivateKey.from_private_bytes(os.pread(fd, 33, 0))
+        if signer.public_key().public_bytes_raw() != bytes.fromhex(os.environ["WORKBAY_BASE_RESULT_VERIFY_KEY"]):
+            raise ValueError("signer differs from configured authority")
+    except (AttributeError, ImportError, KeyError, OSError, OverflowError, ValueError):
+        return BaseResultLookup("refused", "base_result_write_refused")
+    path = root / f"{key}.json"
+    try:
+        import fcntl
+    except ImportError:
+        return BaseResultLookup("unknown", "base_result_cache_lock_unavailable")
+
+    # Serialize misses for this key, including across worktrees. Never lock a
+    # hit, so a read-only lane can use it without opening any writable handle.
+    try:
+        fd = os.open(root / f".{key}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+b") as lock:
+            deadline = time.monotonic() + lock_timeout
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return BaseResultLookup("unknown", "base_result_cache_lock_timeout")
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            lookup = lookup_base_result(root, key)
+            if lookup.status != "miss":
+                return lookup
+            outcomes = measure()
+            if not _usable_base_outcomes(outcomes):
+                return BaseResultLookup("miss", "base_result_measurement_unknown")
+            _publish_base_result(path, key, outcomes, signer)
+            return BaseResultLookup("miss", outcomes=outcomes)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            return BaseResultLookup("refused", "base_result_write_refused")
+        return BaseResultLookup("unknown", "base_result_cache_write_unavailable")
 
 
 def _normalize_correlated_file(path: str | None) -> tuple[str | None, str | None]:

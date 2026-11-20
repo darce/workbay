@@ -13,8 +13,10 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -384,6 +386,125 @@ def _git(
 def _git_output(root: Path, args: list[str], *, env: dict[str, str]) -> str:
     completed = _git(root, args, env=env)
     return completed.stdout.decode("utf-8", "replace").strip()
+
+
+@dataclass(frozen=True)
+class _BranchCasResult:
+    status: Literal["committed", "refused", "unknown"]
+    reason: str = ""
+
+
+class _GitTransactionError(Exception):
+    """The update-ref transaction closed or returned an unexpected response."""
+
+
+def _transaction_response(
+    process: subprocess.Popen[bytes], selector: selectors.BaseSelector, expected: bytes, deadline: float
+) -> None:
+    """Read one bounded Git protocol response without waiting forever on a partial line."""
+    assert process.stdout is not None
+    response = bytearray()
+    while not response.endswith(b"\n"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not selector.select(remaining):
+            raise subprocess.TimeoutExpired(process.args, GIT_OPERATION_TIMEOUT_SECONDS)
+        chunk = os.read(process.stdout.fileno(), 1024)
+        if not chunk:
+            raise _GitTransactionError
+        response.extend(chunk)
+        if len(response) > 1024:
+            raise _GitTransactionError
+    if response != expected:
+        raise _GitTransactionError
+
+
+def _policy_recheck(root: Path, evaluation: Evaluation) -> str:
+    """Re-derive and compare the authority used to evaluate this release."""
+    try:
+        current = review_policy.load_policy(root).to_dict()
+    except review_policy.PolicyHold as exc:
+        return str(exc)
+    except OSError:
+        return "review_policy_authority_unavailable"
+    except (ValueError, TypeError, RecursionError):
+        return "review_policy_invalid_document"
+    # Proof fields are evaluation evidence, not part of the policy document.
+    evaluated = {key: evaluation.review_policy[key] for key in current if key in evaluation.review_policy}
+    return "" if current == evaluated else "review_policy_changed"
+
+
+def _branch_cas(
+    root: Path, branch_ref: str, new_tip: str, expected_tip: str, *, env: dict[str, str], evaluation: Evaluation
+) -> _BranchCasResult:
+    """Prepare the ref CAS, recheck policy while Git holds its lock, then commit.
+
+    This detects changes complete before the recheck. Policy writers do not yet
+    take the ref lock, so it cannot serialize a later revocation with commit.
+    """
+    command = ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", "update-ref", "--stdin"]
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
+        )
+    except OSError:
+        return _BranchCasResult("refused", "git_operation_failed")
+    stdin = process.stdin
+    assert stdin is not None and process.stdout is not None
+    deadline = time.monotonic() + GIT_OPERATION_TIMEOUT_SECONDS
+    phase = "start"
+    commit_requested = False
+
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+
+            def send(data: bytes, response: bytes) -> None:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, GIT_OPERATION_TIMEOUT_SECONDS)
+                stdin.write(data)
+                stdin.flush()
+                _transaction_response(process, selector, response, deadline)
+
+            send(b"start\n", b"start: ok\n")
+            phase = "prepare"
+            update = f"update {branch_ref} {new_tip} {expected_tip}\nprepare\n".encode()
+            send(update, b"prepare: ok\n")
+            phase = "policy"
+            reason = _policy_recheck(root, evaluation)
+            if reason:
+                # Closing stdin aborts the prepared transaction before return.
+                return _BranchCasResult("refused", "review_not_released:" + reason)
+            phase = "commit"
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, GIT_OPERATION_TIMEOUT_SECONDS)
+            # Once writing commit is attempted, loss of its response is ambiguous.
+            commit_requested = True
+            stdin.write(b"commit\n")
+            stdin.flush()
+            _transaction_response(process, selector, b"commit: ok\n", deadline)
+            return _BranchCasResult("committed")
+    except subprocess.TimeoutExpired:
+        if commit_requested:
+            return _BranchCasResult("unknown", "branch_update_outcome_unknown")
+        return _BranchCasResult("refused", "git_operation_timeout")
+    except (OSError, _GitTransactionError):
+        if commit_requested:
+            return _BranchCasResult("unknown", "branch_update_outcome_unknown")
+        return _BranchCasResult("refused", "branch_moved" if phase == "prepare" else "git_operation_failed")
+    finally:
+        try:
+            stdin.close()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+        process.stdout.close()
 
 
 def _release_refusal(reason: str, *, old_tip: str = "") -> ReleaseResult:
@@ -834,14 +955,16 @@ def release(
             stream.flush()
             os.fsync(stream.fileno())
 
-        try:
-            _git(root, ["update-ref", branch_ref, new_tip, expected_tip], env=env)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        cas = _branch_cas(root, branch_ref, new_tip, expected_tip, env=env, evaluation=evaluation)
+        if cas.status == "unknown":
+            # Preserve the receipt and any open production intent for reconciliation.
+            return _release_refusal(cas.reason, old_tip=old_tip)
+        if cas.status == "refused":
             try:
                 receipt_path.unlink()
             except OSError:
                 pass
-            return finish(_release_refusal("branch_moved", old_tip=old_tip))
+            return finish(_release_refusal(cas.reason, old_tip=old_tip))
         production_outcome = "released"
         production_publication = {"ref": branch_ref, "old_oid": old_tip, "new_oid": new_tip}
         return finish(

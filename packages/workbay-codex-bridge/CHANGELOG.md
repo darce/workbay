@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.9] — 2026-11-20
+
+### Fixed
+- Bounded bridge calls use a session leader and bounded group teardown; caller timeouts set the whole-call deadline and invalid timeout values receive typed refusals.
+
 ## [0.3.8] — 2026-11-12
 
 ### Changed

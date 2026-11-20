@@ -32,6 +32,7 @@ _REVIEW_HTTP_STATUS: dict[str, int] = {
     "path_outside_workspace": 400,
     "map_invalid": 400,
     "config_invalid": 400,
+    "config_missing": 400,
     "bundle_too_large": 413,
     "collector_failed": 502,
     "refresh_in_progress": 409,

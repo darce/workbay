@@ -149,6 +149,62 @@ def build_manifest(
     return manifest
 
 
+def build_manifest_from_plan(
+    *,
+    root: Path | str,
+    task_ref: str,
+    plan_path: Path | str,
+    plan_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    """Build one source-stamped lane per validated decomposition item."""
+    from .plan_decomposer import PlanDecomposerError, _load_block, _validate_payload, extract_decomposition_payload
+    from .plan_graph import decomposition_digest
+
+    root = Path(root).resolve()
+    selected = Path(plan_path)
+    selected = (root / selected).resolve() if not selected.is_absolute() else selected.resolve()
+    relative = selected.relative_to(root).as_posix()
+    raw = selected.read_bytes() if plan_bytes is None else plan_bytes
+    items = _validate_payload(_load_block(raw))
+
+    manifest = build_manifest(
+        task_ref=task_ref,
+        lane_ids=[item["id"] for item in items],
+        task_plan=relative,
+        lane_overrides={
+            item["id"]: {
+                "plan_item_id": item["id"],
+                "title": item["title"],
+                "owned_paths": list(item["owns"]),
+            }
+            for item in items
+        },
+    )
+    lane_by_item = {lane["plan_item_id"]: lane_id for lane_id, lane in manifest["lanes"].items()}
+    depends = {lane_by_item[item["id"]]: [lane_by_item[dep] for dep in item["depends"]] for item in items}
+    downstream: dict[str, list[str]] = {lane_id: [] for lane_id in depends}
+    for lane_id, prerequisites in depends.items():
+        for prerequisite in prerequisites:
+            downstream[prerequisite].append(lane_id)
+    # Stable Kahn ordering; item order breaks ties, prerequisites always precede consumers.
+    order: list[str] = []
+    pending = list(depends)
+    while pending:
+        ready = [lane_id for lane_id in pending if all(dep in order for dep in depends[lane_id])]
+        if not ready:
+            raise PlanDecomposerError("Decomposition dependencies contain a cycle")
+        order.extend(ready)
+        pending = [lane_id for lane_id in pending if lane_id not in ready]
+    manifest.update(depends_on=depends, downstream=downstream, merge_order=order)
+    manifest["plan_source"] = {
+        "version": 1,
+        "path": relative,
+        "algorithm": "sha256",
+        "decomposition_digest": decomposition_digest(extract_decomposition_payload(raw)),
+    }
+    return validate_manifest(manifest, Path("<generated-plan-manifest>"))
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a reusable lane manifest scaffold for a task.")
     parser.add_argument(

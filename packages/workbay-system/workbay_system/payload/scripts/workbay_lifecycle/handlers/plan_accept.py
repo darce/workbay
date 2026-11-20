@@ -449,6 +449,7 @@ class _LocalApplyOutcome(tuple):
 
     residual: bool
     production_history_unavailable: dict[str, Any] | None = None
+    accepted_receipt_unavailable: dict[str, Any] | None = None
     commit_sha: str | None = None
     production_tracked: bool = False
 
@@ -1021,6 +1022,9 @@ def _commit_reviewed_index(
             )
             if applied.returncode != 0:
                 return applied
+            # Return the object this transaction wrote, even if a committed
+            # reference hook (or another writer) has since advanced main.
+            applied.stdout = oid
             return applied
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return failure(str(exc))
@@ -1110,7 +1114,44 @@ def _apply_local_accept(
         _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
         err = f"commit_failed: {commit.stderr.strip() or commit.stdout.strip()}"
         return _LocalApplyOutcome(False, err, _residual_after_restore())
-    return _LocalApplyOutcome(True, None, False)
+    outcome = _LocalApplyOutcome(True, None, False)
+    outcome.commit_sha = commit.stdout.strip()
+    return outcome
+
+
+def _plan_branch_suffix(plan_id: str) -> str:
+    """The implementation note D2 branch suffix; the relink and receipt replay share it."""
+    return f"-plan{plan_id}"
+
+
+def _pre_relink_branch(branch: str, plan_id: str | None) -> str | None:
+    """Name the source branch that plan ``plan_id``'s own relink renamed into ``branch``.
+
+    Each relink appends one ``-plan<NNNN>`` segment, so later numbered plans may
+    append theirs after this plan's. Peel only trailing plan segments until this
+    plan's own segment is removed; anything else is not this relink's lineage.
+    The name alone grants nothing; receipt replay must still prove ancestry.
+    """
+    if not plan_id:
+        return None
+    own = _plan_branch_suffix(plan_id)
+    name = branch
+    # Each pass strictly shortens ``name``; every non-matching shape exits.
+    while True:
+        prefix, separator, digits = name.rpartition("-plan")
+        if not separator or not prefix or not digits.isdigit():
+            return None
+        if separator + digits == own:
+            return prefix
+        name = prefix
+
+
+def _source_tip_reachable(repo: Path, source_tip: str, branch: str) -> bool:
+    """True only when the local ``branch`` provably descends from ``source_tip``."""
+    proc = _common.run_subprocess(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_tip, "refs/heads/" + branch]
+    )
+    return proc.returncode == 0
 
 
 def _relink_recorded_plan_suffix(repo: Path, **kwargs: Any) -> dict[str, Any]:
@@ -1163,8 +1204,10 @@ def _relink_plan_suffix(
     rolls the branch rename back. Returns a structured result; ``relinked`` is
     True only when both git moves landed.
     """
-    suffix = f"-plan{plan_id}"
-    if target_branch.endswith(suffix):
+    suffix = _plan_branch_suffix(plan_id)
+    # Already carrying this plan's segment, possibly followed by later plans'
+    # segments: renaming again would mutate Git on every replay.
+    if target_branch.endswith(suffix) or _pre_relink_branch(target_branch, plan_id) is not None:
         return {"relinked": False, "skipped": "suffix_present"}
     if not target_worktree_path:
         return {"relinked": False, "skipped": "no_worktree_path"}
@@ -1280,6 +1323,131 @@ def _relink_plan_suffix(
     repoint = _common.run_subprocess(set_argv)
     result["row_repointed"] = repoint.returncode == 0
     return result
+
+
+def _accepted_plan_receipt(
+    repo: Path, *, task_ref: str, branch: str, plan_path: str,
+    source_tip: str | None = None, applied_commit: str | None = None,
+) -> dict[str, Any] | None:
+    """Publish/recover a source-bound event in the existing decision authority.
+
+    A replay reads the stored applied commit, never the current main tip. The
+    lookup prefix is content-scoped so later source commits do not rebind an
+    earlier acceptance. Missing historical evidence grants no custody proof.
+
+    implementation note D2 relink renames the source branch after the receipt is written.
+    Replay therefore looks up the exact current branch first and then only the
+    branch this plan's own relink renamed from, accepting that record only when
+    its recorded source tip is an ancestor of the current branch. The returned
+    record is the original, unchanged binding.
+    """
+    from workbay_handoff_mcp import RuntimeConfig, configure_runtime, decisions, handoff_state
+
+    configure_runtime(RuntimeConfig.for_repo(repo))
+    source = plan_bytes(repo, plan_path, source_tip or branch)
+    raw_sha256 = hashlib.sha256(source).hexdigest()
+
+    def event_key(source_branch: str) -> tuple[dict[str, str], str]:
+        key = dict(task_ref=task_ref, source_branch=source_branch, path=plan_path, raw_sha256=raw_sha256)
+        return key, "plan_accept_applied:" + hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest() + ":"
+
+    key, prefix = event_key(branch)
+    if applied_commit is not None:
+        if not source_tip or plan_bytes(repo, plan_path, applied_commit) != source:
+            raise ValueError("accepted_source_commit_mismatch")
+        record = dict(key, source_tip=source_tip, applied_commit=applied_commit)
+        event_id = prefix + source_tip + ":" + applied_commit
+        result = decisions.record_decision(
+            task_ref=task_ref, session="plan-accept", decision=event_id,
+            rationale=json.dumps(record, sort_keys=True), event_id=event_id,
+        )
+        if result.get("ok") is not True:
+            raise ValueError("accepted_event_write_failed")
+        return record
+
+    candidates = [branch]
+    original = _pre_relink_branch(branch, resolver.extract_plan_id(plan_path))
+    if original is not None:
+        candidates.append(original)
+    for source_branch in candidates:
+        key, prefix = event_key(source_branch)
+        result = handoff_state.get_handoff_state(
+            task_ref=task_ref, sections="decisions_recent", decision_id_prefix=prefix,
+            top_n_decisions=200, detail="full", verbose=True,
+        )
+        if result.get("ok") is not True:
+            raise ValueError("accepted_event_read_failed")
+        for row in result["data"]["decisions_recent"]:
+            record = json.loads(row.get("rationale") or "{}")
+            if not isinstance(record, dict) or any(record.get(k) != v for k, v in key.items()):
+                raise ValueError("accepted_event_binding_invalid")
+            tip, commit = record.get("source_tip"), record.get("applied_commit")
+            if not isinstance(tip, str) or not isinstance(commit, str) or row.get("decision") != prefix + tip + ":" + commit:
+                raise ValueError("accepted_event_binding_invalid")
+            if source_branch != branch and not _source_tip_reachable(repo, tip, branch):
+                # Same task/path/bytes under the pre-relink name, but the current
+                # branch is not that source's descendant: not this custody.
+                continue
+            if (plan_bytes(repo, plan_path, tip) != source
+                    or plan_bytes(repo, plan_path, commit) != source
+                    or plan_bytes(repo, plan_path, "main") != source):
+                raise ValueError("accepted_event_content_mismatch")
+            return record
+    return None
+
+
+def _apply_source_bound_accept(
+    repo: Path, *, task_ref: str, branch: str, plan_path: str,
+    expected_subject_sha256: str | None = None,
+) -> _LocalApplyOutcome:
+    """Capture immutable source identity before apply and bind its actual result."""
+
+    def unreadable() -> _LocalApplyOutcome:
+        # Nothing was mutated. Report the same typed refusal the apply itself
+        # would have produced rather than a custody-recording failure.
+        refusal = _pre_mutation_refusal(repo, branch, plan_path)
+        return _LocalApplyOutcome(False, refusal or "review_subject_source_unreadable", False)
+
+    try:
+        tip = _common.run_subprocess(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--end-of-options", branch + "^{commit}"]
+        )
+        if tip.returncode != 0:
+            return unreadable()
+        source_tip = tip.stdout.strip()
+        # Main can hold a reviewed, untracked draft. Its source bytes become
+        # immutable in the resulting main commit; a feature source is already
+        # immutable at the captured tip.
+        try:
+            source = plan_bytes(repo, plan_path, None if branch == "main" else source_tip)
+        except (OSError, ValueError, RuntimeError):
+            return unreadable()
+        if hashlib.sha256(source).hexdigest() != expected_subject_sha256:
+            return _LocalApplyOutcome(False, "review_subject_bytes_changed")
+    except Exception:
+        return _LocalApplyOutcome(False, "accepted_receipt_unavailable")
+    outcome = _apply_recorded_accept(
+        repo, task_ref=task_ref, branch=branch, plan_path=plan_path,
+        expected_subject_sha256=expected_subject_sha256,
+    )
+    if outcome.ok:
+        commit = outcome.commit_sha
+        try:
+            if not commit:
+                raise ValueError("accepted_commit_unavailable")
+            outcome.accepted_receipt = _accepted_plan_receipt(
+                repo, task_ref=task_ref, branch=branch, plan_path=plan_path,
+                source_tip=commit if branch == "main" else source_tip, applied_commit=commit,
+            )
+        except Exception as exc:
+            warning = _production_warning("accepted_receipt_unavailable", exc)
+            outcome.accepted_receipt_unavailable = warning
+            # Keep an earlier production warning (its operation_id drives
+            # reconciliation diagnostics); the receipt failure is reported
+            # separately rather than overwriting it.
+            if not outcome.production_history_unavailable:
+                outcome.production_history_unavailable = warning
+    return outcome
 
 
 def run(argv: list[str]) -> int:
@@ -1431,6 +1599,16 @@ def run(argv: list[str]) -> int:
         warning = _reconcile_recorded_accept(canonical, task_ref, str(target_branch))
         if warning:
             extras["production_history_unavailable"] = warning
+        try:
+            accepted_receipt = _accepted_plan_receipt(
+                canonical, task_ref=task_ref, branch=str(target_branch), plan_path=str(plan_path),
+            ) if baseline.plan_exists_on_target_branch else None
+            if accepted_receipt is not None:
+                extras["accepted_receipt"] = accepted_receipt
+        except Exception as exc:
+            reasons.append("accepted_receipt_unavailable")
+            extras["apply_error"] = "accepted_receipt_unavailable"
+            extras["production_history_unavailable"] = _production_warning("accepted_receipt_unavailable", exc)
         # internal: an accepted baseline is a satisfied lifecycle
         # state, not a failure. Exit zero and point at the next command.
         noop_command = _build_already_accepted_next_command(
@@ -1619,7 +1797,7 @@ def run(argv: list[str]) -> int:
                 if args.local:
                     reasons.append("readiness_stale_open_findings")
             else:
-                apply_outcome = _apply_recorded_accept(
+                apply_outcome = _apply_source_bound_accept(
                     apply_target,
                     task_ref=task_ref,
                     branch=str(target_branch),
@@ -1629,10 +1807,17 @@ def run(argv: list[str]) -> int:
                 ok, err = apply_outcome
                 residual = apply_outcome.residual
                 warning = getattr(apply_outcome, "production_history_unavailable", None)
+                receipt_warning = getattr(apply_outcome, "accepted_receipt_unavailable", None)
                 if warning:
                     extras["production_history_unavailable"] = warning
                     if not ok:
                         reasons.append(warning["reason"])
+                        extras["apply_error"] = warning["reason"]
+                if receipt_warning:
+                    reasons.append("accepted_receipt_unavailable")
+                    extras["apply_error"] = "accepted_receipt_unavailable"
+                    if receipt_warning is not warning:
+                        extras["accepted_receipt_unavailable"] = receipt_warning
                 if not ok:
                     extras["applied"] = False
                     extras["apply_error"] = err or "local_accept_failed"
@@ -1659,13 +1844,12 @@ def run(argv: list[str]) -> int:
                 else:
                     extras["applied"] = True
                     extras["accepted"] = True
-                    sha = (
-                        apply_outcome.commit_sha
-                        if getattr(apply_outcome, "production_tracked", False)
-                        else _head_sha(apply_target)
-                    )
+                    sha = apply_outcome.commit_sha
                     if sha:
                         extras["applied_commit_sha"] = sha
+                    accepted_receipt = getattr(apply_outcome, "accepted_receipt", None)
+                    if accepted_receipt is not None:
+                        extras["accepted_receipt"] = accepted_receipt
 
     # implementation note D2: once the plan id is canonical (accepted on ``main`` — either
     # already, or just applied via ``--local`` / default-on ready apply), reconcile
@@ -1701,6 +1885,13 @@ def run(argv: list[str]) -> int:
                 extras["row_repointed"] = relink.get("row_repointed", False)
             elif relink.get("error"):
                 extras["relink_error"] = relink["error"]
+
+    # Keep the readiness diagnostic and expose the producer's typed refusal at
+    # both the early baseline gate and the final pre-commit byte check.
+    if "review_subject_bytes_changed" in reasons or extras.get("apply_error") == "review_subject_bytes_changed":
+        extras.update(applied=False, accepted=False, apply_error="source_mismatch")
+        if "source_mismatch" not in reasons:
+            reasons.append("source_mismatch")
 
     if suppress_next_command:
         next_command: str | None = None

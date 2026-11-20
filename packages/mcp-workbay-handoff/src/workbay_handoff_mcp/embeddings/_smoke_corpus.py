@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from workbay_protocol import reasoning_effort as model_routing
 
 from workbay_handoff_mcp import api as mcp_server
 from workbay_handoff_mcp.config import RuntimeConfig
@@ -21,7 +22,7 @@ from workbay_handoff_mcp.shared_schema import _get_db_connection
 SMOKE_FIXTURE_LABEL = "smoke-synthetic-non-authoritative"
 SMOKE_FIXTURE_BANNER = "SYNTHETIC / non-authoritative / for-machinery-test-only — never present as real ground truth"
 SMOKE_TASK_REF = "SMOKE-RETRIEVAL-01"
-_MODEL_ID = "gte-base-en-v1.5"
+_MODEL_ID = model_routing.ModelId.EMBEDDING
 
 # Distinct marker phrases so BM25 and one-hot semantic both have a clear target.
 _DECISION_MARKER = "alpha-unique-backoff-policy-marker"

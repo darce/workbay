@@ -311,7 +311,7 @@ def run(command: str, argv: list[str]) -> int:
         parser.add_argument("--scope-decision")
         parser.add_argument("--round-justification")
         parser.add_argument("--review-route", default="codex-remote")
-        parser.add_argument("--model", default="gpt-6.1-sol")
+        parser.add_argument("--model")
         parser.add_argument("--effort", default="high")
         parser.add_argument("--speed", default="standard")
         parser.add_argument("--timeout", type=int, default=900)
@@ -319,6 +319,18 @@ def run(command: str, argv: list[str]) -> int:
         parser.add_argument("--session", default="lifecycle-plan-review")
         parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args(argv)
+
+    if command == "plan-review" and args.model is None:
+        try:
+            from workbay_protocol.reasoning_effort import MODEL_ROUTING_DEFAULTS
+
+            model = MODEL_ROUTING_DEFAULTS["plan_review"]
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError("empty plan-review model default")
+        except (ImportError, KeyError, ValueError):
+            _common.emit({"ok": False, "command": command, "error": "routing_source_unavailable"})
+            return 2
+        args.model = model
 
     skill = SKILL_BY_COMMAND[command]
     try:

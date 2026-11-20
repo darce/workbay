@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from workbay_protocol import reasoning_effort as model_routing
 from workbay_protocol.reasoning_effort import CONCRETE_EFFORTS as REMOTE_EFFORTS  # noqa: F401 — compatibility
 from workbay_protocol.reasoning_effort import validate_reasoning_effort
 
@@ -986,19 +987,19 @@ _cursor_remote_argv = _RegistryLaunchRecipe(
 _claude_remote_argv = _RegistryLaunchRecipe(
     argv_builder=_claude_remote_argv,
     spec_builder=_build_claude_agent_spec,
-    default_model=lambda: "claude-sonnet-5-5",
+    default_model=lambda: model_routing.MODEL_ROUTING_DEFAULTS["claude"],
     default_est_tokens=lambda: codex_lane_config.DEFAULT_EST_TOKENS,
 )
 _claude_api_remote_argv = _RegistryLaunchRecipe(
     argv_builder=_claude_api_remote_argv,
     spec_builder=_build_claude_agent_spec,
-    default_model=lambda: "claude-sonnet-5-5",
+    default_model=lambda: model_routing.MODEL_ROUTING_DEFAULTS["claude"],
     default_est_tokens=lambda: codex_lane_config.DEFAULT_EST_TOKENS,
 )
 _muse_remote_argv = _RegistryLaunchRecipe(
     argv_builder=_muse_remote_argv,
     spec_builder=_build_muse_agent_spec,
-    default_model=lambda: "muse-wonder-1.0",
+    default_model=lambda: model_routing.MODEL_ROUTING_DEFAULTS["muse"],
     default_est_tokens=lambda: codex_lane_config.DEFAULT_EST_TOKENS,
 )
 

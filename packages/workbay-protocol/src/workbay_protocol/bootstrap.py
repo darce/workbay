@@ -22,6 +22,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from workbay_protocol import paths
 
@@ -440,6 +441,37 @@ class EmbeddingsInferenceReceipt(BaseModel):
     probe_result: str | None = None
 
 
+def _is_unset(value: object) -> bool:
+    return value is None
+
+
+def _drop_schema_default(schema: dict[str, object]) -> None:
+    # The Python-side None marks "absent"; it is not a wire value, so the
+    # schema advertises no null default.
+    schema.pop("default", None)
+
+
+# An absent policy field is unset. An explicit null is refused by the model,
+# the generated schema and load_remote_exec_mode alike, and a dump omits unset
+# fields instead of writing null.
+class RemoteExecModePolicy(BaseModel):
+    """Strict repository defaults for remote execution; absence keeps attached."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    default: Literal["attached", "detached"] | SkipJsonSchema[None] = Field(
+        default=None, exclude_if=_is_unset, json_schema_extra=_drop_schema_default
+    )
+    per_backend: dict[str, Literal["attached", "detached"]] = Field(default_factory=dict)
+
+    @field_validator("default", mode="before")
+    @classmethod
+    def validate_present_default(cls, value: object) -> object:
+        if value not in ("attached", "detached"):
+            raise ValueError("remote_exec_mode.default must be exactly attached or detached")
+        return value
+
+
 class BootstrapManifest(BaseModel):
     """Top-level shape of ``.workbay-overlay.json``.
 
@@ -501,6 +533,15 @@ class BootstrapManifest(BaseModel):
             "SHA, and how it was obtained) so 'is this really vX.Y.Z?' is "
             "answerable from the ledger. None for git_overlay/worktree "
             "installs and for older package manifests that predate the field."
+        ),
+    )
+    remote_exec_mode: RemoteExecModePolicy | SkipJsonSchema[None] = Field(
+        default=None,
+        exclude_if=_is_unset,
+        json_schema_extra=_drop_schema_default,
+        description=(
+            "Repository remote execution policy. Absent means no policy "
+            "(built-in attached); an explicit null is refused."
         ),
     )
     surfaces: list[OverlaySurface] = Field(default_factory=list)
@@ -574,6 +615,13 @@ class BootstrapManifest(BaseModel):
         ),
     )
 
+    @field_validator("remote_exec_mode", mode="before")
+    @classmethod
+    def _refuse_null_remote_exec_mode(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("remote_exec_mode must be a policy object; omit the key for no policy")
+        return value
+
     @model_validator(mode="after")
     def _check_source_provenance(self) -> "BootstrapManifest":
         """Each delivery source requires its own provenance fields.
@@ -620,6 +668,37 @@ def _read_manifest_capability(repo_root: Path | str, field: str) -> str | None:
             value = data.get(field)
             return value if isinstance(value, str) else None
         return None
+    return None
+
+
+def load_remote_exec_mode(repo_root: Path | str) -> RemoteExecModePolicy | None:
+    """Read and validate the entire selected remote policy, failing closed.
+
+    Only a missing manifest or absent key is unconfigured. Malformed JSON,
+    unreadable files and invalid entries on any backend refuse, even when an
+    environment override would otherwise win. Manifest precedence matches
+    ``load_execution_mode``.
+    """
+    for name in paths.MANIFEST_NAME_PRECEDENCE:
+        candidate = Path(repo_root) / name
+        try:
+            raw = candidate.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"remote_exec_mode: cannot read {candidate}: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"remote_exec_mode: invalid JSON in {candidate}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"remote_exec_mode: manifest must be an object: {candidate}")
+        if "remote_exec_mode" not in data:
+            return None
+        try:
+            return RemoteExecModePolicy.model_validate(data["remote_exec_mode"])
+        except ValueError as exc:
+            raise ValueError(f"remote_exec_mode: invalid policy in {candidate}: {exc}") from exc
     return None
 
 

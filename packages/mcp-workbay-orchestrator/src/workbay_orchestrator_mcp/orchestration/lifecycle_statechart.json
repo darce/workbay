@@ -48,6 +48,7 @@
     "transitions": [
       {
         "id": "t_scoping_to_planned",
+        "event": "t_scoping_to_planned",
         "from": "scoping",
         "to": "planned",
         "guard": {
@@ -58,6 +59,7 @@
       },
       {
         "id": "t_planned_to_branch_open",
+        "event": "t_planned_to_branch_open",
         "from": "planned",
         "to": "branch_open",
         "guard": {
@@ -68,6 +70,7 @@
       },
       {
         "id": "t_branch_open_to_slice_open",
+        "event": "t_branch_open_to_slice_open",
         "from": "branch_open",
         "to": "slice_open",
         "guard": {
@@ -78,6 +81,7 @@
       },
       {
         "id": "t_slice_open_to_slice_review",
+        "event": "t_slice_open_to_slice_review",
         "from": "slice_open",
         "to": "slice_review",
         "guard": {
@@ -88,6 +92,7 @@
       },
       {
         "id": "t_slice_review_exit",
+        "event": "t_slice_review_exit",
         "from": "slice_review",
         "to": [
           "slice_open",
@@ -106,6 +111,7 @@
       },
       {
         "id": "t_branch_open_to_branch_review",
+        "event": "t_branch_open_to_branch_review",
         "from": "branch_open",
         "to": "branch_review",
         "guard": {
@@ -121,6 +127,7 @@
       },
       {
         "id": "t_branch_review_to_close_pending",
+        "event": "t_branch_review_to_close_pending",
         "from": "branch_review",
         "to": "close_pending",
         "guard": {
@@ -134,6 +141,7 @@
       },
       {
         "id": "t_close_pending_to_closed",
+        "event": "t_close_pending_to_closed",
         "from": "close_pending",
         "to": "closed",
         "guard": {
@@ -146,6 +154,12 @@
   },
   "child": {
     "id": "lane_machine",
+    "self_transitions": [
+      {
+        "state": "validated",
+        "event": "request_lane_validated"
+      }
+    ],
     "initial": "planned",
     "terminals": [
       "merged",
@@ -166,6 +180,7 @@
     "transitions": [
       {
         "id": "t_lane_planned_to_active",
+        "event": "request_lane_active",
         "from": "planned",
         "to": "active",
         "guards": [
@@ -183,6 +198,7 @@
       },
       {
         "id": "t_lane_active_to_blocked",
+        "event": "request_lane_blocked",
         "from": "active",
         "to": "blocked",
         "guard": {
@@ -193,6 +209,7 @@
       },
       {
         "id": "t_lane_blocked_to_active",
+        "event": "request_lane_active",
         "from": "blocked",
         "to": "active",
         "guard": {
@@ -203,6 +220,7 @@
       },
       {
         "id": "t_lane_active_to_review",
+        "event": "request_lane_review",
         "from": "active",
         "to": "review",
         "guard": {
@@ -213,6 +231,7 @@
       },
       {
         "id": "t_lane_review_to_merged",
+        "event": "request_lane_merged",
         "from": "review",
         "to": "merged",
         "guard": {
@@ -223,6 +242,7 @@
       },
       {
         "id": "t_lane_review_to_active",
+        "event": "request_lane_active",
         "from": "review",
         "to": "active",
         "guard": {
@@ -233,6 +253,7 @@
       },
       {
         "id": "t_lane_planned_to_closed",
+        "event": "request_lane_closed",
         "from": "planned",
         "to": "closed",
         "guard": {
@@ -243,6 +264,7 @@
       },
       {
         "id": "t_lane_blocked_to_closed",
+        "event": "request_lane_closed",
         "from": "blocked",
         "to": "closed",
         "guard": {
@@ -253,6 +275,7 @@
       },
       {
         "id": "t_lane_active_to_closed",
+        "event": "request_lane_closed",
         "from": "active",
         "to": "closed",
         "guard": {
@@ -263,6 +286,7 @@
       },
       {
         "id": "t_lane_review_to_closed",
+        "event": "request_lane_closed",
         "from": "review",
         "to": "closed",
         "guard": {
@@ -273,6 +297,7 @@
       },
       {
         "id": "t_lane_planned_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "planned",
         "to": "closed_stale",
         "guard": {
@@ -283,6 +308,7 @@
       },
       {
         "id": "t_lane_active_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "active",
         "to": "closed_stale",
         "guard": {
@@ -293,6 +319,7 @@
       },
       {
         "id": "t_lane_blocked_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "blocked",
         "to": "closed_stale",
         "guard": {
@@ -303,6 +330,7 @@
       },
       {
         "id": "t_lane_review_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "review",
         "to": "closed_stale",
         "guard": {
@@ -313,6 +341,7 @@
       },
       {
         "id": "t_lane_closed_stale_to_active",
+        "event": "request_lane_active",
         "from": "closed_stale",
         "to": "active",
         "guard": {
@@ -323,6 +352,7 @@
       },
       {
         "id": "t_lane_closed_stale_to_blocked",
+        "event": "request_lane_blocked",
         "from": "closed_stale",
         "to": "blocked",
         "guard": {
@@ -333,6 +363,7 @@
       },
       {
         "id": "t_lane_active_to_validated",
+        "event": "request_lane_validated",
         "from": "active",
         "to": "validated",
         "guard": {
@@ -343,6 +374,7 @@
       },
       {
         "id": "t_lane_review_to_validated",
+        "event": "request_lane_validated",
         "from": "review",
         "to": "validated",
         "guard": {
@@ -353,6 +385,7 @@
       },
       {
         "id": "t_lane_blocked_to_validated",
+        "event": "request_lane_validated",
         "from": "blocked",
         "to": "validated",
         "guard": {
@@ -363,6 +396,7 @@
       },
       {
         "id": "t_lane_validated_to_gated",
+        "event": "request_lane_gated",
         "from": "validated",
         "to": "gated",
         "guard": {
@@ -373,6 +407,7 @@
       },
       {
         "id": "t_lane_gated_to_merged",
+        "event": "request_lane_merged",
         "from": "gated",
         "to": "merged",
         "guard": {
@@ -383,6 +418,7 @@
       },
       {
         "id": "t_lane_validated_to_active",
+        "event": "request_lane_active",
         "from": "validated",
         "to": "active",
         "guard": {
@@ -393,6 +429,7 @@
       },
       {
         "id": "t_lane_validated_to_blocked",
+        "event": "request_lane_blocked",
         "from": "validated",
         "to": "blocked",
         "guard": {
@@ -403,6 +440,7 @@
       },
       {
         "id": "t_lane_validated_to_review",
+        "event": "request_lane_review",
         "from": "validated",
         "to": "review",
         "guard": {
@@ -413,6 +451,7 @@
       },
       {
         "id": "t_lane_validated_to_closed",
+        "event": "request_lane_closed",
         "from": "validated",
         "to": "closed",
         "guard": {
@@ -423,6 +462,7 @@
       },
       {
         "id": "t_lane_validated_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "validated",
         "to": "closed_stale",
         "guard": {
@@ -433,6 +473,7 @@
       },
       {
         "id": "t_lane_gated_to_active",
+        "event": "request_lane_active",
         "from": "gated",
         "to": "active",
         "guard": {
@@ -443,6 +484,7 @@
       },
       {
         "id": "t_lane_gated_to_blocked",
+        "event": "request_lane_blocked",
         "from": "gated",
         "to": "blocked",
         "guard": {
@@ -453,6 +495,7 @@
       },
       {
         "id": "t_lane_gated_to_review",
+        "event": "request_lane_review",
         "from": "gated",
         "to": "review",
         "guard": {
@@ -463,6 +506,7 @@
       },
       {
         "id": "t_lane_gated_to_closed",
+        "event": "request_lane_closed",
         "from": "gated",
         "to": "closed",
         "guard": {
@@ -473,6 +517,7 @@
       },
       {
         "id": "t_lane_gated_to_closed_stale",
+        "event": "request_lane_closed_stale",
         "from": "gated",
         "to": "closed_stale",
         "guard": {

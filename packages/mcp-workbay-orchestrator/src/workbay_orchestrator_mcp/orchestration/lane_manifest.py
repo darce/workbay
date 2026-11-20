@@ -49,17 +49,21 @@ EVICTABLE_TERMINAL_STATUSES = TERMINAL_LANE_STATUSES
 
 REQUIRED_TOP_LEVEL_KEYS = ("task_ref", "merge_order", "lanes", "downstream")
 REQUIRED_LANE_KEYS = ("branch", "worktree_path", "owned_paths", "test_commands")
+EXECUTION_MANIFEST_SCHEMA = "workbay/lane-execution@1"
+ADVISORY_GRAPH_SCHEMA = "workbay/lane-advisory@1"
 # Known top-level keys (required + optional). Unknown keys are not refused
 # (compat) but emit a warning at validate time — e.g. metrics keys merged
 # into the dict before save must not silently re-serialize as schema.
 KNOWN_TOP_LEVEL_KEYS = frozenset(
     {
         "task_ref",
+        "schema",
         "merge_order",
         "lanes",
         "downstream",
         "depends_on",
         "task_plan_path",
+        "plan_source",
         "heading_to_lane",
         "plan_routing_hints",
         "routing",
@@ -387,6 +391,7 @@ _COMPACTED_LANE_KEYS = (
             "retired",
             "title",
             "review_subject",
+            "plan_item_id",
             "test_commands",
         }
     )
@@ -1131,9 +1136,137 @@ def _validate_integration_branch(value: Any, path: Path) -> None:
     )
 
 
+def _validate_plan_source(data: dict[str, Any], path: Path) -> None:
+    if "plan_source" not in data:
+        return
+    source = data["plan_source"]
+    if (
+        not isinstance(source, dict)
+        or type(source.get("version")) is not int
+        or source["version"] != 1
+        or source.get("algorithm") != "sha256"
+        or not isinstance(source.get("decomposition_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", source["decomposition_digest"]) is None
+        or not isinstance(source.get("path"), str)
+        or not source["path"]
+        or source["path"] != data.get("task_plan_path")
+    ):
+        raise RuntimeError(
+            f"lane manifest plan_source requires version 1, sha256 digest and matching task_plan_path: {path}"
+        )
+    try:
+        _normalize_owned_path(source["path"])
+    except ValueError as exc:
+        raise RuntimeError(f"lane manifest plan_source.path must be repo-relative: {path}") from exc
+    seen: set[str] = set()
+    for lane_id, lane in data["lanes"].items():
+        item_id = lane.get("plan_item_id") if isinstance(lane, dict) else None
+        if not isinstance(item_id, str) or re.fullmatch(r"s[0-9]+", item_id) is None or item_id in seen:
+            raise RuntimeError(f"lane manifest plan_source lane '{lane_id}' requires a unique plan_item_id: {path}")
+        seen.add(item_id)
+
+
+def manifest_schema(data: dict[str, Any], path: Path) -> str:
+    """Identify the versioned schema used for inspection, including legacy files.
+
+    Explicit schema tags are authoritative. Untagged execution-shaped inputs
+    stay on the strict execution path even when they are incomplete. The
+    untagged graph form predates schema tags and contains no execution-only
+    top-level or lane metadata.
+    """
+    if "schema" in data:
+        schema = data["schema"]
+        if schema == EXECUTION_MANIFEST_SCHEMA or schema == ADVISORY_GRAPH_SCHEMA:
+            return str(schema)
+        raise RuntimeError(f"lane manifest has unsupported schema {schema!r}: {path}")
+    if "merge_order" in data or "downstream" in data:
+        return EXECUTION_MANIFEST_SCHEMA
+    lanes = data.get("lanes")
+    execution_keys = ("branch", "worktree_path", "test_commands")
+    if isinstance(lanes, dict) and any(
+        isinstance(lane, dict) and any(key in lane for key in execution_keys) for lane in lanes.values()
+    ):
+        return EXECUTION_MANIFEST_SCHEMA
+    return ADVISORY_GRAPH_SCHEMA
+
+
+def _validate_advisory_lane(lane_id: str, lane: Any, path: Path) -> None:
+    if not isinstance(lane, dict):
+        raise RuntimeError(f"advisory graph lane '{lane_id}' must be an object: {path}")
+    for key in ("tier", "preferred_tier"):
+        if key in lane and not _is_non_empty_str(lane[key]):
+            raise RuntimeError(f"advisory graph lane '{lane_id}' {key} must be a non-empty string: {path}")
+    for key in ("owned_paths", "state_reads", "state_writes"):
+        if key not in lane:
+            continue
+        value = lane[key]
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise RuntimeError(f"advisory graph lane '{lane_id}' {key} must be a list of strings: {path}")
+        if key == "owned_paths":
+            for item in value:
+                try:
+                    _normalize_owned_path(item)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"advisory graph lane '{lane_id}' owned_paths must be repo-relative: {path}"
+                    ) from exc
+
+
+def _validate_advisory_conflicts(data: dict[str, Any], lane_ids: set[str], path: Path) -> None:
+    if "conflict_edges" not in data:
+        return
+    edges = data["conflict_edges"]
+    if not isinstance(edges, list):
+        raise RuntimeError(f"advisory graph conflict_edges must be a list: {path}")
+    for index, edge in enumerate(edges):
+        if (
+            not isinstance(edge, (list, tuple))
+            or len(edge) != 2
+            or any(not isinstance(item, str) or item not in lane_ids for item in edge)
+            or edge[0] == edge[1]
+        ):
+            raise RuntimeError(f"advisory graph conflict_edges[{index}] must name two distinct lanes: {path}")
+
+
+def validate_advisory_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Validate advisory graph v1 without conferring execution authority."""
+    if "schema" in data and data["schema"] != ADVISORY_GRAPH_SCHEMA:
+        raise RuntimeError(f"advisory graph requires schema {ADVISORY_GRAPH_SCHEMA!r}: {path}")
+    if not _is_non_empty_str(data.get("task_ref")):
+        raise RuntimeError(f"advisory graph task_ref must be a non-empty string: {path}")
+    lanes = data.get("lanes")
+    if not isinstance(lanes, dict):
+        raise RuntimeError(f"advisory graph lanes must be an object: {path}")
+    if any(not _is_non_empty_str(lane_id) for lane_id in lanes):
+        raise RuntimeError(f"advisory graph lane ids must be non-empty strings: {path}")
+    for lane_id in sorted(lanes):
+        _validate_advisory_lane(lane_id, lanes[lane_id], path)
+    lane_ids = set(lanes)
+    if "depends_on" in data and not isinstance(data["depends_on"], dict):
+        raise RuntimeError(f"advisory graph depends_on must be an object: {path}")
+    _validate_depends_on(data.get("depends_on"), lane_ids, path)
+    _validate_advisory_conflicts(data, lane_ids, path)
+    return data
+
+
+def _require_execution_metadata(data: dict[str, Any], path: Path) -> None:
+    """Report all absent required execution fields in a stable order."""
+    missing = [f"top-level key '{key}'" for key in REQUIRED_TOP_LEVEL_KEYS if key not in data]
+    lanes = data.get("lanes")
+    if isinstance(lanes, dict):
+        for lane_id in sorted(key for key in lanes if isinstance(key, str)):
+            lane = lanes[lane_id]
+            if isinstance(lane, dict):
+                missing.extend(f"lane '{lane_id}' key '{key}'" for key in REQUIRED_LANE_KEYS if key not in lane)
+    if missing:
+        raise RuntimeError(f"lane manifest missing required {'; missing required '.join(missing)}: {path}")
+
+
 def validate_manifest(data: dict[str, Any], path: Path) -> dict[str, Any]:
-    for key in REQUIRED_TOP_LEVEL_KEYS:
-        _require_key(data, key, path=path, context="top-level")
+    """Validate the execution schema; advisory graphs never pass this gate."""
+    if "schema" in data and data["schema"] != EXECUTION_MANIFEST_SCHEMA:
+        raise RuntimeError(f"lane execution manifest requires schema {EXECUTION_MANIFEST_SCHEMA!r}: {path}")
+    _require_execution_metadata(data, path)
 
     # Compat: unknown top-level keys are not refused, but warn so metrics keys
     # merged into the dict before save are visible (serialization hygiene).
@@ -1163,6 +1296,7 @@ def validate_manifest(data: dict[str, Any], path: Path) -> dict[str, Any]:
             raise RuntimeError(f"lane manifest landing_policy has unknown key(s) {unknown_landing_policy}: {path}")
         if "no_ff_merge" in landing_policy and not isinstance(landing_policy["no_ff_merge"], bool):
             raise RuntimeError(f"lane manifest landing_policy.no_ff_merge must be a boolean: {path}")
+    _validate_plan_source(data, path)
     if "integration_branch" in data:
         _validate_integration_branch(data.get("integration_branch"), path)
     task_plan_path = data.get("task_plan_path")
@@ -1955,13 +2089,17 @@ def load_manifest(
     *,
     orchestrator_root: str | None = None,
     manifest_dir: str | Path | None = None,
+    allow_advisory: bool = False,
 ) -> dict[str, Any]:
+    """Load an execution manifest; inspection callers may also allow advisory v1."""
     path = _resolve_manifest_dir(orchestrator_root=orchestrator_root, manifest_dir=manifest_dir) / f"{task_ref}.json"
     if not path.exists():
         raise FileNotFoundError(f"lane manifest not found for task {task_ref}: {path}")
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise RuntimeError(f"lane manifest must be a JSON object: {path}")
+    if allow_advisory and manifest_schema(data, path) == ADVISORY_GRAPH_SCHEMA:
+        return validate_advisory_graph(data, path)
     return validate_manifest(data, path)
 
 
@@ -1998,6 +2136,8 @@ def _persist_manifest_unlocked(manifest: dict[str, Any], path: Path) -> dict[str
             existing = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
             existing = None
+        if isinstance(existing, dict) and "plan_source" in existing and "plan_source" not in validated:
+            validated["plan_source"] = copy.deepcopy(existing["plan_source"])
         if isinstance(existing, dict) and "task_plan_path" not in validated:
             existing_task_plan = existing.get("task_plan_path")
             if isinstance(existing_task_plan, str) and existing_task_plan.strip():
@@ -2165,9 +2305,13 @@ def _atomic_update_unlocked(
     prior_lane_ids = _manifest_lane_ids(data)
     had_task_plan_path = "task_plan_path" in data
     existing_task_plan_path = data.get("task_plan_path")
+    had_plan_source = "plan_source" in data
+    existing_plan_source = copy.deepcopy(data.get("plan_source"))
     mutate_fn(data)
     if had_task_plan_path and "task_plan_path" not in data:
         data["task_plan_path"] = existing_task_plan_path
+    if had_plan_source and "plan_source" not in data:
+        data["plan_source"] = existing_plan_source
     _ensure_task_plan_required_docs(data)
     _manifest_rmw_barrier()
     validated, _ = _encode_and_publish_manifest(

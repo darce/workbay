@@ -831,6 +831,25 @@ def _reap_open_lanes_for_task(
 # the core `complete-task` port; it is set by `run()` for every invocation and
 # a successful Done carries only its returned revision/status forward, never a
 # re-read identity. Absent/mismatched selection fails closed.
+_PLANNING_CUSTODY: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "planning_custody", default=None
+)
+# Accepted-planning proof holds meaning "no accepted-planning completion basis".
+# Race codes (planning_source_changed / planning_integration_changed) and
+# custody failures (planning_thin_custody_required) are deliberately absent.
+_PLANNING_BASIS_ABSENT_CODES = frozenset(
+    {
+        "planning_unmerged_source_commit",
+        "planning_integration_unreadable",
+        "planning_file_drift",
+        "planning_receipt_missing",
+        "planning_receipt_invalid",
+        "planning_applied_commit_unmerged",
+        "planning_evidence_unreadable",
+    }
+)
+
+
 _COMPLETION_SELECTION: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "task_finish_completion_selection", default=None
 )
@@ -1745,6 +1764,10 @@ def _remove_worktree(
     )
     if proc.returncode == 0:
         return "removed", None
+    custody = _PLANNING_CUSTODY.get()
+    if custody and custody["root"] == str(primary) and custody["branch"] == target_branch:
+        # Accepted committed bytes never authorize force-removing new user work.
+        return "failed", "planning_worktree_changed: preserve dirty or locked source and retry safe removal"
     # The safe remove refuses a dirty worktree. Automatic ``--force`` is
     # allowed ONLY when ``target_branch`` is fully merged into the primary HEAD
     # and the active guard finds no non-regenerable content (see the
@@ -1957,6 +1980,34 @@ def _delete_merged_branch_status(
             return "skipped_active", active_reason
     if _branch_checked_out_in_other_worktree(primary, target_branch):
         return "skipped_checked_out", None
+    custody = _PLANNING_CUSTODY.get()
+    if custody and custody["branch"] == target_branch and custody["root"] == str(primary):
+        try:
+            reason = _planning_custody_hold_reason(primary, custody)
+        except (
+            ImportError,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            RuntimeError,
+            sqlite3.Error,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            reason = f"planning_thin_custody_required: restore proof unavailable ({type(exc).__name__})"
+        if reason:
+            return "failed", reason
+        # Existing owner/liveness/checkout and durable-record gates ran above.
+        # CAS is mandatory: accepted bytes do not make the original tip merged.
+        deleted = _common.run_subprocess(
+            ["git", "-C", str(primary), "update-ref", "-d", "refs/heads/" + target_branch, custody["tip"]],
+            timeout=TASK_FINISH_GIT_TIMEOUT_S,
+        )
+        return (
+            ("deleted", None)
+            if deleted.returncode == 0
+            else ("failed", "planning_source_changed: requalify source ref")
+        )
     proc = _common.run_subprocess(
         ["git", "-C", str(primary), "branch", "-d", target_branch],
         timeout=TASK_FINISH_GIT_TIMEOUT_S,
@@ -2005,6 +2056,114 @@ def _resolve_branch_tip_sha(primary: Path, target_branch: str) -> str | None:
     if len(sha) != 40 or not set(sha) <= _HEX40_ALPHABET:
         return None
     return sha
+
+
+def _source_has_git_completion(primary: Path, branch: str, integration_ref: str) -> bool:
+    """Keep the existing ancestor and complete cherry proofs on the named ref."""
+    ancestor = _common.run_subprocess(
+        ["git", "-C", str(primary), "merge-base", "--is-ancestor", "refs/heads/" + branch, integration_ref],
+        timeout=TASK_FINISH_GIT_TIMEOUT_S,
+    )
+    if ancestor.returncode == 0:
+        return True
+    if ancestor.returncode != 1:
+        return False
+    cherry = _common.run_subprocess(
+        ["git", "-C", str(primary), "cherry", integration_ref, "refs/heads/" + branch],
+        timeout=TASK_FINISH_GIT_TIMEOUT_S,
+    )
+    patches = (cherry.stdout or "").splitlines()
+    return cherry.returncode == 0 and bool(patches) and all(re.fullmatch(r"- [0-9a-f]{40}", p) for p in patches)
+
+
+def _planning_custody_hold_reason(primary: Path, custody: dict[str, Any]) -> str | None:
+    """Recheck source, declared canonical prerequisites, and the restore proof."""
+    from workbay_handoff_mcp.import_export import planning_completion_hold_reason
+    from workbay_orchestrator_mcp.lane_reaping import _bundle_prerequisite_shas, _verified_bundle_contains
+
+    if custody["root"] != str(primary) or _branch_sha(primary, custody["branch"]) != custody["tip"]:
+        return "planning_source_changed: requalify the exact source tip"
+    reason = planning_completion_hold_reason(
+        workspace_root=primary,
+        task_ref=custody["task_ref"],
+        branch=custody["branch"],
+        source_tip=custody["tip"],
+        integration_ref=custody["integration_ref"],
+    )
+    if reason:
+        return reason
+    path = Path(custody["bundle_path"])
+    prerequisites = _bundle_prerequisite_shas(path)
+    if not prerequisites:
+        return "planning_thin_custody_required: full bundle fallback refused"
+    for prerequisite in prerequisites:
+        if not re.fullmatch(r"[0-9a-f]{40}", prerequisite):
+            return "planning_thin_custody_required: malformed canonical prerequisite"
+        contained = _common.run_subprocess(
+            ["git", "-C", str(primary), "merge-base", "--is-ancestor", prerequisite, "refs/heads/main"],
+            timeout=TASK_FINISH_GIT_TIMEOUT_S,
+        )
+        if contained.returncode != 0:
+            return "planning_thin_custody_required: restore the declared canonical-main prerequisite"
+    if not _verified_bundle_contains(primary, path, custody["tip"]):
+        return "planning_thin_custody_required: restore verification failed"
+    return None
+
+
+def _prepare_planning_custody(
+    primary: Path, *, task_ref: str, branch: str, integration_ref: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Use the existing bundle owner; do not introduce another history reaper."""
+    try:
+        from workbay_handoff_mcp.import_export import planning_completion_hold_reason
+        from workbay_orchestrator_mcp.lane_reaping import _bundle_before_reap
+
+        tip = _resolve_branch_tip_sha(primary, branch)
+        reason = planning_completion_hold_reason(
+            workspace_root=primary,
+            task_ref=task_ref,
+            branch=branch,
+            source_tip=tip or "",
+            integration_ref=integration_ref,
+        )
+        if reason:
+            return None, reason
+        # The existing bundler uses canonical main as its exclusion. Refuse an
+        # absent/disjoint canonical history before it could create a full fallback.
+        common = _common.run_subprocess(
+            ["git", "-C", str(primary), "merge-base", tip or "", "refs/heads/main"],
+            timeout=TASK_FINISH_GIT_TIMEOUT_S,
+        )
+        if common.returncode != 0 or not (common.stdout or "").strip():
+            return None, "planning_thin_custody_required: restore canonical-main history"
+        bundle = _bundle_before_reap(primary, branch)
+        if bundle.get("ok") is not True or bundle.get("bundle_mode") != "delta" or bundle.get("tip_sha") != tip:
+            return None, "planning_thin_custody_required: " + str(bundle.get("error") or "exact delta bundle required")
+        custody = dict(
+            root=str(primary),
+            task_ref=task_ref,
+            branch=branch,
+            tip=tip,
+            integration_ref=integration_ref,
+            bundle_path=str(bundle["bundle_path"]),
+            bundle_mode="delta",
+        )
+        reason = _planning_custody_hold_reason(primary, custody)
+        return (None, reason) if reason else (custody, None)
+    except (
+        ImportError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        RuntimeError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        return (
+            None,
+            f"planning_thin_custody_required: custody unavailable ({type(exc).__name__}); restore evidence and retry",
+        )
 
 
 def _record_branch_tip_identity(
@@ -2092,7 +2251,15 @@ def _record_branch_tip_identity(
         ["git", "-C", str(primary), "merge-base", "--is-ancestor", tip_sha, "HEAD"],
         timeout=TASK_FINISH_GIT_TIMEOUT_S,
     )
-    if contained.returncode != 0:
+    custody = _PLANNING_CUSTODY.get()
+    qualified_planning = bool(
+        custody
+        and custody["branch"] == target_branch
+        and custody["tip"] == tip_sha
+        and custody["task_ref"] == task_ref
+        and custody["root"] == str(primary)
+    )
+    if contained.returncode != 0 and not qualified_planning:
         note["disposition"] = "no_rows"
         return note
     try:
@@ -2536,6 +2703,7 @@ def _note_codemap_reindex_on_receipt(
 
 
 def run(argv: list[str]) -> int:
+    _PLANNING_CUSTODY.set(None)
     parser = argparse.ArgumentParser(prog="lifecycle task-finish", add_help=True)
     parser.add_argument("--task", dest="task", default="")
     parser.add_argument("--json", dest="emit_json", action="store_true", default=False)
@@ -2753,6 +2921,7 @@ def run(argv: list[str]) -> int:
                     "events": events,
                     "error": "task_completion_held",
                     "detail_reason": hold,
+                    "detail_code": hold.split(":", 1)[0],
                     "target_branch": verify_target_branch,
                     "target_worktree_path": verify_target_worktree_path,
                     "warnings": warnings,
@@ -2958,12 +3127,95 @@ def run(argv: list[str]) -> int:
     # row's disposition becomes undecidable rather than merely unknown. It is
     # written on every path, so all eight branch-delete outcomes below (seven of
     # which leave the branch alive) still leave a bound row behind.
+    if (
+        target_branch
+        and _resolve_branch_tip_sha(primary, target_branch) is not None
+        and not _source_has_git_completion(primary, target_branch, integration_ref)
+    ):
+        custody, refusal = _prepare_planning_custody(
+            primary,
+            task_ref=task_ref,
+            branch=target_branch,
+            integration_ref=integration_ref,
+        )
+        if refusal and already_terminal and refusal.split(":", 1)[0] in _PLANNING_BASIS_ABSENT_CODES:
+            # A re-run of an archived task skipped the early explicit proof, so
+            # planning custody applies only when the accepted-planning proof is
+            # the completion basis. Otherwise keep the regular guarded path
+            # (safe removal; ``branch -d`` preserves unmerged work). Source and
+            # integration races and custody failures still refuse below.
+            custody = refusal = None
+        if refusal:
+            _common.emit(
+                {
+                    "ok": False,
+                    "command": "task-finish",
+                    "task_ref": task_ref,
+                    "error": "cleanup_incomplete",
+                    "finish_status": "cleanup_pending",
+                    "cleanup_pending": True,
+                    "retryable": True,
+                    "detail_code": refusal.split(":", 1)[0],
+                    "detail_reason": refusal,
+                    "target_branch": target_branch,
+                    "target_worktree_path": target_worktree_path,
+                    "events": events,
+                    "warnings": warnings,
+                }
+            )
+            return 2
+        if custody is not None:
+            _PLANNING_CUSTODY.set(custody)
+            events.append("planning_unique_history_thin_verified")
+
     branch_tip = _record_branch_tip_identity(
         primary,
         task_ref=task_ref,
         target_branch=target_branch,
         tip_sha=_resolve_branch_tip_sha(primary, target_branch),
     )
+
+    custody = _PLANNING_CUSTODY.get()
+    if custody is not None:
+        # Do not discard even the worktree until both recoverable history and
+        # its durable task/lane identity are proven. Safe removal still owns
+        # all existing liveness/shared-path/dirt checks below.
+        try:
+            refusal = _planning_custody_hold_reason(primary, custody)
+        except (
+            ImportError,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            RuntimeError,
+            sqlite3.Error,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            refusal = f"planning_thin_custody_required: restore proof unavailable ({type(exc).__name__})"
+        if branch_tip.get("disposition") not in {"recorded", "recorded_task_archive"}:
+            refusal = "planning_identity_unrecorded: restore the task archive or registered lane before cleanup"
+        if refusal:
+            _common.emit(
+                {
+                    "ok": False,
+                    "command": "task-finish",
+                    "task_ref": task_ref,
+                    "error": "cleanup_incomplete",
+                    "finish_status": "cleanup_pending",
+                    "cleanup_pending": True,
+                    "retryable": True,
+                    "detail_code": refusal.split(":", 1)[0],
+                    "detail_reason": refusal,
+                    "branch_tip": branch_tip,
+                    "planning_custody": custody,
+                    "target_branch": target_branch,
+                    "target_worktree_path": target_worktree_path,
+                    "events": events,
+                    "warnings": warnings,
+                }
+            )
+            return 2
 
     worktree_status, worktree_err = _remove_worktree(
         primary,
@@ -3037,6 +3289,7 @@ def run(argv: list[str]) -> int:
         "target_branch": target_branch,
         "branch_status": branch_status,
         "branch_tip": branch_tip,
+        "planning_custody": _PLANNING_CUSTODY.get(),
         "open_lanes": open_lanes,
         "reaped_lanes": reaped_lanes,
         "lane_close": lane_close_report,

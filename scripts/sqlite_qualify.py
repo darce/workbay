@@ -5,8 +5,11 @@ Usage::
 
     python3 -I scripts/sqlite_qualify.py --db <copy-of-handoff.db> --json
 
-Stdlib only. The source DB is opened read-only and backed up into a scratch
-directory; every check that writes (FTS integrity-check commands, trigger
+Stdlib only outside ``handoff_package``: the engine, schema and concurrency
+sections import nothing from the handoff package, so ``--skip-package`` runs
+under any interpreter. The source DB is opened
+read-only and backed up into a scratch directory; every check that writes
+(FTS integrity-check commands, trigger
 exercise, package migrations, the concurrency probe) runs on a scratch copy,
 never on ``--db``. A path inside a ``.task-state`` directory is refused: copy
 the production DB first.
@@ -21,10 +24,14 @@ Report sections (JSON on stdout, diagnostics on stderr):
 * ``schema``: ``PRAGMA integrity_check``, ``PRAGMA user_version``, each FTS5
   table's ``'integrity-check'`` command, and a rolled-back exercise of every
   trigger that writes an FTS5 table or its shadow tables (the
-  ``may not write to shadow table`` class of version/config skew).
+  ``may not write to shadow table`` class of version/config skew). The row
+  exercised is the newest one that none of the DB's installed guard triggers
+  (``WHEN <cond> BEGIN SELECT RAISE(...); END``, e.g. the native immutable
+  coordination-fact guards) would abort; protected-only tables are skipped.
 * ``handoff_package``: the handoff package's own connection factory (with its
   write-lock authorizer) and ``_prepare_handoff_connection`` migrations open
-  the scratch copy, and the authorizer reports RESERVED correctly.
+  the scratch copy, and the authorizer reports RESERVED correctly. With
+  ``--package-path`` the package must load from those site dirs (``identity``).
 * ``concurrency``: for N in ``--writers`` (default 1,4,8), N threads each run
   short ``BEGIN IMMEDIATE`` transactions with one concurrent
   ``wal_checkpoint(TRUNCATE)``; reports p50/p95/p99 lock wait and the count
@@ -33,7 +40,8 @@ Report sections (JSON on stdout, diagnostics on stderr):
 Exit status ([AGT-21]): 0 every check ran and passed; 3 a schema check ran and
 failed (integrity, FTS integrity, FTS trigger write, package migration or
 authorizer); 4 a check could not run (source unreadable or refused, handoff
-package not importable, concurrency probe error). 3 wins over 4.
+package not importable or not from ``--package-path``, a guard trigger whose
+protected rows cannot be derived, concurrency probe error). 3 wins over 4.
 """
 
 from __future__ import annotations
@@ -253,17 +261,113 @@ def _update_columns(conn: sqlite3.Connection, table: str, triggers: list[tuple[s
     return chosen
 
 
+_SQL_TOKEN = re.compile(
+    r"\s+|--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|\[[^\]]*\]"
+    r"|(?P<word>[A-Za-z_][A-Za-z_0-9$]*)|(?P<other>.)",
+    re.DOTALL,
+)
+
+
+def _sql_words(sql: str) -> list[tuple[str, int, int, int]]:
+    """Unquoted keyword-like tokens as (UPPER, start, end, paren depth); literals/comments skipped."""
+    words, depth = [], 0
+    for match in _SQL_TOKEN.finditer(sql):
+        if match.group("word"):
+            words.append((match.group("word").upper(), match.start(), match.end(), depth))
+        elif match.group("other") in ("(", ")", ";"):
+            depth += {"(": 1, ")": -1}.get(match.group("other"), 0)
+            words.append((match.group("other"), match.start(), match.end(), depth))
+    return words
+
+
+def _guard_condition(sql: str) -> str | None:
+    """Rows a native guard trigger protects, as its own WHEN SQL ("1" if unconditional).
+
+    A guard is a trigger whose whole body is ``SELECT RAISE(...);``. Returns
+    None for triggers that cannot RAISE. Raises ValueError when RAISE is
+    reachable but the protected rows cannot be read off the trigger itself.
+    """
+    words = _sql_words(sql)
+    begin = next((i for i, w in enumerate(words) if w[0] == "BEGIN" and w[3] == 0), None)
+    if begin is None or not any(w[0] == "RAISE" for w in words):
+        return None
+    head, body = words[:begin], words[begin + 1 :]
+    if body and body[-1][0] == "END":
+        body = body[:-1]
+    if body and body[-1][0] == ";":
+        body = body[:-1]
+    pure = (
+        len(body) >= 4
+        and [w[0] for w in body[:3]] == ["SELECT", "RAISE", "("]
+        and body[-1][0] == ")"
+        and body[-1][3] == 0
+        and all(w[3] > 0 for w in body[2:-1])
+        and not any(w[0] == "RAISE" for w in head)
+    )
+    if not pure:
+        raise ValueError("RAISE is not the trigger's only, unconditional body statement")
+    when = next((i for i, w in enumerate(head) if w[0] == "WHEN" and w[3] == 0), None)
+    return "1" if when is None else sql[head[when][2] : words[begin][1]].strip()
+
+
+def _mutable_row(conn: sqlite3.Connection, table: str) -> tuple[int | None, list[str]]:
+    """Newest row no installed guard trigger on ``table`` would abort (stdlib only).
+
+    The guards' own stored WHEN clauses (``immutable_fact_condition`` for the
+    coordination facts) are evaluated with OLD and NEW bound to the candidate
+    row, which is exactly what the no-op UPDATE / DELETE / re-INSERT sees. No
+    predicate is duplicated here and the handoff package is never imported.
+    Raises ValueError naming the guard when that proof is unavailable.
+    """
+    qt = _quote(table)
+    guards: dict[str, str] = {}
+    for name, sql in conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name", (table,)
+    ):
+        try:
+            condition = _guard_condition(sql or "")
+        except ValueError as exc:
+            raise ValueError(f"guard {name}: {exc}") from None
+        if condition is not None:
+            guards[name] = condition
+    where = ""
+    if guards:
+        protected = " ".join(f"WHEN ({condition}) THEN 0" for condition in guards.values())
+        where = f" WHERE CASE {protected} ELSE 1 END"
+    try:
+        row = conn.execute(
+            f"SELECT OLD.rowid FROM {qt} AS OLD JOIN {qt} AS NEW ON NEW.rowid = OLD.rowid"
+            f"{where} ORDER BY OLD.rowid DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError(f"guards {sorted(guards)} not evaluable: {_error_text(exc)}") from None
+    return (row[0] if row else None), sorted(guards)
+
+
 def _exercise_triggers(conn: sqlite3.Connection, fts_tables: list[str]) -> list[dict]:
-    """Fire every FTS-writing trigger on one existing row, then roll back."""
+    """Fire FTS-writing triggers on an existing unguarded row, then roll back.
+
+    Rows the DB's own guard triggers protect (immutable coordination facts) are
+    never probed: empty/protected-only tables are reported as skipped and their
+    FTS integrity checks still run. A guard whose protected rows cannot be
+    proven makes the entry ``unavailable``, never ``ok``.
+    """
     results = []
     for table, triggers in sorted(_fts_writing_triggers(conn, fts_tables).items()):
         entry: dict = {"table": table, "triggers": [name for name, _ in triggers]}
-        row = conn.execute(f"SELECT rowid FROM {_quote(table)} ORDER BY rowid DESC LIMIT 1").fetchone()
-        if row is None:
-            entry.update(status="skipped", reason="table has no rows")
+        try:
+            rowid, guards = _mutable_row(conn, table)
+        except ValueError as exc:
+            entry.update(status="unavailable", reason=str(exc))
             results.append(entry)
             continue
-        rowid = row[0]
+        if guards:
+            entry["guards"] = guards
+        if rowid is None:
+            empty = conn.execute(f"SELECT 1 FROM {_quote(table)} LIMIT 1").fetchone() is None
+            entry.update(status="skipped", reason="table has no rows" if empty else "no mutable rows")
+            results.append(entry)
+            continue
         qt = _quote(table)
         conn.execute("SAVEPOINT qualify_triggers")
         try:
@@ -312,8 +416,9 @@ def schema_report(scratch: Path, *, defensive: bool) -> dict:
         and all(c["status"] == "ok" for c in fts_checks)
         and all(c["status"] != "failed" for c in trigger_checks)
     )
+    unproven = any(c["status"] == "unavailable" for c in trigger_checks)
     return {
-        "status": "ok" if ok else "failed",
+        "status": "failed" if not ok else "unavailable" if unproven else "ok",
         "defensive": defensive,
         "integrity_check": integrity,
         "user_version": user_version,
@@ -328,33 +433,77 @@ def schema_report(scratch: Path, *, defensive: bool) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _import_shared_schema(extra_paths: list[str]):
-    # addsitedir honours .pth files (editable installs); the added entries are
-    # moved first so they win over the system dist-packages that -I keeps.
+def _site_roots(sitedir: str) -> list[str]:
+    """``sitedir`` plus the directories its .pth files name (site.addpackage rules)."""
+    roots = [os.path.abspath(sitedir)]
+    try:
+        names = sorted(n for n in os.listdir(sitedir) if n.endswith(".pth") and not n.startswith("."))
+    except OSError:
+        return roots
+    for name in names:
+        try:
+            lines = Path(sitedir, name).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith(("#", "import ", "import\t")):
+                path = os.path.abspath(os.path.join(sitedir, line))
+                if os.path.isdir(path) and path not in roots:
+                    roots.append(path)
+    return roots
+
+
+def _import_shared_schema(extra_paths: list[str]) -> tuple[object, dict]:
+    """Import shared_schema once, from ``extra_paths`` when given, and prove where from.
+
+    The requested site dirs (and their .pth entries, for editable installs) are
+    placed first on sys.path *before* the first handoff import; -I keeps the
+    interpreter's own site dirs, which must not win. With explicit paths there
+    is no in-tree fallback, and a module that resolves outside them (already
+    imported, or shadowed) is reported, not trusted.
+    """
+    preloaded = "workbay_handoff_mcp" in sys.modules
+    roots: list[str] = []
     for path in extra_paths:
-        before = list(sys.path)
         site.addsitedir(path)
-        added = [p for p in sys.path if p not in before]
-        sys.path[:] = added + before
+        roots.extend(r for r in _site_roots(path) if r not in roots)
+    if roots:
+        sys.path[:] = roots + [p for p in sys.path if os.path.abspath(p or os.curdir) not in roots]
+    identity: dict = {"requested": list(extra_paths), "roots": roots, "first_import_after_paths": not preloaded}
     try:
         from workbay_handoff_mcp import shared_schema
     except ImportError:
+        if extra_paths:
+            raise
         for path in _IN_TREE_PACKAGE_PATHS:
             if path.is_dir() and str(path) not in sys.path:
                 sys.path.insert(0, str(path))
         from workbay_handoff_mcp import shared_schema
-    return shared_schema
+    if extra_paths:
+        module = os.path.realpath(getattr(shared_schema, "__file__", None) or "")
+        identity["under_requested"] = not preloaded and any(
+            module.startswith(os.path.realpath(root) + os.sep) for root in roots
+        )
+    return shared_schema, identity
 
 
 def package_report(scratch: Path, extra_paths: list[str]) -> dict:
     try:
-        shared_schema = _import_shared_schema(extra_paths)
+        shared_schema, identity = _import_shared_schema(extra_paths)
     except ImportError as exc:
         return {"status": "unavailable", "error": _error_text(exc)}
     report: dict = {
         "module": getattr(shared_schema, "__file__", None),
         "package_schema_version": getattr(shared_schema, "HANDOFF_SCHEMA_VERSION", None),
     }
+    if extra_paths:
+        report["identity"] = identity
+        if not identity["under_requested"]:
+            report.update(
+                status="unavailable", error=f"handoff package not loaded from --package-path: {report['module']}"
+            )
+            return report
     conn = None
     try:
         conn = shared_schema.connect_handoff_db(scratch)
@@ -551,7 +700,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--package-path",
         action="append",
         default=[],
-        help="site dir holding the handoff package and its deps (repeatable; .pth honoured; -I drops PYTHONPATH)",
+        help="site dir holding the handoff package and its deps (repeatable; .pth honoured; -I drops PYTHONPATH;"
+        " applied before the only handoff import, which must resolve under it)",
     )
     parser.add_argument("--keep-scratch", action="store_true", help="keep the scratch directory")
     args = parser.parse_args(argv)
@@ -612,7 +762,10 @@ def main(argv: list[str] | None = None) -> int:
                     report["schema"] = schema_report(schema_db, defensive=args.defensive)
                 except sqlite3.Error as exc:
                     report["schema"] = {"status": "failed", "error": _error_text(exc)}
-                if report["schema"]["status"] != "ok":
+                if report["schema"]["status"] == "unavailable":
+                    _diag("schema trigger exercise unproven: guard trigger rows not derivable")
+                    unavailable.append("schema")
+                elif report["schema"]["status"] != "ok":
                     failed.append("schema")
 
                 if args.skip_package:

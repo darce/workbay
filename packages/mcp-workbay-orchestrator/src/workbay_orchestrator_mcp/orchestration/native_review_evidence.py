@@ -1,4 +1,4 @@
-"""Collect native review evidence without granting model output scope authority.
+"""Publish branch review judgments and collect host-bound native evidence.
 
 Canon 0.26.2: SECD-03 complete mediation (Security Engineering), DATA-14
 No dual writes (Designing Data-Intensive Applications, ch. 11), GRPH-14
@@ -109,41 +109,293 @@ def _judgment(result: dict) -> dict:
     return completion
 
 
-def _review_run(job: str, scope: dict, actor: dict, judgment: dict, session: str) -> dict:
-    from workbay_handoff_mcp.core import record_review_run
+class _ReviewConflict(ValueError):
+    """Two producers supplied different known values for the same judgment."""
+
+
+def _merge_known(previous: dict, observed: dict) -> dict:
+    merged = dict(previous)
+    for key, value in observed.items():
+        if value is not None and merged.get(key) is not None and value != merged[key]:
+            raise _ReviewConflict(f"review_run_identity_mismatch:{key}")
+        if value is not None or key not in merged:
+            merged[key] = value
+    return merged
+
+
+def publish_branch_judgment(
+    run_id: str,
+    *,
+    task_ref: str,
+    session: str,
+    subject_path: str,
+    actor: dict,
+    verdict: str | None,
+    producer: str,
+    judge_pin: dict,
+    receipt: dict | None = None,
+    cycle_n: int | None = None,
+    parent_run_id: str | None = None,
+) -> dict:
+    """Commit the producer's observation before writing findings or projecting the run.
+
+    The host receipt already binds the managed pass to its reserved dispatch.
+    The dispatch and its native collection therefore share the managed pass ID,
+    even if native collection happens first. Neither a session label nor the
+    number of rows in the database is a run identity.
+    """
     from workbay_handoff_mcp.shared_schema import _get_db_connection
 
-    expected = dict(
-        task_ref=scope["task_ref"],
-        session=session,
-        subject_path=scope["base_sha"] + "..." + scope["tip_sha"],
-        subject_kind="branch",
-        review_mode="branch",
-        verdict=judgment["verdict"],
-        branch=actor["branch"],
-        commit_sha=actor["commit_sha"],
-        model=actor["model"],
-        agent=actor["agent"],
-        model_label=actor["model_label"],
-    )
-    with _get_db_connection() as conn:
-        existing = conn.execute("SELECT * FROM review_runs WHERE review_run_id = ?", (job,)).fetchone()
-    if existing is not None:
-        if any(existing[key] != value for key, value in expected.items()):
-            return dict(status="refused", reason="native_review_run_identity_mismatch")
-        return dict(status="recorded", review_run_id=job)
-    response = record_review_run(
-        review_run_id=job,
-        actor=actor,
-        **{
-            key: value
-            for key, value in expected.items()
-            if key not in {"branch", "commit_sha", "model", "agent", "model_label"}
-        },
-    )
-    if response.get("ok") is not True:
-        return dict(status="refused", reason="native_review_run_refused", response=response)
-    return dict(status="recorded", review_run_id=job, response=response)
+    receipt = receipt or {}
+    reservation = (receipt.get("decision") or {}).get("row") or {}
+    dispatch_id = reservation.get("dispatch_id")
+    run_id = (receipt.get("managed_identity") or {}).get("pass_id") or dispatch_id or run_id
+    cycle_n = reservation.get("round", cycle_n)
+    previous = reservation.get("previous_gate_dispatch_id")
+    scope = dict(task_ref=task_ref, branch=actor["branch"], commit_sha=actor["commit_sha"])
+    observation = dict(session=session, subject_path=subject_path)
+    pin = {key: None if value in ("", "unknown") else value for key, value in judge_pin.items()}
+    pin["dispatch_id"] = dispatch_id
+    try:
+        with _get_db_connection(begin_immediate=True) as conn:
+            from workbay_handoff_mcp.review_findings_support import _canonical_task_ref_from_handoff
+
+            canonical_task = _canonical_task_ref_from_handoff(conn, task_ref)
+            if canonical_task is None:
+                return dict(status="refused", reason="unknown_task_ref", run_id=run_id)
+            scope["task_ref"] = task_ref = canonical_task
+            if previous:
+                parent = conn.execute(
+                    """SELECT run_id FROM branch_review_judgments WHERE dispatch_id = ? AND task_ref = ?
+                       UNION SELECT review_run_id FROM review_runs WHERE task_ref = ?
+                       AND (review_run_id = ? OR CASE WHEN json_valid(judge_pin_json)
+                            THEN json_extract(judge_pin_json, '$.dispatch_id') END = ?)""",
+                    (previous, task_ref, task_ref, previous, previous),
+                ).fetchall()
+                if len(parent) == 1:
+                    parent_run_id = parent[0][0]
+            # A BASE native collector may have used the dispatch ID for this
+            # managed pass. Retain the actual row and its foreign dependents.
+            aliases = conn.execute(
+                """SELECT run_id FROM branch_review_judgments WHERE run_id=? OR dispatch_id=?
+                   UNION SELECT review_run_id FROM review_runs WHERE review_run_id IN (?, ?)""",
+                (run_id, dispatch_id, run_id, dispatch_id),
+            ).fetchall()
+            if len(aliases) == 1:
+                run_id = aliases[0][0]
+            old = conn.execute("SELECT * FROM branch_review_judgments WHERE run_id = ?", (run_id,)).fetchone()
+            metadata = dict(verdict=verdict, cycle_n=cycle_n, parent_run_id=parent_run_id, dispatch_id=dispatch_id)
+            sources = {producer: observation}
+            try:
+                if len(aliases) > 1:
+                    raise _ReviewConflict("review_run_alias_conflict")
+                if old:
+                    _merge_known({key: old[key] for key in scope}, scope)
+                    metadata = _merge_known({key: old[key] for key in metadata}, metadata)
+                    previous_pin = json.loads(old["judge_pin_json"])
+                    previous_pin.pop("unavailable_fields", None)
+                    pin = _merge_known(previous_pin, pin)
+                    sources = json.loads(old["sources_json"])
+                    sources[producer] = _merge_known(sources.get(producer, {}), observation)
+                state, error = "pending", None
+            except _ReviewConflict as exc:
+                state, error = "identity_mismatch", str(exc)
+                conn.execute(
+                    "UPDATE branch_review_judgments SET projection_status=?, projection_error=? WHERE run_id=?",
+                    (state, error, run_id),
+                )
+            pin["unavailable_fields"] = [
+                key
+                for key, value in (
+                    ("model", pin.get("model")),
+                    ("effort", pin.get("effort")),
+                    ("cycle_n", metadata["cycle_n"]),
+                    ("parent_run_id", metadata["parent_run_id"]),
+                )
+                if value is None
+            ]
+            conn.execute(
+                """INSERT INTO branch_review_judgments
+                   (run_id, task_ref, branch, commit_sha, dispatch_id, verdict, cycle_n, parent_run_id,
+                    judge_pin_json, sources_json, projection_status, projection_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (run_id, task_ref, branch, commit_sha) DO UPDATE SET
+                       dispatch_id=excluded.dispatch_id, verdict=coalesce(branch_review_judgments.verdict, excluded.verdict),
+                       cycle_n=excluded.cycle_n, parent_run_id=excluded.parent_run_id,
+                       judge_pin_json=excluded.judge_pin_json, sources_json=excluded.sources_json
+                   WHERE branch_review_judgments.projection_status <> 'identity_mismatch'""",
+                (
+                    run_id,
+                    task_ref,
+                    scope["branch"],
+                    scope["commit_sha"],
+                    metadata["dispatch_id"],
+                    metadata["verdict"],
+                    metadata["cycle_n"],
+                    metadata["parent_run_id"],
+                    _json(pin),
+                    _json(sources),
+                    state,
+                    error,
+                ),
+            )
+            if error or (old and old["projection_status"] == "identity_mismatch"):
+                return dict(status="identity_mismatch", reason=error or old["projection_error"], run_id=run_id)
+        return dict(
+            status="published",
+            run_id=run_id,
+            session=session,
+            subject_path=subject_path,
+            actor=actor,
+            verdict=metadata["verdict"],
+        )
+    except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+        return dict(
+            status="failed", reason="review_judgment_unavailable", error=f"{type(exc).__name__}: {exc}", run_id=run_id
+        )
+
+
+def project_branch_judgment(
+    publication: dict,
+    *,
+    finding_ids: list[str],
+    blocking_ids: list[str],
+    blocking_paths: set[str] | None = None,
+) -> dict:
+    """Project a committed judgment. The existing writer retains its branch review guards."""
+    from workbay_handoff_mcp import core
+    from workbay_handoff_mcp.api import link_review_run_findings
+    from workbay_handoff_mcp.shared_schema import _get_db_connection
+
+    if publication["status"] != "published":
+        return publication
+    run_id = publication["run_id"]
+    try:
+        with _get_db_connection(begin_immediate=True) as conn:
+            journal = conn.execute("SELECT * FROM branch_review_judgments WHERE run_id=?", (run_id,)).fetchone()
+            if journal["projection_status"] == "identity_mismatch":
+                raise _ReviewConflict(journal["projection_error"])
+            ids = set(json.loads(journal["blocking_ids"] or "[]")) | set(blocking_ids)
+            if blocking_paths and finding_ids:
+                # Standalone finding IDs are assigned (and sometimes re-keyed)
+                # by the findings writer. Use its confirmed rows in the reviewed scope.
+                from workbay_protocol.review_impact import is_blocking
+
+                recorded = conn.execute(
+                    """SELECT finding_id, severity, impact, origin, file_path FROM review_findings
+                       WHERE task_ref=? AND session=? AND status='open'
+                       AND finding_id IN (SELECT value FROM json_each(?))""",
+                    (journal["task_ref"], publication["session"], _json(finding_ids)),
+                )
+                ids.update(
+                    row["finding_id"]
+                    for row in recorded
+                    if row["file_path"] in blocking_paths and is_blocking(dict(row))
+                )
+            conn.execute(
+                "UPDATE branch_review_judgments SET blocking_ids=? WHERE run_id=?", (_json(sorted(ids)), run_id)
+            )
+            existing = conn.execute("SELECT 1 FROM review_runs WHERE review_run_id=?", (run_id,)).fetchone()
+        response = None
+        if existing is None:
+            response = core.record_review_run(
+                review_run_id=run_id,
+                task_ref=journal["task_ref"],
+                subject_kind="branch",
+                review_mode="branch",
+                session=publication["session"],
+                subject_path=publication["subject_path"],
+                actor=publication["actor"],
+                verdict=journal["verdict"],
+                cycle_n=journal["cycle_n"],
+                parent_run_id=journal["parent_run_id"],
+                judge_pin_json=journal["judge_pin_json"],
+            )
+        # The writer uses its own transaction. Re-read after it returns: a
+        # concurrent collector can win the insert and still be the same run.
+        with _get_db_connection(begin_immediate=True) as conn:
+            journal = conn.execute("SELECT * FROM branch_review_judgments WHERE run_id=?", (run_id,)).fetchone()
+            row = conn.execute("SELECT * FROM review_runs WHERE review_run_id=?", (run_id,)).fetchone()
+            if journal["projection_status"] == "identity_mismatch":
+                raise _ReviewConflict(journal["projection_error"])
+            if row is None:
+                data = (response or {}).get("data") or {}
+                result = dict(status="refused", reason=data.get("error") or "review_run_refused", response=response)
+            else:
+                fields = ("task_ref", "branch", "commit_sha", "verdict", "cycle_n", "parent_run_id")
+                _merge_known(
+                    dict(subject_kind=row["subject_kind"], review_mode=row["review_mode"]),
+                    dict(subject_kind="branch", review_mode="branch"),
+                )
+                merged = _merge_known({key: row[key] for key in fields}, {key: journal[key] for key in fields})
+                sources = json.loads(journal["sources_json"])
+                known_sessions = {source["session"] for source in sources.values()}
+                known_subjects = {source["subject_path"] for source in sources.values()}
+                if journal["dispatch_id"]:
+                    known_sessions.add("review-cycle:" + journal["dispatch_id"])
+                    known_subjects.add(journal["branch"])
+                if row["session"] and row["session"] not in known_sessions:
+                    raise _ReviewConflict("review_run_identity_mismatch:session")
+                if row["subject_path"] not in known_subjects:
+                    raise _ReviewConflict("review_run_identity_mismatch:subject_path")
+                prior_pin = json.loads(row["judge_pin_json"] or "{}")
+                prior_pin.pop("unavailable_fields", None)
+                # Older producer pins used a sentinel or nested the executed route.
+                for key in ("backend", "model", "effort"):
+                    value = prior_pin.get(key) or (prior_pin.get("route") or {}).get(key)
+                    prior_pin[key] = None if value in ("", "unknown") else value
+                pin = _merge_known(prior_pin, json.loads(journal["judge_pin_json"]))
+                model = _merge_known({"model": row["model"]}, {"model": pin.get("model")})["model"]
+                conn.execute(
+                    """UPDATE review_runs SET task_ref=:task_ref, branch=:branch, commit_sha=:commit_sha,
+                       verdict=:verdict, cycle_n=:cycle_n, parent_run_id=:parent_run_id, judge_pin_json=:pin, model=:model
+                       WHERE review_run_id=:run""",
+                    {**merged, "pin": _json(pin), "run": run_id, "model": model},
+                )
+                result = dict(status="recorded", review_run_id=run_id)
+                link_review_run_findings(conn, run_id, finding_ids, session=publication["session"])
+            conn.execute(
+                "UPDATE branch_review_judgments SET projection_status=?, projection_error=? WHERE run_id=?",
+                (result["status"], result.get("reason"), run_id),
+            )
+            return {**result, "run_id": run_id}
+    except _ReviewConflict as exc:
+        result = dict(status="identity_mismatch", reason=str(exc))
+    except (sqlite3.Error, OSError, RuntimeError, ValueError, TypeError) as exc:
+        result = dict(status="failed", reason="review_projection_failed", error=f"{type(exc).__name__}: {exc}")
+    try:
+        with _get_db_connection(begin_immediate=True) as conn:
+            conn.execute(
+                """UPDATE branch_review_judgments SET projection_status=?, projection_error=?
+                   WHERE run_id=? AND projection_status <> 'identity_mismatch'
+                     AND (projection_status <> 'recorded' OR ? = 'identity_mismatch')""",
+                (result["status"], result.get("error") or result.get("reason"), run_id, result["status"]),
+            )
+    except (sqlite3.Error, RuntimeError, OSError) as exc:
+        return dict(status="failed", reason="review_projection_receipt_unavailable", error=str(exc), run_id=run_id)
+    return {**result, "run_id": run_id}
+
+
+def clean_judgment_with_projection_fault(dispatch_id: str, harvest: dict) -> bool:
+    """A failed SQLite projection leaves a durable clean gate eligible to settle."""
+    from workbay_handoff_mcp.shared_schema import _get_db_connection
+
+    receipt = harvest.get("judgment_receipt") or {}
+    if receipt.get("status") != "published":
+        return False
+    try:
+        with _get_db_connection() as conn:
+            return (
+                conn.execute(
+                    """SELECT 1 FROM branch_review_judgments WHERE run_id=? AND dispatch_id=?
+                   AND verdict IN ('pass', 'pass_with_findings') AND blocking_ids='[]'
+                   AND projection_status IN ('failed', 'refused', 'recorded')""",
+                    (receipt["run_id"], dispatch_id),
+                ).fetchone()
+                is not None
+            )
+    except (KeyError, sqlite3.Error, OSError, RuntimeError):
+        return False
 
 
 def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
@@ -235,18 +487,33 @@ def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
             scope = _scope(repo, host, config, lane)
             output.pop("reason", None)
             output["source_review_scope"] = scope
-            route = host.get("executed_route") or host["decision"]["row"]["required_route"]
-            if not isinstance(route, dict) or not route.get("model") or not route.get("effort"):
-                raise ValueError("native_review_route_unavailable")
+            review_path = config.state_dir / f"review-receipt-{job}.json"
+            if review_path.exists():
+                saved = json.loads(review_path.read_text())
+                if saved.get("identity", {}).get("native_result_sha256") != digest:
+                    raise ValueError("native_review_result_conflict")
+            observed_route = host.get("executed_route") or {}
             from workbay_handoff_mcp.shared_write_context import build_write_actor
 
             actor = build_write_actor(
                 lane_id=lane["lane_id"],
                 branch=scope["source_branch"],
                 commit_sha=scope["tip_sha"],
-                model=route["model"],
-                reasoning_level=route["effort"],
+                model=observed_route.get("model"),
+                reasoning_level=observed_route.get("effort"),
             )
+            session = "review-cycle:" + job
+            publication = None
+            if output["judgment"]["complete"] and output["judgment"]["verdict"] in {"pass", "pass_with_findings", "fail"}:
+                publication = publish_branch_judgment(
+                    job, task_ref=scope["task_ref"], session=session, subject_path=scope["base_sha"] + "..." + scope["tip_sha"],
+                    actor=actor, verdict=output["judgment"]["verdict"], producer="native", receipt=host,
+                    judge_pin={key: observed_route.get(key) for key in ("backend", "model", "effort")},
+                )
+                output["judgment_receipt"] = publication
+            route = host.get("executed_route") or host["decision"]["row"]["required_route"]
+            if not isinstance(route, dict) or not route.get("model") or not route.get("effort"):
+                raise ValueError("native_review_route_unavailable")
             identity = dict(
                 pass_id=job,
                 dispatch_id=job,
@@ -267,11 +534,6 @@ def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
                 started_at=host["decision"]["row"]["activated_at"],
                 source_task_subject=host.get("source_task_subject"),
             )
-            review_path = config.state_dir / f"review-receipt-{job}.json"
-            if review_path.exists():
-                saved = json.loads(review_path.read_text())
-                if saved.get("identity", {}).get("native_result_sha256") != digest:
-                    raise ValueError("native_review_result_conflict")
             from .offload_pass import _PASSING_HARVEST_VERDICTS, _harvest_review_findings, _harvest_verdict
 
             # The native structured format needs a carrier for the canonical
@@ -279,7 +541,6 @@ def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
             carrier = result
             if isinstance(result.get("findings"), list) and result.get("result_parse") != "degraded":
                 carrier = {**result, "details": "GROK_REVIEW_FINDINGS_JSON\n" + _json(result["findings"])}
-            session = "review-cycle:" + job
             harvest = _harvest_review_findings(
                 carrier,
                 None,
@@ -292,7 +553,6 @@ def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
             )
             output.update(harvest)
             output["findings_harvest"] = harvest
-            output["judgment"] = _judgment(result)
             from workbay_handoff_mcp.core import record_test_result
 
             if output["native_rc"] is not None:
@@ -317,9 +577,14 @@ def harvest_native_review(repo: Path, receipt: dict, result: dict) -> dict:
                 and output["judgment"]["complete"]
                 and output["judgment"]["verdict"] in {"pass", "pass_with_findings", "fail"}
             ):
-                output["review_run_receipt"] = _review_run(job, scope, actor, output["judgment"], session)
+                output["review_run_receipt"] = project_branch_judgment(
+                    publication, finding_ids=harvest.get("recorded_ids") or harvest.get("finding_ids") or [],
+                    blocking_ids=[row["finding_id"] for row in harvest.get("blocking_findings", [])],
+                )
+                if output["review_run_receipt"]["status"] == "identity_mismatch":
+                    output["review_run_receipt"].update(status="refused", reason="native_review_run_identity_mismatch")
                 if output["review_run_receipt"]["status"] == "recorded":
-                    output["review_run_id"] = job
+                    output["review_run_id"] = output["review_run_receipt"]["review_run_id"]
                     output["status"] = "recorded"
                     output.pop("reason", None)
                     output.setdefault("blocking_findings", [])

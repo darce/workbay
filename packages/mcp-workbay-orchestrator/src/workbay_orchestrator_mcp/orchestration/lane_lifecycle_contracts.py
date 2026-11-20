@@ -140,6 +140,8 @@ def _dump_contract(obj: object) -> str:
     for item in fields(obj):
         if item.name == "extras":
             continue
+        if isinstance(obj, RemoteJobSpec) and item.name == "remote_exec_mode" and obj.remote_exec_mode is None:
+            continue  # Legacy jobs keep their unstamped wire shape.
         payload[item.name] = getattr(obj, item.name)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -155,6 +157,9 @@ def _load_contract(cls: type, text: str) -> object:
     kwargs = {}
     for name in known:
         if name not in data:
+            if cls is RemoteJobSpec and name == "remote_exec_mode":
+                kwargs[name] = None
+                continue
             raise ContractError(name, "missing")
         kwargs[name] = _coerce(name, _field_annotation(cls, name), data[name])
     kwargs["extras"] = {key: value for key, value in data.items() if key not in known}
@@ -307,6 +312,7 @@ class RemoteJobSpec(_ContractMixin):
     created_at: str
     schema_version: int = SCHEMA_VERSION
     extras: dict = field(default_factory=dict)
+    remote_exec_mode: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)

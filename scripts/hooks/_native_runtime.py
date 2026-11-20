@@ -412,6 +412,7 @@ def _run_probe(python: Path, request: dict, *, timeout: float | None = None) -> 
     """Bound both wall time and allocated output, including a broken interpreter."""
     budget = probe_budget_seconds() if timeout is None else timeout
     started = time.monotonic()
+    deadline = started + budget
     with tempfile.TemporaryDirectory(prefix="workbay-native-") as private:
         env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ}
         env.update(
@@ -459,10 +460,10 @@ def _run_probe(python: Path, request: dict, *, timeout: float | None = None) -> 
         reader.start()
         try:
             proc.wait(timeout=budget)
-            reader.join(timeout=0.2)
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
             if reader.is_alive():
                 kill()
-                raise ValueError("probe_incomplete_output")
+                raise ProbeTimeout(time.monotonic() - started, budget)
         except subprocess.TimeoutExpired as exc:
             raise ProbeTimeout(time.monotonic() - started, budget) from exc
         finally:

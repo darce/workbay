@@ -138,6 +138,7 @@ class _AuthenticatedTransportCommand(list[str]):
         self.open_borrowers = 0
         self.snapshot_released = False
         self.snapshot_exclusion = None
+        self.orphan_hold = None
 
 
 class _SnapshotConsumerArgv(list[str]):
@@ -196,6 +197,15 @@ def _record_consumer_lifetime(command, state, evidence=None):
         _finish_transport_owner(owner)
 
 
+def _with_orphan_hold(diagnostic, orphan_hold):
+    """Keep an earlier sweep hold alongside every outcome of this owner."""
+    if orphan_hold is None:
+        return diagnostic
+    if diagnostic is None:
+        return orphan_hold
+    return {**diagnostic, "orphan_hold": orphan_hold}
+
+
 def _finish_transport_owner(owner):
     """Release only a closed owner with no open borrower or unknown consumer."""
     if owner.consumer_lifetime == "unknown" or owner.open_borrowers:
@@ -210,7 +220,7 @@ def _finish_transport_owner(owner):
         }
         if owner.snapshot_exclusion is not None:
             diagnostic["snapshot_exclusion"] = owner.snapshot_exclusion
-        owner.cleanup_diagnostic = diagnostic
+        owner.cleanup_diagnostic = _with_orphan_hold(diagnostic, owner.orphan_hold)
         return
     if not owner.closed or owner.snapshot_released:
         return
@@ -230,10 +240,10 @@ def _finish_transport_owner(owner):
         }
         if owner.snapshot_exclusion is not None:
             diagnostic["snapshot_exclusion"] = owner.snapshot_exclusion
-        owner.cleanup_diagnostic = diagnostic
+        owner.cleanup_diagnostic = _with_orphan_hold(diagnostic, owner.orphan_hold)
         return
     owner.snapshot_released = True
-    owner.cleanup_diagnostic = owner.snapshot_exclusion
+    owner.cleanup_diagnostic = _with_orphan_hold(owner.snapshot_exclusion, owner.orphan_hold)
 
 
 def _execution_command(command):
@@ -345,16 +355,60 @@ def _ps_lines(spec: str, pid: int | None = None, *, deadline: float | None = Non
     return stdout.splitlines()
 
 
+def _proc_generations(deadline: float) -> dict[str, str | None] | None:
+    """Sample visible Linux PIDs and their start ticks within the view deadline.
+
+    A PID whose stat cannot be read is retained with an unknown generation:
+    if ps also omits it, that uncertainty cannot establish absence.
+    """
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    generations = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            start = Path(f"/proc/{name}/stat").read_text(errors="replace").rsplit(")", 1)[1].split()[19]
+            generations[name] = start if start.isdigit() else None
+        except (OSError, IndexError):
+            generations[name] = None
+    return generations
+
+
 def _complete_process_view(spec: str, *, deadline: float | None = None) -> list[str] | None:
     """Require a self-visible, unrestricted process table before proving absence.
 
-    A successful empty ps, or Linux hidepid/subset view, is not absence
-    authority. Namespace/boot/generation checks remain separate [SECD-05].
+    A successful empty ps, Linux hidepid/subset view, or a ps table omitting a
+    process visible throughout the probe is not absence authority. This check
+    cannot see a process omitted by both ps and /proc [SECD-05].
     """
+    probe_deadline = time.monotonic() + _PS_PROBE_TIMEOUT_SECONDS
+    deadline = min(deadline, probe_deadline) if deadline is not None else probe_deadline
+    if time.monotonic() >= deadline:
+        return None
+    linux = sys.platform.startswith("linux")
+    before = _proc_generations(deadline) if linux else {}
+    if before is None:
+        return None
     rows = _ps_lines("pid=," + spec, deadline=deadline)
     if rows is None or not any(row.split()[:1] == [str(os.getpid())] for row in rows):
         return None
-    if sys.platform.startswith("linux"):
+    if linux:
+        if str(os.getpid()) not in before:
+            return None
+        after = _proc_generations(deadline)
+        if after is None or str(os.getpid()) not in after:
+            return None
+        listed = {row.split(None, 1)[0] for row in rows if row.strip()}
+        for pid in before.keys() & after.keys() - listed:
+            # A changed generation may be a PID reused around the ps probe.
+            # Unreadable generations cannot disprove that the process persisted.
+            if before[pid] is None or after[pid] is None or before[pid] == after[pid]:
+                return None
         try:
             if os.readlink("/proc/self") != str(os.getpid()):
                 return None  # this proc mount exposes a different PID namespace
@@ -375,6 +429,8 @@ def _complete_process_view(spec: str, *, deadline: float | None = None) -> list[
     # Remove only the visibility sentinel column, retaining the requested data.
     fields = [row.split(None, 1) for row in rows]
     if any(len(row) != 2 or not row[0].isdigit() for row in fields):
+        return None
+    if time.monotonic() >= deadline:
         return None
     return [row[1] for row in fields]
 
@@ -440,32 +496,49 @@ def _owner_verdict(pid: int, start: str, boot: str, namespace: str) -> str:
     return "dead" if zombie else "alive"
 
 
-def _consumer_may_run(snapshot: Path) -> bool:
-    """A live process whose command line names the snapshot still runs from it [SECD-05]."""
+def _consumer_census(snapshot: Path) -> str:
+    """Distinguish a visible consumer, proven absence, and unknown visibility."""
     rows = _complete_process_view("args=")
     if rows is None:
-        return True  # the process table is unreadable, so no consumer can be ruled out
-    return any(str(snapshot) in row for row in rows)
+        return "unknown"
+    return "running" if any(str(snapshot) in row for row in rows) else "absent"
 
 
-def _unlink_orphaned_snapshots(directory: Path, prefix: str) -> None:
+def _unlink_orphaned_snapshots(directory: Path, prefix: str) -> dict[str, Any] | None:
     """Remove a snapshot only when its owner is provably dead and no live consumer runs it [SECD-05].
 
     Legacy bare-pid names, other record versions and unparsable names are kept.
     """
     pattern = re.compile(re.escape(prefix) + r"[a-z0-9_]+" + _SNAPSHOT_RECORD)
+    held_paths: list[str] = []
+    held_count = 0
     for candidate in directory.glob(f"{prefix}*.sh"):
         match = pattern.fullmatch(candidate.name)
         if match is None:
             continue
         if _owner_verdict(int(match["pid"]), match["start"], match["boot"], match["ns"]) != "dead":
             continue
-        if _consumer_may_run(candidate):
+        census = _consumer_census(candidate)
+        if census == "unknown":
+            held_count += 1
+            if len(held_paths) < 8:
+                held_paths.append(str(candidate))
+        if census != "absent":
             continue
         try:
             candidate.unlink(missing_ok=True)
         except OSError:
             continue
+    if not held_count:
+        return None
+    return {
+        "reason": "transport_orphan_snapshot_held",
+        "consumer_visibility": "unknown",
+        "source_dir": str(directory),
+        "transport_paths": held_paths,
+        "held": held_count,
+        "retryable": True,
+    }
 
 
 @contextmanager
@@ -497,6 +570,7 @@ def _authenticated_transport(
             transport_owner=owner,
         )
         borrowed.deadline = owned_transport.deadline
+        borrowed.cleanup_diagnostic = owner.cleanup_diagnostic
         owner.open_borrowers += 1
         try:
             yield borrowed
@@ -511,6 +585,7 @@ def _authenticated_transport(
     carrier = None
     binding_error = None
     exclude_diagnostic = None
+    orphan_hold = None
     try:
         source = Path(selected_source["transport_path"])
         if not command or str(source) != command[0]:
@@ -531,7 +606,7 @@ def _authenticated_transport(
         # The git rule and orphan sweep run first, so a crash after this point
         # leaves an ignored file whose owner record is recorded in its suffix.
         exclude_diagnostic = _ignore_private_snapshots(source.parent)
-        _unlink_orphaned_snapshots(source.parent, snapshot_prefix)
+        orphan_hold = _unlink_orphaned_snapshots(source.parent, snapshot_prefix)
         # Same directory preserves native shebang, dirname($0), BASH_SOURCE and
         # adjacent VM assets; no interpreter wrapper or alternate source tree.
         fd, name = tempfile.mkstemp(prefix=snapshot_prefix, suffix=f"{_snapshot_record()}.sh", dir=source.parent)
@@ -551,14 +626,16 @@ def _authenticated_transport(
             "selected_inode": info.st_ino,
         }
         carrier = _AuthenticatedTransportCommand(command, snapshot, receipt)
-        carrier.cleanup_diagnostic = exclude_diagnostic
         carrier.snapshot_exclusion = exclude_diagnostic
+        carrier.orphan_hold = orphan_hold
+        carrier.cleanup_diagnostic = _with_orphan_hold(exclude_diagnostic, orphan_hold)
     except _TransportBindingRefused as exc:
         binding_error = exc
     except (OSError, KeyError, ValueError) as exc:
         binding_error = _TransportBindingRefused(f"snapshot_unavailable:{type(exc).__name__}")
     try:
         if binding_error is not None:
+            binding_error.cleanup_diagnostic = _with_orphan_hold(exclude_diagnostic, orphan_hold)
             raise binding_error
         yield carrier
     finally:
@@ -582,7 +659,7 @@ def _authenticated_transport(
                     diagnostic["snapshot_exclusion"] = exclude_diagnostic
                 target = carrier if carrier is not None else binding_error
                 if target is not None:
-                    target.cleanup_diagnostic = diagnostic
+                    target.cleanup_diagnostic = _with_orphan_hold(diagnostic, orphan_hold)
 
 
 _PROCESS_GROUP_GRACE_SECONDS = 2.0
@@ -1060,8 +1137,11 @@ def _status_payload(
         return None
     if not isinstance(payload.get("state"), str):
         return None
-    if strict and (type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
-                   or "observer_error" not in payload):
+    if strict and (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or "observer_error" not in payload
+    ):
         return None
     return payload
 
@@ -1172,7 +1252,7 @@ def _read_status(
         detail = (status.stderr or "").strip()
         suffix = f" {detail}" if detail else ""
         return subprocess.CompletedProcess(
-            context.cmd,
+            status_cmd,
             status.returncode,
             "",
             f"remote_job_status_failed rc={status.returncode}{suffix}",
@@ -1199,9 +1279,7 @@ def _poll_job(
             payload.get("observer_error") is not None
             or state not in {"claiming", "submitted", "queued", "running", "done"}
         ):
-            return _refusal(
-                context.cmd, f"state={state} observer_error={payload.get('observer_error')}"
-            )
+            return _refusal(context.cmd, f"state={state} observer_error={payload.get('observer_error')}")
         if state == "lost":
             return subprocess.CompletedProcess(context.cmd, 1, "", f"remote_job_lost job_id={context.identity.job_id}")
         if state == "done":
@@ -1237,7 +1315,7 @@ def _collect_job(
     if collected.stderr:
         stderr_parts.append(collected.stderr)
     return subprocess.CompletedProcess(
-        context.cmd,
+        collect_cmd if collected.returncode else context.cmd,
         collected.returncode,
         collected.stdout or "",
         "".join(stderr_parts),

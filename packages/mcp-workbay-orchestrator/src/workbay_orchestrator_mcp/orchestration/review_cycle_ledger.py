@@ -339,6 +339,39 @@ def _valid_correction(event: object, row: dict) -> bool:
     )
 
 
+HOLDER_RELEASE_SCHEMA = "workbay/review-cycle-holder-release@1"
+_HOLDER_RELEASE_CHECKS = (
+    "lane_terminal", "branch_absent", "head_on_integration", "receipt_sha256_matches", "unproven_record"
+)
+
+
+def _valid_holder_release(event: object, data: dict) -> bool:
+    """The ledger event is a link to exact rows and observations, not a new receipt."""
+    if not isinstance(event, dict) or event.get("schema") != HOLDER_RELEASE_SCHEMA:
+        return False
+    ids, digests, observations = (event.get(key) for key in ("dispatch_ids", "receipt_sha256s", "preconditions"))
+    if (not isinstance(ids, list) or not ids or not all(isinstance(item, str) and item for item in ids)
+            or ids != sorted(set(ids)) or not isinstance(digests, dict) or set(digests) != set(ids)
+            or not all(isinstance(value, str) and _SHA256.fullmatch(value) for value in digests.values())
+            or not isinstance(observations, dict) or set(observations) != set(ids)
+            or type(event.get("operator_decision_id")) is not int or event["operator_decision_id"] <= 0
+            or type(event.get("recorded_sequence")) is not int
+            or not 0 < event["recorded_sequence"] <= data.get("sequence", -1)):
+        return False
+    for dispatch_id in ids:
+        row = data["rows"].get(dispatch_id)
+        observed = observations[dispatch_id]
+        if (not isinstance(row, dict) or not isinstance(observed, dict)
+                or row.get("dispatch_id") != dispatch_id or row.get("decision") != "reserved"
+                or row.get("kind") not in {"implement", "gate"}
+                or row.get("subject_branch") != observed.get("subject_branch")
+                or any(observed.get(key) is not True for key in _HOLDER_RELEASE_CHECKS)
+                or not all(isinstance(observed.get(key), str) and observed[key] for key in (
+                    "task_ref", "lane_id", "source_branch", "source_head", "integration_branch", "integration_head"))):
+            return False
+    return True
+
+
 def effective_outcome_class(data: dict, row: dict) -> str:
     """The single accounting fold: the stored class unless one valid event corrects it.
 
@@ -537,6 +570,26 @@ def correction_effects(data: dict, dispatch_id: str, policy: TrustedPolicy) -> d
     }
 
 
+def _gate_overlap(previous: dict, latest: dict) -> tuple[int, int, bool]:
+    """Return intersection, union and whether a mixed-format comparison lost identity."""
+    mixed = ("legacy_blocking_fingerprints" in previous) != ("legacy_blocking_fingerprints" in latest)
+    key = "legacy_blocking_fingerprints" if mixed else "blocking_fingerprints"
+    left, right = (set(row.get(key, row["blocking_fingerprints"])) for row in (previous, latest))
+    common = len(left & right)
+    union = len(left | right)
+    if mixed:
+        # BASE kept two independently sorted sets. A shared ID whose text
+        # changed cannot establish either a match or a change of file.
+        ids = set(previous["blocking_ids"])
+        other = set(latest["blocking_ids"])
+        shared_ids = len(ids & other)
+        union = len(ids | other)
+        common = min(common, shared_ids)
+        if shared_ids > common and 2 * shared_ids >= union:
+            return common, union, True
+    return common, union, False
+
+
 class ReviewCycleLedger:
     def __init__(self, authority_path: Path, policy: TrustedPolicy, *, repo: Path | None = None):
         self.path = Path(authority_path)
@@ -567,16 +620,16 @@ class ReviewCycleLedger:
                     last_gate_blocking_ids=(data["subjects"][subject]["last_gate"] or {}).get("blocking_ids", []),
                     operator_command=command)
 
-    def _read(self) -> dict:
+    def _read(self, *, project_corrections: bool = True) -> dict:
         try:
             # Explicit mode check also refuses unreadable files under privileged tests.
             if not self.path.stat().st_mode & 0o444:
                 raise _Hold("ledger_unreadable")
-            return self._decode(self.path.read_bytes())
+            return self._decode(self.path.read_bytes(), project_corrections=project_corrections)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise _Hold("ledger_unreadable_or_corrupt") from exc
 
-    def _decode(self, raw: bytes) -> dict:
+    def _decode(self, raw: bytes, *, project_corrections: bool = True) -> dict:
         """Verify already-read ledger bytes exactly as ``_read`` does (no I/O)."""
         try:
             envelope = json.loads(raw)
@@ -600,11 +653,24 @@ class ReviewCycleLedger:
                 if dispatch_id in seen or row is None or not _valid_correction(event, row):
                     raise _Hold("ledger_correction_integrity")
                 seen.add(dispatch_id)
-            # Disposable projection: every recovery/read derives fixes from the
-            # same events that reserve uses for ordinal and route selection.
-            for event in corrections:
-                subject = event["subject_branch"]
-                data["subjects"][subject]["fixes"] = _subject_fixes(data, subject)
+            releases = data.get("holder_releases", [])
+            if not isinstance(releases, list):
+                raise _Hold("ledger_holder_release_integrity")
+            released_ids: set[str] = set()
+            last_sequence = 0
+            for event in releases:
+                if not _valid_holder_release(event, data) or released_ids.intersection(event["dispatch_ids"]):
+                    raise _Hold("ledger_holder_release_integrity")
+                if event["recorded_sequence"] <= last_sequence:
+                    raise _Hold("ledger_holder_release_integrity")
+                released_ids.update(event["dispatch_ids"])
+                last_sequence = event["recorded_sequence"]
+            # A release must not rewrite even a stale persisted subject projection.
+            # Other consumers retain the normal correction-derived read view.
+            if project_corrections:
+                for event in corrections:
+                    subject = event["subject_branch"]
+                    data["subjects"][subject]["fixes"] = _subject_fixes(data, subject)
             return data
         except (ValueError, KeyError, TypeError) as exc:
             raise _Hold("ledger_unreadable_or_corrupt") from exc
@@ -627,7 +693,8 @@ class ReviewCycleLedger:
             finally:
                 temporary.unlink(missing_ok=True)
 
-    def _transaction(self, operation: Callable, *, activation: bool = False) -> LedgerDecision:
+    def _transaction(self, operation: Callable, *, activation: bool = False,
+                     project_corrections: bool = True) -> LedgerDecision:
         try:
             # Stable sibling lock inode is never replaced/unlinked. Like worker_lock,
             # use kernel flock LOCK_NB; contention is an immediate typed hold.
@@ -649,7 +716,7 @@ class ReviewCycleLedger:
                             "sequence": 0,
                         }
                     else:
-                        data = self._read()
+                        data = self._read(project_corrections=project_corrections)
                     result = operation(data)
                     self._write(data)
                     return result
@@ -715,7 +782,7 @@ class ReviewCycleLedger:
     def reserve(
         self, dispatch_id: str, subject_branch: str, kind: str, *, canon_proposal_path: Path | None = None
     ) -> LedgerDecision:
-        """Reserve before spawn, stopping for an exact-round grant above the allowance."""
+        """Reserve before spawn, checking the allowance and repeated gate state."""
         if not dispatch_id or not subject_branch or kind not in KINDS:
             return LedgerDecision("ledger_hold", "invalid_identity")
 
@@ -738,10 +805,30 @@ class ReviewCycleLedger:
             proposal = None
             status, reason = "reserved", ""
             threshold = self.policy.threshold(kind)
-            needs_approval = state["terminal"] or number > threshold
+            completed_gates = sorted(
+                (
+                    row for row in charged
+                    if kind == "gate"
+                    and effective_outcome_class(data, row) == PassOutcomeClass.VERDICT.value
+                    and row.get("completion")
+                    and row["completion"].get("judgment") != "incomplete"
+                    and not row.get("provider_refusal")
+                ),
+                key=lambda row: row["settled_sequence"],
+            )
+            repeated_gate = False
+            incomparable = False
+            if number >= 3 and len(completed_gates) >= 2:
+                overlap, union, incomparable = _gate_overlap(
+                    completed_gates[-2]["completion"], completed_gates[-1]["completion"]
+                )
+                repeated_gate = bool(union) and 2 * overlap >= union
+            needs_approval = state["terminal"] or number > threshold or repeated_gate or incomparable
             approval = self._approval(data, subject_branch, kind, number) if needs_approval else None
             if needs_approval and approval is None:
-                status, reason = "approval_required", "operator_approval_required"
+                status, reason = "approval_required", (
+                    "gate_fingerprint_comparison_unavailable" if incomparable else "operator_approval_required"
+                )
             elif kind == "gate" and any(
                 row["kind"] == "gate"
                 and row["decision"] == "reserved"
@@ -755,7 +842,7 @@ class ReviewCycleLedger:
                 proposal = self._proposal(canon_proposal_path, rows)
                 if proposal is None:
                     status, reason = "cycle_budget_stop", "new_verified_canon_correction_required"
-            elif kind == "gate" and state["repeated"]:
+            elif kind == "gate" and state["repeated"] and not ((repeated_gate or incomparable) and approval is not None):
                 continuation = data["rows"].get(state["continuation"])
                 if (
                     continuation is None
@@ -786,6 +873,8 @@ class ReviewCycleLedger:
             if status == "approval_required":
                 row["announcement"] = self._announcement(data, subject_branch, kind, number)
                 row["loud_decision"] = True
+            if completed_gates:
+                row["previous_gate_dispatch_id"] = completed_gates[-1]["dispatch_id"]
             if status == "reserved" and approval is not None:
                 row["operator_approval"] = approval
                 if state["terminal"]:
@@ -808,6 +897,7 @@ class ReviewCycleLedger:
         refusal_reason: str | None = None,
         blocking_ids: tuple[str, ...] | None = None,
         blocking_fingerprints: tuple[str, ...] | None = None,
+        legacy_blocking_fingerprints: tuple[str, ...] | None = None,
         provider_refusal: dict | None = None,
     ) -> LedgerDecision:
         """Settle actual D2 outcome; harvest supplies canonical, classified blockers.
@@ -846,6 +936,13 @@ class ReviewCycleLedger:
             "blocking_fingerprints": sorted(set(blocking_fingerprints)),
         }
 
+        if legacy_blocking_fingerprints is not None:
+            if (not isinstance(legacy_blocking_fingerprints, (tuple, list))
+                    or len(legacy_blocking_fingerprints) != len(blocking_fingerprints)
+                    or not all(isinstance(value, str) and value for value in legacy_blocking_fingerprints)):
+                return LedgerDecision("ledger_hold", "invalid_completion")
+            completion["legacy_blocking_fingerprints"] = sorted(set(legacy_blocking_fingerprints))
+
         def operation(data):
             nonlocal classification
             actual_completion = dict(completion)
@@ -863,6 +960,10 @@ class ReviewCycleLedger:
                     if any(row["provider_refusal"][key] != provider_refusal[key]
                            for key in ("stream_sha256", "message", "http_status", "error_code", "request_id")):
                         return LedgerDecision("ledger_hold", "dispatch_outcome_mismatch")
+                if ("legacy_blocking_fingerprints" in actual_completion
+                        and "legacy_blocking_fingerprints" not in row["completion"]):
+                    # An exact replay of a BASE settlement uses its original format.
+                    actual_completion["blocking_fingerprints"] = actual_completion.pop("legacy_blocking_fingerprints")
                 if row["completion"] != actual_completion:
                     return LedgerDecision("ledger_hold", "dispatch_outcome_mismatch")
                 raise _Unchanged(_settled_decision(row["settlement_status"], "replay", row))
@@ -899,7 +1000,7 @@ class ReviewCycleLedger:
                     repeated = (
                         previous is not None
                         and state["fixes"] > previous["fixes"]
-                        and bool(set(previous["blocking_fingerprints"]) & set(completion["blocking_fingerprints"]))
+                        and _gate_overlap(previous, completion)[0] > 0
                     )
                     state["last_gate"] = {**completion, "fixes": state["fixes"], "dispatch_id": dispatch_id}
                     state["repeated"] = bool(repeated)
@@ -935,6 +1036,40 @@ class ReviewCycleLedger:
             row["settled_sequence"] = data["sequence"]
             return LedgerDecision("settled", "unjudged_incomplete", copy.deepcopy(row))
         return self._transaction(operation)
+
+    def _append_holder_release(
+        self, *, dispatch_ids: list[str], receipt_sha256s: dict[str, str],
+        operator_decision_id: int, authenticate: Callable,
+    ) -> LedgerDecision:
+        """Append one host-authenticated release under the ledger's single writer.
+
+        ``authenticate(data)`` reopens operator and producer evidence while this
+        transaction and its receipt locks are held. No receipt, charged row,
+        issuance counter, or subject record is altered.
+        """
+        if (not isinstance(dispatch_ids, list) or not dispatch_ids
+                or not all(isinstance(item, str) and item for item in dispatch_ids)
+                or len(dispatch_ids) != len(set(dispatch_ids))
+                or not isinstance(receipt_sha256s, dict) or set(receipt_sha256s) != set(dispatch_ids)
+                or not all(isinstance(value, str) and _SHA256.fullmatch(value) for value in receipt_sha256s.values())
+                or type(operator_decision_id) is not int or operator_decision_id <= 0):
+            return LedgerDecision("ledger_hold", "holder_release_invalid_request")
+
+        def operation(data):
+            if any(set(event["dispatch_ids"]).intersection(dispatch_ids) for event in data.get("holder_releases", [])):
+                raise _Unchanged(LedgerDecision("ledger_hold", "holder_release_already_recorded"))
+            observations = authenticate(data)
+            data["sequence"] += 1
+            event = dict(schema=HOLDER_RELEASE_SCHEMA, dispatch_ids=sorted(dispatch_ids),
+                         receipt_sha256s=copy.deepcopy(receipt_sha256s),
+                         operator_decision_id=operator_decision_id, preconditions=copy.deepcopy(observations),
+                         recorded_sequence=data["sequence"])
+            if not _valid_holder_release(event, data):
+                raise _Hold("holder_release_observation_invalid")
+            data.setdefault("holder_releases", []).append(event)
+            return LedgerDecision("released", "", copy.deepcopy(event))
+
+        return self._transaction(operation, project_corrections=False)
 
     def append_outcome_correction(
         self, *, dispatch_id: str, expected_ledger_sha256: str, expected_observation_sha256: str, authenticate: Callable

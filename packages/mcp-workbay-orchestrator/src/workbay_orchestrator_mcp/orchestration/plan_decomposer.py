@@ -30,6 +30,10 @@ class PlanDecomposerError(ValueError):
     """Schema / forced-declaration / overlap refusal (CLI exit 2)."""
 
 
+class NoDecompositionError(PlanDecomposerError):
+    """The plan has no decomposition heading (a typed legacy-plan skip)."""
+
+
 class EnrichmentRefuseError(PlanDecomposerError):
     """Codemap enrichment refusal (CLI exit 3)."""
 
@@ -104,32 +108,46 @@ def _roots_overlap(left: str, right: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _load_block(plan_text: str) -> dict[str, Any]:
-    """Parse the FIRST fenced ```json block under ``## Decomposition``.
+def extract_decomposition_payload(plan: str | bytes | Path) -> bytes:
+    """Return the exact first JSON fence interior under ``## Decomposition``.
 
-    Prose, inline backticks, and Files tables are documentation-only and must
-    never be scraped. A plan with no Decomposition block or no fenced JSON
-    under it refuses loudly.
+    Paths are read as bytes. Strings remain supported for the pure decomposer;
+    callers reading files must pass bytes or a Path to preserve CRLF and spaces.
+    Only parsing may strip the returned payload; provenance hashes never do.
     """
-    if not isinstance(plan_text, str):
-        raise PlanDecomposerError("plan_text must be a string")
-    heading = _DECOMPOSITION_HEADING_RE.search(plan_text)
+    if isinstance(plan, Path):
+        raw = plan.read_bytes()
+    elif isinstance(plan, str):
+        raw = plan.encode("utf-8")
+    elif isinstance(plan, bytes):
+        raw = plan
+    else:
+        raise PlanDecomposerError("plan_text must be a string or bytes or Path")
+    heading = re.search(rb"^##[ \t]+Decomposition\b[^\r\n]*(?:\r?\n|$)", raw, re.MULTILINE)
     if heading is None:
-        raise PlanDecomposerError(
+        raise NoDecompositionError(
             "no ## Decomposition heading — plan is not decomposer-eligible "
             "(legacy plans use --operator-items / findings instead)"
         )
-    # Slice the plan from the heading to the next same-or-higher heading, else EOF.
-    rest = plan_text[heading.end() :]
-    next_heading = re.search(r"^##\s+\S", rest, re.MULTILINE)
+    rest = raw[heading.end() :]
+    next_heading = re.search(rb"^#{1,2}[ \t]+\S", rest, re.MULTILINE)
     section = rest[: next_heading.start()] if next_heading else rest
-    match = _FENCED_JSON_RE.search(section)
+    match = re.search(
+        rb"^[ \t]*```json[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*(?:\r?$)",
+        section,
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
     if match is None:
         raise PlanDecomposerError("no fenced ```json block under ## Decomposition — prose is never parsed")
-    raw = match.group(1).strip()
+    return match.group(1)
+
+
+def _load_block(plan_text: str | bytes) -> dict[str, Any]:
+    """Parse the same exact-byte extraction used for source provenance."""
+    raw = extract_decomposition_payload(plan_text)
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(raw.strip())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PlanDecomposerError(f"Decomposition block is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise PlanDecomposerError("Decomposition block must be a JSON object")

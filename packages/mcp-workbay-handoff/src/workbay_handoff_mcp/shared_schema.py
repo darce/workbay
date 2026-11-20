@@ -24,6 +24,7 @@ import time
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
 from typing import TypeVar, cast
 from urllib.parse import parse_qs, unquote
@@ -5556,6 +5557,112 @@ def _ensure_released_row_terminal_trigger(conn: sqlite3.Connection) -> None:
     """)
 
 
+class DispatchAttemptReason(StrEnum):
+    REAL_DEFECT = "real_defect"
+    FIXTURE_DEFECT = "fixture_defect"
+    SCOPE_WIDENING = "scope_widening"
+    PROVIDER_REFUSAL = "provider_refusal"
+    INFRA_OOM = "infra_oom"
+    INFRA_ADMISSION = "infra_admission"
+    COLLATERAL_HOLD = "collateral_hold"
+
+
+def _ensure_blocking_review_schema(conn: sqlite3.Connection) -> None:
+    """Install review identities and the release attempt ledger additively."""
+    # SQLite omits generated columns from table_info. Probe table_xinfo before
+    # using the concurrent-safe additive migration helper.
+    for table, name, definition in (
+        (
+            "review_runs",
+            "subject_key",
+            """TEXT GENERATED ALWAYS AS (
+                CASE
+                    WHEN task_ref IS NULL OR (subject_kind = 'branch' AND NULLIF(branch, '') IS NULL) THEN NULL
+                    ELSE json_array(task_ref, subject_kind, CASE subject_kind
+                        WHEN 'branch' THEN branch ELSE subject_path END)
+                END
+            ) VIRTUAL""",
+        ),
+        # The canonical finding ID survives line moves and updates to reviewer
+        # wording. Gate settlement compares identities within one subject.
+        (
+            "review_findings", "fingerprint",
+            "TEXT GENERATED ALWAYS AS (json_array(task_ref, branch, file_path, finding_id)) VIRTUAL",
+        ),
+    ):
+        if not any(row["name"] == name for row in conn.execute(f"PRAGMA table_xinfo({table})")):
+            _add_column_if_missing(conn, table, name, definition)
+
+    # A judgment survives a refused or interrupted review_runs projection.
+    # Deliberately no FK to review_runs: a missing projection is observable.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS branch_review_judgments (
+            run_id TEXT NOT NULL,
+            task_ref TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            dispatch_id TEXT,
+            verdict TEXT CHECK (verdict IN ('pass','pass_with_findings','fail')),
+            blocking_ids TEXT,
+            cycle_n INTEGER,
+            parent_run_id TEXT,
+            judge_pin_json TEXT NOT NULL,
+            projection_status TEXT NOT NULL DEFAULT 'pending',
+            projection_error TEXT,
+            sources_json TEXT NOT NULL,
+            PRIMARY KEY (run_id, task_ref, branch, commit_sha)
+        )
+    """)
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_branch_review_judgments_tip
+                    ON branch_review_judgments(task_ref, branch, commit_sha)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_branch_review_judgments_dispatch
+                    ON branch_review_judgments(dispatch_id) WHERE dispatch_id IS NOT NULL""")
+    # The general review writer numbers planning rounds by counting rows. A
+    # branch projection can attest only to the round observed by its producer.
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS branch_review_project_observed_round
+        AFTER INSERT ON review_runs
+        WHEN EXISTS (SELECT 1 FROM branch_review_judgments WHERE run_id = NEW.review_run_id
+                     AND task_ref = NEW.task_ref AND branch = NEW.branch AND commit_sha = NEW.commit_sha)
+        BEGIN
+            UPDATE review_runs SET (cycle_n, model) = (
+                SELECT cycle_n, json_extract(judge_pin_json, '$.model') FROM branch_review_judgments
+                WHERE run_id = NEW.review_run_id AND task_ref = NEW.task_ref
+                  AND branch = NEW.branch AND commit_sha = NEW.commit_sha
+            ) WHERE id = NEW.id;
+        END
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS review_snapshot_history (
+            task_ref TEXT PRIMARY KEY,
+            state TEXT NOT NULL CHECK (state IN ('available', 'unavailable')),
+            legacy_sections_json TEXT NOT NULL
+        )
+    """)
+
+    if not _sqlite_objects_exist(conn, "table", frozenset({"dispatch_attempts"})):
+        reasons = tuple(reason.value for reason in DispatchAttemptReason)
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS dispatch_attempts (
+                subject_key TEXT NOT NULL CHECK (length(trim(subject_key)) > 0),
+                ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 1),
+                lane_id TEXT NOT NULL CHECK (length(trim(lane_id)) > 0),
+                reason TEXT NOT NULL CHECK (reason IN {reasons}),
+                evidence_ref TEXT NOT NULL CHECK (length(trim(evidence_ref)) > 0),
+                PRIMARY KEY (subject_key, ordinal, lane_id)
+            )
+        """)
+
+
+def review_history_unavailable(conn: sqlite3.Connection, task_ref: str) -> bool:
+    if not conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='review_snapshot_history'").fetchone():
+        return True
+    return conn.execute(
+        "SELECT 1 FROM review_snapshot_history WHERE task_ref = ? AND state = 'unavailable'", (task_ref,)
+    ).fetchone() is not None
+
+
 def _prepare_handoff_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     """Bootstrap schema, enforce version match, ensure FTS. Mutates ``conn``."""
     if _handoff_schema_bootstrapped is False or not _handoff_schema_bootstrapped(conn):
@@ -5576,6 +5683,7 @@ def _prepare_handoff_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
             )
             return conn
     _assert_schema_version_compatible(conn)
+    _ensure_blocking_review_schema(conn)
     _ensure_released_row_terminal_trigger(conn)
     # Indexes are not in _HANDOFF_REQUIRED_*; a stamped-current DB missing
     # idx_review_findings_finding_id would otherwise skip bootstrap forever.
@@ -5631,6 +5739,30 @@ def _prepare_handoff_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     if conn.in_transaction:
         conn.commit()
     return conn
+
+
+# Migrate on the first retention write, in the same transaction as removal.
+# A displaced registration need not belong to an archived task.
+def _retained_registration_store(conn: sqlite3.Connection, *, create: bool = False) -> bool:
+    version = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'retained_registration_snapshots_version'"
+    ).fetchone()
+    if version is not None:
+        if version[0] != 1:
+            raise ValueError("unknown retained lane registration schema")
+        # Readers/writers query the table next. A missing table after the
+        # migration is loss of evidence and must raise, even on a writer.
+        return True
+    if conn.execute("SELECT 1 FROM sqlite_schema WHERE name = 'retained_registration_snapshots'").fetchone():
+        raise ValueError("unversioned retained lane registration schema")
+    if create:
+        if not conn.in_transaction:
+            raise ValueError("retaining a registration requires the removal transaction")
+        conn.execute("""CREATE TABLE retained_registration_snapshots (
+            task_ref TEXT NOT NULL, snapshot_json TEXT NOT NULL
+        )""")
+        conn.execute("INSERT INTO schema_meta(key, value) VALUES ('retained_registration_snapshots_version', 1)")
+    return create
 
 
 def _open_bounded_roster_read_connection(

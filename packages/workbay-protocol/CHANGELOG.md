@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.16] — 2026-11-20
+
+### Changed
+- Remote execution has one visible, stamped mode authority; review and ACE use result collection and null mode policies are refused.
+- Reclaim decisions require explicit residue facts and generation confirmation, and ignored content requires per-request native cache proof.
+- On hosts with GNU timeout, remote routing and driver startup share one bounded deadline with typed refusals; BusyBox timeout hosts are not covered by this bound.
+
 ## [0.3.15] — 2026-11-12
 
 ### Changed

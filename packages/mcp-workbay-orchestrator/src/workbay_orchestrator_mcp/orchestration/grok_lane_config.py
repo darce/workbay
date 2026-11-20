@@ -50,6 +50,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from workbay_orchestrator_mcp.orchestration.offload_timeout_ssot import (
     GROK_TIMEOUT_CAP,  # noqa: F401  # re-exported for existing importers (worker_daemon, tests)
 )
@@ -68,7 +70,7 @@ _GROK_CONFIG_RELPATH = ".grok/config.toml"
 # default. Verified against the live catalog on the lane VM rather than assumed
 # — `grok models` reports "Default model: grok-4.6" with grok-4.6 marked
 # (default) and grok-4.5 demoted to a plain legacy entry.
-TRACKED_GROK_MODEL = "grok-4.6"
+TRACKED_GROK_MODEL = model_routing.MODEL_ROUTING_DEFAULTS["grok"]
 WORKBAY_GROK_MODEL_ENV = "WORKBAY_GROK_MODEL"
 # VM catalogue probe (implementation note M2). Fixture-driven in tests; never invent a slug.
 GROK_LIST_MODELS_ARGV: tuple[str, ...] = ("grok", "models")
@@ -93,7 +95,7 @@ SHIPPED_GROK_MODEL = TRACKED_GROK_MODEL
 #: 2026-08-13 discovery: bumping the code default was NOT sufficient — a stale
 #: WORKBAY_GROK_MODEL=grok-4.5 in operator settings silently outranked it, so
 #: every dispatch still used the retired slug. Env is the thing to check.
-RETIRED_GROK_MODELS: frozenset[str] = frozenset({"grok-4.5"})
+RETIRED_GROK_MODELS: frozenset[str] = frozenset({model_routing.ModelId.GROK_RETIRED})
 
 
 def resolve_tracked_or_env_grok_model() -> str:
@@ -179,7 +181,7 @@ SECONDS_PER_TURN = 30
 # the exact id is the load-bearing part. Relative to the configured pin:
 # subagent pins use ``model``; build family is never the pin and is always
 # listed here. [AGT-02][PERF-06]
-_GROK_BUILD_DISABLE_IDS: tuple[str, ...] = ("grok-build", "grok-build-*")
+_GROK_BUILD_DISABLE_IDS: tuple[str, ...] = (model_routing.ModelId.GROK_BUILD, f"{model_routing.ModelId.GROK_BUILD}-*")
 
 # Builtin subagent types from grok-cli (``grok inspect`` agents[] / docs).
 _SUBAGENT_MODEL_PIN_NAMES: tuple[str, ...] = ("general-purpose", "explore", "plan")

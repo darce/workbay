@@ -1,10 +1,9 @@
 """Worker-guidance resolution: classify, apply, and cycle through worker guidance messages."""
 
-from __future__ import annotations
-
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -144,6 +143,25 @@ class GuidanceQueueResult(list):
         super().__init__(items)
         self.complete = complete
         self.truncation_detail = truncation_detail
+
+
+@dataclass(frozen=True)
+class GuidanceFacts:
+    """Observed guidance inputs, independent of the caller's storage or runtime."""
+
+    lane_id: str
+    worker_message_id: int
+    latest_report_id: int | None
+    combined_text: str
+    has_pending_actions: bool
+    next_assignment: tuple[str, str] | None
+    redispatch_block_reason: str | None
+    landed_commit: str | None
+    unknown_ancestry: bool
+    landing_commit_sha: str | None
+    branch_tip_sha: str | None
+    close_dispatch_ids: tuple[int, ...]
+    redispatch_close_dispatch_ids: tuple[int, ...]
 
 
 class GuidanceResolution:
@@ -1053,55 +1071,22 @@ def _redispatch_configuration_block_reason(
     return admission.reason
 
 
-def _classify_guidance(
-    *,
-    task_ref: str,
-    worker_message: dict[str, Any],
-    latest_report: dict[str, Any] | None,
-    activity: dict[str, Any],
-    open_dispatches: list[dict[str, Any]],
-    orchestrator_root: Path | None = None,
-) -> GuidanceResolution:
-    lane_id = _normalize_text(worker_message.get("lane_id"))
-    worker_message_id_raw = worker_message.get("id")
-    if worker_message_id_raw is None:
-        raise RuntimeError("Worker guidance message is missing an id.")
-    worker_message_id = int(worker_message_id_raw)
-    latest_report_id = (
-        int(latest_report["id"]) if isinstance(latest_report, dict) and latest_report.get("id") is not None else None
-    )
-    combined = _combined_text(
-        worker_message.get("subject"),
-        worker_message.get("message"),
-        latest_report.get("summary") if isinstance(latest_report, dict) else "",
-        _json_list_text(latest_report.get("blockers_json")) if isinstance(latest_report, dict) else "",
-    )
-    close_dispatch_ids = tuple(
-        int(row["id"]) for row in open_dispatches if isinstance(row, dict) and row.get("id") is not None
-    )
-
-    pending_actions = _pending_lane_actions(activity)
+def decide_guidance(facts: GuidanceFacts) -> GuidanceResolution:
+    """Decide from observed facts without consulting storage, git, or the clock."""
+    lane_id = facts.lane_id
+    worker_message_id = facts.worker_message_id
+    latest_report_id = facts.latest_report_id
+    combined = facts.combined_text
+    close_dispatch_ids = facts.close_dispatch_ids
+    landed_commit = facts.landed_commit
+    unknown_ancestry = facts.unknown_ancestry
+    landing_commit_sha = facts.landing_commit_sha
+    branch_tip_sha = facts.branch_tip_sha
+    branch_tip_source = "branch" if branch_tip_sha else None
     has_resolved_marker = any(marker in combined for marker in _RESOLVED_MARKERS)
     has_env_blocker = any(marker in combined for marker in _ENV_BLOCKER_MARKERS)
 
-    landed_commit, unknown_ancestry = _landed_commit_sha(
-        latest_report,
-        orchestrator_root=orchestrator_root,
-        task_ref=task_ref,
-        lane_id=lane_id,
-        activity=activity,
-    )
-    branch_tip_sha = (
-        _live_branch_tip(orchestrator_root, activity.get("lane") or {})
-        if landed_commit and orchestrator_root is not None
-        else None
-    )
-    branch_tip_source = "branch" if branch_tip_sha else None
-    landing_commit_sha = None
-    if landed_commit and orchestrator_root is not None:
-        landing_commit_sha = _recorded_integration_sha(task_ref, lane_id, landed_commit, orchestrator_root, activity)
-
-    if has_resolved_marker and not pending_actions:
+    if has_resolved_marker and not facts.has_pending_actions:
         return GuidanceResolution(
             kind=GuidanceResolutionKind.REVIEW,
             lane_id=lane_id,
@@ -1117,16 +1102,10 @@ def _classify_guidance(
             close_dispatch_ids=close_dispatch_ids,
         )
 
-    next_assignment = _resolve_next_assignment(task_ref, lane_id, activity, combined)
+    next_assignment = facts.next_assignment
 
     if next_assignment is not None:
-        block_reason = _redispatch_configuration_block_reason(
-            task_ref=task_ref,
-            lane_id=lane_id,
-            activity=activity,
-            latest_report=latest_report,
-            orchestrator_root=orchestrator_root,
-        )
+        block_reason = facts.redispatch_block_reason
         if block_reason is not None:
             return GuidanceResolution(
                 kind=GuidanceResolutionKind.FATAL_ERROR,
@@ -1139,15 +1118,6 @@ def _classify_guidance(
                 close_dispatch_ids=close_dispatch_ids,
             )
         subject, message = next_assignment
-        # Only a redispatch replay retains its existing dispatch. A changed
-        # resolution must reconcile that effect along with other stale work.
-        close_dispatch_ids = tuple(
-            int(row["id"])
-            for row in open_dispatches
-            if isinstance(row, dict)
-            and row.get("id") is not None
-            and row.get("dispatch_id") != f"{_guidance_effect_key(task_ref, lane_id, worker_message_id)}:redispatch"
-        )
         return GuidanceResolution(
             kind=GuidanceResolutionKind.REDISPATCH,
             lane_id=lane_id,
@@ -1159,7 +1129,7 @@ def _classify_guidance(
             lane_notes="Orchestrator resolved worker guidance and dispatched the next lane-owned slice.",
             dispatch_subject=subject,
             dispatch_message=message,
-            close_dispatch_ids=close_dispatch_ids,
+            close_dispatch_ids=facts.redispatch_close_dispatch_ids,
         )
 
     if landed_commit:
@@ -1270,6 +1240,116 @@ def _classify_guidance(
         decision=f"Failed to resolve worker guidance for {lane_id}.",
         rationale="Guidance message did not match a known resolved, redispatchable, or environment-blocked pattern.",
         close_dispatch_ids=close_dispatch_ids,
+    )
+
+
+def build_guidance_facts(
+    *,
+    task_ref: str,
+    worker_message: dict[str, Any],
+    latest_report: dict[str, Any] | None,
+    activity: dict[str, Any],
+    open_dispatches: list[dict[str, Any]],
+    orchestrator_root: Path | None = None,
+) -> GuidanceFacts:
+    """Gather daemon facts while preserving the classifier's lookup short circuits."""
+    lane_id = _normalize_text(worker_message.get("lane_id"))
+    worker_message_id_raw = worker_message.get("id")
+    if worker_message_id_raw is None:
+        raise RuntimeError("Worker guidance message is missing an id.")
+    worker_message_id = int(worker_message_id_raw)
+    latest_report_id = (
+        int(latest_report["id"]) if isinstance(latest_report, dict) and latest_report.get("id") is not None else None
+    )
+    combined = _combined_text(
+        worker_message.get("subject"),
+        worker_message.get("message"),
+        latest_report.get("summary") if isinstance(latest_report, dict) else "",
+        _json_list_text(latest_report.get("blockers_json")) if isinstance(latest_report, dict) else "",
+    )
+    close_dispatch_ids = tuple(
+        int(row["id"]) for row in open_dispatches if isinstance(row, dict) and row.get("id") is not None
+    )
+
+    pending_actions = _pending_lane_actions(activity)
+    has_resolved_marker = any(marker in combined for marker in _RESOLVED_MARKERS)
+
+    landed_commit, unknown_ancestry = _landed_commit_sha(
+        latest_report,
+        orchestrator_root=orchestrator_root,
+        task_ref=task_ref,
+        lane_id=lane_id,
+        activity=activity,
+    )
+    branch_tip_sha = (
+        _live_branch_tip(orchestrator_root, activity.get("lane") or {})
+        if landed_commit and orchestrator_root is not None
+        else None
+    )
+    landing_commit_sha = None
+    if landed_commit and orchestrator_root is not None:
+        landing_commit_sha = _recorded_integration_sha(task_ref, lane_id, landed_commit, orchestrator_root, activity)
+
+    next_assignment = None
+    block_reason = None
+    redispatch_close_dispatch_ids = close_dispatch_ids
+    if not (has_resolved_marker and not pending_actions):
+        next_assignment = _resolve_next_assignment(task_ref, lane_id, activity, combined)
+        if next_assignment is not None:
+            block_reason = _redispatch_configuration_block_reason(
+                task_ref=task_ref,
+                lane_id=lane_id,
+                activity=activity,
+                latest_report=latest_report,
+                orchestrator_root=orchestrator_root,
+            )
+            if block_reason is None:
+                # Only a redispatch replay retains its existing dispatch. A changed
+                # resolution must reconcile that effect along with other stale work.
+                redispatch_close_dispatch_ids = tuple(
+                    int(row["id"])
+                    for row in open_dispatches
+                    if isinstance(row, dict)
+                    and row.get("id") is not None
+                    and row.get("dispatch_id")
+                    != f"{_guidance_effect_key(task_ref, lane_id, worker_message_id)}:redispatch"
+                )
+
+    return GuidanceFacts(
+        lane_id=lane_id,
+        worker_message_id=worker_message_id,
+        latest_report_id=latest_report_id,
+        combined_text=combined,
+        has_pending_actions=bool(pending_actions),
+        next_assignment=next_assignment,
+        redispatch_block_reason=block_reason,
+        landed_commit=landed_commit or None,
+        unknown_ancestry=unknown_ancestry,
+        landing_commit_sha=landing_commit_sha,
+        branch_tip_sha=branch_tip_sha,
+        close_dispatch_ids=close_dispatch_ids,
+        redispatch_close_dispatch_ids=redispatch_close_dispatch_ids,
+    )
+
+
+def _classify_guidance(
+    *,
+    task_ref: str,
+    worker_message: dict[str, Any],
+    latest_report: dict[str, Any] | None,
+    activity: dict[str, Any],
+    open_dispatches: list[dict[str, Any]],
+    orchestrator_root: Path | None = None,
+) -> GuidanceResolution:
+    return decide_guidance(
+        build_guidance_facts(
+            task_ref=task_ref,
+            worker_message=worker_message,
+            latest_report=latest_report,
+            activity=activity,
+            open_dispatches=open_dispatches,
+            orchestrator_root=orchestrator_root,
+        )
     )
 
 

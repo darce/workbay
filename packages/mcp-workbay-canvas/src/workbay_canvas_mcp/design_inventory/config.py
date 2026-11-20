@@ -81,6 +81,9 @@ class DesignSources(_StrictModel):
     examples: list[ExampleRef] = Field(default_factory=list)
     attributions: list[Attribution] = Field(default_factory=list)
     generated_dir: str = DEFAULT_GENERATED_DIR
+    # Where the collector's typescript/postcss live, not a design source: kept out
+    # of dumps so the canonical source digest of every config stays unchanged.
+    toolchain_root: str | None = Field(default=None, exclude=True)
 
     @field_validator("config_version", mode="before")
     @classmethod
@@ -175,7 +178,7 @@ def resolve_config_path(rel: str, *, workspace_root: Path, pointer: str) -> Path
     return resolved
 
 
-def load_design_sources(path: Path, *, workspace_root: Path) -> DesignSources:
+def load_design_sources(path: Path, *, workspace_root: Path, requested_path: str | None = None) -> DesignSources:
     root = workspace_root.resolve()
     try:
         real = path.resolve()
@@ -191,8 +194,16 @@ def load_design_sources(path: Path, *, workspace_root: Path) -> DesignSources:
             code="escape",
             message="config path escapes workspace",
         )
+    relative_path = requested_path if requested_path is not None else real.relative_to(root).as_posix()
     try:
         size = real.stat().st_size
+    except FileNotFoundError as exc:
+        raise InventoryConfigError(
+            pointer="",
+            code="missing",
+            message="config file is missing",
+            path=relative_path,
+        ) from exc
     except OSError as exc:
         raise InventoryConfigError(
             pointer="",
@@ -207,6 +218,13 @@ def load_design_sources(path: Path, *, workspace_root: Path) -> DesignSources:
         )
     try:
         raw = json.loads(real.read_bytes())
+    except FileNotFoundError as exc:
+        raise InventoryConfigError(
+            pointer="",
+            code="missing",
+            message="config file is missing",
+            path=relative_path,
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise InventoryConfigError(
             pointer="",
@@ -297,4 +315,6 @@ def _iter_path_fields(model: DesignSources) -> list[tuple[str, str]]:
     for index, attribution in enumerate(model.attributions):
         items.append((attribution.path, f"/attributions/{index}/path"))
     items.append((model.generated_dir, "/generated_dir"))
+    if model.toolchain_root is not None:
+        items.append((model.toolchain_root, "/toolchain_root"))
     return items

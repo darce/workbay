@@ -17,12 +17,16 @@ import pwd
 import re
 import shutil
 import signal
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
 import uuid
+from datetime import date, datetime
+from datetime import time as datetime_time
 from pathlib import Path
 
 from .codex_lane_config import EXECUTION_PREFLIGHT_TIMEOUT_S as DEFAULT_TIMEOUT
@@ -34,6 +38,7 @@ ANALYSIS_CAPABILITY = "analysis-read-only"
 ANALYSIS_PERMISSION_PROFILE = "workbay_analysis_read_only"
 ANALYSIS_PERMISSION_CONFIG = 'permissions={workbay_analysis_read_only={extends=":read-only"}}'
 ANALYSIS_PERMISSION_TEMPLATE = 'permissions.workbay_analysis_read_only.extends=":read-only"'
+EXECUTION_CONTEXT_CHANGED = "execution_context_changed"
 
 
 def capability_policy(roots, capability):
@@ -92,7 +97,27 @@ class Refused(Exception):
         retryable=False,
         repair="Repair provisioning and retry before charging source work.",
     ):
-        self.reason, self.status, self.retryable, self.repair = reason, status, retryable, repair
+        self.reason, self.status = reason, status
+        self.retryable = retryable or reason == EXECUTION_CONTEXT_CHANGED
+        self.repair = repair
+
+
+class ContextChanged(Refused):
+    """A lane-local observation changed; a fresh dispatch can observe it again."""
+
+    def __init__(self, changed_keys):
+        super().__init__(
+            EXECUTION_CONTEXT_CHANGED,
+            repair="Retry with a fresh execution preflight for this lane.",
+        )
+        self.changed_keys = sorted(set(changed_keys))
+
+
+class ContextObservationError(Exception):
+    """A live-context field could not be observed, so it cannot match a PASS."""
+
+    def __init__(self, field):
+        self.field = field
 
 
 def _digest(value):
@@ -506,11 +531,150 @@ finally:
 """
 
 
+def _canonical_toml(value):
+    """Represent all TOML types without collisions between values or types."""
+    if isinstance(value, dict):
+        return ["table", [[key, _canonical_toml(value[key])] for key in sorted(value)]]
+    if isinstance(value, list):
+        return ["array", [_canonical_toml(item) for item in value]]
+    if isinstance(value, datetime):
+        return ["datetime", value.isoformat()]
+    if isinstance(value, date):
+        return ["date", value.isoformat()]
+    if isinstance(value, datetime_time):
+        return ["time", value.isoformat()]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["integer", str(value)]
+    if isinstance(value, float):
+        return ["float", struct.pack("!d", value).hex()]
+    if isinstance(value, str):
+        return ["string", value]
+    raise ValueError("unsupported TOML value")
+
+
+def _read_config_file(path):
+    # O_NONBLOCK prevents a path replaced by a FIFO from hanging the model
+    # boundary. Inspect the opened object, not an earlier path stat.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # A dangling symlink is an unreadable config, not an absent config.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        raise
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("config path is not a regular file")
+        return stream.read()
+
+
+_USER_CONFIG_PARSE = {}
+
+
+def _parse_user_config(data):
+    # Equal bytes parse equally; the probe observes the context twice in one
+    # process, so reuse the last parse. Relevance is recomputed on every call.
+    key = hashlib.sha256(data).digest()
+    if key not in _USER_CONFIG_PARSE:
+        parsed = tomllib.loads(data.decode("utf-8"))
+        _USER_CONFIG_PARSE.clear()
+        _USER_CONFIG_PARSE[key] = parsed
+    return _USER_CONFIG_PARSE[key]
+
+
+def _project_relevance(cwd):
+    """Return a predicate: may this ``projects`` key name the cwd or an ancestor?
+
+    Codex's path normalization is not settled (finding 8341 case lane), so a
+    key is relevant under either reading, lexical or symlink-resolved. A key
+    that is not a canonical absolute path, or cannot be resolved, stays bound.
+    """
+    ancestors = set()
+    for start in (os.path.normpath(os.path.abspath(cwd)), os.path.realpath(cwd)):
+        while start not in ancestors:
+            ancestors.add(start)
+            start = os.path.dirname(start)
+    # Component -> (resolved path without trailing slash, exists). Thousands
+    # of entries share a few prefixes; below a missing component nothing
+    # exists, so the rest of the key is lexical and costs no system call.
+    resolved = {}
+
+    def physical(key):
+        current = ""
+        parts = key.split("/")
+        for index in range(1, len(parts)):
+            candidate = current + "/" + parts[index]
+            hit = resolved.get(candidate)
+            if hit is None:
+                try:
+                    mode = os.lstat(candidate).st_mode
+                except (FileNotFoundError, NotADirectoryError):
+                    hit = (candidate, False)
+                else:
+                    hit = (os.path.realpath(candidate).rstrip("/") if stat.S_ISLNK(mode) else candidate, True)
+                resolved[candidate] = hit
+            current, exists = hit
+            if not exists:
+                return "/".join([current, *parts[index + 1:]])
+        return current or "/"
+
+    def relevant(key):
+        if not key.startswith("/") or key == "/" or os.path.normpath(key) != key:
+            return True
+        try:
+            return key in ancestors or physical(key) in ancestors
+        except (OSError, RuntimeError, ValueError):
+            return True
+
+    return relevant
+
+
+def _user_config_projection(path, cwd):
+    """Bind all non-project settings and the project entries relevant to this cwd.
+
+    Absence has the same projection as a valid empty file; a read or parse
+    error is never treated as absence.
+    """
+    data = _read_config_file(path)
+    config = _parse_user_config(b"" if data is None else data)
+    projected = {key: value for key, value in config.items() if key != "projects"}
+    projects = config.get("projects")
+    if isinstance(projects, dict):
+        relevant = _project_relevance(cwd)
+        bound = {key: value for key, value in projects.items() if relevant(key)}
+        if bound:
+            projected["projects"] = bound
+    elif projects is not None:
+        # An unexpected TOML shape must remain bound, not disappear.
+        projected["projects"] = projects
+    return _digest(_canonical_toml(projected))
+
+
 def _config_observation(cwd, env):
     home = Path(env.get("CODEX_HOME", str(Path(env.get("HOME", "")) / ".codex")))
-    paths = {home / "config.toml", Path("/etc/codex/requirements.toml"), Path("/etc/codex/config.toml")}
+    user_config = home / "config.toml"
+    paths = {Path("/etc/codex/requirements.toml"), Path("/etc/codex/config.toml")}
     paths.update(p / ".codex/config.toml" for p in (Path(cwd), *Path(cwd).parents))
-    return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None for p in sorted(paths)}
+    try:
+        # The user config is bound by its projection in every role it has. On
+        # the VM HOME is an ancestor of every lane cwd, so the shared
+        # $HOME/.codex/config.toml is also an ancestor project config; its full
+        # digest would bind every other lane's trust table again.
+        user_file = os.path.realpath(user_config)
+        observed = {}
+        for path in sorted(paths):
+            if os.path.realpath(path) == user_file:
+                continue
+            data = _read_config_file(path)
+            observed[str(path)] = hashlib.sha256(data).hexdigest() if data is not None else None
+        observed[str(user_config)] = _user_config_projection(user_config, cwd)
+        return observed
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise ContextObservationError("config_files") from exc
 
 
 def _effective_environment(env, logical_keys=None):
@@ -519,23 +683,35 @@ def _effective_environment(env, logical_keys=None):
     # Omit only this call's supervisor-added tags. Caller-provided variables,
     # including ones with the same prefix, remain bound and invalidate on drift.
     extras = set(env) - set(logical_keys)
-    if any(not key.startswith("WORKBAY_EXECUTION_PROBE_") or env[key] != "1" for key in extras):
-        raise Refused("execution_context_changed")
+    if set(logical_keys) - set(env) or any(
+        not key.startswith("WORKBAY_EXECUTION_PROBE_") or env[key] != "1" for key in extras
+    ):
+        raise ContextChanged(["environment_digest"])
     return {key: env[key] for key in logical_keys}
 
 
+def _context_field(field, observe):
+    try:
+        return observe()
+    except (OSError, RuntimeError, ValueError, Refused) as exc:
+        exc.context_field = field
+        raise
+
+
 def _live_context(binary, argv, cwd, output_dir, env, logical_keys=None):
-    roots = _roots(cwd, output_dir, env)
+    roots = _context_field("roots", lambda: _roots(cwd, output_dir, env))
     rc, source = _child(["git", "rev-parse", "HEAD", "HEAD^{tree}"], deadline=time.monotonic() + 2, env=env, cwd=cwd)
     if rc:
         raise Refused("source_identity_unavailable")
     source = source.splitlines()
     return {
         "source": source,
-        "roots": [{k: v for k, v in _file_identity(p).items() if k not in {"mtime_ns", "size"}} for p in roots],
-        "environment_digest": _digest(_effective_environment(env, logical_keys)),
-        "binary": _cli_identity(binary),
-        "interpreter": _executable_identity(sys.executable),
+        "roots": _context_field("roots", lambda: [
+            {k: v for k, v in _file_identity(p).items() if k not in {"mtime_ns", "size"}} for p in roots
+        ]),
+        "environment_digest": _context_field("environment_digest", lambda: _digest(_effective_environment(env, logical_keys))),
+        "binary": _context_field("binary", lambda: _cli_identity(binary)),
+        "interpreter": _context_field("interpreter", lambda: _executable_identity(sys.executable)),
         "argv_digest": _digest(argv),
         "config_files": _config_observation(cwd, env),
         "implementation": {
@@ -551,14 +727,31 @@ def _live_context(binary, argv, cwd, output_dir, env, logical_keys=None):
     }
 
 
-def check_execution_context(proof, binary, argv, *, cwd, output_dir, env):
+def _changed_context_keys(before, after):
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return ["live_context"]
+    missing = object()
+    return sorted(key for key in before.keys() | after.keys() if before.get(key, missing) != after.get(key, missing))
+
+
+def execution_context_changes(proof, binary, argv, *, cwd, output_dir, env):
     # Directory mtime changes when our own fresh probe files are unlinked;
     # compare stable ownership/inode/mode, not directory modification clocks.
-    current = _live_context(binary, argv, cwd, output_dir, env)
+    try:
+        current = _live_context(binary, argv, cwd, output_dir, env)
+    except ContextObservationError as exc:
+        return [exc.field]
+    except (OSError, RuntimeError, ValueError, Refused) as exc:
+        return [getattr(exc, "context_field", "live_context_unavailable")]
     owner = proof.get("owner", {})
+    changed = _changed_context_keys(proof.get("live_context"), current)
     if owner != {"pid": os.getpid(), "uid": os.getuid(), "start": Path("/proc/self/stat").read_text().split()[21]}:
-        return False
-    return proof.get("live_context") == current
+        changed.append("owner")
+    return sorted(changed)
+
+
+def check_execution_context(proof, binary, argv, *, cwd, output_dir, env):
+    return not execution_context_changes(proof, binary, argv, cwd=cwd, output_dir=output_dir, env=env)
 
 
 def _observe(binary, argv, cwd, output_dir, env, deadline, receipt):
@@ -672,7 +865,7 @@ def _observe(binary, argv, cwd, output_dir, env, deadline, receipt):
     receipt["host_writes"] = json.loads(observed)
     live_before = _live_context(observed_binary, argv, cwd, output_dir, env, receipt["environment_keys"])
     if live_before["environment_digest"] != receipt["requested_environment_digest"]:
-        raise Refused("execution_context_changed")
+        raise ContextChanged(["environment_digest"])
     profile, selectors = _policy(argv, roots, capability=receipt["capability"])
     checks = receipt.setdefault("native_checks", [])
     for command, required in [
@@ -762,10 +955,12 @@ def _observe(binary, argv, cwd, output_dir, env, deadline, receipt):
         rc, source_now = _child(
             ["git", "rev-parse", suffix], deadline=deadline, env=env, cwd=cwd, evidence=checks, evidence_dir=output_dir
         )
-        if rc or source_now.strip() != receipt["source"][field]:
-            raise Refused("source_identity_changed")
+        if rc:
+            raise Refused("source_identity_unavailable")
+        if source_now.strip() != receipt["source"][field]:
+            raise ContextChanged(["source"])
     if receipt["live_context"] != live_before:
-        raise Refused("execution_context_changed")
+        raise ContextChanged(_changed_context_keys(live_before, receipt["live_context"]))
 
 
 def refusal_receipt(reason, *, binding=None, error_type=None):
@@ -774,7 +969,7 @@ def refusal_receipt(reason, *, binding=None, error_type=None):
         "schema": SCHEMA,
         "status": "UNKNOWN",
         "reason": reason,
-        "retryable": False,
+        "retryable": Refused(reason).retryable,
         "cache_reused": False,
         "binding": binding or {},
         "started_at": stamp,
@@ -783,6 +978,17 @@ def refusal_receipt(reason, *, binding=None, error_type=None):
         "deadline_seconds": 20,
         "error_type": error_type,
     }
+    proof["evidence_digest"] = _digest(proof)
+    return proof
+
+
+def context_changed_receipt(changed_keys, *, binding=None, observed=None):
+    change = ContextChanged(changed_keys)
+    proof = refusal_receipt(change.reason, binding=binding)
+    proof.update(retryable=change.retryable, repair_hint=change.repair, changed_keys=change.changed_keys)
+    if observed is not None:
+        proof["native_observation"] = observed
+    proof.pop("evidence_digest", None)
     proof["evidence_digest"] = _digest(proof)
     return proof
 
@@ -829,6 +1035,8 @@ def _worker(request):
                                               else "native_create_read_unlink"), retryable=False)
     except Refused as exc:
         receipt.update(status=exc.status, reason=exc.reason, retryable=exc.retryable, repair_hint=exc.repair)
+        if isinstance(exc, ContextChanged):
+            receipt["changed_keys"] = exc.changed_keys
     except Exception as exc:  # typed unknown, never infer a grant after an error
         receipt.update(
             reason="probe_exception",

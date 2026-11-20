@@ -1,4 +1,4 @@
-"""Freeze and observe coordinator-owned Python acceptance scripts (stdlib only).
+"""Freeze and observe coordinator-owned Python acceptance scripts.
 
 CLI::
 
@@ -17,15 +17,27 @@ Each case has a unique ``id``, external relative ``path``, ``argv`` beginning
 writes canonical manifest bytes exclusively plus a separate digest. The caller
 must pin that digest outside author-controlled files and supply it to run.
 
+Matched-suite cases add ``known_red``, the base failure IDs. Set it to
+``"measure"`` in the spec to run the pinned base at freeze time, a list
+to supply an independently measured baseline, or ``null`` to record
+an unavailable baseline. A measured clean baseline is ``[]``. The case
+must finish normally and expose its complete failure ID list as ``FAILED``.
+Run checks the frozen baseline against the base arm before comparing the tip.
+Use the characterization claim to check for new failures in matched suites.
+Cases without the field use the assertion protocol.
+
 The observer runs case scripts with ``python -S -P`` and revision-local source
-roots. Only a caught Python AssertionError is RED; a completed script with
-verified imports is GREEN. Other exceptions, early SystemExit, import/source
-errors, and timeout are UNKNOWN. This script-only grammar deliberately excludes
+roots. In assertion cases, a caught Python AssertionError is RED and a
+completed script with verified imports is GREEN. Other exceptions, early
+SystemExit, import/source errors, and timeout are UNKNOWN. The grammar excludes
 shell commands, pytest plugins, and author-written JSON/JUnit receipts. Exit
 codes are 0 observed, 1 disproven, 2 unknown, 64 invalid inputs, 70 harness I/O.
 With ``-S``, site hooks and installed third-party dependencies are unavailable;
 case scripts and declared source modules must run using stdlib and pinned source
 roots, or their outcomes are UNKNOWN.
+
+Each arm gets a fresh shared path for TMPDIR, OUTPUT and HOME. Case execution
+requires bubblewrap or sandbox-exec to make other filesystem paths read-only.
 
 The digest is an integrity check, not a signature. A coordinator must own its
 expected value and source refs. Processes with the same UID can interfere with
@@ -49,12 +61,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Never
 
 SPEC_SCHEMA = "workbay/acceptance-spec@1"
 MANIFEST_SCHEMA = "workbay/acceptance-manifest@1"
 RECEIPT_SCHEMA = "workbay/acceptance-observation@1"
 LOG_LIMIT = 65_536
+_COMPLETION_LIMIT = 1_048_576
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*\Z")
@@ -87,10 +100,11 @@ except BaseException:
     traceback.print_exc()
     sys.exit(81)
 done_fd = int(os.environ['WB_ACCEPT_DONE_FD'])
+matched_suite = 'WB_ACCEPT_MATCHED_SUITE' in os.environ
 os.write(done_fd, ('SOURCES:' + json.dumps(origins, sort_keys=True) + '\n').encode('utf-8'))
 try:
     sys.argv = [str(case), *sys.argv[4:]]
-    runpy.run_path(str(case), run_name='__main__')
+    case_globals = runpy.run_path(str(case), run_name='__main__')
 except AssertionError:
     traceback.print_exc()
     try:
@@ -108,7 +122,18 @@ try:
 except BaseException:
     traceback.print_exc()
     sys.exit(81)
-os.write(done_fd, b'GREEN')
+if matched_suite:
+    try:
+        failures = case_globals['FAILED']
+        if not isinstance(failures, list):
+            raise TypeError('FAILED must be a list')
+        encoded = json.dumps(failures, ensure_ascii=True).encode('ascii')
+    except (KeyError, TypeError, ValueError):
+        traceback.print_exc()
+        sys.exit(81)
+    os.write(done_fd, b'FAILED:' + encoded)
+else:
+    os.write(done_fd, b'GREEN')
 '''
 
 
@@ -193,14 +218,30 @@ def _case_bytes(root: Path, name: Any) -> bytes:
     return path.read_bytes()
 
 
+def _failure_ids(value: Any) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item or item != item.strip()
+        or any(char in item for char in "\r\n\x00")
+        for item in value
+    ):
+        raise ValueError("failure IDs must be a list of nonempty single-line strings")
+    if len(set(value)) != len(value):
+        raise ValueError("failure IDs must be unique")
+    return sorted(value)
+
+
 def _validate_case(case: Any, *, frozen: bool) -> dict[str, Any]:
     if not isinstance(case, dict):
         raise ValueError("case must be an object")
     expected = {"id", "path", "argv", "timeout_seconds", "seed", "source_modules"}
     if frozen:
         expected.add("sha256")
-    if set(case) != expected:
+    if set(case) - {"known_red"} != expected:
         raise ValueError("case fields differ from schema")
+    if "known_red" in case:
+        known_red = case["known_red"]
+        if known_red is not None and (frozen or known_red != "measure"):
+            _failure_ids(known_red)
     if not isinstance(case["id"], str) or not _ID.fullmatch(case["id"]):
         raise ValueError("invalid case id")
     if not isinstance(case["argv"], list) or case["argv"][:2] != ["{python}", "{case}"]:
@@ -276,7 +317,14 @@ def freeze_manifest(repo: Path | str, spec_path: Path | str, cases_root: Path | 
     }
     for case in spec["cases"]:
         data = _case_bytes(root, case["path"])
-        manifest["cases"].append({**case, "sha256": _sha(data)})
+        frozen_case = {**case, "sha256": _sha(data)}
+        if case.get("known_red") == "measure":
+            with tempfile.TemporaryDirectory(prefix="workbay-acceptance-measure-") as directory:
+                result = _arm(repository, base, manifest["base_tree"], case, data, Path(directory).resolve(), "base")
+            frozen_case["known_red"] = result.get("failed") if result["outcome"] == "GREEN" else None
+        elif isinstance(case.get("known_red"), list):
+            frozen_case["known_red"] = _failure_ids(case["known_red"])
+        manifest["cases"].append(frozen_case)
     canonical = _canonical(manifest)
     digest = _sha(canonical)
     destination, digest_destination = Path(manifest_path), Path(digest_path)
@@ -303,6 +351,8 @@ def freeze_manifest(repo: Path | str, spec_path: Path | str, cases_root: Path | 
 def _capture(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> dict[str, Any]:
     read_fd, write_fd = os.pipe()
     env = {**env, "WB_ACCEPT_DONE_FD": str(write_fd)}
+    # The child can start running before Popen returns to the monitor.
+    started = time.monotonic()
     try:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(write_fd,))
@@ -314,54 +364,65 @@ def _capture(command: list[str], cwd: Path, env: dict[str, str], timeout: float)
     assert process.stdout is not None
     digest = hashlib.sha256()
     retained = bytearray()
+    completion = bytearray()
+    stdout_fd = process.stdout.fileno()
+    readers = {stdout_fd, read_fd}
     total = 0
     timed_out = False
-    started = time.monotonic()
+    drain_deadline = None
     try:
-        drain_deadline = None
         while True:
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0 and not timed_out:
-                timed_out = True
+            # Sample after poll so a pause during the check counts against the budget.
+            exited = process.poll() is not None
+            now = time.monotonic()
+            remaining = timeout - (now - started)
+            if drain_deadline is None and (exited or remaining <= 0):
+                timed_out = remaining <= 0
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                process.wait(timeout=1)
                 drain_deadline = time.monotonic() + 1
-            if drain_deadline is not None and time.monotonic() >= drain_deadline:
+            if drain_deadline is not None and now >= drain_deadline:
                 break
-            ready, _, _ = select.select([process.stdout], [], [], min(max(remaining, 0.01), 0.1))
-            if ready:
-                chunk = os.read(process.stdout.fileno(), 8192)
+            # The observer has closed its writers on exit. Read buffered
+            # evidence without waiting for EOF from an inherited writer.
+            wait = 0 if drain_deadline is not None else min(remaining, 0.1)
+            ready, _, _ = select.select(list(readers), [], [], wait)
+            if drain_deadline is not None and not ready:
+                break
+            for descriptor in ready:
+                chunk = os.read(descriptor, 8192)
                 if not chunk:
-                    break
-                digest.update(chunk)
-                total += len(chunk)
-                if len(retained) < LOG_LIMIT:
+                    readers.remove(descriptor)
+                elif descriptor == read_fd:
+                    completion.extend(chunk[:max(0, _COMPLETION_LIMIT + 1 - len(completion))])
+                else:
+                    digest.update(chunk)
+                    total += len(chunk)
                     retained.extend(chunk[:LOG_LIMIT - len(retained)])
-        process.wait(timeout=1)
-        ready, _, _ = select.select([read_fd], [], [], 0)
-        completion = os.read(read_fd, 65_536) if ready else b""
     finally:
         os.close(read_fd)
         process.stdout.close()
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        if process.poll() is None:
-            process.wait()
+        if drain_deadline is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=1)
     code = process.returncode
     try:
-        source_line, marker = completion.split(b"\n", 1)
+        if len(completion) > _COMPLETION_LIMIT:
+            raise ValueError("completion exceeds observation limit")
+        source_line, marker = bytes(completion).split(b"\n", 1)
         if not source_line.startswith(b"SOURCES:"):
             raise ValueError("missing source observation")
         source_origins = json.loads(source_line[len(b"SOURCES:"):])
     except (ValueError, json.JSONDecodeError):
         source_origins, marker = {}, b""
-    outcome = "UNKNOWN" if timed_out or not source_origins or (code, marker) not in {(0, b"GREEN"), (80, b"RED")} else "RED" if code == 80 else "GREEN"
-    return {
-        "outcome": outcome, "exit_code": code, "timed_out": timed_out,
+    result = {
+        "outcome": "UNKNOWN", "exit_code": code, "timed_out": timed_out,
         "source_origins": source_origins,
         "seconds": round(time.monotonic() - started, 6),
         "log_sha256": digest.hexdigest(), "log_bytes": total,
@@ -369,52 +430,104 @@ def _capture(command: list[str], cwd: Path, env: dict[str, str], timeout: float)
         "log_truncated": total > len(retained),
         "_log": bytes(retained),
     }
+    if timed_out:
+        result["reason"] = "case_timeout"
+        return result
+    if not source_origins:
+        if code == 1 and not completion:
+            # Launchers return 1 on setup refusal, before the observer
+            # can emit a source record or its own status (0, 80, or 81).
+            result["reason"] = "sandbox_start_failed"
+        else:
+            result["reason"] = "source_audit_failed" if code == 81 else "observer_start_failed"
+        return result
+    if "WB_ACCEPT_MATCHED_SUITE" in env:
+        if code == 0 and marker.startswith(b"FAILED:"):
+            try:
+                result["failed"] = _failure_ids(json.loads(marker[len(b"FAILED:"):]))
+            except ValueError:
+                return result
+            result["outcome"] = "GREEN"
+    elif (code, marker) in {(0, b"GREEN"), (80, b"RED")}:
+        result["outcome"] = "RED" if code == 80 else "GREEN"
+    return result
+
+
+def _sandbox_command(command: list[str], writable: Path) -> list[str]:
+    if bubblewrap := shutil.which("bwrap"):
+        return [bubblewrap, "--die-with-parent", "--ro-bind", "/", "/",
+                "--bind", str(writable), str(writable),
+                "--dev-bind", "/dev/null", "/dev/null",
+                "--dev-bind", "/dev/urandom", "/dev/urandom",
+                "--unshare-pid", "--proc", "/proc", "--", *command]
+    if seatbelt := shutil.which("sandbox-exec"):
+        path = str(writable).replace("\\", "\\\\").replace('"', '\\"')
+        profile = (
+            '(version 1) (allow default) (deny file-write*) '
+            f'(allow file-write* (subpath "{path}")) '
+            '(allow file-write* (literal "/dev/null"))'
+        )
+        return [seatbelt, "-p", profile, *command]
+    return []
+
+
+def _unknown(reason: str) -> dict[str, Any]:
+    return {
+        "outcome": "UNKNOWN", "reason": reason, "exit_code": None, "timed_out": False,
+        "seconds": None, "source_origins": {}, "log_sha256": _sha(b""), "log_bytes": 0,
+        "log_retained_bytes": 0, "retained_log_sha256": _sha(b""),
+        "log_truncated": False, "_log": b"",
+    }
 
 
 def _arm(repository: Path, revision: str, tree: str, case: dict[str, Any], data: bytes,
          scratch: Path, arm: str) -> dict[str, Any]:
     worktree = scratch / f"tree-{arm}"
     overlay = scratch / f"overlay-{arm}"
+    writable = scratch / f"fixtures-{arm}"
     case_path = overlay / "case.py"
     command = [sys.executable, "-S", "-P", "-c", _OBSERVER, str(worktree), str(case_path),
                json.dumps(case["source_modules"]), *case["argv"][2:]]
     result: dict[str, Any] | None = None
     checked_out_commit: str | None = None
     checked_out_tree: str | None = None
+    if "known_red" in case and case["known_red"] is None:
+        result = _unknown("known_red_unavailable")
+    else:
+        sandboxed = _sandbox_command(command, writable)
+        if not sandboxed:
+            result = _unknown("sandbox_unavailable")
     try:
-        _git(repository, "worktree", "add", "--detach", "--force", str(worktree), revision)
-        checked_out_commit = _git(worktree, "rev-parse", "HEAD")
-        checked_out_tree = _git(worktree, "rev-parse", "HEAD^{tree}")
-        if checked_out_commit != revision or checked_out_tree != tree:
-            raise ValueError("disposable worktree source differs from pinned commit/tree")
-        overlay.mkdir()
-        case_path.write_bytes(data)
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "PYTHONHASHSEED": str(case["seed"]),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-        result = _capture(command, worktree, env, case["timeout_seconds"])
+        if result is None:
+            _git(repository, "worktree", "add", "--detach", "--force", str(worktree), revision)
+            checked_out_commit = _git(worktree, "rev-parse", "HEAD")
+            checked_out_tree = _git(worktree, "rev-parse", "HEAD^{tree}")
+            if checked_out_commit != revision or checked_out_tree != tree:
+                raise ValueError("disposable worktree source differs from pinned commit/tree")
+            overlay.mkdir()
+            case_path.write_bytes(data)
+            writable.mkdir(mode=0o700)
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONHASHSEED": str(case["seed"]),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "TMPDIR": str(writable),
+                "OUTPUT": str(writable),
+                "HOME": str(writable),
+            }
+            if "known_red" in case:
+                env["WB_ACCEPT_MATCHED_SUITE"] = "1"
+            result = _capture(sandboxed, worktree, env, case["timeout_seconds"])
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        result = {
-            "outcome": "UNKNOWN", "reason": "harness_error", "error": str(exc)[:2000],
-            "exit_code": None, "timed_out": False, "seconds": None,
-            "source_origins": {}, "log_sha256": _sha(b""), "log_bytes": 0,
-            "log_retained_bytes": 0, "retained_log_sha256": _sha(b""),
-            "log_truncated": False, "_log": b"",
-        }
+        result = _unknown("harness_error")
+        result["error"] = str(exc)[:2000]
     finally:
         if worktree.exists():
             try:
                 _git(repository, "worktree", "remove", "--force", str(worktree))
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 if result is None:
-                    result = {
-                        "exit_code": None, "timed_out": False, "seconds": None,
-                        "source_origins": {}, "log_sha256": _sha(b""), "log_bytes": 0,
-                        "log_retained_bytes": 0, "retained_log_sha256": _sha(b""),
-                        "log_truncated": False, "_log": b"",
-                    }
+                    result = _unknown("cleanup_error")
                 result.update(outcome="UNKNOWN", reason="cleanup_error", error=str(exc)[:2000])
     assert result is not None
     result.update(source_commit=revision, source_tree=tree,
@@ -422,6 +535,26 @@ def _arm(repository: Path, revision: str, tree: str, case: dict[str, Any], data:
                   argv=case["argv"],
                   observer_argv=command, observer_sha256=_sha(_OBSERVER.encode("utf-8")))
     return result
+
+
+def _compare_matched(known_red: list[str] | None, base: dict[str, Any], tip: dict[str, Any]) -> None:
+    if known_red is None:
+        return  # Neither arm was run.
+    for result in (base, tip):
+        if result["outcome"] == "UNKNOWN":
+            result.setdefault("reason", "known_red_measurement_incomplete")
+    if base["outcome"] == "GREEN" and set(base["failed"]) != set(known_red):
+        base.update(outcome="UNKNOWN", reason="known_red_base_mismatch")
+    if base["outcome"] == "GREEN":
+        base["new_failures"] = []
+    if tip["outcome"] != "GREEN":
+        return
+    if base["outcome"] == "UNKNOWN":
+        tip.update(outcome="UNKNOWN", reason="known_red_base_unverified")
+        return
+    tip["new_failures"] = sorted(set(tip["failed"]) - set(known_red))
+    if tip["new_failures"]:
+        tip["outcome"] = "RED"
 
 
 def run_contract(repo: Path | str, manifest_path: Path | str, cases_root: Path | str,
@@ -455,7 +588,7 @@ def run_contract(repo: Path | str, manifest_path: Path | str, cases_root: Path |
         raise ValueError("output must be a new directory")
     observations = []
     with tempfile.TemporaryDirectory(prefix="workbay-acceptance-") as directory:
-        scratch = Path(directory)
+        scratch = Path(directory).resolve()
         for case, data in zip(manifest["cases"], case_data, strict=True):
             # A changed external file between validation and overlay cannot be used.
             if _case_bytes(root, case["path"]) != data:
@@ -463,7 +596,11 @@ def run_contract(repo: Path | str, manifest_path: Path | str, cases_root: Path |
             arms = {}
             for arm, revision in (("base", base), ("tip", tip)):
                 arms[arm] = _arm(repository, revision, manifest[f"{arm}_tree"], case, data, scratch / case["id"], arm)
-            observations.append({"id": case["id"], "case_sha256": case["sha256"], **arms})
+            observation = {"id": case["id"], "case_sha256": case["sha256"], **arms}
+            if "known_red" in case:
+                observation["known_red"] = case["known_red"]
+                _compare_matched(case["known_red"], arms["base"], arms["tip"])
+            observations.append(observation)
     outcomes = [(entry["base"]["outcome"], entry["tip"]["outcome"]) for entry in observations]
     if any("UNKNOWN" in pair for pair in outcomes):
         verdict = "unknown"
@@ -501,7 +638,7 @@ def run_contract(repo: Path | str, manifest_path: Path | str, cases_root: Path |
 
 
 class _Parser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> Never:
         self.print_usage(sys.stderr)
         print(f"acceptance-contract: {message}", file=sys.stderr)
         raise SystemExit(64)

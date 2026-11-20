@@ -830,16 +830,12 @@ def _latest_lane_pass(
     return _latest_lane_pass_from_index(task_ref, lane_id, indexed)
 
 
-def _authoritative_base_sha(
-    repo_root: Path,
+def _recorded_base_sha(
     row: dict[str, Any],
     manifest: dict[str, Any] | None,
     pass_record: dict[str, Any] | None,
-    *,
-    timeout_s: float,
-    deadline: float | None = None,
 ) -> tuple[str | None, str | None]:
-    """Resolve a pinned base from lane evidence, falling back to branch creation reflog."""
+    """Resolve a pinned base from the recorded lane, manifest, or pass evidence."""
     candidates: list[tuple[object, str]] = [(row.get("base_sha"), "lane_row")]
     lane_id = str(row.get("lane_id") or "")
     lanes = manifest.get("lanes") if isinstance(manifest, dict) else None
@@ -858,6 +854,22 @@ def _authoritative_base_sha(
         resolved = _full_commit_sha(value)
         if resolved is not None:
             return resolved, source
+    return None, None
+
+
+def _authoritative_base_sha(
+    repo_root: Path,
+    row: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    pass_record: dict[str, Any] | None,
+    *,
+    timeout_s: float,
+    deadline: float | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve a pinned base from lane evidence, falling back to branch creation reflog."""
+    recorded, source = _recorded_base_sha(row, manifest, pass_record)
+    if recorded is not None:
+        return recorded, source
 
     branch = str(row.get("branch") or "").strip().removeprefix("refs/heads/")
     if not branch or timeout_s <= 0:
@@ -2997,7 +3009,7 @@ def _absorbed_landing(
     manifest_cache: dict[str, dict[str, Any] | None] | None = None,
     integration_refs_cache: dict[str, tuple[list[str], str | None]] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Prove succession and actual Git branch containment; unknowns fail closed."""
+    """Prove succession, commits after and descending from the recorded cut, and Git containment."""
     task = str(row.get("task_ref") or "")
     lane = str(row.get("lane_id") or "")
     if not task or Path(task).name != task:
@@ -3042,6 +3054,28 @@ def _absorbed_landing(
     try:
         if not branch or git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode != 0:
             return None, "branch_missing"
+        # Containment alone also holds for an untouched cut. Use a recorded
+        # base, not reflog inference, and pin the branch tip for every probe.
+        base, _base_source = _recorded_base_sha(row, manifest, None)
+        if base is None:
+            return None, "base_sha_unavailable"
+        resolved = git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+        branch_tip = _full_commit_sha(resolved.stdout.strip()) if resolved.returncode == 0 else None
+        if branch_tip is None:
+            return None, "merge_probe_failed"
+        ahead = git("rev-list", "--count", f"{base}..{branch_tip}", "--")
+        count = ahead.stdout.strip()
+        if ahead.returncode != 0 or not count.isascii() or not count.isdecimal():
+            return None, "merge_probe_failed"
+        if int(count) == 0:
+            return None, "no_commits_ahead"
+        # The range counts lane work only when the branch descends from its cut;
+        # otherwise it counts whatever history the branch sits on.
+        descends = git("merge-base", "--is-ancestor", base, branch_tip)
+        if descends.returncode == 1:
+            return None, "base_not_ancestor"
+        if descends.returncode != 0:
+            return None, "merge_probe_failed"
         refs, _source = _integration_refs_cached(
             repo_root,
             task,
@@ -3053,12 +3087,14 @@ def _absorbed_landing(
             tip = git("rev-parse", "--verify", f"{ref}^{{commit}}")
             if tip.returncode != 0:
                 return None, "integration_ref_missing"
-            landing = tip.stdout.strip()
-            merged = git("branch", "--merged", landing, "--format=%(refname)")
-            if merged.returncode != 0:
-                return None, "merge_probe_failed"
-            if f"refs/heads/{branch}" in merged.stdout.splitlines():
+            landing = _full_commit_sha(tip.stdout.strip())
+            if landing is None:
+                return None, "integration_ref_missing"
+            merged = git("merge-base", "--is-ancestor", branch_tip, landing)
+            if merged.returncode == 0:
                 return landing, None
+            if merged.returncode != 1:
+                return None, "merge_probe_failed"
         return None, "not_merged"
     except TimeoutError:
         return None, "budget_exhausted"

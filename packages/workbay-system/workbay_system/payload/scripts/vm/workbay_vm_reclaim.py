@@ -580,14 +580,89 @@ class DependencyCensus:
             raise exc
         return result
 
+    def git_reference(self, path, targets, *, gitfile=False, base=None):
+        """Read one bounded Git path and preserve its literal traversal edges.
+
+        Gitfile paths are relative to the file's directory; commondir paths are
+        relative to the worktree gitdir. Neither permits inferred absence.
+        """
+        self.locate(path, "read_gitfile" if gitfile else "read_commondir")
+        self.check()
+        value = read_regular(path).decode("utf-8").rstrip("\r\n")
+        if gitfile:
+            if not value.startswith("gitdir: "):
+                raise ValueError("invalid Git gitdir reference")
+            value = value[len("gitdir: "):]
+        if not value or any(char in value for char in "\x00\r\n"):
+            raise ValueError("invalid Git directory reference")
+        target = Path(value)
+        if not target.is_absolute():
+            target = (path.parent if base is None else base) / target
+        resolved, traversed = self.resolve(target)
+        targets.update(traversed)
+        targets.add(resolved)
+        directory = self.directory(resolved, targets)
+        if directory is None:
+            raise ValueError("Git directory reference disappeared")
+        return directory
+
+    def git_objects(self, repo, targets):
+        """Observe .git, optional commondir, then the one named objects slot.
+
+        Resolving metadata never grants permission to enumerate a foreign tree.
+        All reads and component/link traversals share the census's existing caps.
+        """
+        metadata = repo / ".git"
+        self.locate(metadata, "git_metadata_slot")
+        self.check()
+        try:
+            info = metadata.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            metadata, traversed = self.resolve(metadata)
+            targets.update(traversed)
+            targets.add(metadata)
+            self.check()
+            info = metadata.lstat()
+        gitfile = stat.S_ISREG(info.st_mode)
+        # A symlinked gitfile still interprets its text relative to repo/.git,
+        # as native Git does, rather than relative to the symlink destination.
+        gitdir = (self.git_reference(metadata, targets, gitfile=True, base=repo) if gitfile
+                  else self.directory(metadata, targets))
+        if gitdir is None:
+            raise ValueError("Git metadata disappeared")
+        common = gitdir / "commondir"
+        self.locate(common, "commondir_slot")
+        self.check()
+        try:
+            common.lstat()
+        except FileNotFoundError:
+            has_common = False
+        else:
+            has_common = True
+            gitdir = self.git_reference(common, targets)
+            # Git uses one commondir indirection. A nested reference is not an
+            # invitation to follow a chain and miss the actual objects slot;
+            # ambiguous chains and cycles remain UNKNOWN.
+            nested = gitdir / "commondir"
+            self.locate(nested, "commondir_slot")
+            self.check()
+            try:
+                nested.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("nested Git common directory or cycle")
+        objects = self.directory(gitdir / "objects", targets)
+        if objects is None and (gitfile or has_common):
+            raise ValueError("referenced Git objects directory missing")
+        return objects
+
     def _alternates(self, repo, targets):
-        objects = repo
-        for part in (".git", "objects"):
-            # A gitfile (e.g. linked worktree) needs gitdir/commondir semantics.
-            # Unsupported inspection is UNKNOWN, not a false empty census.
-            objects = self.directory(objects / part, targets)
-            if objects is None:
-                return
+        objects = self.git_objects(repo, targets)
+        if objects is None:
+            return
         # Git alternate stores can themselves borrow from other stores. Follow
         # only their info/alternates slot, with the same global time/probe cap.
         # An explicit stack avoids recursion; active vs completed distinguishes
@@ -1595,6 +1670,109 @@ def scan(root=None, read_only=False, deadline=None, sandbox_root=None, lease_rel
     return {"root": str(root), "entries": rows, "counts": counts,
             "health": "degraded" if blocked or diagnostics.get("dependency_census") else "ok",
             "recover_blocked_foreign_owner": blocked, **diagnostics}
+
+
+def inventory_held_jobs(root=None, *, deadline, limit=100):
+    """Bounded, read-only held-job census for Fleet, using our own classifier.
+
+    Keep only the oldest N rows in memory. Count completeness is independent of
+    row truncation: a complete census may have an exact total and a short list.
+    Neither unclassified entries nor failed discovery prove an empty job root.
+    No lease observation, release, lock acquisition, measurement walk or apply.
+    """
+    root = Path(root or Path.home())
+    limit = min(100, max(1, limit))
+    count, scanned = 0, 0
+    quality, reason = "exact", None
+    census = DependencyCensus(deadline)
+
+    def incomplete(why):
+        nonlocal quality, reason
+        quality = "lower_bound"
+        reason = why
+
+    selected = []
+    try:
+        if time.monotonic() >= deadline:
+            raise ScanDeadline
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    raise ScanDeadline
+                if entry.name in EXCLUDED or not JOB_NAME.fullmatch(entry.name):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    incomplete("job_scan")
+                    continue
+                path = Path(entry.path)
+                row = classify(
+                    path, root, read_only=True, deadline=deadline, dependency_census=census, explain_borrowers=False
+                )
+                scanned += 1
+                if row["verdict"] == "unclassified":
+                    incomplete(row["reason"])
+                    continue
+                if not row["verdict"].startswith("hold_"):
+                    continue
+                count += 1
+                # Identity is producer metadata, never guessed from a basename.
+                row["identity_sources"] = {}
+                for name in ("RETENTION.json", "spec.json"):
+                    try:
+                        value = json.loads(read_regular(path / name))
+                        if not isinstance(value, dict):
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                    for key in (
+                        "job_id",
+                        "task_ref",
+                        "lane_id",
+                        "branch",
+                        "repository",
+                        "repository_path",
+                        "repository_root",
+                        "repository_identity",
+                        "repo_root",
+                    ):
+                        if key not in row and isinstance(value.get(key), str) and value[key].strip():
+                            row[key] = value[key]
+                            row["identity_sources"][key] = name + ":" + key
+                try:
+                    stamp = released_time(row.get("created_at"))
+                    source = "RETENTION.json:created_at"
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    stamp, source = info.st_mtime, "directory:mtime"
+                row.update(
+                    age_seconds=max(0, time.time() - stamp),
+                    age_source=source,
+                    bytes=None,
+                    bytes_state="unknown",
+                    observed_at=utc_now(),
+                )
+                selected.append(((stamp, row["basename"]), row))
+                selected.sort(key=lambda item: item[0])
+                if len(selected) > limit:
+                    selected.pop()
+    except ScanDeadline:
+        incomplete("deadline")
+    except OSError:
+        quality, reason = ("lower_bound" if scanned else "unknown"), "job_scan"
+    rows = [row for _, row in selected]
+    truncated = quality != "exact" or count > len(rows)
+    return dict(
+        held_job_dirs=rows,
+        held_job_dirs_count=count if quality != "unknown" else None,
+        held_job_dirs_emitted=len(rows),
+        held_job_dirs_count_quality=quality,
+        held_job_dirs_state="known" if quality == "exact" else "unknown",
+        held_job_dirs_truncated=truncated,
+        held_job_dirs_truncation_reason=reason or ("limit" if truncated else None),
+    )
 
 
 def starvation(rows):

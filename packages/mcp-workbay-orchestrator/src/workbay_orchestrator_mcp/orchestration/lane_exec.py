@@ -726,6 +726,11 @@ def run_lane_exec(
     # pass that authorized a smaller model clock in adapter_timeout. None keeps
     # the established contract: adapter_timeout bounds the whole job.
     remote_phase_budget: Any = None,
+    # Pass-engine opt-in (worker_daemon._execute_phase when
+    # _is_detached_pass_begin holds): a detached turn only submits its job and
+    # returns remote_job_pending for the engine to resume. False keeps the
+    # collecting run_detached path every other detached caller gets.
+    detached_pass_begin: bool = False,
 ) -> Path:
     """Run Codex for a lane and write a structured result file.
 
@@ -964,6 +969,7 @@ def run_lane_exec(
             # Remaining-at-spawn is computed by the adapter from this deadline;
             # absent, execute keeps its pre-existing keyword shape.
             **({"remote_phase_budget": remote_phase_budget} if remote_phase_budget is not None else {}),
+            **({"detached_pass_begin": True} if detached_pass_begin else {}),
         )
     except Exception as exc:  # noqa: BLE001 - annotate for daemon telemetry
         raise LaneExecError(str(exc), jailed=jailed, cause=exc) from exc
@@ -1033,7 +1039,7 @@ def _parse_args() -> argparse.Namespace:
         choices=WORKER_REASONING_EFFORT_CHOICES,
         help="Optional reasoning effort hint for codex-subagent turns.",
     )
-    parser.add_argument("--model", help="Explicit model to use (e.g. gpt-5.4-mini).")
+    parser.add_argument("--model", help="Explicit model to use.")
     parser.add_argument("--speed", choices=("standard", "fast"), help="Codex service speed.")
     parser.add_argument("--tier", choices=("senior", "junior"), help="Model tier selector.")
     parser.add_argument("--codex-bin", help="Explicit path to the codex binary.")

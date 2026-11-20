@@ -50,6 +50,8 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, TypedDict
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from .. import preflight_attestation
 from ..backend_adapter import INVALID_HANDOFF_SCHEMA_MARKER, BackendAdapter, BackendResult
 from ..backend_registry import BackendSpec, retained_artifact_aliases_for_backend
@@ -434,8 +436,29 @@ def _detached_begin_result(
     identity: RemoteJobIdentity,
     deadline: float | None = None,
     refresh_clocks=None,
+    remote_exec_selection: dict[str, Any] | None = None,
 ) -> BackendResult:
     """Submit a managed detached pass without waiting for its remote turn."""
+    from ..remote_exec_mode import (
+        RemoteExecModeError,
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    try:
+        if remote_exec_selection is None:
+            selection = current_remote_exec_selection(backend_id, repo_root=orchestrator_root)
+            if selection is None:
+                selection = resolve_remote_exec_mode(backend_id, repo_root=orchestrator_root, effective_env=env)
+            remote_exec_selection = selection.to_mapping()
+    except RemoteExecModeError as exc:
+        return BackendResult(
+            handoff_action="needs_guidance",
+            summary=str(exc),
+            details=str(exc),
+            blockers=[exc.code],
+            raw_payload={"failure_reason": exc.code, "typed_outcome": True},
+        )
     lock_deadline = time.monotonic() + max(0.0, timeout)
     if deadline is not None:
         lock_deadline = min(lock_deadline, deadline)
@@ -487,6 +510,7 @@ def _detached_begin_result(
         lane_key=_remote_lane_key_for_branch(branch),
         argv=list(command),
         bound_seconds=max(1, int(timeout)),
+        remote_exec_mode=remote_exec_selection,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
     try:
@@ -6768,6 +6792,7 @@ ProbeReason = Literal[
     "sandbox_denied",
     "probe_capacity",
     "transport_failure",
+    "routing_source_unavailable",
     "malformed_result",
     "commit_absent",
     "exception",
@@ -6785,6 +6810,7 @@ _NON_OBSERVATION_PROBE_REASONS = frozenset(
     {
         "probe_capacity",
         "transport_failure",
+        "routing_source_unavailable",
         "spawn_error",
         "executor_failed",
         "exception",
@@ -6840,6 +6866,7 @@ class WritableRootsProbe:
             "sandbox_denied",
             "probe_capacity",
             "transport_failure",
+            "routing_source_unavailable",
             "malformed_result",
             "commit_absent",
             "exception",
@@ -6871,6 +6898,7 @@ def _observed_probe_cleanup(*probes: WritableRootsProbe) -> str:
         "timeout",
         "spawn_error",
         "transport_failure",
+        "routing_source_unavailable",
         "exception",
         "probe_capacity",
         "executor_failed",
@@ -7614,6 +7642,7 @@ def _probe_receipt_result(
         "spawn_error": "spawn_error",
         "probe_capacity": "probe_capacity",
         "transport_failure": "transport_failure",
+        "routing_source_unavailable": "routing_source_unavailable",
         "commit_absent": "commit_absent",
         "executor_failed": "executor_failed",
         "probe_result_invalid": "probe_result_invalid",
@@ -8141,6 +8170,7 @@ def _probe_from_flight_record(record: Mapping[str, Any]) -> tuple[WritableRootsP
             "sandbox_denied",
             "probe_capacity",
             "transport_failure",
+            "routing_source_unavailable",
             "malformed_result",
             "commit_absent",
             "exception",
@@ -8502,11 +8532,19 @@ def _grok_row_uses_live_listing(row: BackendSpec) -> bool:
     )
 
 
+class RemoteModelRefusal(RuntimeError):
+    """A remote-model refusal with a machine-readable reason."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def _refuse_grok_build_or_retired(backend_id: str, slug: str) -> None:
     """Family refusals stay ahead of any listing call."""
     retired_warning = retired_model_warning(slug)
     if _GROK_BUILD_RE.search(slug):
-        raise RuntimeError(f"Refusing {backend_id} dispatch with a build model '{slug}' (grok-build family refused).")
+        raise RuntimeError(f"Refusing {backend_id} dispatch with a build model '{slug}' ({model_routing.ModelId.GROK_BUILD} family refused).")
     if retired_warning is not None:
         raise RuntimeError(f"Refusing {backend_id} dispatch with retired model '{slug}'. {retired_warning}")
 
@@ -8526,7 +8564,8 @@ def _refuse_unlisted_grok_slug(
         detail = f"live listing admits {named}"
         if failure_cause:
             detail = f"{failure_cause}; {detail}"
-    raise RuntimeError(f"Refusing {backend_id} dispatch with model '{slug}': {detail}")
+    kind = "catalogue_unavailable" if failure_cause and not slugs else "unknown_model"
+    raise RemoteModelRefusal(f"Refusing {backend_id} dispatch with model '{slug}': {detail}", kind=kind)
 
 
 def _read_grok_live_slugs(backend_id: str, *, request_model: str | None) -> tuple[tuple[str, ...], str | None]:
@@ -8636,7 +8675,7 @@ def resolve_effective_model(row: BackendSpec, backend_id: str, model: str | None
         try:
             return hooks.model_resolver(selected or "")
         except CodexCapabilityError as exc:
-            raise RuntimeError(str(exc)) from exc
+            raise RemoteModelRefusal(str(exc), kind=exc.kind) from exc
 
     if _grok_row_uses_live_listing(row):
         return _resolve_grok_live_listing_model(row, backend_id, model)
@@ -8673,7 +8712,7 @@ def resolve_effective_model(row: BackendSpec, backend_id: str, model: str | None
     retired_warning = retired_model_warning(effective_model)
     if _GROK_BUILD_RE.search(effective_model):
         raise RuntimeError(
-            f"Refusing {backend_id} dispatch with a build model '{effective_model}' (grok-build family refused)."
+            f"Refusing {backend_id} dispatch with a build model '{effective_model}' ({model_routing.ModelId.GROK_BUILD} family refused)."
         )
     if retired_warning is not None:
         raise RuntimeError(f"Refusing {backend_id} dispatch with retired model '{effective_model}'. {retired_warning}")
@@ -8696,41 +8735,30 @@ def resolve_effective_model(row: BackendSpec, backend_id: str, model: str | None
         # fallback singleton merely because it replaced the mutable row field.
         base_pin = pin if pin_is_authorized_provenance else None
         allowed_models = frozenset({base_pin}) if base_pin else frozenset()
-    # The configured pin is admissible by construction, curated row or not. The
-    # curated-list refusal wording below already promises "including configured
-    # pin", and codex_lane_config states the boundary directly: "an explicit
-    # operator env pin must stay admissible even with no curated tier row."
-    # Without this union the promise was false -- a pin absent from the curated
-    # projection (gpt-6-astra: measured service tiers, no tier-table row)
-    # refused *itself*, with a message asserting it was allowed. Union at the
-    # membership test rather than widening the curated constant, so
-    # `gpt-6-astra not in CODEX_ALLOWED_MODELS` stays true and the
-    # known/unknown distinction the tier table draws survives. The grok-build
-    # and retired-model refusals stay AHEAD of this, and the live entitlement
-    # sweep below still narrows, so a pin cannot resurrect a refused slug.
-    if pin is not None and pin_is_authorized_provenance:
-        allowed_models = allowed_models | {pin}
+    # A configured default chooses from a curated set; it does not widen that
+    # set. Codex's live catalogue resolver has already run above, so an
+    # advertised Codex override need not appear in the curated tier table.
     if effective_model not in allowed_models:
         env_hint = f" ({row.allowed_model_env})" if row.allowed_model_env else ""
         if pin_is_authorized_provenance and allowed_models == frozenset({pin}):
             allowed_clause = f"allowed is the configured pin '{pin}'{env_hint}."
-        elif pin_is_authorized_provenance:
+        elif pin_is_authorized_provenance and pin is not None and pin in allowed_models:
             allowed_clause = f"allowed is the curated allow-list including configured pin '{pin}'{env_hint}."
+        elif row.allowed_models is not None:
+            allowed_clause = f"allowed is the curated allow-list{env_hint}."
         elif pin is None:
             allowed_clause = "allowed is the curated allow-list."
         else:
             allowed_clause = (
                 f"configured discovery pin '{pin}' is not authorization; allowed is the hand-curated registry boundary."
             )
-        raise RuntimeError(f"Refusing {backend_id} dispatch with model '{effective_model}': {allowed_clause}")
-    # A successful live entitlement sweep is fresher than the curated table.
-    # It may narrow authorization but never expand beyond the curated set.
-    # It may only narrow over slugs it ACTUALLY INTERROGATED: the per-candidate
-    # sweep enumerates `spec.model_tiers`, so an operator env pin with no
-    # curated row (gpt-6-astra) was never asked about, and reading its absence
-    # from the entitled set as a denial refuses a model the sweep is silent on.
-    # An exhaustive `codex models` listing does answer for every slug, and
-    # `live_entitlement_answers_for` keeps that case narrowing as before.
+        raise RemoteModelRefusal(
+            f"Refusing {backend_id} dispatch with model '{effective_model}': {allowed_clause}",
+            kind="unknown_model" if row.allowed_models is not None else "model_not_allowed",
+        )
+    # The selected model passed the row's membership check above, including
+    # when it came from an environment pin. A live sweep can narrow admission
+    # only for models it covered.
     from ..offload_model_discovery import (  # noqa: PLC0415
         live_entitled_models_for,
         live_entitlement_answers_for,
@@ -8742,9 +8770,10 @@ def resolve_effective_model(row: BackendSpec, backend_id: str, model: str | None
         and effective_model not in live_entitled
         and live_entitlement_answers_for(backend_id, effective_model)
     ):
-        raise RuntimeError(
+        raise RemoteModelRefusal(
             f"Refusing {backend_id} dispatch with model '{effective_model}': live entitlement catalogue "
-            f"admits {sorted(live_entitled)}"
+            f"admits {sorted(live_entitled)}",
+            kind="model_not_entitled",
         )
     return effective_model
 
@@ -8883,17 +8912,36 @@ class RemoteExecAdapter(BackendAdapter):
         # worktree or transport preflight so an unknown value cannot fall
         # through to an attached dispatch.
         mode_env = env if env else os.environ
-        raw_remote_exec_mode = mode_env.get("WORKBAY_REMOTE_EXEC_MODE", "attached")
-        if raw_remote_exec_mode not in {"attached", "detached"}:
-            invalid_mode = str(raw_remote_exec_mode)
+        from ..remote_exec_mode import (
+            RemoteExecModeError,
+            current_remote_exec_selection,
+            resolve_remote_exec_mode,
+        )
+
+        mode_repo_root = Path(kwargs.get("orchestrator_root") or worktree_path)
+        try:
+            mode_selection = kwargs.get("remote_exec_selection") or current_remote_exec_selection(
+                self.backend_id,
+                repo_root=mode_repo_root,
+            )
+            if mode_selection is not None and (
+                mode_selection.backend_id != self.backend_id or mode_selection.repo_root != mode_repo_root.resolve()
+            ):
+                raise RemoteExecModeError("remote execution selection differs from the adapter repository/backend")
+            if mode_selection is None:
+                mode_selection = resolve_remote_exec_mode(
+                    self.backend_id,
+                    repo_root=mode_repo_root,
+                    effective_env=mode_env,
+                )
+        except RemoteExecModeError as exc:
+            invalid_mode = str(getattr(exc, "value", str(exc)))
             summary = f"{self.backend_id} refused unknown WORKBAY_REMOTE_EXEC_MODE"
             return _attribute_refusal(
                 BackendResult(
                     handoff_action="needs_guidance",
                     summary=summary,
-                    details=_refusal_details(
-                        f"WORKBAY_REMOTE_EXEC_MODE value {invalid_mode!r} is invalid; expected attached or detached."
-                    ),
+                    details=_refusal_details(str(exc)),
                     merge_ready=False,
                     blockers=["invalid_remote_exec_mode"],
                     response_model=effective_model,
@@ -8909,7 +8957,10 @@ class RemoteExecAdapter(BackendAdapter):
                 backend_id=self.backend_id,
                 constructor_refusal=True,
             )
-        remote_exec_mode = raw_remote_exec_mode
+        remote_exec_mode = mode_selection.mode
+        remote_exec_selection = mode_selection.to_mapping()
+        if progress_callback is not None:
+            progress_callback("remote_exec_selected", remote_exec_selection=dict(remote_exec_selection))
 
         # Fail-closed on a dirty local tree: the offload pass checkpoints before each
         # turn, so HEAD is always the turn's committed input; a dirty tree is an
@@ -9158,6 +9209,9 @@ class RemoteExecAdapter(BackendAdapter):
             exposed whether or not it succeeded, and the only other record of it
             is a log line that a default root logger at WARNING discards.
             """
+            result = replace(
+                result, raw_payload={**(result.raw_payload or {}), "remote_exec_selection": remote_exec_selection}
+            )
             _close_transport_owner()
             if preflight_transport is not None and preflight_source is not None:
                 transport_binding_evidence.setdefault(
@@ -10285,6 +10339,26 @@ class RemoteExecAdapter(BackendAdapter):
                 bool(agent_spec.requires_live_sandbox_preflight) and carrier_state != MODEL_CLOCK_CARRIER_MALFORMED
             )
             native_boundary_authority = _uses_native_boundary_write_authority(agent_spec.backend_id, agent_spec.argv)
+            # Ask whether this backend has a native recipe, independently of
+            # whether this dispatch uses it. Supported backends' legacy argv
+            # must retain their historical probe path.
+            native_write_recipe_available = _uses_native_boundary_write_authority(
+                agent_spec.backend_id, writable_roots_preflight_argv()
+            )
+            if agent_spec.requires_live_sandbox_preflight and not native_write_recipe_available:
+                return _envelope(
+                    _capability_gate_result(
+                        backend_id=self.backend_id,
+                        model=effective_model,
+                        effort=applied_effort,
+                        reason="write_capability_unmeasured",
+                        blockers=[
+                            f"{self.backend_id} has no native write boundary; write capability is unmeasured [FM-08]"
+                        ],
+                        evidence={"retryable": False},
+                    ),
+                    constructor_refusal=True,
+                )
             if native_boundary_authority and admitted_source is None:
                 return _envelope(
                     _source_binding_failure("selected_source_unreadable_or_changed"), constructor_refusal=True
@@ -10341,9 +10415,15 @@ class RemoteExecAdapter(BackendAdapter):
                         constructor_refusal=True,
                     )
                 remote_job_identity_fields = identity_values
+            # Submit-only belongs to the pass engine, the one caller that
+            # resumes a pending job. Only its explicit opt-in selects it;
+            # orchestrator_root names the policy repository and the identity
+            # names the job, and review and ACE send both, so neither may pick
+            # the protocol. Without the opt-in a detached turn collects.
             detached_pass_begin = (
                 remote_exec_mode == "detached"
                 and remote_job_identity_fields is not None
+                and kwargs.get("detached_pass_begin") is True
                 and kwargs.get("orchestrator_root") is not None
             )
             gate_host = _transport_attestation_gate_host(worktree_path, run_env)
@@ -11493,6 +11573,7 @@ class RemoteExecAdapter(BackendAdapter):
                                     branch=branch,
                                     orchestrator_root=Path(kwargs["orchestrator_root"]),
                                     identity=identity,
+                                    remote_exec_selection=remote_exec_selection,
                                     selected_source=selected_source,
                                     deadline=(time.monotonic() + detached_budget.remaining_seconds())
                                     if detached_budget is not None

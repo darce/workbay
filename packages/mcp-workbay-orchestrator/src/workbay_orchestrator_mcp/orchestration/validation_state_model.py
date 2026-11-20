@@ -82,8 +82,8 @@ def _new_report(bounds):
         "scope": {
             "machines": list(MACHINES),
             "semantics": "edge-membership-only",
-            "abstraction": "finite states with shortest reachable witnesses; all ordered state pairs plus unknown",
-            "self_transitions": "all known states, including terminals",
+            "abstraction": "finite states with shortest reachable witnesses; all state pairs and events plus unknown",
+            "self_transitions": "only explicitly declared event-labelled edges",
             "terminals": "labels; outgoing declared edges remain legal",
             "limitations": [
                 "guards remain with predicate owners",
@@ -100,6 +100,7 @@ def _new_report(bounds):
             "complete": False,
             "states": {"checked": 0, "total": 0},
             "pairs": {"checked": 0, "total": 0},
+            "event_probes": {"checked": 0, "total": 0},
             "exploration_exhausted": False,
         },
         "counterexamples": [],
@@ -154,10 +155,11 @@ def _derive(chart, clock):
             where = f"{key}.transitions[{index}]"
             if not isinstance(transition, Mapping):
                 raise _Invalid(f"{where} must be an object")
-            event = _name(transition.get("id"), f"{where}.id")
-            if event in ids:
-                raise _Invalid(f"{where}: duplicate transition id {event}")
-            ids.add(event)
+            tid = _name(transition.get("id"), f"{where}.id")
+            if tid in ids:
+                raise _Invalid(f"{where}: duplicate transition id {tid}")
+            ids.add(tid)
+            event = _name(transition.get("event"), f"{where}.event")
             source = _name(transition.get("from"), f"{where}.from")
             target = transition.get("to")
             targets = [target] if isinstance(target, str) else target
@@ -169,7 +171,19 @@ def _derive(chart, clock):
                 _name(dest, f"{where}.to")
                 if source not in states or dest not in states:
                     raise _Invalid(f"{where}: endpoints must be known states")
-                edges.append((event, source, dest))
+                edges.append((tid, event, source, dest))
+        self_transitions = machine.get("self_transitions", [])
+        if not isinstance(self_transitions, list):
+            raise _Invalid(f"{key}.self_transitions must be a list")
+        for index, transition in enumerate(self_transitions):
+            where = f"{key}.self_transitions[{index}]"
+            if not isinstance(transition, Mapping):
+                raise _Invalid(f"{where} must be an object")
+            state = _name(transition.get("state"), f"{where}.state")
+            event = _name(transition.get("event"), f"{where}.event")
+            if state not in states:
+                raise _Invalid(f"{where}: state must be known")
+            edges.append((f"self:{state}:{event}", event, state, state))
         model[key] = {"states": states, "initial": initial, "terminals": terminals, "edges": sorted(set(edges))}
     return model
 
@@ -187,7 +201,7 @@ def _walk(model, max_depth, max_states, clock):
         paths[m["initial"]] = [m["initial"]]
         used += 1
         queue = deque([m["initial"]])
-        successors = {s: sorted({t for _, src, t in m["edges"] if src == s}) for s in m["states"]}
+        successors = {s: sorted({t for _, _, src, t in m["edges"] if src == s}) for s in m["states"]}
         while queue:
             clock.check()
             source = queue.popleft()
@@ -214,16 +228,14 @@ def _unknown(states):
     return result
 
 
-def _allowed(model, source, target):
-    return (source == target and source in model["states"]) or any(
-        src == source and dest == target for _, src, dest in model["edges"]
-    )
+def _allowed(model, source, event, target):
+    return any(e == event and src == source and dest == target for _, e, src, dest in model["edges"])
 
 
-def _observe(checker, chart, key, source, target, clock):
+def _observe(checker, chart, key, source, event, target, clock):
     clock.check()
     try:
-        checker(chart, key, source, target)
+        checker(chart[key], source, event, target)
         outcome = "accept"
     except conformance.IllegalTransition:
         outcome = "reject"
@@ -251,36 +263,45 @@ def _counterexample(report, prop, key, source, target, expected, observed, paths
 
 
 def _compare(report, prop, chart, model, paths, checker, clock, mapping=None):
-    """All-pair checker evidence against the independent immutable relation."""
+    """All-pair and event evidence against the independent immutable relation."""
     evidence = {}
     for key in MACHINES:
         m = model[key]
         states = m["states"] + [_unknown(m["states"])]
+        events = sorted({event for _, event, _, _ in m["edges"]})
+        events.append(_unknown(events))
         evidence[key] = []
         for source in states:
             for target in states:
                 clock.check()
-                expected = "accept" if _allowed(m, source, target) else "reject"
                 src = mapping[key]["states"].get(source, source) if mapping else source
                 dest = mapping[key]["states"].get(target, target) if mapping else target
-                observed = _observe(checker, chart, key, src, dest, clock)
-                evidence[key].append({"from": source, "to": target, "expected": expected, "actual": observed})
+                for event in events:
+                    expected = "accept" if _allowed(m, source, event, target) else "reject"
+                    mapped_event = mapping[key]["events"].get(event, event) if mapping else event
+                    observed = _observe(checker, chart, key, src, mapped_event, dest, clock)
+                    evidence[key].append(
+                        {"from": source, "event": event, "to": target, "expected": expected, "actual": observed}
+                    )
+                    if prop == "membership":
+                        report["coverage"]["event_probes"]["checked"] += 1
+                    else:
+                        report["properties"][prop]["comparisons"] += 1
+                    if expected != observed:
+                        _counterexample(
+                            report,
+                            prop,
+                            key,
+                            source,
+                            target,
+                            expected,
+                            observed,
+                            paths[key],
+                            event=event,
+                            mapped_probe={"from": src, "event": mapped_event, "to": dest},
+                        )
                 if prop == "membership":
                     report["coverage"]["pairs"]["checked"] += 1
-                else:
-                    report["properties"][prop]["comparisons"] += 1
-                if expected != observed:
-                    _counterexample(
-                        report,
-                        prop,
-                        key,
-                        source,
-                        target,
-                        expected,
-                        observed,
-                        paths[key],
-                        mapped_probe={"from": src, "to": dest},
-                    )
     return evidence
 
 
@@ -312,16 +333,21 @@ def _variants(chart, model, seed):
         names = list(model[key]["states"])
         rng.shuffle(names)
         state_map = {s: f"renamed_{key}_{i}" for i, s in enumerate(names)}
-        event_map = {e: f"event_{key}_{i}" for i, e in enumerate(sorted({e for e, _, _ in model[key]["edges"]}))}
+        event_map = {e: f"event_{key}_{i}" for i, e in enumerate(sorted({e for _, e, _, _ in model[key]["edges"]}))}
+        id_map = {tid: f"transition_{key}_{i}" for i, tid in enumerate(sorted({t["id"] for t in m["transitions"]}))}
         mapping[key] = {"states": state_map, "events": event_map}
         m = renamed[key]
         m["states"] = [state_map[s] for s in m["states"]]
         m["initial"] = state_map[m["initial"]]
         m["terminals"] = [state_map[s] for s in m["terminals"]]
         for t in m["transitions"]:
-            t["id"] = event_map[t["id"]]
+            t["id"] = id_map[t["id"]]
+            t["event"] = event_map[t["event"]]
             t["from"] = state_map[t["from"]]
             t["to"] = [state_map[s] for s in t["to"]] if isinstance(t["to"], list) else state_map[t["to"]]
+        for t in m.get("self_transitions", []):
+            t["state"] = state_map[t["state"]]
+            t["event"] = event_map[t["event"]]
     return ordered, renamed, mapping
 
 
@@ -353,14 +379,15 @@ def _metamorphic(report, chart, model, paths, checker, clock, max_depth, max_sta
         )
 
     # Independent malformed-only path: the extra declared state has no valid inbound edge.
-    # Production assert_transition eagerly rejects malformed transitions (except known self loops).
+    # Production assert_transition eagerly rejects malformed transitions.
     # Production check_reachability must keep this state unreachable as well.
     malformed = [
         None,
         {},
-        {"id": "bad", "from": "start", "to": []},
-        {"id": "bad", "from": "start", "to": ["island", 7]},
-        {"from": "start", "to": "island"},
+        {"id": "bad", "event": "go", "from": "start", "to": []},
+        {"id": "bad", "event": "go", "from": "start", "to": ["island", 7]},
+        {"event": "go", "from": "start", "to": "island"},
+        {"id": "missing_event", "from": "start", "to": "island"},
     ]
     for key in MACHINES:
         for bad in malformed:
@@ -371,7 +398,7 @@ def _metamorphic(report, chart, model, paths, checker, clock, max_depth, max_sta
                 "states": ["start", "done", "island"],
                 "initial": "start",
                 "terminals": ["done"],
-                "transitions": [{"id": "good", "from": "start", "to": "done"}, bad],
+                "transitions": [{"id": "good", "event": "go", "from": "start", "to": "done"}, bad],
             }
             errors = conformance.check_reachability(variant)
             clock.check()
@@ -388,7 +415,7 @@ def _metamorphic(report, chart, model, paths, checker, clock, max_depth, max_sta
                     {"start": ["start"]},
                     malformed_transition=bad,
                 )
-            observed = _observe(checker, variant, key, "start", "island", clock)
+            observed = _observe(checker, variant, key, "start", "go", "island", clock)
             report["properties"]["malformed"]["comparisons"] += 1
             if observed != "malformed":
                 _counterexample(
@@ -411,14 +438,18 @@ def _metamorphic(report, chart, model, paths, checker, clock, max_depth, max_sta
     for key in MACHINES:
         m = model[key]
         source = m["initial"]
-        target = next((s for s in m["states"] if not _allowed(m, source, s)), _unknown(m["states"]))
+        event = _unknown([e for _, e, _, _ in m["edges"]])
+        target = source
         variant = copy.deepcopy(chart)
-        variant[key]["transitions"].append({"id": "model_injected_illegal", "from": source, "to": target})
-        observed = _observe(checker, variant, key, source, target, clock)
+        variant[key]["transitions"].append(
+            {"id": "model_injected_illegal", "event": event, "from": source, "to": target}
+        )
+        observed = _observe(checker, variant, key, source, event, target, clock)
         report["properties"]["illegal_edge"]["comparisons"] += 1
         witness = {
             "machine": key,
             "source": source,
+            "event": event,
             "target": target,
             "expected": "reject",
             "actual": observed,
@@ -474,6 +505,9 @@ def check_model(
             raise _Invalid(f"chart must contain finite JSON values: {exc}") from exc
         report["coverage"]["states"]["total"] = sum(len(m["states"]) for m in model.values())
         report["coverage"]["pairs"]["total"] = sum((len(m["states"]) + 1) ** 2 for m in model.values())
+        report["coverage"]["event_probes"]["total"] = sum(
+            (len(m["states"]) + 1) ** 2 * (len({e for _, e, _, _ in m["edges"]}) + 1) for m in model.values()
+        )
         paths, cutoffs = _walk(model, max_depth, max_states, clock)
         for key in MACHINES:
             m = model[key]
@@ -483,8 +517,10 @@ def check_model(
                 "states": m["states"],
                 "paths": paths[key],
                 "unreachable_or_unexplored": sorted(set(m["states"]) - set(paths[key])),
-                "transitions": [{"id": e, "from": s, "to": t} for e, s, t in m["edges"]],
-                "known_self_edges": [[s, s] for s in m["states"]],
+                "transitions": [{"id": tid, "event": e, "from": s, "to": t} for tid, e, s, t in m["edges"]],
+                "known_self_edges": [
+                    [s, s] for s in m["states"] if any(src == s == dest for _, _, src, dest in m["edges"])
+                ],
             }
         report["coverage"]["states"]["checked"] = sum(len(p) for p in paths.values())
         report["coverage"]["exploration_exhausted"] = not cutoffs
@@ -503,6 +539,7 @@ def check_model(
         report["coverage"]["complete"] = (
             not report["reasons"]
             and report["coverage"]["pairs"]["checked"] == report["coverage"]["pairs"]["total"]
+            and report["coverage"]["event_probes"]["checked"] == report["coverage"]["event_probes"]["total"]
             and all(p["status"] == "pass" for p in report["properties"].values())
         )
         report["status"] = (

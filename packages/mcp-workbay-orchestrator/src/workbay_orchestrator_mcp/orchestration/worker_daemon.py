@@ -22,7 +22,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -31,6 +30,8 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from workbay_protocol import reasoning_effort as model_routing
 
 if TYPE_CHECKING:
     from workbay_handoff_mcp.validation_lane import NativeValidationResult
@@ -2163,7 +2164,7 @@ def _record_token_usage_to_handoff(
     duration_seconds: float | None = None,
 ) -> None:
     """Best-effort recording of token usage to MCP handoff as a decision."""
-    from workbay_handoff_mcp.enums import normalize_model_label  # noqa: PLC0415
+    from workbay_handoff_mcp.enums import WorkerEventName, normalize_model_label  # noqa: PLC0415
 
     totals = entry.get("token_usage_totals") or {}
     total_tokens = totals.get("total_tokens")
@@ -2367,7 +2368,7 @@ def _record_token_usage_to_handoff(
             # The dedup key must reach the row the check above reads.
             raw_usage["remote_job_id"], raw_usage["remote_job_attempt"] = remote_job
 
-        turn_metrics(
+        result = turn_metrics(
             operation="record",
             task_ref=task_ref,
             session=session,
@@ -2402,6 +2403,19 @@ def _record_token_usage_to_handoff(
             actor=actor_payload,
             duration_seconds=resolved_duration,
         )
+        if isinstance(result, Mapping) and result.get("ok") is False:
+            error = result.get("error")
+            _log(
+                lane_id,
+                orchestrator_root / "logs" / "worker-daemon",
+                "WARNING",
+                WorkerEventName.TOKEN_METRIC_REFUSED,
+                task_ref=task_ref,
+                cycle=cycle,
+                phase=phase,
+                writer="workbay_orchestrator_mcp.lanes.turn_metrics",
+                error=error[:200] if isinstance(error, str) else "",
+            )
     except (RuntimeError, TypeError, ValueError, json.JSONDecodeError, OSError, sqlite3.Error) as exc:
         # sqlite3.Error covers schema skew against an older handoff DB (e.g. a
         # v25 CHECK constraint rejecting usage_source='grok_context_delta' with
@@ -3501,7 +3515,7 @@ def _grok_build_contamination_info(ctx: WorkerRunContext) -> dict[str, Any] | No
     raw = result.get("raw_payload") if isinstance(result.get("raw_payload"), dict) else {}
     evidence = raw.get("composer_violation_evidence")
     blockers = [str(item) for item in result.get("blockers", []) if str(item).strip()]
-    contaminated = bool(evidence) or any("grok-build" in blocker.lower() for blocker in blockers)
+    contaminated = bool(evidence) or any(model_routing.ModelId.GROK_BUILD in blocker.lower() for blocker in blockers)
     if not contaminated:
         return None
     return {
@@ -3597,11 +3611,19 @@ def _breaker_trial_has_model_result(result: dict[str, Any]) -> bool:
 
 def _is_detached_pass_begin(config: WorkerConfig) -> bool:
     """Whether this worker call only submits a managed remote pass job."""
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import (
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    selection = current_remote_exec_selection(config.backend, repo_root=config.orchestrator_root)
+    if selection is None:
+        selection = resolve_remote_exec_mode(config.backend, repo_root=config.orchestrator_root)
     return (
         config.single_pass
         and bool(config.pass_id)
         and str(config.backend).endswith("-remote")
-        and os.environ.get("WORKBAY_REMOTE_EXEC_MODE", "attached") == "detached"
+        and selection.mode == "detached"
     )
 
 
@@ -3615,6 +3637,15 @@ def _execute_phase(ctx: WorkerRunContext) -> bool:
     from workbay_handoff_mcp.enums import WorkerEventName  # noqa: PLC0415
 
     config = ctx.config
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import RemoteExecModeError
+
+    try:
+        detached_pass_begin = _is_detached_pass_begin(config)
+    except RemoteExecModeError as exc:
+        ctx.execute_error = exc.code
+        ctx.execute_stop_reason = exc.code
+        ctx.log("WARNING", "dispatch_refused", failure_reason=exc.code, detail=str(exc))
+        return False
     from backend_registry import get_adapter  # noqa: PLC0415
     from lane_exec import build_fix_prompt, run_lane_exec  # noqa: PLC0415
 
@@ -4180,6 +4211,10 @@ def _execute_phase(ctx: WorkerRunContext) -> bool:
                         if config.remote_phase_budget is not None
                         else {}
                     ),
+                    # The pass engine's submit-only opt-in, the only producer:
+                    # the adapter never infers it from orchestrator_root or
+                    # the job identity, which review and ACE also send.
+                    **({"detached_pass_begin": True} if detached_pass_begin else {}),
                 )
                 if ctx.row_read_note and ctx.final_result_path.exists():
                     _append_result_warning(ctx.final_result_path, ctx.row_read_note)
@@ -6954,28 +6989,12 @@ def _compute_dormant_age_result(run_ctx: WorkerRunContext, dormant_since: float,
 
 
 def _call_with_timeout(fn: Callable[[], str], timeout_seconds: float) -> str:
-    """Run ``fn`` on a daemon thread and fail closed if it exceeds ``timeout_seconds``."""
-    if timeout_seconds <= 0:
-        raise TimeoutError("age probe timeout must be positive")
-    box: list[str] = []
-    error: list[BaseException] = []
+    """Keep the age-probe seam while sharing the bounded-call contract."""
+    from workbay_handoff_mcp.bounded_call import run_with_daemon_timeout  # noqa: PLC0415
 
-    def runner() -> None:
-        try:
-            box.append(fn())
-        except Exception as exc:  # noqa: BLE001 — probe body must not kill the daemon
-            error.append(exc)
-
-    thread = threading.Thread(target=runner, name="dormant-age-probe", daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise TimeoutError(f"age probe timed out after {timeout_seconds}s")
-    if error:
-        raise error[0]
-    if not box:
-        raise RuntimeError("age probe returned no result")
-    return box[0]
+    return run_with_daemon_timeout(
+        fn, timeout_seconds=timeout_seconds, timeout_message=f"age probe timed out after {timeout_seconds}s"
+    )
 
 
 def _probe_dormant_age(
@@ -7797,7 +7816,15 @@ def worker_loop(config: WorkerConfig, lock: WorkerLock | None = None) -> int:
     from workbay_orchestrator_mcp.orchestration.daemon_startup import (  # noqa: PLC0415
         emit_daemon_startup_warning,
     )
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import RemoteExecModeError
 
+    try:
+        _is_detached_pass_begin(config)
+    except RemoteExecModeError as exc:
+        print(
+            json.dumps({"outcome": "dispatch_refused", "failure_reason": exc.code, "error": str(exc)}), file=sys.stderr
+        )
+        return 1
     run_ctx, dormant_state = _setup_worker_run(config)
     cfg = run_ctx.config
     dispatch_breaker.consume_reset_env(cfg.orchestrator_root, os.environ)
@@ -8074,7 +8101,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-args", default=None, help="Extra args for codex exec (space-separated).")
     parser.add_argument("--grok-bin", default=None, help="Explicit path to the grok binary.")
     parser.add_argument("--grok-args", default=None, help="Extra args for grok exec (space-separated).")
-    parser.add_argument("--model", default=None, help="Explicit model to use (e.g. gpt-5.4-mini).")
+    parser.add_argument("--model", default=None, help="Explicit model to use.")
     parser.add_argument(
         "--speed",
         default=None,
@@ -8160,6 +8187,15 @@ def main() -> int:
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
 
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import RemoteExecModeError, resolve_remote_exec_mode
+
+    try:
+        resolve_remote_exec_mode(args.backend, repo_root=orchestrator_root)
+    except RemoteExecModeError as exc:
+        print(
+            json.dumps({"outcome": "dispatch_refused", "failure_reason": exc.code, "error": str(exc)}), file=sys.stderr
+        )
+        return 1
     # Per-lane exclusive lock
     lock = WorkerLock(args.lane_id, state_dir)
     if not lock.acquire():

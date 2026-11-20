@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from workbay_protocol import reasoning_effort as model_routing
+
 _LOGGER = logging.getLogger(__name__)
 
 from ..backend_adapter import BackendAdapter, BackendResult
@@ -87,7 +89,7 @@ def _last_flag_value(argv: list[str], flag: str) -> str | None:
 
 #: Pinned-model guarantee: grok-build must never author task work. Any resolved
 #: ``-m`` model carrying a build spelling is refused pre-exec (decision #2799).
-_GROK_BUILD_TOKEN = "grok-build"
+_GROK_BUILD_TOKEN = model_routing.ModelId.GROK_BUILD
 
 #: Tolerant build-token matcher: catches ``grok-build``, ``grok_build``,
 #: ``grok4-build``, dotted versioned builds (``grok-4.5-build``), and build
@@ -389,7 +391,7 @@ def _scan_conversation_served_models(
             evidence[:20],
         )
     return (
-        "authored served-model is bare grok-build — contamination quarantine",
+        f"authored served-model is bare {_GROK_BUILD_TOKEN} — contamination quarantine",
         evidence[:20],
     )
 
@@ -485,19 +487,19 @@ def _detect_grok_build_contamination(
         raw = debug_file.read_bytes()
     except OSError:
         return (
-            "debug log is not valid UTF-8 — grok-build contamination quarantine",
+            f"debug log is not valid UTF-8 — {_GROK_BUILD_TOKEN} contamination quarantine",
             [],
         )
     if _looks_like_wide_encoding(raw):
         return (
-            "debug log is a wide encoding — grok-build contamination quarantine",
+            f"debug log is a wide encoding — {_GROK_BUILD_TOKEN} contamination quarantine",
             [],
         )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return (
-            "debug log is not valid UTF-8 — grok-build contamination quarantine",
+            f"debug log is not valid UTF-8 — {_GROK_BUILD_TOKEN} contamination quarantine",
             [],
         )
     if not text.strip():
@@ -1315,7 +1317,7 @@ class GrokCliAdapter(BackendAdapter):
             message = (
                 f"Refusing to dispatch grok with model '{effective_model}': allowed is "
                 f"the configured pin '{DEFAULT_GROK_MODEL}' (WORKBAY_GROK_MODEL); "
-                "grok-build family is refused (decision #2799)."
+                f"{_GROK_BUILD_TOKEN} family is refused (decision #2799)."
             )
             if retired_warning is not None:
                 message = f"{message} {retired_warning}"
@@ -1331,7 +1333,7 @@ class GrokCliAdapter(BackendAdapter):
             raise RuntimeError(
                 f"Refusing to dispatch grok with model '{effective_model}': allowed is "
                 f"the configured pin '{DEFAULT_GROK_MODEL}' (WORKBAY_GROK_MODEL); "
-                "grok-build family is refused (decision #2799)."
+                f"{_GROK_BUILD_TOKEN} family is refused (decision #2799)."
             )
         # A model re-pin smuggled through grok_args would bypass the guard above
         # (grok appends extra_args AFTER '-m', last-wins), so refuse any
@@ -1593,7 +1595,7 @@ class GrokCliAdapter(BackendAdapter):
                 return _stamp_grok_result(
                     BackendResult(
                         handoff_action="needs_guidance",
-                        summary="grok-build contamination detected in debug log",
+                        summary=f"{_GROK_BUILD_TOKEN} contamination detected in debug log",
                         details=_tail_text(stdout),
                         merge_ready=False,
                         blockers=[blocker],

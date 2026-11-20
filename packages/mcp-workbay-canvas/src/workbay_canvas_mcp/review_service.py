@@ -472,7 +472,7 @@ class ReviewService:
                 workspace_root=self._workspace_root,
                 pointer="/config",
             )
-            config = load_design_sources(config_path, workspace_root=self._workspace_root)
+            config = load_design_sources(config_path, workspace_root=self._workspace_root, requested_path=self._config)
             generated_dir = resolve_config_path(
                 config.generated_dir,
                 workspace_root=self._workspace_root,
@@ -598,15 +598,30 @@ def _collector_reason(message: str) -> str:
 def _collector_error(exc: InventoryCollectError, last_good_digest: str | None) -> ReviewServiceError:
     typed = getattr(exc, "reason", None)
     reason = typed if typed in _COLLECTOR_MESSAGES else _collector_reason(str(exc))
+    message = _COLLECTOR_MESSAGES[reason]
+    details = _failure_details("collector", last_good_digest, reason=reason)
+    # The runner sets the pair only for the configured root's own derived remedy.
+    remedy = getattr(exc, "remedy", None)
+    dependency_root = getattr(exc, "dependency_root", None)
+    if reason == "deps_missing" and isinstance(remedy, str) and isinstance(dependency_root, str):
+        details.update(remedy=remedy, dependency_root=dependency_root)
+        message = f"Install typescript and postcss: {remedy}"
     return ReviewServiceError(
         code="collector_failed",
-        message=_COLLECTOR_MESSAGES[reason],
-        details=_failure_details("collector", last_good_digest, reason=reason),
+        message=message,
+        details=details,
     )
 
 
 def _config_error(exc: InventoryConfigError, last_good_digest: str | None) -> ReviewServiceError:
     details = _failure_details("config", last_good_digest, pointer=exc.pointer, code=exc.code)
+    if exc.code == "missing":
+        details["path"] = exc.path
+        return ReviewServiceError(
+            code="config_missing",
+            message=f"Create {exc.path} to configure Studio.",
+            details=details,
+        )
     return ReviewServiceError(
         code="config_invalid",
         message="invalid design-sources config",

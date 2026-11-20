@@ -1423,6 +1423,12 @@ def daemon_start(
     pass_id: str | None = None,
     dispatch_id: str | None = None,
 ) -> dict[str, Any]:
+    from workbay_handoff_mcp.coordination_declaration import PROOF_ERRORS, pending_error, reserve_native_execution
+
+    try:
+        reserve_native_execution(task_ref, lane_id)
+    except PROOF_ERRORS as exc:
+        return {**pending_error(exc), "error": str(exc), "lane_id": lane_id}
     from workbay_orchestrator_mcp.orchestration.offload_profiles import (  # noqa: PLC0415
         OffloadPreflightError,
     )

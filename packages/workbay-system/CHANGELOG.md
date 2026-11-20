@@ -3,6 +3,26 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.34] — 2026-11-20
+
+### Fixed
+- The remote boundary runtime pin follows orchestrator 0.3.38.
+- Lifecycle cleanup reaps only owned, released scratch, observes linked worktree dependencies, and accounts for native roots and external volumes.
+- Doctor and lifecycle readers report unavailable or unqualified native handoff evidence, and the qualification probe respects its shared budget.
+- Planning custody follows accepted evidence and reuses producer plan IDs, including receipt replay across relinking.
+- Remote gate routing retains oversized input refusals while allowing quoted data words.
+- Studio installs retain Canvas and the handoff embeddings extra.
+
+### Changed
+- Maintenance task start uses the lifecycle guard; doctor fails on embedding backfill gaps.
+- Remote execution uses a visible, stamped mode selection, and Codex configuration and trust are managed in the VM layout.
+- Temporary inventory continues through bounded portable cursors.
+
+### Added
+- Doctor reports a remote workspace nested inside another Git repository as `remote_enclosing_repo` and reports unknown when Git inspection fails.
+- Fleet provides bounded VM inventory, a rebuildable plan projection, and a web view that polls and ages observations.
+- Task start writes a digest-stamped lane manifest.
+
 ## [0.4.33] — 2026-11-12
 
 ### Fixed

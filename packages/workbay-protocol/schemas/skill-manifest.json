@@ -30,7 +30,7 @@
         }
       ],
       "default": null,
-      "description": "Optional preferred model identifier (e.g. 'claude-opus-4-7').",
+      "description": "Optional preferred model identifier.",
       "title": "Model"
     },
     "name": {

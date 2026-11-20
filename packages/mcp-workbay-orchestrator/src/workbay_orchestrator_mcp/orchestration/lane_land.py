@@ -8,10 +8,12 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,6 +215,65 @@ def _verified_test(raw: object, expected_tip: str) -> tuple[int | None, bool]:
     if isinstance(test_id, bool) or not isinstance(test_id, int) or test_id <= 0:
         return None, False
     return test_id, True
+
+
+def _blocking_review_hold(db_path: Path, task_ref: str, branch: str, tip: str) -> str | None:
+    """Require a matching run for a completed blocking judgment at this tip."""
+    from workbay_handoff_mcp.shared_schema import connect_handoff_db, review_history_unavailable
+    from workbay_protocol.review_impact import is_blocking
+
+    identity = {"task": task_ref, "branch": branch, "tip": tip}
+    try:
+        with closing(connect_handoff_db(db_path, read_only=True)) as conn:
+            conn.execute("BEGIN")
+            if review_history_unavailable(conn, task_ref):
+                return "blocking_review_evidence_unavailable"
+            row = conn.execute(
+                """
+                SELECT CASE
+                    WHEN judgment.verdict = 'fail' AND run.id IS NULL THEN 'blocking_review_unrecorded'
+                    WHEN judgment.verdict = 'fail' OR json_array_length(judgment.blocking_ids) > 0
+                        THEN 'blocking_review_failed'
+                    ELSE 'blocking_review_evidence_unavailable'
+                END AS reason
+                FROM branch_review_judgments AS judgment
+                LEFT JOIN review_runs AS run ON run.review_run_id = judgment.run_id
+                    AND run.task_ref = judgment.task_ref AND run.branch = judgment.branch
+                    AND run.commit_sha = judgment.commit_sha AND run.verdict = judgment.verdict
+                WHERE judgment.task_ref = :task AND judgment.branch = :branch AND judgment.commit_sha = :tip
+                    AND (judgment.verdict IS NULL OR judgment.verdict = 'fail' OR judgment.blocking_ids IS NULL
+                         OR json_array_length(judgment.blocking_ids) > 0
+                         OR judgment.projection_status = 'identity_mismatch')
+                LIMIT 1
+                """, identity,
+            ).fetchone()
+            if row is not None:
+                return row["reason"]
+            # Pre-journal producers recorded completed failures directly.
+            if conn.execute(
+                """SELECT 1 FROM review_runs WHERE task_ref = :task AND branch = :branch AND commit_sha = :tip
+                   AND subject_kind = 'branch' AND verdict = 'fail' LIMIT 1""", identity,
+            ).fetchone() is not None:
+                return "blocking_review_failed"
+            unlinked = conn.execute(
+                """
+                SELECT finding.severity, finding.impact, finding.origin FROM review_findings AS finding
+                WHERE finding.task_ref = :task AND finding.branch = :branch AND finding.commit_sha = :tip
+                  AND finding.status = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM review_runs AS run
+                      WHERE run.review_run_id = finding.review_run_id AND run.task_ref = finding.task_ref
+                        AND run.branch = finding.branch AND run.commit_sha = finding.commit_sha
+                        AND run.subject_kind = 'branch' AND run.verdict = 'fail'
+                  )
+                """,
+                identity,
+            )
+            if any(is_blocking(dict(finding)) for finding in unlinked):
+                return "blocking_review_unrecorded"
+    except (OSError, sqlite3.Error):
+        return "blocking_review_evidence_unavailable"
+    return None
 
 
 def _ref_oid(orchestrator_lanes: object, root: Path, ref: str) -> tuple[str | None, str | None]:
@@ -992,6 +1053,12 @@ def _finish_cleanup_impl(
     """Resume local and remote cleanup from its durable per-landing intent."""
     from . import landing_cleanup
 
+    if intent.get("local_status") == "pending":
+        from workbay_handoff_mcp.coordination_declaration import pre_retire_refusal
+
+        refusal = pre_retire_refusal(identity["task_ref"], identity["lane_id"])
+        if refusal is not None:
+            return {"complete": False, "detail": refusal, "local_status": "pending", "remote_status": "pending"}
     local_status = intent.get("local_status")
     remote_status = intent.get("remote_status")
     local_result = intent.get("local_result") if isinstance(intent.get("local_result"), dict) else {}
@@ -1007,7 +1074,7 @@ def _finish_cleanup_impl(
         }
     branch = branch.strip()
     backend = lane_row.get("backend")
-    if isinstance(backend, str) and backend.strip() and remote_status not in {"complete", "skipped"}:
+    if isinstance(backend, str) and backend.strip() and remote_status not in {"complete", "skipped", "not_required"}:
         try:
             from .worker_daemon_ctl import is_remote_worker_backend
 
@@ -1044,7 +1111,7 @@ def _finish_cleanup_impl(
 
     retire_outcome: str | None = None
     bundle_path = local_result.get("bundle_path") if isinstance(local_result.get("bundle_path"), str) else None
-    if local_status not in {"complete", "skipped"}:
+    if local_status not in {"complete", "skipped", "not_required"}:
         current, branch_error = _ref_oid(
             orchestrator_lanes, root, branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
         )
@@ -1246,7 +1313,37 @@ def _finish_cleanup_impl(
         retire_outcome = str(local_result.get("outcome") or "already_retired")
         bundle_path = local_result.get("bundle_path") if isinstance(local_result.get("bundle_path"), str) else None
 
-    if remote_status not in {"complete", "skipped"}:
+    if remote_status not in {"complete", "skipped", "not_required"}:
+        # Declaration first: only a declared lane needs the full registry snapshot.
+        # An undeclared lane (None) falls through to the unchanged native path.
+        coordination = landing_cleanup.coordination_not_required(
+            root,
+            {**intent, "identity": intent.get("identity", identity)},
+            lambda: _all_registered_lane_rows(lanes_recording),
+        )
+        if coordination is not None:
+            succeeded = coordination.get("ok") is True and coordination.get("status") == "not_required"
+            saved = _persist_intent(
+                root,
+                landing_cleanup,
+                intent,
+                remote_status="not_required" if succeeded else "pending",
+                remote_result=coordination,
+            )
+            if not succeeded or saved is None:
+                return {
+                    "complete": False,
+                    "detail": coordination.get("reason", "coordination_projection_failed"),
+                    "local_status": local_status,
+                    "remote_status": "pending",
+                    "retire_outcome": retire_outcome,
+                    "bundle_path": bundle_path,
+                    **_retire_release_fields(local_result),
+                }
+            intent = saved
+            remote_status = "not_required"
+            remote_result = coordination
+    if remote_status not in {"complete", "skipped", "not_required"}:
         backend = lane_row.get("backend")
         if not isinstance(backend, str) or not backend.strip():
             # The immutable intent can predate a routing repair. Recover only
@@ -1268,7 +1365,7 @@ def _finish_cleanup_impl(
             ):
                 backend = current_lane.get("backend")
         if not isinstance(backend, str) or not backend.strip():
-            pending_remote = {"status": "pending", "reason": "lane_backend_unavailable"}
+            pending_remote = {"status": "pending", "state": "unknown", "reason": "lane_backend_unavailable"}
             saved = _persist_intent(root, landing_cleanup, intent, remote_result=pending_remote)
             if saved is not None:
                 intent = saved
@@ -1449,7 +1546,11 @@ def _finish_cleanup_impl(
                     "bundle_path": bundle_path,
                 }
 
-    complete = local_status in {"complete", "skipped"} and remote_status in {"complete", "skipped"}
+    complete = local_status in {"complete", "skipped", "not_required"} and remote_status in {
+        "complete",
+        "skipped",
+        "not_required",
+    }
     return {
         **_retire_release_fields(local_result),
         "complete": complete,
@@ -2057,6 +2158,7 @@ def _land_once(
         # without creating a lanes -> lane_land -> lanes import cycle.
         import workbay_handoff_mcp.lanes_recording as lanes_recording
         import workbay_handoff_mcp.verified_tests as verified_tests
+        from workbay_handoff_mcp.runtime import get_runtime_config
 
         from .. import lane_reaping, lanes
         from . import harness_protocol, landing_log, orchestrator_lanes
@@ -2616,11 +2718,9 @@ def _land_once(
                 intent_complete = contained_intent.get("local_status") in {
                     "complete",
                     "skipped",
-                } and contained_intent.get("remote_status") in {"complete", "skipped"}
+                } and contained_intent.get("remote_status") in {"complete", "skipped", "not_required"}
                 if not intent_complete and current_lane is not None:
                     try:
-                        from workbay_handoff_mcp.runtime import get_runtime_config
-
                         state_dir = get_runtime_config().state_dir
                     except Exception:
                         state_dir = root / ".task-state"
@@ -2797,6 +2897,20 @@ def _land_once(
                     expected_tip=tip_value,
                     run_id=request_run_id,
                     detail=None if gate_readable else "verified_tests_unreadable",
+                    integration_before=integration_before,
+                    pin_ref=pin_ref,
+                )
+
+            review_hold = _blocking_review_hold(get_runtime_config().db_path, task_value, branch, tip_value)
+            if review_hold is not None:
+                return _land_envelope(
+                    "merge_refused",
+                    task_ref=task_value,
+                    lane_id=lane_value,
+                    expected_tip=tip_value,
+                    run_id=request_run_id,
+                    detail=review_hold,
+                    gate_id=gate_id,
                     integration_before=integration_before,
                     pin_ref=pin_ref,
                 )

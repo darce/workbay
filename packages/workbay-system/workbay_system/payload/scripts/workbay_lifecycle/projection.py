@@ -148,17 +148,22 @@ def project_decision(
 
     worktree_branch = resolver.current_branch(repo_root)
     worktree_head = resolver.head_sha(repo_root)
-    argv: list[str] = _common.handoff_command_argv(
-        repo_root,
-        "event",
-        "--event-kind", "decision",
-        "--session", session,
-        "--decision", decision_id,
-        "--rationale", rationale,
-        *_common.worktree_write_context_argv(repo_root, task_ref=task_ref),
-    )
+    try:
+        argv: list[str] = _common.handoff_command_argv(
+            repo_root,
+            "event",
+            "--event-kind", "decision",
+            "--session", session,
+            "--decision", decision_id,
+            "--rationale", rationale,
+            *_common.worktree_write_context_argv(repo_root, task_ref=task_ref),
+        )
 
-    proc = _common.run_subprocess(argv, timeout=_common.handoff_timeout())
+        proc = _common.run_subprocess(argv, timeout=_common.handoff_timeout())
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        proc = _common.subprocess.CompletedProcess([], 127, stdout="", stderr=str(exc))
     status = _classify_returncode(proc.returncode)
     # Same exit-0-on-rejection contract as project_state_sync: the CLI exits 0
     # even when ``record_event`` rejects the payload, so a zero-exit ``ok:false``
@@ -231,22 +236,27 @@ def project_test_result(
         return "error"
     worktree_branch = resolver.current_branch(repo_root)
     worktree_head = resolver.head_sha(repo_root)
-    argv: list[str] = _common.handoff_command_argv(
-        repo_root,
-        "event",
-        "--event-kind", "test_result",
-        "--session", session,
-        "--command", command,
-        *_common.worktree_write_context_argv(repo_root, task_ref=task_ref),
-    )
-    if passed:
-        argv.append("--passed")
-    if exit_code is not None:
-        argv.extend(["--exit-code", str(exit_code)])
-    if result:
-        argv.extend(["--result", result])
+    try:
+        argv: list[str] = _common.handoff_command_argv(
+            repo_root,
+            "event",
+            "--event-kind", "test_result",
+            "--session", session,
+            "--command", command,
+            *_common.worktree_write_context_argv(repo_root, task_ref=task_ref),
+        )
+        if passed:
+            argv.append("--passed")
+        if exit_code is not None:
+            argv.extend(["--exit-code", str(exit_code)])
+        if result:
+            argv.extend(["--result", result])
 
-    proc = _common.run_subprocess(argv, timeout=_common.handoff_timeout())
+        proc = _common.run_subprocess(argv, timeout=_common.handoff_timeout())
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        proc = _common.subprocess.CompletedProcess([], 127, stdout="", stderr=str(exc))
     status = _classify_returncode(proc.returncode)
     # Same exit-0-on-rejection contract as project_state_sync: a zero-exit
     # ``ok:false`` from ``record_event`` must spool rather than report synced.
@@ -381,41 +391,47 @@ def project_state_sync(
         "commit_sha": target_head, "event_id": "lifecycle-state-" + uuid4().hex,
         "staging_root": str(repo_root),
     }
-    argv = _common.handoff_command_argv(
-        repo_root,
-        "set",
-        "--task-ref", task_ref,
-        "--target-branch", target_branch,
-        "--target-worktree-path", target_worktree_path,
-        "--status", status,
-    )
-    argv.extend(["--event-id", payload["event_id"]])
-    if objective is not None:
-        argv.extend(["--objective", objective])
-    if task_plan_path:
-        argv.extend(["--task-plan-path", task_plan_path])
-    if target_branch:
-        argv.extend(["--branch", target_branch])
-    if target_head:
-        argv.extend(["--commit-sha", target_head])
+    try:
+        argv = _common.handoff_command_argv(
+            repo_root,
+            "set",
+            "--task-ref", task_ref,
+            "--target-branch", target_branch,
+            "--target-worktree-path", target_worktree_path,
+            "--status", status,
+        )
+        argv.extend(["--event-id", payload["event_id"]])
+        if objective is not None:
+            argv.extend(["--objective", objective])
+        if task_plan_path:
+            argv.extend(["--task-plan-path", task_plan_path])
+        if target_branch:
+            argv.extend(["--branch", target_branch])
+        if target_head:
+            argv.extend(["--commit-sha", target_head])
 
-    proc = _common.run_handoff_subprocess(repo_root, argv, timeout=_common.handoff_timeout(), cwd=target_worktree_path)
-    projection_status = _classify_returncode(proc.returncode)
-    # A structured rejection can arrive with a non-zero exit. Inspect stdout
-    # regardless of the returncode so an expected-revision rejection can still
-    # retry once using the revision the CLI observed. A second rejection is a
-    # real failure even if it reports another current_revision.
-    rejection = _rejection_data(proc.stdout)
-    if rejection is not None:
-        current_revision = rejection.get("current_revision")
-        if isinstance(current_revision, int) and not isinstance(current_revision, bool) and current_revision >= 0:
-            retry_argv = [*argv, "--expected-revision", str(current_revision)]
-            proc = _common.run_handoff_subprocess(repo_root, retry_argv, timeout=_common.handoff_timeout(), cwd=target_worktree_path)
-            projection_status = _classify_returncode(proc.returncode)
-            if _rejection_data(proc.stdout) is not None:
+        proc = _common.run_handoff_subprocess(repo_root, argv, timeout=_common.handoff_timeout(), cwd=target_worktree_path)
+        projection_status = _classify_returncode(proc.returncode)
+        # A structured rejection can arrive with a non-zero exit. Inspect stdout
+        # regardless of the returncode so an expected-revision rejection can still
+        # retry once using the revision the CLI observed. A second rejection is a
+        # real failure even if it reports another current_revision.
+        rejection = _rejection_data(proc.stdout)
+        if rejection is not None:
+            current_revision = rejection.get("current_revision")
+            if isinstance(current_revision, int) and not isinstance(current_revision, bool) and current_revision >= 0:
+                retry_argv = [*argv, "--expected-revision", str(current_revision)]
+                proc = _common.run_handoff_subprocess(repo_root, retry_argv, timeout=_common.handoff_timeout(), cwd=target_worktree_path)
+                projection_status = _classify_returncode(proc.returncode)
+                if _rejection_data(proc.stdout) is not None:
+                    projection_status = "spooled"
+            else:
                 projection_status = "spooled"
-        else:
-            projection_status = "spooled"
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        proc = _common.subprocess.CompletedProcess([], 127, stdout="", stderr=str(exc))
+        projection_status = "pending"
     if projection_status == "synced" and not state_sync_receipt_matches(proc.stdout, payload):
         projection_status = "spooled"
     if projection_status == "synced":

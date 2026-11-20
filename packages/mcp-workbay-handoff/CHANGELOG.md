@@ -3,6 +3,20 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.31] — 2026-11-20
+
+### Fixed
+- Review subjects are resolved before charging, lane releases identify their proven issuer, and lane registrations survive archive and import operations.
+- Reimporting an exported review archive no longer duplicates occurrences, and blocking reviews use the cycle ledger.
+- Empty validation passes require completed collection evidence; interrupted collection reports unknown, and base results are signed and published by the harness.
+- On hosts with GNU timeout, remote routing and driver startup share one bounded deadline and return typed refusals; BusyBox timeout hosts are not covered by this bound.
+- SQLite qualification honors the package path and avoids probing protected facts.
+- Coordination history before observation coverage remains unknown, and lane close and planning custody use guarded evidence.
+
+### Added
+- Continuation lookup by exact packet ID distinguishes a missing packet (`not_found`) from an unreadable store (`continuation_load_failed`).
+- Task start writes a digest-stamped lane manifest and supports proven zero-dispatch lanes.
+
 ## [0.3.30] — 2026-11-12
 
 ### Fixed

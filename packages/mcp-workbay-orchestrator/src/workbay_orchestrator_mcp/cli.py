@@ -27,6 +27,7 @@ Subcommands:
   lane-report              Record a worker lane report.
   lane-report-list         List worker lane reports.
   lane-report-ack-backfill Backfill stranded submitted worker reports to acknowledged.
+  lane-queue-drain          Drain terminal lane queues (dry-run by default).
   lane-reap                Reap conclusive-dead non-terminal lane rows (dry-run by default).
                            --cross-session reaps preserved, clean, unowned lanes of an
                            in-progress task (exit 0 nothing to reclaim; exit 3 backlog
@@ -85,6 +86,7 @@ from .lanes import (
 from .lanes import (
     DEFAULT_BLOCKED_LANE_REAP_BATCH,
     backfill_worker_report_acks,
+    drain_terminal_lane_queues,
     get_lane_activity,
     lane_communication,
     manage_worktree_lane,
@@ -1306,6 +1308,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional max rows to process (default: all).",
     )
 
+    lane_queue_drain_p = subparsers.add_parser(
+        "lane-queue-drain", help="Drain terminal lane messages and reports (dry-run by default)."
+    )
+    drain_mode = lane_queue_drain_p.add_mutually_exclusive_group()
+    drain_mode.add_argument("--dry-run", action="store_true", help="Preview eligible rows without changing them.")
+    drain_mode.add_argument("--apply", action="store_true", help="Apply the terminal lane queue drain.")
+    lane_queue_drain_p.add_argument("--limit", type=_nonnegative_int_arg, required=True)
+    lane_queue_drain_p.add_argument("--task-ref", default=None)
+
     lane_reap_p = subparsers.add_parser(
         "lane-reap",
         help="Reap conclusive-dead non-terminal lane rows (dry-run by default).",
@@ -1961,6 +1972,10 @@ def main() -> None:
                 limit=args.limit,
             )
         )
+        return
+
+    if cmd == "lane-queue-drain":
+        _emit_lane_payload(drain_terminal_lane_queues(task_ref=args.task_ref, limit=args.limit, dry_run=not args.apply))
         return
 
     if cmd == "lane-reap":

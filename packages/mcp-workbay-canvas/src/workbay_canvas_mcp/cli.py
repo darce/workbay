@@ -626,6 +626,7 @@ _BUNDLE_CLI_EXIT_CODES = {
     "path_outside_workspace": 2,
     "map_invalid": 2,
     "config_invalid": 2,
+    "config_missing": 2,
     "bundle_not_found": 1,
     "bundle_too_large": 1,
     "collector_failed": 1,
@@ -814,9 +815,16 @@ def workbay_studio_front_door(argv: Sequence[str] | None = None) -> int:
 
 def serve_fleet(argv: Sequence[str] | None = None) -> int:
     """Public Fleet launcher sharing the local server, without a Studio destination."""
+    from workbay_canvas_mcp.fleet_refresher import FleetRefresher
+
     args = _parse_args(["local", *list(sys.argv[1:] if argv is None else argv)])
     args.view = "fleet"
-    return _run_local(args)
+    refresher = FleetRefresher(Path(args.workspace_root) if args.workspace_root else Path.cwd())
+    try:
+        refresher.start()
+        return _run_local(args)
+    finally:
+        refresher.stop()
 
 
 def ux_map_main(argv: Sequence[str] | None = None) -> int:

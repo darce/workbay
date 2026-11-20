@@ -51,11 +51,51 @@ function moduleMajor(req, name, mod) {
   return 0;
 }
 
-function loadToolchain(workspaceRoot) {
+// A toolchain root is copied into a shell command only when it is a plain
+// relative path that no shell or npm option parser can reinterpret.
+const SHELL_SAFE_ROOT = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/;
+const MAX_REMEDY_ROOT_LENGTH = 200;
+
+function containedToolchainRoot(workspaceRoot, toolchainRoot) {
+  if (toolchainRoot === null) {
+    return null;
+  }
+  try {
+    const candidate = fs.realpathSync(path.join(workspaceRoot, toolchainRoot));
+    return isInsideRoot(candidate, fs.realpathSync(workspaceRoot)) ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function dependencyRemedy(toolchainRoot, candidate) {
+  if (candidate === null || toolchainRoot.length > MAX_REMEDY_ROOT_LENGTH || !SHELL_SAFE_ROOT.test(toolchainRoot)) {
+    return {};
+  }
+  try {
+    if (!fs.statSync(path.join(candidate, "package-lock.json")).isFile()) {
+      return {};
+    }
+  } catch {
+    return {};
+  }
+  return { dependency_root: toolchainRoot, remedy: `npm --prefix ${toolchainRoot} ci` };
+}
+
+function loadToolchain(workspaceRoot, toolchainRoot) {
+  const candidate = containedToolchainRoot(workspaceRoot, toolchainRoot);
   const sources = [
     () => createRequire(import.meta.url),
     () => createRequire(path.join(workspaceRoot, "package.json")),
   ];
+  if (candidate !== null) {
+    sources.unshift(() => {
+      const req = createRequire(path.join(candidate, "package.json"));
+      // Absolute package directories prohibit Node's parent walk for this pair.
+      // node_modules itself may point to a provisioned dependency cache.
+      return (name) => req(path.join(candidate, "node_modules", name));
+    });
+  }
   for (const makeRequire of sources) {
     try {
       const req = makeRequire();
@@ -73,6 +113,7 @@ function loadToolchain(workspaceRoot) {
   throw new CollectError(4, {
     code: "deps_missing",
     message: "typescript>=5 and postcss>=8 not found beside the collector or in the workspace",
+    ...dependencyRemedy(toolchainRoot, candidate),
   });
 }
 
@@ -389,6 +430,24 @@ function requireVersion1(request) {
   }
 }
 
+function requestToolchainRoot(request) {
+  const value = request.toolchain_root;
+  if (value == null) {
+    return null;
+  }
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.includes("\0")
+    || path.isAbsolute(value)
+    || path.win32.isAbsolute(value)
+    || value.split(/[\\/]/).includes("..")
+  ) {
+    throw invalid("toolchain_root must be a workspace-relative path");
+  }
+  return value;
+}
+
 function listField(request, name) {
   const value = request[name];
   if (value == null) {
@@ -414,6 +473,7 @@ function maxBytes(request, name, fallback) {
 
 export function collect(request, io) {
   requireVersion1(request);
+  const toolchainRoot = requestToolchainRoot(request);
   const readFile = io && io.readFile;
   const realpath = io && io.realpath;
   const lstat = io && io.lstat;
@@ -427,7 +487,7 @@ export function collect(request, io) {
   } catch {
     throw invalid("workspace_root does not exist");
   }
-  loadToolchain(rootReal);
+  loadToolchain(rootReal, toolchainRoot);
 
   const maxSource = maxBytes(request, "max_source_file_bytes", 1 << 20);
   const maxCss = maxBytes(request, "max_css_bytes", 8 << 20);

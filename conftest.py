@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-pytest_plugins = ["wb_live_state_guard", "wb_test_tier"]
+pytest_plugins = ["wb_live_state_guard", "wb_test_tier", "wb_native_console"]
 
 
 @pytest.fixture(scope="session", autouse=True)

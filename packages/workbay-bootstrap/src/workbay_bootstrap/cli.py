@@ -22,7 +22,12 @@ from workbay_bootstrap.install import (
     _split_managed_optional,
     install,
 )
-from workbay_bootstrap.install_receipt import InstallReceipt, TrackedChangeReport, snapshot_tracked_files
+from workbay_bootstrap.install_receipt import (
+    MAINTENANCE_START_EXAMPLE,
+    InstallReceipt,
+    TrackedChangeReport,
+    snapshot_tracked_files,
+)
 from workbay_bootstrap.mcp_resolve import resolve_managed_mcp_servers
 from workbay_bootstrap.mcp_sync import (
     DEFAULT_SURFACES,
@@ -92,6 +97,19 @@ def _run_with_tracked_change_report(
     except OSError as exc:
         print(f"warning: could not save install receipt: {exc}", file=sys.stderr)
     return manifest
+
+
+def _print_tracked_change_report(target: Path, manifest: Mapping[str, Any]) -> None:
+    report = TrackedChangeReport(**manifest["tracked_changes"])
+    lifecycle_recipe = (report.commit_recipe or {}).get("kind") == "lifecycle"
+    if lifecycle_recipe or ((target / "Makefile").is_file() and (target / "Makefile.d/lifecycle.mk").is_file()):
+        print("For on-main installation maintenance, reuse a registered task if appropriate.")
+        if lifecycle_recipe:
+            print("Otherwise choose a unique task and objective for the registration recipe below.")
+        else:
+            print("Otherwise register a unique task and objective from the target repository, as in this example.")
+            print(f"  {MAINTENANCE_START_EXAMPLE}")
+    report.print_block()
 
 
 def _collect_mcp_opt_in_flags(args: argparse.Namespace) -> frozenset[str]:
@@ -1537,7 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"state backup: {manifest['state_backup_path']}", file=sys.stdout)
         _print_local_precedence_skips(manifest, args.target.resolve())
         _advise_optional_mcp_availability(args.target.resolve(), mcp_servers)
-        TrackedChangeReport(**manifest["tracked_changes"]).print_block()
+        _print_tracked_change_report(args.target, manifest)
         return 0
 
     if args.command in ("clean", "gc"):
@@ -1597,14 +1615,18 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         # Most informational notes and advisory warnings do not affect the
-        # exit code. local_incompatible and local_unprobed both gate dispatch:
-        # either the transport is incompatible, or its compatibility could
-        # not be established.
+        # exit code. These warnings do gate it: the transport is incompatible
+        # or unprobed, or historical embedding coverage needs backfilling.
+        gating_warning_kinds = {
+            "local_incompatible",
+            "local_unprobed",
+            "embedding_backfill_gap",
+        }
         notes = [
             f
             for f in findings
             if f.get("severity") == "info"
-            or (f.get("severity") == "warning" and f.get("kind") not in {"local_incompatible", "local_unprobed"})
+            or (f.get("severity") == "warning" and f.get("kind") not in gating_warning_kinds)
         ]
         actionable = [f for f in findings if f not in notes]
 
@@ -1615,7 +1637,7 @@ def main(argv: list[str] | None = None) -> int:
             return f"{f['kind']}: {f['path']}" + (f" — {detail}" if detail else "")
 
         for f in actionable:
-            prefix = "warning " if f.get("kind") in {"local_incompatible", "local_unprobed"} else ""
+            prefix = "warning " if f.get("severity") == "warning" else ""
             print(prefix + _line(f), file=sys.stdout)
         for f in notes:
             prefix = "warning" if f.get("severity") == "warning" else "note"
@@ -1680,7 +1702,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stdout,
             )
         _print_local_precedence_skips(manifest, args.target.resolve())
-        TrackedChangeReport(**manifest["tracked_changes"]).print_block()
+        _print_tracked_change_report(args.target, manifest)
         return 0
 
     if args.command == "apply-hooks":

@@ -12,9 +12,12 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from workbay_protocol import reasoning_effort as model_routing
 
 from workbay_orchestrator_mcp.orchestration.offload_timeout_ssot import CODEX_TIMEOUT_CAP
 
@@ -336,7 +339,7 @@ def _registry_identity(role: str) -> RoleIdentity:
             role=ROLE_REVIEW,
             backend="codex-remote",
             provider="openai",
-            model="gpt-5.6-luna",
+            model=model_routing.MODEL_ROUTING_DEFAULTS["review_role"],
             effort="max",
             transport="remote_exec",
         )
@@ -344,7 +347,7 @@ def _registry_identity(role: str) -> RoleIdentity:
         role=ROLE_EXECUTION,
         backend="grok-cli",
         provider="xai",
-        model="grok-4.6",
+        model=model_routing.MODEL_ROUTING_DEFAULTS["grok"],
         effort="high",
         transport="grok-cli",
     )
@@ -382,7 +385,13 @@ def _model_family(model: str) -> str | None:
     slug = model.strip().lower()
     if slug.startswith("grok"):
         return "grok"
-    if slug.startswith(("gpt-", "o1", "o3", "o4")) or "luna" in slug or slug.endswith("-sol") or "codex" in slug:
+    if (
+        slug.startswith("gpt-")
+        or re.match(r"o[134]", slug)
+        or "luna" in slug
+        or slug.endswith("-sol")
+        or "codex" in slug
+    ):
         return "codex"
     if slug.startswith("cursor") or slug.startswith("kimi"):
         return "cursor"

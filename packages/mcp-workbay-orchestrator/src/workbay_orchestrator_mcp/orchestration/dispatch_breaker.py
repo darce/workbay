@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from .learned_wave_cap import bounded_file_lock
 
 STATE_FILE = ".task-state/dispatch-breaker.json"
@@ -36,7 +38,7 @@ _DETERMINISTIC_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 _DETERMINISTIC_REFUSAL_PHRASES = (
-    "grok-build family refused",
+    f"{model_routing.ModelId.GROK_BUILD} family refused",
     "allowed is the configured pin",
     "allowed is the curated allow-list",
 )

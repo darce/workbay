@@ -724,8 +724,8 @@ def _handoff_cli_reachable(repo: Path) -> tuple[bool, int | None]:
     # permanently. (mcp_handoff_bin already honours MCP_WORKBAY_HANDOFF_BIN.)
     from handlers import _common  # lazy import: avoid a queue<->handlers cycle
 
-    binary = _common.mcp_handoff_bin(repo)
     try:
+        binary = _common.mcp_handoff_bin(repo)
         proc = subprocess.run(
             [binary, "--help"],
             cwd=repo,
@@ -738,6 +738,16 @@ def _handoff_cli_reachable(repo: Path) -> tuple[bool, int | None]:
             ),
             check=False,
         )
+    except ValueError as exc:
+        # The policy is loaded afresh by the resolver, so use its stable code
+        # contract rather than the identity of a separately loaded class.
+        code = getattr(exc, "code", None)
+        if code == "native_runtime_unqualified":
+            return False, 127
+        if code == "native_runtime_unverified":
+            # Qualification exhausted its budget: no evidence of absence.
+            return False, PROBE_TIMEOUT_RETURNCODE
+        raise
     except FileNotFoundError:
         return False, 127
     except subprocess.TimeoutExpired:

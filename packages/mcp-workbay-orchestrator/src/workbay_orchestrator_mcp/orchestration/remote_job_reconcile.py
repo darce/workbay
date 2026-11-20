@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 from .lane_lifecycle_contracts import JOB_ID_RE
-from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError
+from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError, plan_review_failure
 
 _logger = logging.getLogger(__name__)
 
@@ -158,12 +158,6 @@ def reconcile_remote_jobs_at_startup(
     ledger = RemoteJobLedger(resolved_state / "remote-jobs")
     applied_ids: set[str] = set()
     rewritten_ids: set[str] = set()
-    _readopt_running_jobs(
-        ledger,
-        state_dir=resolved_state,
-        now=now,
-        result=result,
-    )
     jobs = _load_sweep(
         result,
         vm_jobs=vm_jobs,
@@ -172,11 +166,71 @@ def reconcile_remote_jobs_at_startup(
         sweep_cwd=sweep_cwd,
         sweep_timeout=sweep_timeout,
     )
+    held_jobs: set[str] = set()
+    records = _open_ledger_jobs(ledger, result, held_jobs)
+    if records is None:
+        return result
+    for report in jobs or ():
+        state = report.get("state")
+        if state in ("unknown", "unreachable") or (report.get("observer_error") and state not in _TERMINAL_STATES):
+            held_jobs.add(report["job_id"])
+            result["ok"] = False
+            result["refused"].append(
+                {
+                    "job_id": report["job_id"],
+                    "attempt": report.get("attempt"),
+                    "reason": "remote_state_unknown",
+                    "state": "unknown",
+                    "remote_state": state,
+                    "observer_error": report.get("observer_error"),
+                }
+            )
+    _readopt_running_jobs(
+        records,
+        state_dir=resolved_state,
+        now=now,
+        result=result,
+        held_jobs=held_jobs,
+    )
+    finisher = complete_pass or _default_complete
+    # Durable done is terminal VM evidence, even when no new inventory is
+    # available. Observed jobs go through report validation below, preserving
+    # fences, uncertain observations and the legacy attached rescue path.
+    observed_ids = {
+        report["job_id"]
+        for report in jobs or ()
+        if isinstance(report, Mapping) and isinstance(report.get("job_id"), str)
+    }
+    for record in records:
+        if record.get("stage") != "done" or result["sweep_status"] == "failed":
+            continue
+        identity = _spec_identity(record)
+        if identity is None:
+            continue  # readoption already reported the malformed identity
+        job_id, _pass_id, attempt = identity
+        if job_id in held_jobs or job_id in observed_ids or _legacy_attached(record):
+            continue
+        _ingest_known_report(
+            {"job_id": job_id, "attempt": attempt, "state": record.get("remote_state", "done")},
+            record,
+            job_id=job_id,
+            state_dir=resolved_state,
+            orchestrator_root=resolved_root,
+            now=now,
+            result=result,
+            complete_pass=finisher,
+            applied_ids=applied_ids,
+        )
     if jobs is None:
         return result
-    known = _known_job_ids(ledger)
-    finisher = complete_pass or _default_complete
+    try:
+        known = ledger.job_ids()
+    except OSError as exc:
+        _refuse_ledger_inventory(result, exc)
+        return result
     for report in jobs:
+        if report["job_id"] in held_jobs or (not result["orphans_known"] and report["job_id"] not in known):
+            continue
         _ingest_report(
             report,
             ledger=ledger,
@@ -201,23 +255,73 @@ def reconcile_remote_jobs_at_startup(
     return result
 
 
+def _open_ledger_jobs(ledger: RemoteJobLedger, result: dict[str, Any], held_jobs: set[str]) -> list[dict] | None:
+    def refuse_record(job_id: str, exc: Exception) -> None:
+        held_jobs.add(job_id)
+        result["ok"] = result["orphans_known"] = False
+        result["refused"].append(
+            {
+                "job_id": job_id,
+                "state": "unknown",
+                "store": "remote-jobs/ledger",
+                "path": f"remote-jobs/ledger/{job_id}.json",
+                "reason": "ledger_read_error",
+                "error_type": type(exc).__name__,
+            }
+        )
+
+    try:
+        return ledger.open_jobs(on_read_error=refuse_record)
+    except (OSError, ValueError, RecursionError, RemoteJobLedgerError) as exc:
+        _refuse_ledger_inventory(result, exc)
+        return None
+
+
+def _refuse_ledger_inventory(result: dict[str, Any], exc: Exception) -> None:
+    result["ok"] = False
+    result["orphans_known"] = False
+    result["refused"].append(
+        {
+            "state": "unknown",
+            "store": "remote-jobs/ledger",
+            "reason": "ledger_read_error",
+            "error_type": type(exc).__name__,
+        }
+    )
+
+
 def _readopt_running_jobs(
-    ledger: RemoteJobLedger,
+    records: list[dict],
     *,
     state_dir: Path,
     now: datetime,
     result: dict[str, Any],
+    held_jobs: set[str],
 ) -> None:
     seen: set[str] = set()
-    for record in ledger.open_jobs():
+    for record in records:
         identity = _spec_identity(record)
         if identity is None:
             job_id, _pass_id, attempt = _spec_identity_parts(record)
             _refuse_missing_spec_identity(result, job_id=job_id, attempt=attempt)
             continue
         job_id, pass_id, attempt = identity
-        pass_state = _pass_state(state_dir, pass_id)
-        if pass_state.get("status") != "running":
+        if job_id in held_jobs:
+            continue
+        pass_state = _observed_pass_state(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt)
+        if pass_state is None:
+            held_jobs.add(job_id)
+            continue
+        if "plan_review_binding" in record["spec"]:
+            continue
+        pass_result = pass_state.get("result")
+        # A done/pending receipt is still owned by the fenced remote job.
+        if not (
+            pass_state.get("status") == "running"
+            or pass_state.get("status") == "done"
+            and isinstance(pass_result, Mapping)
+            and pass_result.get("outcome") == "remote_job_pending"
+        ):
             continue
         fence_reason = _fence_reason(pass_state, job_id=job_id, attempt=attempt)
         if fence_reason is not None:
@@ -229,14 +333,9 @@ def _readopt_running_jobs(
                 reason=fence_reason,
             )
             continue
-        _write_adoption(
-            state_dir,
-            job_id=job_id,
-            attempt=attempt,
-            pass_id=pass_id,
-            now=now,
-            applied=False,
-        )
+        if not _record_adoption(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt, now=now):
+            held_jobs.add(job_id)
+            continue
         if job_id not in seen:
             seen.add(job_id)
             result["adopted"].append({"job_id": job_id, "attempt": attempt, "pass_id": pass_id})
@@ -344,15 +443,27 @@ def _ingest_known_report(
         _refuse(result, job_id=job_id, attempt=_presented_attempt(report, 0), reason="spec_identity_missing")
         return
     _job_id, pass_id, attempt = identity
-    if not _ingest_fence_allows(report, state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt):
+    if "plan_review_binding" in record["spec"]:
+        # This reservation has its own producer and no lane pass fence.
+        if _observed_pass_state(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt) is None:
+            return
+        if (failure := plan_review_failure(record)) is not None:
+            result.setdefault("plan_review_failures", []).append(failure)
+        elif record.get("stage") != "completed" and report.get("state") in _TERMINAL_STATES:
+            _refuse(result, job_id=job_id, attempt=attempt, reason="plan_review_owner_pending")
         return
-    _write_adoption(state_dir, job_id=job_id, attempt=attempt, pass_id=pass_id, now=now, applied=False)
+    pass_state = _fenced_pass_state(report, state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt)
+    if pass_state is None:
+        return
+    if not _record_adoption(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt, now=now):
+        return
     if report.get("state") not in _TERMINAL_STATES:
         return
     _apply_once(
         job_id,
         attempt=attempt,
         pass_id=pass_id,
+        pass_state=pass_state,
         state_dir=state_dir,
         orchestrator_root=orchestrator_root,
         now=now,
@@ -362,7 +473,7 @@ def _ingest_known_report(
     )
 
 
-def _ingest_fence_allows(
+def _fenced_pass_state(
     report: Mapping[str, Any],
     state_dir: Path,
     result: dict[str, Any],
@@ -370,19 +481,28 @@ def _ingest_fence_allows(
     job_id: str,
     pass_id: str,
     attempt: int,
-) -> bool:
-    pass_state = _pass_state(state_dir, pass_id)
+) -> dict[str, Any] | None:
+    pass_state = _observed_pass_state(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt)
+    if pass_state is None:
+        return None
     # RES-10: the pass attempt is the only token allowed to apply, including
     # after this same startup has already finished the current attempt.
     fence_reason = _fence_reason(pass_state, job_id=job_id, attempt=attempt)
     if fence_reason is not None:
         _refuse_presented(result, pass_state, job_id=job_id, attempt=attempt, reason=fence_reason)
-        return False
+        return None
     report_reason = _fence_reason(report, job_id=job_id, attempt=attempt)
     if report_reason is not None:
         _refuse_presented(result, report, job_id=job_id, attempt=attempt, reason=report_reason)
-        return False
-    return pass_state.get("status") == "running"
+        return None
+    pass_result = pass_state.get("result")
+    if pass_state.get("status") == "running" or (
+        pass_state.get("status") == "done"
+        and isinstance(pass_result, Mapping)
+        and pass_result.get("outcome") == "remote_job_pending"
+    ):
+        return pass_state
+    return None
 
 
 class _Renew(Enum):
@@ -467,11 +587,12 @@ def _apply_once(
     result: dict[str, Any],
     complete_pass: Callable[..., object],
     applied_ids: set[str],
+    pass_state: dict[str, Any] | None = None,
 ) -> None:
     if job_id in applied_ids:
         return
     try:
-        budget = _completion_budget(complete_pass, state_dir, pass_id)
+        budget = _completion_budget(complete_pass, pass_state)
     except ValueError as exc:
         result["ok"] = False
         result["completion_errors"].append({"job_id": job_id, "reason": str(exc)})
@@ -490,14 +611,16 @@ def _apply_once(
         )
 
 
-def _completion_budget(complete_pass: Callable[..., object], state_dir: Path, pass_id: str) -> float | None:
+def _completion_budget(complete_pass: Callable[..., object], pass_state: dict[str, Any] | None) -> float | None:
     """Production completion carries its configured budget; injected callbacks keep the compatibility bound."""
 
     if complete_pass is not _default_complete:
         return None
     from .offload_pass import completion_timeout_seconds  # noqa: PLC0415
 
-    return completion_timeout_seconds(_pass_state(state_dir, pass_id))
+    if pass_state is None:
+        raise ValueError("pass_state_unobserved")
+    return completion_timeout_seconds(pass_state)
 
 
 def _acquire_for_completion(
@@ -512,9 +635,13 @@ def _acquire_for_completion(
 ) -> _HeldClaim | None:
     """Return the claim only when this call acquired it; any other decision is settled here."""
 
-    decision, fence_token = _acquire_completion_claim(
-        state_dir, job_id=job_id, attempt=attempt, pass_id=pass_id, now=now
-    )
+    try:
+        decision, fence_token = _acquire_completion_claim(
+            state_dir, job_id=job_id, attempt=attempt, pass_id=pass_id, now=now
+        )
+    except (OSError, RemoteJobReconcileError) as exc:
+        _refuse_adoption_io(state_dir, result, job_id=job_id, attempt=attempt, exc=exc)
+        return None
     if decision == "skip":
         return None
     if decision == "held":
@@ -562,6 +689,16 @@ def _complete_under_claim(
         _fail_completion(result, claim, done)
     elif not isinstance(done.outcome, dict) or done.outcome.get("terminal") is not True:
         _settle_nonterminal_claim(result, claim)
+        if isinstance(done.outcome, dict) and done.outcome.get("reason") == "pass_state_unreadable":
+            result["ok"] = False
+            _refuse(
+                result,
+                job_id=claim.job_id,
+                attempt=claim.attempt,
+                reason=done.outcome["reason"],
+                store=done.outcome.get("store"),
+                error_type=done.outcome.get("error_type"),
+            )
     else:
         _finalize_completion(result, claim, applied_ids)
 
@@ -917,11 +1054,23 @@ def _default_complete(
     return outcome
 
 
-def _pass_state(state_dir: Path, pass_id: str) -> dict[str, Any]:
-    from .offload_pass import read_pass_state  # noqa: PLC0415
+def _observed_pass_state(
+    state_dir: Path, result: dict[str, Any], *, job_id: str, pass_id: str, attempt: int
+) -> dict[str, Any] | None:
+    from .offload_pass import PassStateUnreadable, read_pass_state  # noqa: PLC0415
 
-    loaded = read_pass_state(state_dir, pass_id)
-    return loaded if isinstance(loaded, dict) else {}
+    try:
+        return read_pass_state(state_dir, pass_id, strict=True) or {}
+    except PassStateUnreadable as exc:
+        _refuse_unknown_store(
+            result,
+            job_id=job_id,
+            attempt=attempt,
+            store=exc.store,
+            reason="pass_state_unreadable",
+            exc=exc.__cause__ or exc,
+        )
+        return None
 
 
 def _spec_identity(record: Mapping[str, Any]) -> tuple[str, str, int] | None:
@@ -1044,8 +1193,11 @@ def _refuse(
     attempt: int,
     reason: str,
     error_type: str | None = None,
+    store: str | None = None,
 ) -> None:
     row: dict[str, Any] = {"job_id": job_id, "attempt": attempt, "reason": reason}
+    if store is not None:
+        row.update(state="unknown", store=store)
     if error_type is None:
         _logger.warning("remote job reconcile refused job_id=%s reason=%s", job_id, reason)
     else:
@@ -1057,6 +1209,13 @@ def _refuse(
             error_type,
         )
     result["refused"].append(row)
+
+
+def _refuse_unknown_store(
+    result: dict[str, Any], *, job_id: str, attempt: int, store: str, reason: str, exc: BaseException
+) -> None:
+    result["ok"] = False
+    _refuse(result, job_id=job_id, attempt=attempt, reason=reason, error_type=type(exc).__name__, store=store)
 
 
 def _refuse_ledger_read(
@@ -1077,13 +1236,6 @@ def _refuse_ledger_read(
 
 def _adoption_path(state_dir: Path, job_id: str) -> Path:
     return state_dir / "remote-jobs" / "adoptions" / f"{job_id}.json"
-
-
-def _adoption_applied(state_dir: Path, job_id: str, attempt: int) -> bool:
-    record = _read_json(_adoption_path(state_dir, job_id))
-    if not isinstance(record, dict):
-        return False
-    return record.get("applied") is True and record.get("applied_attempt") == attempt
 
 
 def _claim_now_ns() -> int:
@@ -1176,9 +1328,9 @@ def _acquire_completion_claim(
 
     path = _adoption_path(state_dir, job_id)
     with _locked(path.parent / ".lock"):
-        if _adoption_applied(state_dir, job_id, attempt):
+        current = _read_adoption_strict(path, job_id, pass_id, attempt)
+        if current.get("applied") is True and current.get("applied_attempt") == attempt:
             return "skip", None
-        current = _read_json(path) or {}
         claim = current.get("claim")
         if _claim_is_live(claim):
             return "held", None
@@ -1224,7 +1376,7 @@ def _stored_lease_seconds(claim: Mapping[str, Any]) -> float | None:
     return float(lease)
 
 
-def _read_adoption_strict(path: Path) -> dict[str, Any]:
+def _read_adoption_strict(path: Path, job_id: str, pass_id: str, attempt: int) -> dict[str, Any]:
     """Read an adoption record. Absent is ``{}``; an unreadable one is a typed error.
 
     ``_read_json`` maps both to ``None``, which reads as "no claim" and would end
@@ -1239,6 +1391,15 @@ def _read_adoption_strict(path: Path) -> dict[str, Any]:
         raise RemoteJobReconcileError("adoption_unreadable") from exc
     if not isinstance(payload, dict):
         raise RemoteJobReconcileError("adoption_unreadable")
+    if payload.get("pass_id") != pass_id or not _fence_matches(payload, job_id, attempt):
+        raise RemoteJobReconcileError("adoption_identity_mismatch")
+    if type(payload.get("applied")) is not bool:
+        raise RemoteJobReconcileError("adoption_invalid_applied_fence")
+    if payload["applied"]:
+        if type(payload.get("applied_attempt")) is not int or payload["applied_attempt"] != attempt:
+            raise RemoteJobReconcileError("adoption_invalid_applied_fence")
+    elif "applied_attempt" in payload:
+        raise RemoteJobReconcileError("adoption_invalid_applied_fence")
     return payload
 
 
@@ -1263,7 +1424,7 @@ def _renew_completion_claim(
 
     path = _adoption_path(state_dir, job_id)
     with _locked(path.parent / ".lock"):
-        current = _read_adoption_strict(path)
+        current = _read_adoption_strict(path, job_id, pass_id, attempt)
         if current.get("applied") is True:
             return _Renew.applied, None
         if "claim" not in current:
@@ -1383,7 +1544,7 @@ def _finish_applied_claim(
 
     path = _adoption_path(state_dir, job_id)
     with _locked(path.parent / ".lock"):
-        current = _read_adoption_strict(path)
+        current = _read_adoption_strict(path, job_id, pass_id, attempt)
         claim = current.get("claim")
         if not _claim_token_matches(claim, fence_token) or not isinstance(claim, dict):
             _logger.warning("remote job reconcile stale fence finalize job_id=%s", job_id)
@@ -1414,7 +1575,7 @@ def _release_own_claim(
 ) -> bool:
     path = _adoption_path(state_dir, job_id)
     with _locked(path.parent / ".lock"):
-        current = _read_adoption_strict(path)
+        current = _read_adoption_strict(path, job_id, pass_id, attempt)
         claim = current.get("claim")
         if not _claim_token_matches(claim, fence_token) or not isinstance(claim, dict):
             return False
@@ -1432,6 +1593,25 @@ def _release_own_claim(
             keep_claim=False,
         )
         return True
+
+
+def _refuse_adoption_io(
+    state_dir: Path, result: dict[str, Any], *, job_id: str, attempt: int, exc: OSError | RemoteJobReconcileError
+) -> None:
+    store = str(_adoption_path(state_dir, job_id).relative_to(state_dir))
+    reason = exc.reason if isinstance(exc, RemoteJobReconcileError) else "adoption_io_error"
+    _refuse_unknown_store(result, job_id=job_id, attempt=attempt, store=store, reason=reason, exc=exc)
+
+
+def _record_adoption(
+    state_dir: Path, result: dict[str, Any], *, job_id: str, pass_id: str, attempt: int, now: datetime
+) -> bool:
+    try:
+        _write_adoption(state_dir, job_id=job_id, attempt=attempt, pass_id=pass_id, now=now, applied=False)
+    except (OSError, RemoteJobReconcileError) as exc:
+        _refuse_adoption_io(state_dir, result, job_id=job_id, attempt=attempt, exc=exc)
+        return False
+    return True
 
 
 def _write_adoption(
@@ -1471,7 +1651,7 @@ def _write_adoption_unlocked(
     keep_claim: bool = True,
 ) -> None:
     path = _adoption_path(state_dir, job_id)
-    current = _read_json(path) or {}
+    current = _read_adoption_strict(path, job_id, pass_id, attempt)
     adopted_at = current.get("adopted_at")
     if not isinstance(adopted_at, str):
         adopted_at = now.isoformat()
@@ -1489,13 +1669,8 @@ def _write_adoption_unlocked(
         payload["claim"] = dict(claim)
     elif keep_claim and isinstance(current.get("claim"), dict):
         payload["claim"] = current["claim"]
-    _write_json(path, payload)
-
-
-def _known_job_ids(ledger: RemoteJobLedger) -> set[str]:
-    if not ledger.ledger_dir.is_dir():
-        return set()
-    return {path.stem for path in ledger.ledger_dir.glob("j*.json") if JOB_ID_RE.fullmatch(path.stem)}
+    if payload != current:
+        _write_json(path, payload)
 
 
 def _clock_now(clock: Callable[[], datetime] | None) -> datetime:

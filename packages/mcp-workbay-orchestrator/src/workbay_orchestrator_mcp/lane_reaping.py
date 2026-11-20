@@ -3115,6 +3115,82 @@ def _package_virtualenv_rule(
     return f"package_virtualenv:{venv_dir}"
 
 
+class _EditableMetadataProbeError(RuntimeError):
+    """The tracked-package evidence for ignored metadata was unreadable."""
+
+
+def _editable_install_metadata_rule(
+    normalized: str,
+    worktree_path: str | None,
+    manifest_cache: dict[str, bool],
+) -> str | None:
+    """Recognize editable-install metadata only beneath a tracked project.
+
+    The package root and metadata directory are intentionally narrow: a name
+    elsewhere, or a project manifest which exists but is not tracked, cannot
+    authorize the deletion. Cache the index proof once per package and per
+    ignored-content probe, never across probes or worktrees.
+    """
+    parts = normalized.split("/")
+    if (
+        worktree_path is None
+        or len(parts) < 5
+        or parts[0] != "packages"
+        or parts[2] != "src"
+        or not any(parts[3].endswith(suffix) and parts[3] != suffix for suffix in (".egg-info", ".dist-info"))
+    ):
+        return None
+
+    # Git enumerates ignored leaves, so do not use a symlinked ancestor or a
+    # special leaf as proof of an editable-install metadata directory.
+    directory = Path(worktree_path)
+    try:
+        for component in parts[:4]:
+            directory /= component
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                return None
+    except OSError:
+        return None
+    candidate = _contained_worktree_path(worktree_path, normalized)
+    if candidate is None or _regular_file_size(candidate) is None:
+        return None
+
+    manifest = "/".join((parts[0], parts[1], "pyproject.toml"))
+    manifest_path = _contained_worktree_path(worktree_path, manifest)
+    if manifest_path is None or _regular_file_size(manifest_path) is None:
+        return None
+    if manifest not in manifest_cache:
+        proc = _run_reclaim_command(
+            ["git", "-C", worktree_path, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", manifest]
+        )
+        if proc is None or proc.returncode != 0 or (proc.stderr or "").strip():
+            reason = "editable_metadata_manifest_probe_failed"
+            if proc is not None and proc.returncode == _RECLAIM_TIMEOUT_RETURN_CODE:
+                reason = "editable_metadata_manifest_probe_timeout"
+            raise _EditableMetadataProbeError(f"{reason}:{manifest}")
+        output = proc.stdout or ""
+        if output and not output.endswith("\0"):
+            raise _EditableMetadataProbeError(f"editable_metadata_manifest_probe_incomplete:{manifest}")
+        entries = [entry for entry in output.split("\0") if entry]
+        valid = False
+        if len(entries) == 1:
+            metadata, separator, tracked_path = entries[0].partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3:
+                raise _EditableMetadataProbeError(f"editable_metadata_manifest_probe_incomplete:{manifest}")
+            mode, oid, stage = fields
+            valid = (
+                tracked_path == manifest
+                and mode in {"100644", "100755"}
+                and stage == "0"
+                and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) is not None
+            )
+        manifest_cache[manifest] = valid
+    if not manifest_cache[manifest]:
+        return None
+    return "editable_install_metadata:" + "/".join(parts[:4])
+
+
 def _ignored_path_regenerable_rule(
     path: str,
     *,
@@ -3122,6 +3198,7 @@ def _ignored_path_regenerable_rule(
     identity: _ContentIdentityContext | None = None,
     worktree_path: str | None = None,
     package_virtualenv_cache: dict[str, bool] | None = None,
+    package_metadata_cache: dict[str, bool] | None = None,
 ) -> str | None:
     """Name the positive classification rule for one ignored file.
 
@@ -3145,6 +3222,7 @@ def _ignored_path_regenerable_rule(
         return "hardcoded_root:.task-state/*.stamp"
     hardcoded_roots = {root: root for root in _REGENERABLE_IGNORED_ROOTS}
     venv_marker_cache = package_virtualenv_cache if package_virtualenv_cache is not None else {}
+    metadata_cache = package_metadata_cache if package_metadata_cache is not None else {}
     return (
         _root_rule(normalized, hardcoded_roots, prefix="hardcoded_root")
         or _package_virtualenv_rule(normalized, worktree_path, venv_marker_cache)
@@ -3157,6 +3235,7 @@ def _ignored_path_regenerable_rule(
         # its own and its pointee survives removal -- ``Makefile.d`` and
         # ``.venv`` symlinked at the primary checkout.  Needs no ledger.
         or _symlink_outside_worktree_rule(normalized, worktree_path)
+        or _editable_install_metadata_rule(normalized, worktree_path, metadata_cache)
         # Consulted after content identity, and last overall.  It authorizes on
         # a weaker premise -- not "a copy survives" but "the bytes are worthless
         # once this worktree is gone" -- so it only ever converts a would-be
@@ -3184,7 +3263,7 @@ def _ignored_path_is_nested_repository(worktree_path: str, path: str) -> bool | 
         return None
     candidate = Path(worktree_path) / normalized
     try:
-        candidate_mode = candidate.stat().st_mode
+        candidate_mode = candidate.lstat().st_mode
     except FileNotFoundError:
         return False
     except OSError:
@@ -3301,21 +3380,25 @@ def _classification_verdict(
 ) -> _IgnoredContentVerdict:
     """Combine per-path authority rules into one auditable verdict."""
     package_virtualenv_cache: dict[str, bool] = {}
-    classified = [
-        (
-            path,
-            "audit_trail_harvested"
-            if _normalized_reclaim_relpath(path) in harvested
-            else _ignored_path_regenerable_rule(
-                path,
-                managed_roots=managed_roots,
-                identity=identity,
-                worktree_path=worktree_path,
-                package_virtualenv_cache=package_virtualenv_cache,
-            ),
-        )
-        for path in ignored
-    ]
+    package_metadata_cache: dict[str, bool] = {}
+    classified: list[tuple[str, str | None]] = []
+    for path in ignored:
+        try:
+            rule = (
+                "audit_trail_harvested"
+                if _normalized_reclaim_relpath(path) in harvested
+                else _ignored_path_regenerable_rule(
+                    path,
+                    managed_roots=managed_roots,
+                    identity=identity,
+                    worktree_path=worktree_path,
+                    package_virtualenv_cache=package_virtualenv_cache,
+                    package_metadata_cache=package_metadata_cache,
+                )
+            )
+        except _EditableMetadataProbeError as exc:
+            return _IgnoredContentVerdict(None, str(exc)[:_RECLAIM_DETAIL_CAP])
+        classified.append((path, rule))
     potentially_unique = [path for path, rule in classified if rule is None]
     if potentially_unique:
         refusals = _PRIMARY_COPY_REFUSALS.get()

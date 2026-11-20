@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -39,6 +40,26 @@ SECTION_KEYS: tuple[str, ...] = (
 )
 # Cap across all section text (UTF-8 bytes) so a single packet stays prompt-cheap.
 MAX_SECTIONS_BYTES = 16 * 1024
+
+
+class _PhaseTimer:
+    """Measure non-overlapping wall-clock phases without changing packet data."""
+
+    def __init__(self) -> None:
+        self._last = time.perf_counter_ns()
+        self._durations: dict[str, int] = {}
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter_ns()
+        self._durations[name] = now - self._last
+        self._last = now
+
+    def snapshot(self) -> dict[str, object]:
+        # The session transport budget is checked against serialized bytes.
+        # Keep measurement digits from changing its size between equivalent
+        # requests while retaining the actual numeric nanosecond values.
+        padding = max(0, 20 * len(self._durations) - sum(len(str(v)) for v in self._durations.values()))
+        return {**self._durations, "serialization_padding": " " * padding}
 
 
 def continuation_source_label(lane_id: str | None) -> str:
@@ -135,14 +156,11 @@ def _load_existing_packet(
     source_label: str,
 ) -> tuple[dict[str, Any] | None, int | None]:
     config = get_runtime_config()
-    try:
-        source = artifact_index.get_artifact_source(
-            task_ref=task_ref,
-            source_label=source_label,
-            artifact_db_path=config.artifact_db_path,
-        )
-    except RuntimeError:
-        return None, None
+    source = artifact_index.get_artifact_source(
+        task_ref=task_ref,
+        source_label=source_label,
+        artifact_db_path=config.artifact_db_path,
+    )
     if source is None:
         return None, None
     # Prefer the row that matches our source_kind + lane scoping when labels collide.
@@ -155,49 +173,46 @@ def _load_existing_packet(
 
 def _load_packet_by_id(packet_id: str, task_ref: str | None = None) -> tuple[dict[str, Any] | None, bool]:
     config = get_runtime_config()
-    try:
-        archive = None
-        if task_ref is not None:
-            archive = artifact_index.get_artifact_source(
-                task_ref=task_ref,
-                source_label=f"archive:{packet_id}",
-                artifact_db_path=config.artifact_db_path,
-            )
-        if archive is None or archive.get("source_kind") != ARCHIVE_SOURCE_KIND:
-            archive = artifact_index.find_artifact_source(
-                source_kind=ARCHIVE_SOURCE_KIND,
-                source_label=f"archive:{packet_id}",
-                artifact_db_path=config.artifact_db_path,
-            )
-        if archive is not None and archive.get("source_kind") == ARCHIVE_SOURCE_KIND:
-            packet = _packet_from_source(dict(archive))
-            if packet and packet.get("packet_id") == packet_id:
-                packet["source_id"] = int(archive["id"])
-                return packet, True
+    archive = None
+    if task_ref is not None:
+        archive = artifact_index.get_artifact_source(
+            task_ref=task_ref,
+            source_label=f"archive:{packet_id}",
+            artifact_db_path=config.artifact_db_path,
+        )
+    if archive is None or archive.get("source_kind") != ARCHIVE_SOURCE_KIND:
+        archive = artifact_index.find_artifact_source(
+            source_kind=ARCHIVE_SOURCE_KIND,
+            source_label=f"archive:{packet_id}",
+            artifact_db_path=config.artifact_db_path,
+        )
+    if archive is not None and archive.get("source_kind") == ARCHIVE_SOURCE_KIND:
+        packet = _packet_from_source(dict(archive))
+        if packet and packet.get("packet_id") == packet_id:
+            packet["source_id"] = int(archive["id"])
+            return packet, True
 
-        offset = 0
-        while True:
-            sources = artifact_index.list_artifact_sources(
-                task_ref=task_ref,
-                source_kind=SOURCE_KIND,
-                limit=200,
-                offset=offset,
+    offset = 0
+    while True:
+        sources = artifact_index.list_artifact_sources(
+            task_ref=task_ref,
+            source_kind=SOURCE_KIND,
+            limit=200,
+            offset=offset,
+            artifact_db_path=config.artifact_db_path,
+        )
+        for row in sources:
+            source = artifact_index.get_artifact_source(
+                source_id=int(row["id"]),
                 artifact_db_path=config.artifact_db_path,
             )
-            for row in sources:
-                source = artifact_index.get_artifact_source(
-                    source_id=int(row["id"]),
-                    artifact_db_path=config.artifact_db_path,
-                )
-                packet = _packet_from_source(dict(source) if source else None)
-                if packet and packet.get("packet_id") == packet_id:
-                    packet["source_id"] = int(row["id"])
-                    return packet, False
-            if len(sources) < 200:
-                break
-            offset += len(sources)
-    except RuntimeError:
-        return None, False
+            packet = _packet_from_source(dict(source) if source else None)
+            if packet and packet.get("packet_id") == packet_id:
+                packet["source_id"] = int(row["id"])
+                return packet, False
+        if len(sources) < 200:
+            break
+        offset += len(sources)
     return None, False
 
 
@@ -211,6 +226,13 @@ def save_continuation(
     gotchas: str | None = None,
 ) -> dict:
     """Upsert the newest continuation packet for ``(task_ref, lane_id)``."""
+    timer = _PhaseTimer()
+
+    def finish(result: dict, phase: str) -> dict:
+        timer.mark(phase)
+        result["data"]["phase_timings_ns"] = timer.snapshot()
+        return result
+
     sections = _normalize_sections(
         done_do_not_redo=done_do_not_redo,
         next_actions=next_actions,
@@ -218,18 +240,26 @@ def save_continuation(
         gotchas=gotchas,
     )
     if "error" in sections:
-        return _envelope(ok=False, tool="continuation", data=sections, task_ref=task_ref)
+        return finish(
+            _envelope(ok=False, tool="continuation", data={**sections, "outcome": "refused"}, task_ref=task_ref),
+            "validate",
+        )
+    timer.mark("validate")
 
     try:
         with _get_db_connection() as conn:
             resolved_task_ref = _resolve_task_ref(conn, task_ref)
     except Exception as exc:  # noqa: BLE001 — surface as write-contract-shaped error
-        return _envelope(
-            ok=False,
-            tool="continuation",
-            data={"error": str(exc), "code": "task_ref_unresolved"},
-            task_ref=task_ref,
+        return finish(
+            _envelope(
+                ok=False,
+                tool="continuation",
+                data={"error": str(exc), "code": "task_ref_unresolved", "outcome": "refused"},
+                task_ref=task_ref,
+            ),
+            "resolve_task",
         )
+    timer.mark("resolve_task")
 
     normalized_lane = _normalize_optional_text(lane_id)
     source_label = continuation_source_label(normalized_lane)
@@ -297,17 +327,19 @@ def save_continuation(
                 metadata=body,
             )
     except Exception as exc:  # noqa: BLE001 — rolled back; never replace a packet whose archive failed
-        if phase == "archive":
-            return _envelope(
+        code = "continuation_archive_failed" if phase == "archive" else "continuation_write_failed"
+        return finish(
+            _envelope(
                 ok=False,
                 tool="continuation",
-                data={"error": str(exc), "code": "continuation_archive_failed"},
+                data={"error": str(exc) or type(exc).__name__, "code": code, "outcome": "refused"},
                 task_ref=resolved_task_ref,
-            )
-        if isinstance(exc, RuntimeError):
-            return _envelope(ok=False, tool="continuation", data={"error": str(exc)}, task_ref=resolved_task_ref)
-        raise
+            ),
+            "durable_write",
+        )
+    timer.mark("durable_write")
 
+    retention = "complete"
     try:
         artifact_index.prune_artifact_sources(
             task_ref=resolved_task_ref,
@@ -317,6 +349,7 @@ def save_continuation(
             artifact_db_path=get_runtime_config().artifact_db_path,
         )
     except Exception:  # noqa: BLE001 — the head is committed; retention is best effort
+        retention = "failed"
         logging.getLogger(__name__).warning(
             "Continuation archive prune failed for task_ref=%s lane_id=%s packet_id=%s",
             resolved_task_ref,
@@ -326,25 +359,30 @@ def save_continuation(
         )
 
     source_id = head_result["source_id"]
-    return _envelope(
-        ok=True,
-        tool="continuation",
-        data={
-            "operation": "save",
-            "packet_id": packet_id,
-            "prior_packet_id": prior_packet_id,
-            "source_id": source_id,
-            "prior_source_id": prior_source_id,
-            "task_ref": resolved_task_ref,
-            "lane_id": normalized_lane,
-            "source_label": source_label,
-            "saved_at": saved_at,
-            "sections": sections,
-            "superseded": prior_packet_id is not None,
-            "dropped_sections": dropped_sections,
-        },
-        task_ref=resolved_task_ref,
-        mutation={"entity": "continuation_packet", "operation": "upsert"},
+    return finish(
+        _envelope(
+            ok=True,
+            tool="continuation",
+            data={
+                "operation": "save",
+                "outcome": "saved",
+                "packet_id": packet_id,
+                "prior_packet_id": prior_packet_id,
+                "source_id": source_id,
+                "prior_source_id": prior_source_id,
+                "task_ref": resolved_task_ref,
+                "lane_id": normalized_lane,
+                "source_label": source_label,
+                "saved_at": saved_at,
+                "sections": sections,
+                "superseded": prior_packet_id is not None,
+                "dropped_sections": dropped_sections,
+                "archive_retention": retention,
+            },
+            task_ref=resolved_task_ref,
+            mutation={"entity": "continuation_packet", "operation": "upsert"},
+        ),
+        "archive_retention",
     )
 
 
@@ -356,8 +394,16 @@ def load_continuation(
 ) -> dict:
     """Load newest packet for ``(task_ref, lane_id)`` or a specific packet by id.
 
-    Absent packets return ``ok=True`` with ``packet: null`` (empty result).
+    Absent packets return ``ok=True`` with ``packet: null`` and a typed
+    ``not_found`` outcome. An explicitly supplied id is compared exactly.
     """
+    timer = _PhaseTimer()
+
+    def finish(result: dict, phase: str) -> dict:
+        timer.mark(phase)
+        result["data"]["phase_timings_ns"] = timer.snapshot()
+        return result
+
     resolved_task_ref: str | None = None
     try:
         if task_ref is not None or packet_id is None:
@@ -366,28 +412,46 @@ def load_continuation(
     except Exception as exc:  # noqa: BLE001
         # Load by explicit packet_id may still succeed without task resolution.
         if packet_id is None:
-            return _envelope(
-                ok=False,
-                tool="continuation",
-                data={"error": str(exc), "code": "task_ref_unresolved"},
-                task_ref=task_ref,
+            return finish(
+                _envelope(
+                    ok=False,
+                    tool="continuation",
+                    data={"error": str(exc), "code": "task_ref_unresolved"},
+                    task_ref=task_ref,
+                ),
+                "resolve_task",
             )
+    timer.mark("resolve_task")
 
-    normalized_packet_id = _normalize_optional_text(packet_id)
-    if normalized_packet_id is not None:
-        packet, archived = _load_packet_by_id(normalized_packet_id, task_ref=resolved_task_ref)
-        if packet is None and resolved_task_ref is not None:
-            # Retry unscoped when the caller supplied a task that may not match.
-            packet, archived = _load_packet_by_id(normalized_packet_id, task_ref=None)
-        return _envelope(
-            ok=True,
-            tool="continuation",
-            data={
-                "operation": "load",
-                "packet": packet,
-                "archived": archived,
-            },
-            task_ref=(packet or {}).get("task_ref") if packet else resolved_task_ref,
+    if packet_id is not None:
+        try:
+            packet, archived = _load_packet_by_id(packet_id, task_ref=resolved_task_ref)
+            if packet is None and resolved_task_ref is not None:
+                # Preserve the existing global packet-id lookup contract.
+                packet, archived = _load_packet_by_id(packet_id, task_ref=None)
+        except Exception as exc:  # noqa: BLE001 — storage failure is not an absent packet
+            return finish(
+                _envelope(
+                    ok=False,
+                    tool="continuation",
+                    data={"error": str(exc) or type(exc).__name__, "code": "continuation_load_failed"},
+                    task_ref=resolved_task_ref,
+                ),
+                "lookup",
+            )
+        return finish(
+            _envelope(
+                ok=True,
+                tool="continuation",
+                data={
+                    "operation": "load",
+                    "outcome": "found" if packet is not None else "not_found",
+                    "packet": packet,
+                    "archived": archived,
+                },
+                task_ref=(packet or {}).get("task_ref") if packet else resolved_task_ref,
+            ),
+            "lookup",
         )
 
     if resolved_task_ref is None:
@@ -395,20 +459,34 @@ def load_continuation(
             with _get_db_connection() as conn:
                 resolved_task_ref = _resolve_task_ref(conn, task_ref)
         except Exception as exc:  # noqa: BLE001
-            return _envelope(
-                ok=False,
-                tool="continuation",
-                data={"error": str(exc), "code": "task_ref_unresolved"},
-                task_ref=task_ref,
+            return finish(
+                _envelope(
+                    ok=False,
+                    tool="continuation",
+                    data={"error": str(exc), "code": "task_ref_unresolved"},
+                    task_ref=task_ref,
+                ),
+                "lookup",
             )
 
     normalized_lane = _normalize_optional_text(lane_id)
     source_label = continuation_source_label(normalized_lane)
-    packet, source_id = _load_existing_packet(
-        task_ref=resolved_task_ref,
-        lane_id=normalized_lane,
-        source_label=source_label,
-    )
+    try:
+        packet, source_id = _load_existing_packet(
+            task_ref=resolved_task_ref,
+            lane_id=normalized_lane,
+            source_label=source_label,
+        )
+    except Exception as exc:  # noqa: BLE001 — storage failure is not an absent packet
+        return finish(
+            _envelope(
+                ok=False,
+                tool="continuation",
+                data={"error": str(exc) or type(exc).__name__, "code": "continuation_load_failed"},
+                task_ref=resolved_task_ref,
+            ),
+            "lookup",
+        )
     if packet is not None:
         packet = dict(packet)
         packet["source_id"] = source_id
@@ -416,15 +494,19 @@ def load_continuation(
         if packet.get("task_ref") and packet["task_ref"] != resolved_task_ref:
             packet = None
 
-    return _envelope(
-        ok=True,
-        tool="continuation",
-        data={
-            "operation": "load",
-            "packet": packet,
-            "archived": False,
-        },
-        task_ref=resolved_task_ref,
+    return finish(
+        _envelope(
+            ok=True,
+            tool="continuation",
+            data={
+                "operation": "load",
+                "outcome": "found" if packet is not None else "not_found",
+                "packet": packet,
+                "archived": False,
+            },
+            task_ref=resolved_task_ref,
+        ),
+        "lookup",
     )
 
 
@@ -436,6 +518,7 @@ def build_session_continuation(
     """Compact continuation packet for ``load_session`` injection.
 
     Returns ``None`` when no packet exists (caller leaves the section absent).
+    A storage failure returns an unavailable status instead of an empty result.
     When ``last_injected_continuation_id`` matches the newest packet, returns
     only ``{packet_id, deduped: true}`` instead of the full body.
     Compact full shape: ``packet_id``, ``saved_at``, ``lane_id``, ``sections``.
@@ -444,7 +527,8 @@ def build_session_continuation(
         return None
     envelope = load_continuation(task_ref=task_ref)
     if not envelope.get("ok"):
-        return None
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        return {"status": "unavailable", "code": data.get("code", "continuation_load_failed")}
     data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
     packet = data.get("packet")
     if not isinstance(packet, dict) or not packet.get("packet_id"):

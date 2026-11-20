@@ -57,5 +57,5 @@ class SkillManifest(BaseModel):
     )
     model: str | None = Field(
         default=None,
-        description="Optional preferred model identifier (e.g. 'claude-opus-4-7').",
+        description="Optional preferred model identifier.",
     )

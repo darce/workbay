@@ -7,7 +7,7 @@ if [ "$script_directory" = "${BASH_SOURCE[0]}" ]; then
 fi
 exec /usr/bin/python3 -I - "$script_directory/workbay_host_reclaim.py" "$@" <<'PY'
 import argparse
-import json
+import importlib.util
 import os
 import plistlib
 import subprocess
@@ -21,8 +21,8 @@ mode.add_argument('--dry-run', action='store_true')
 mode.add_argument('--uninstall', action='store_true')
 parser.add_argument('--root', action='append', default=[])
 args = parser.parse_args(sys.argv[2:])
-if any(not Path(p).is_absolute() for p in args.root):
-    parser.error('--root must be absolute')
+if args.uninstall and args.root:
+    parser.error('--root cannot be used with --uninstall')
 home = Path.home()
 source = Path(sys.argv[1])
 destination = home / '.local/lib/workbay/workbay_host_reclaim.py'
@@ -65,6 +65,21 @@ try:
             plist_path.unlink()
         print('uninstalled; state and registration retained')
         sys.exit(0)
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('workbay_host_reclaim', source)
+    native = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native)
+    engine = native.HostReclaimer(home=home)
+    # Validate the entire batch/config before code, plist, logs or service writes.
+    # No explicit roots preserves an existing config byte for byte, even if invalid.
+    registration_result = None
+    if args.root or not os.path.lexists(str(registration)):
+        try:
+            registration_result = engine._register_roots(args.root, dry_run=args.dry_run)
+        except native.Refusal as exc:
+            raise ValueError(str(exc)) from exc
+        if registration_result['outcome'] != 'unchanged':
+            print(('would register: ' if args.dry_run else 'registered: ') + str(registration))
     plist = dict(Label='com.workbay.host-reclaim',
                  ProgramArguments=['/usr/bin/python3', '-I', str(destination), 'run', '--apply', '--trigger', 'timer'],
                  StartInterval=600, RunAtLoad=True, ProcessType='Background', LowPriorityIO=True, Nice=10,
@@ -82,28 +97,13 @@ try:
             print('would write: ' + str(path))
         else:
             atomic_write(path, content, permissions, lint=lint)
-    if not os.path.lexists(str(registration)):
-        if args.dry_run:
-            print('would write: ' + str(registration) + ' (0600, only if absent)')
-        else:
-            registration.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                fd = os.open(str(registration), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                pass  # A concurrent creator's registration wins, byte for byte.
-            else:
-                with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                    json.dump(dict(schema=1, roots=args.root), stream, sort_keys=True)
-                    stream.write('\n')
-                    stream.flush()
-                    os.fsync(stream.fileno())
     if args.dry_run:
         if changed:
             print('would write: ' + str(state) + ' (log directory)')
             print('would run: plutil -lint ' + str(plist_path))
             print('would run: launchctl bootout gui/<uid>/com.workbay.host-reclaim')
             print('would run: launchctl bootstrap gui/<uid> ' + str(plist_path))
-        else:
+        elif registration_result is None or registration_result['outcome'] == 'unchanged':
             print('unchanged')
     else:
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -112,9 +112,9 @@ try:
             bootout(uid)
             run(['launchctl', 'bootstrap', 'gui/' + uid, str(plist_path)])
             print('installed')
-        else:
+        elif registration_result is None or registration_result['outcome'] == 'unchanged':
             print('unchanged')
-except (OSError, subprocess.SubprocessError) as exc:
+except (OSError, ValueError, subprocess.SubprocessError) as exc:
     print(str(exc), file=sys.stderr)
     sys.exit(2)
 PY

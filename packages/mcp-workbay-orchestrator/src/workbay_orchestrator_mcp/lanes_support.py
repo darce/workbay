@@ -14,9 +14,12 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
 
-CLOSEABLE_LANE_STATUSES = frozenset({"closed", "merged"})
-# Pinned by test to the statechart child terminals and handoff LaneStatus (finding 31890).
-TERMINAL_LANE_STATUSES: frozenset[str] = frozenset({"merged", "closed", "closed_stale"})
+from workbay_handoff_mcp.shared_primitives import (
+    CLOSEABLE_LANE_STATUSES as CLOSEABLE_LANE_STATUSES,
+)
+from workbay_handoff_mcp.shared_primitives import (
+    TERMINAL_LANE_STATUSES as TERMINAL_LANE_STATUSES,
+)
 
 # internal: blocked-lane aging + conclusive-close.
 DEFAULT_BLOCKED_LANE_REAP_BATCH = 50

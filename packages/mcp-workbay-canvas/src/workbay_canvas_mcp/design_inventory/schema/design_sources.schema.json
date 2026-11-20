@@ -247,6 +247,18 @@
       "default": "docs/design/generated",
       "title": "Generated Dir",
       "type": "string"
+    },
+    "toolchain_root": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Toolchain Root"
     }
   },
   "required": [

@@ -148,6 +148,103 @@ class HostReclaimer:
                     warn_free_bytes=15 * GIB, critical_free_bytes=5 * GIB,
                     per_run_byte_cap=50 * GIB, release_grace_seconds=600, notify=True)
 
+    def validate_root(self, path):
+        """Validate an explicit, narrow, existing user-owned root without writing."""
+        try:
+            path = os.fspath(path)
+        except TypeError:
+            raise ValueError('root must be a directory path') from None
+        if (not isinstance(path, str) or not path or any(ord(c) < 32 or ord(c) == 127 for c in path)
+                or not Path(path).is_absolute() or path != str(Path(path)) or '..' in Path(path).parts):
+            raise ValueError('root must be a canonical absolute directory path')
+        root = Path(path)
+        if (within(self.home.resolve(), root) or len(root.parts) <= 2 or
+                root.parent == Path('/Volumes') or os.path.ismount(root)):
+            raise Refusal('root_too_broad')
+        if not real_directory(root):
+            raise ValueError('root must be an existing non-symlink directory')
+        info = root.lstat()
+        if info.st_uid != self.uid or info.st_mode & 0o022:
+            raise Refusal('root_insecure')
+        return str(root)
+
+    def _registration_parents(self, create=False):
+        # Do not follow aliases or write through another user's configuration directory.
+        for parent in (self.home, self.home / '.config', self.registration.parent):
+            try:
+                info = parent.lstat()
+            except FileNotFoundError:
+                if not create:
+                    continue
+                try:
+                    parent.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass  # Concurrent registration created it; validate below.
+                info = parent.lstat()
+            if (not real_directory(parent) or info.st_uid != self.uid or info.st_mode & 0o022):
+                raise Refusal('registration_insecure')
+
+    def _registration_plan(self, paths):
+        self._registration_parents()
+        try:
+            data = regular_json(self.registration, secure_uid=self.uid)
+            exists = True
+        except FileNotFoundError:
+            data, exists = dict(schema=1, roots=[]), False
+        self._validated_config(data)
+        added = list(dict.fromkeys(p for p in paths if p not in data['roots']))
+        return dict(data, roots=data['roots'] + added), added, exists
+
+    def _register_roots(self, paths, dry_run=False):
+        """Installer batch: validate everything, then merge once under a stable lock.
+
+        Dry-run returns a read-only snapshot. The real transaction re-reads and
+        validates under the lock; no pre-lock snapshot can overwrite another writer.
+        """
+        paths = [self.validate_root(p) for p in paths]
+        data, added, exists = self._registration_plan(paths)
+        if dry_run:
+            return dict(outcome='would_register' if added or not exists else 'unchanged',
+                        roots=data['roots'], added_roots=added)
+        self._registration_parents(create=True)
+        lock = self.registration.with_name('.' + self.registration.name + '.lock')
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid or info.st_mode & 0o022
+                    or info.st_nlink != 1):
+                raise Refusal('registration_insecure')
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise Refusal('registration_busy')
+                    time.sleep(0.05)
+            paths = [self.validate_root(p) for p in paths]
+            data, added, exists = self._registration_plan(paths)
+            if added or not exists:
+                atomic_json(self.registration, data)
+            return dict(outcome='registered' if added or not exists else 'unchanged',
+                        roots=data['roots'], added_roots=added)
+        finally:
+            os.close(fd)
+
+    def register_root(self, path):
+        """Enroll one existing root; never creates roots or retention/release markers.
+
+        Frozen producer API: register_root(path: str | Path) -> JSON object with
+        outcome ('registered' or 'unchanged'), root, roots, and added_roots. Raises
+        Refusal/OSError/ValueError on unsafe paths, invalid config or contention.
+        Registration is mode 0600 and atomically replaced; other fields survive.
+        """
+        output = self._register_roots([path])
+        return dict(output, root=os.fspath(path))
+
     def config(self):
         defaults = self.defaults()
         try:
@@ -159,60 +256,132 @@ class HostReclaimer:
         except (OSError, ValueError):
             return defaults, 'registration_invalid'
         try:
-            if type(data.get('schema')) is not int or data['schema'] != 1:
-                raise ValueError('schema must be 1')
-            config = dict(defaults, **data)
-            if 'roots' not in data:
-                raise ValueError('roots required')
-            for key in ('roots', 'inventory_roots', 'inventory_exclude'):
-                if not isinstance(config[key], list) or not all(isinstance(p, str) and p and Path(p).is_absolute()
-                                                               for p in config[key]):
-                    raise ValueError('absolute path lists required')
-            for item in config['roots']:
-                root = Path(item)
-                if within(self.home.resolve(), root.resolve()):
-                    raise Refusal('root_too_broad')
-                if not real_directory(root):
-                    raise ValueError('root must be an existing non-symlink directory')
-            for key in ('warn_free_bytes', 'critical_free_bytes', 'per_run_byte_cap', 'release_grace_seconds'):
-                if type(config[key]) is not int or config[key] < 0:
-                    raise ValueError('nonnegative integer required')
-            if config['warn_free_bytes'] <= config['critical_free_bytes'] or config['per_run_byte_cap'] == 0:
-                raise ValueError('invalid thresholds or cap')
-            if type(config['notify']) is not bool:
-                raise ValueError('notify must be boolean')
-            return config, None
+            return self._validated_config(data), None
         except Refusal as exc:
             return defaults, exc.kind
         except (OSError, ValueError, TypeError):
             return defaults, 'registration_invalid'
 
-    def pressure(self, config=None):
-        config = config or self.config()[0]
-        free, size, source, reference = None, None, None, None
-        errors, volumes, advisories = [], [], []
+    def _validated_config(self, data):
+        defaults = self.defaults()
+        if type(data.get('schema')) is not int or data['schema'] != 1:
+            raise ValueError('schema must be 1')
+        config = dict(defaults, **data)
+        if 'roots' not in data:
+            raise ValueError('roots required')
+        for key in ('roots', 'inventory_roots', 'inventory_exclude'):
+            if not isinstance(config[key], list) or not all(isinstance(p, str) and p and Path(p).is_absolute()
+                                                           for p in config[key]):
+                raise ValueError('absolute path lists required')
+        for item in config['roots']:
+            self.validate_root(item)
+        for key in ('warn_free_bytes', 'critical_free_bytes', 'per_run_byte_cap', 'release_grace_seconds'):
+            if type(config[key]) is not int or config[key] < 0:
+                raise ValueError('nonnegative integer required')
+        if config['warn_free_bytes'] <= config['critical_free_bytes'] or config['per_run_byte_cap'] == 0:
+            raise ValueError('invalid thresholds or cap')
+        if type(config['notify']) is not bool:
+            raise ValueError('notify must be boolean')
+        return config
+
+    def _volume_facts(self, path, config, primary=False):
+        """One capacity observation, scoped to an APFS container or filesystem.
+
+        A diskutil failure falls back only to statvfs at this same path. Missing
+        identity/capacity remains explicit; a root name never implies a device.
+        """
+        row = dict(path=str(path), primary_data=primary, registered_roots=[],
+                   container_reference=None, device_identifier=None, mount_point=None,
+                   filesystem_device=None, accounting_scope=None, free_bytes=None,
+                   size_bytes=None, source=None, level='unknown', errors=[])
         try:
-            response = self.diskutil(['diskutil', 'info', '-plist', '/System/Volumes/Data'], timeout=10)
+            row['filesystem_device'] = self.lstat(path).st_dev
+        except OSError as exc:
+            row['errors'].append('device: ' + str(exc))
+        try:
+            response = self.diskutil(['diskutil', 'info', '-plist', str(path)], timeout=10)
             if response.returncode != 0:
                 raise ValueError('diskutil info failed')
             data = plistlib.loads(response.stdout)
-            free, size = data['APFSContainerFree'], data['APFSContainerSize']
-            reference = data['APFSContainerReference']
-            if type(free) is not int or type(size) is not int or not 0 <= free <= size or not reference:
-                raise ValueError('invalid container facts')
-            source = 'diskutil'
-        except (OSError, ValueError, TypeError, KeyError, plistlib.InvalidFileException, ExpatError, subprocess.SubprocessError) as exc:
-            errors.append('diskutil: ' + str(exc))
-            free, size = None, None
+            if not isinstance(data, dict):
+                raise ValueError('diskutil info must be a dictionary')
+            for key, field in (('APFSContainerReference', 'container_reference'),
+                               ('DeviceIdentifier', 'device_identifier'), ('MountPoint', 'mount_point')):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    row[field] = value
+            if row['container_reference'] is not None:
+                free, size = data['APFSContainerFree'], data['APFSContainerSize']
+                scope = 'apfs_container'
+            elif not primary:
+                free = data['VolumeFreeSpace']
+                size = data.get('VolumeTotalSpace', data.get('TotalSize'))
+                scope = 'filesystem'
+            else:
+                raise ValueError('missing container facts')
+            if type(free) is not int or type(size) is not int or not 0 <= free <= size:
+                raise ValueError('invalid capacity facts')
+            row.update(free_bytes=free, size_bytes=size, source='diskutil', accounting_scope=scope)
+        except (OSError, ValueError, TypeError, KeyError, plistlib.InvalidFileException,
+                ExpatError, subprocess.SubprocessError) as exc:
+            row['errors'].append('diskutil: ' + str(exc))
             try:
-                info = self.statvfs('/System/Volumes/Data')
+                info = self.statvfs(str(path))
                 free, size = info.f_bavail * info.f_frsize, info.f_blocks * info.f_frsize
-                if not 0 <= free <= size:
+                if type(free) is not int or type(size) is not int or not 0 <= free <= size:
                     raise ValueError('invalid statvfs facts')
-                source = 'statvfs'
+                row.update(free_bytes=free, size_bytes=size, source='statvfs', accounting_scope='filesystem')
             except (OSError, ValueError) as fallback:
-                errors.append('statvfs: ' + str(fallback))
-                free, size, source = None, None, None
+                row['errors'].append('statvfs: ' + str(fallback))
+        free = row['free_bytes']
+        row['level'] = ('unknown' if free is None else 'critical' if free < config['critical_free_bytes'] else
+                        'warn' if free < config['warn_free_bytes'] else 'ok')
+        return row
+
+    def _physical_volumes(self, config, primary):
+        """Group shared APFS containers/devices; never sum aliases or unknowns."""
+        groups = [[primary]]
+
+        def same_volume(left, right):
+            for key in ('container_reference', 'device_identifier', 'filesystem_device'):
+                if left[key] is not None and right[key] is not None:
+                    return left[key] == right[key]
+            return False
+
+        for root in dict.fromkeys(config['roots']):
+            facts = self._volume_facts(root, config)
+            facts['registered_roots'] = [root]
+            # Keep all aliases: a later observation can connect a fallback
+            # filesystem device to an already observed shared APFS container.
+            matches = [group for group in groups if any(same_volume(row, facts) for row in group)]
+            if not matches:
+                groups.append([facts])
+                continue
+            target = matches[0]
+            target.append(facts)
+            for group in matches[1:]:
+                target.extend(group)
+                groups.remove(group)
+        rows = []
+        for group in groups:
+            best = max(group, key=lambda row: (row['source'] is not None,
+                       row['accounting_scope'] == 'apfs_container', row['source'] == 'diskutil'))
+            row = dict(best, primary_data=any(item['primary_data'] for item in group),
+                       registered_roots=[root for item in group for root in item['registered_roots']],
+                       device_identifiers=sorted({item['device_identifier'] for item in group
+                                                  if item['device_identifier'] is not None}),
+                       filesystem_devices=sorted({item['filesystem_device'] for item in group
+                                                   if item['filesystem_device'] is not None}),
+                       errors=[item['path'] + ': ' + error for item in group for error in item['errors']])
+            rows.append(row)
+        return rows
+
+    def pressure(self, config=None):
+        config = config or self.config()[0]
+        primary = self._volume_facts('/System/Volumes/Data', config, primary=True)
+        free, size, source = primary['free_bytes'], primary['size_bytes'], primary['source']
+        reference = primary['container_reference']
+        errors, volumes, advisories = list(primary['errors']), [], []
         if reference is not None:
             try:
                 response = self.diskutil(['diskutil', 'apfs', 'list', '-plist'], timeout=10)
@@ -241,6 +410,7 @@ class HostReclaimer:
                  'warn' if free < config['warn_free_bytes'] else 'ok')
         return dict(schema='workbay/host-disk-pressure@1', observed_at=timestamp(self.clock()), level=level,
                     container_free_bytes=free, container_size_bytes=size, source=source, volumes=volumes,
+                    physical_volumes=self._physical_volumes(config, primary),
                     advisories=advisories, last_inventory=None, last_reclaim=None, errors=errors)
 
     def inventory(self, config=None, deadline_seconds=120, entry_cap=2000000):
@@ -704,6 +874,8 @@ def main(argv=None):
     run_parser.add_argument('--trigger', choices=('timer', 'headroom', 'manual'), default='manual')
     commands.add_parser('scan', help='read-only candidate scan')
     commands.add_parser('status', help='read-only pressure and candidate status')
+    register_parser = commands.add_parser('register-root', help='enroll an existing narrow user-owned root')
+    register_parser.add_argument('path')
     allocate_parser = commands.add_parser('allocate')
     allocate_parser.add_argument('directory')
     allocate_parser.add_argument('--owner', required=True)
@@ -725,6 +897,8 @@ def main(argv=None):
             output = engine.scan()
         elif args.command == 'status':
             output = engine.status()
+        elif args.command == 'register-root':
+            output = engine.register_root(args.path)
         elif args.command == 'allocate':
             output = engine.allocate(args.directory, args.owner, args.retention_class,
                                      args.task_ref, args.note, args.adopt)

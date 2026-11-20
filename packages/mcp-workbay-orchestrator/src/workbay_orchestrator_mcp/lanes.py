@@ -15,12 +15,13 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 from pydantic import Field
+from workbay_handoff_mcp.coordination_declaration import ExecutionDomain
 
 from .lanes_support import (
     _BRANCH_PROBE_TIMEOUT_S,
@@ -2622,7 +2623,8 @@ def _lane_status_transition_receipt(
         if isinstance(loaded, statechart.ChartUnavailable):
             raise loaded
         chart = loaded
-        statechart.assert_transition(chart, "child", source, target)
+        event = statechart.lane_status_requested_event(target)
+        statechart.assert_transition(chart["child"], source, event, target)
         return None
     except statechart.IllegalTransition:
         pass  # An absent edge is a receipt, with enforcement scoped below.
@@ -2674,6 +2676,8 @@ def upsert_worktree_lane(
     tier: str | None = None,
     test_cmd: str | None = None,
     lane_kind: str | None = None,
+    execution_domain: ExecutionDomain | None = None,
+    coordination_owner_proof: dict | None = None,
     status: str | None = None,
     notes: str | None = None,
     task_ref: str | None = None,
@@ -2685,6 +2689,16 @@ def upsert_worktree_lane(
     update_review_subject: bool = False,
     event_id: str | None = None,
 ) -> dict:
+    if execution_domain is not None and (
+        execution_domain != "local_coordination" or backend is not None or model is not None
+    ):
+        return _json_response(
+            {
+                "ok": False,
+                "error_kind": "coordination_declaration_held",
+                "error": "coordination_execution_routing_present_or_domain_invalid",
+            }
+        )
     valid_statuses = LANE_STATUSES
     normalized_lane_id = _normalize_optional_text(lane_id)
     normalized_path = _normalize_optional_text(worktree_path)
@@ -2728,12 +2742,59 @@ def upsert_worktree_lane(
     except Exception as exc:  # noqa: BLE001 — unknown reads must not authorize writes
         return _json_response({"ok": False, "error_kind": "lane_row_read_failed", "error": str(exc)})
 
+    if (
+        execution_domain is not None
+        and previous is not None
+        and any(previous.get(k) is not None for k in ("backend", "model"))
+    ):
+        return _json_response(
+            {
+                "ok": False,
+                "error_kind": "coordination_declaration_held",
+                "error": "coordination_execution_routing_present",
+            }
+        )
     # Resolve the persisted status once; rows without one are effectively planned.
     previous_status = str(previous.get("status") or "planned") if isinstance(previous, dict) else None
     if status is None:
         status = previous_status if previous_status is not None else "planned"
     if status not in valid_statuses:
         return _json_response({"ok": False, "error": f"Invalid status. Valid: {', '.join(sorted(valid_statuses))}"})
+
+    if execution_domain is not None and event_id is not None:
+        from workbay_handoff_mcp.lane_resource_producer import LaneResourceConflict, replay_receipt
+
+        try:
+            with _get_db_connection() as conn:
+                delivery = replay_receipt(
+                    conn, task_ref=task_ref, lane_id=normalized_lane_id, operation="open_lane", event_id=event_id
+                )
+        except LaneResourceConflict as exc:
+            return _json_response({"ok": False, "error_kind": "coordination_declaration_held", "error": str(exc)})
+        if delivery is not None:
+            # Recover the immutable delivery before considering a new status
+            # transition or touching a retired materialization. The native port
+            # still verifies the request, declaration digest and current owner.
+            return _adapt_lane_envelope(
+                open_lane(
+                    task_ref=task_ref,
+                    lane_id=normalized_lane_id,
+                    worktree_path=normalized_path,
+                    branch=normalized_branch,
+                    owner_agent=owner_agent,
+                    model=model,
+                    backend=backend,
+                    reasoning_effort=reasoning_effort,
+                    speed=speed,
+                    tier=tier,
+                    status=status,
+                    branch_tip_sha=branch_tip_sha,
+                    branch_tip_source=branch_tip_source,
+                    execution_domain=execution_domain,
+                    event_id=event_id,
+                    coordination_owner_proof=coordination_owner_proof,
+                )
+            )
 
     transition_receipt = None
     if previous_status is not None and previous_status != status:
@@ -2871,6 +2932,14 @@ def upsert_worktree_lane(
     if event_id is not None:
         open_lane_values["event_id"] = event_id
     lane_writer = open_lane
+    if execution_domain is not None and previous_status in {"closed", "closed_stale"}:
+        return _json_response(
+            {
+                "ok": False,
+                "error_kind": "coordination_declaration_held",
+                "error": "coordination_terminal_reopen_forbidden",
+            }
+        )
     if previous_status == "closed_stale" and status == "active":
         # Use the existing stale-reopen patch port: open_lane's terminal reopen
         # appends prose to notes, which would invalidate structured custody data.
@@ -2886,6 +2955,8 @@ def upsert_worktree_lane(
         open_lane_values.pop("lane_kind")
         lane_writer = update_lane
         open_lane_values["expected_status"] = "closed_stale"
+    if execution_domain is not None:
+        open_lane_values.update(execution_domain=execution_domain, coordination_owner_proof=coordination_owner_proof)
     if guarded_route:
         lock_path, intent_path = _routing_state_paths(task_ref, normalized_lane_id)
         lock_fd = _try_acquire_routing_guard(lock_path)
@@ -4722,7 +4793,15 @@ def close_worktree_lane(
         return _json_response({"ok": False, "error": "lane_id is required."})
     if status not in valid_close_statuses:
         return _json_response(
-            {"ok": False, "error": f"Invalid status. Valid: {', '.join(sorted(valid_close_statuses))}"}
+            {
+                "ok": False,
+                "error": f"orchestrator.close_worktree_lane: invalid public close status {status!r}",
+                "error_kind": "status_reserved_for_reaper"
+                if status in TERMINAL_LANE_STATUSES
+                else "lane_status_invalid",
+                "surface": "orchestrator.close_worktree_lane",
+                "allowed": sorted(valid_close_statuses),
+            }
         )
     resolved_landing, resolved_tip, tip_source, extra_warnings = _resolve_close_identity(
         lane_id=normalized_lane_id,
@@ -5034,6 +5113,13 @@ def _retire_worktree_lane(
     _parse_close_authority = getattr(domain, "_parse_close_authority")
     _probe_worktree_gone = getattr(domain, "_probe_worktree_gone")
     _reopen_moved_closed_row = getattr(domain, "_reopen_moved_closed_row")
+
+    if apply and task_ref and lane_id:
+        from workbay_handoff_mcp.coordination_declaration import pre_retire_refusal
+
+        refusal = pre_retire_refusal(task_ref, lane_id)
+        if refusal is not None:
+            return _json_response({"ok": False, "outcome": "coordination_retirement_held", "error": refusal})
 
     apply_flag = bool(apply)
     delete_branch = bool(delete_merged_branch)
@@ -6048,6 +6134,8 @@ def manage_worktree_lane(
     tier: str | None = None,
     test_cmd: str | None = None,
     lane_kind: str | None = None,
+    execution_domain: ExecutionDomain | None = None,
+    coordination_owner_proof: dict | None = None,
     status: str | None = None,
     notes: str | None = None,
     task_ref: str | None = None,
@@ -6094,6 +6182,11 @@ def manage_worktree_lane(
             tier=tier,
             test_cmd=normalized_test_cmd,
             lane_kind=lane_kind,
+            **(
+                {"execution_domain": execution_domain, "coordination_owner_proof": coordination_owner_proof}
+                if execution_domain is not None
+                else {}
+            ),
             status=status,
             notes=notes,
             task_ref=task_ref,
@@ -7253,6 +7346,99 @@ def consume_lane_worker_reports(
             "noop": not acknowledged and not superseded,
         }
     )
+
+
+def consume_lane_pass_snapshot(
+    lane_id: str,
+    *,
+    task_ref: str | None = None,
+    message_ids: Iterable[int] = (),
+    report_ids: Iterable[int] = (),
+) -> dict:
+    """Consume only the named pass inputs for one task/lane; retries are no-ops."""
+    normalized_lane_id = _normalize_optional_text(lane_id)
+    if normalized_lane_id is None:
+        return _json_response({"ok": False, "error": "lane_id is required."})
+    closed_message_ids: list[int] = []
+    acknowledged_report_ids: list[int] = []
+    with _get_db_connection(begin_immediate=True) as conn:
+        resolved_task_ref = _resolve_task_ref(conn, task_ref)
+        for message_id in message_ids:
+            cur = conn.execute(
+                """
+                UPDATE lane_messages SET status = 'closed', updated_at = datetime('now')
+                WHERE id = ? AND status = 'open' AND task_ref = ? AND lane_id = ?
+                  AND direction = 'worker_to_orchestrator'
+                """,
+                (message_id, resolved_task_ref, normalized_lane_id),
+            )
+            if cur.rowcount:
+                closed_message_ids.append(message_id)
+        for report_id in report_ids:
+            cur = conn.execute(
+                """
+                UPDATE worker_reports SET status = 'acknowledged'
+                WHERE id = ? AND status = 'submitted' AND task_ref = ? AND lane_id = ?
+                """,
+                (report_id, resolved_task_ref, normalized_lane_id),
+            )
+            if cur.rowcount:
+                acknowledged_report_ids.append(report_id)
+    return _json_response(
+        {"ok": True, "closed_message_ids": closed_message_ids, "acknowledged_report_ids": acknowledged_report_ids}
+    )
+
+
+def drain_terminal_lane_queues(
+    *,
+    task_ref: str | None = None,
+    limit: int,
+    dry_run: bool = True,
+) -> dict:
+    """Drain each terminal-lane queue up to its own limit, previewing by default."""
+    if limit < 0:
+        return _json_response({"ok": False, "error": "limit must be zero or greater."})
+    counts: dict[str, int] = {}
+    with _get_db_connection(begin_immediate=not dry_run) as conn:
+        resolved_task_ref = _resolve_task_ref(conn, task_ref) if task_ref is not None else None
+        for table, expected, target, count_key in (
+            ("lane_messages", "open", "closed", "close_messages"),
+            ("worker_reports", "submitted", "acknowledged", "acknowledge_reports"),
+        ):
+            # Keep the task/lane join in both selection and CAS: a row is
+            # eligible only while its own lane is terminal.
+            terminal = ", ".join("?" for _ in TERMINAL_LANE_STATUSES)
+            where = f"""
+                status = ? AND EXISTS (
+                    SELECT 1 FROM worktree_lanes AS lane
+                    WHERE lane.task_ref = {table}.task_ref AND lane.lane_id = {table}.lane_id
+                      AND lane.status IN ({terminal})
+                )
+            """
+            params: list[object] = [expected, *sorted(TERMINAL_LANE_STATUSES)]
+            if table == "lane_messages":
+                where += " AND direction = 'worker_to_orchestrator'"
+            if resolved_task_ref is not None:
+                where += " AND task_ref = ?"
+                params.append(resolved_task_ref)
+            rows = conn.execute(
+                f"SELECT id, task_ref, lane_id FROM {table} WHERE {where} ORDER BY created_at, id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            if dry_run:
+                counts[f"would_{count_key}"] = len(rows)
+                continue
+            moved = 0
+            bookkeeping = ", updated_at = datetime('now')" if table == "lane_messages" else ""
+            for row in rows:
+                cur = conn.execute(
+                    f"UPDATE {table} SET status = ?{bookkeeping} "
+                    f"WHERE id = ? AND {where} AND task_ref = ? AND lane_id = ?",
+                    (target, row["id"], *params, row["task_ref"], row["lane_id"]),
+                )
+                moved += cur.rowcount
+            counts["closed_messages" if table == "lane_messages" else "acknowledged_reports"] = moved
+    return _json_response({"ok": True, **counts})
 
 
 def backfill_worker_report_acks(

@@ -70,7 +70,9 @@ def _reserve(boundary, consumer) -> None:
         "def shell_collect():\n    raise AssertionError('unexpected collect')\n"
     )
     source = consumer.script.read_text()
-    # Include the stored pin, VM resolver, host ladder, and bridge unchanged.
+    # The pruner is outside what this rehearsal observes.
+    pruner = "_load_probe_trust_pruner() { :; }\n"
+    # Include the no-op pruner and the unchanged pin, VM resolver, host ladder, and bridge.
     helpers = "_BOUNDARY_RUNTIME_VERSION=" + source.split("\n_BOUNDARY_RUNTIME_VERSION=", 1)[1].split(
         "\n# Read the consumer cadence", 1
     )[0]
@@ -79,7 +81,7 @@ def _reserve(boundary, consumer) -> None:
     script = consumer.tmp / "scripts/unit-host-reserve.sh"
     script.parent.mkdir()
     script.write_text(
-        "set -euo pipefail\n" + helpers + "\n"
+        "set -euo pipefail\n" + pruner + helpers + "\n"
         "JOB_ID=unit-reserve REVIEW_SUBJECT_BRANCH=unit REVIEW_KIND=analysis AGENT_SPEC=unit-spec CANON_PROPOSAL_PATH=\n"
         + reserve + "\n"
     )

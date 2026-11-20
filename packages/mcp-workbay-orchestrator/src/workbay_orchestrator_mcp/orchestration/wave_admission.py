@@ -191,17 +191,12 @@ def decide(
             memory_max * values["memory_headroom_pct"] // 100,
             memory_max - values["memory_reserve_bytes"],
         )
-    elif gauges.get("unlimited_memory_exemption") is True:
-        memory_limit = None
     else:
         memory_available = _gauge_number(gauges, "memory_available_bytes", integer=True)
         if memory_available is None:
             return result(False, "vm_admission_unmeasured:vm_memory_limit")
-        memory_limit = values["memory_anon_bytes"] + max(
-            0,
-            memory_available - values["memory_reserve_bytes"],
-        )
-    if memory_limit is not None and projected_anon > memory_limit:
+        memory_limit = values["memory_anon_bytes"] + memory_available - values["memory_reserve_bytes"]
+    if projected_anon > memory_limit:
         return result(False, "vm_memory")
 
     if values["memory_psi_avg60"] > values["memory_psi_max"]:
@@ -212,8 +207,6 @@ def decide(
     if values["disk_free_bytes"] - projected_job_dirs < values["disk_floor_bytes"]:
         return result(False, "vm_disk")
 
-    if memory_max == "max" and gauges.get("unlimited_memory_exemption") is True:
-        return result(True, f"admit:{UNLIMITED_MEMORY_EXEMPTION_ENV}")
     return result(True, "admit")
 
 
@@ -321,12 +314,12 @@ def read_gauges(root: Path) -> dict[str, object]:
     with ``WORKBAY_REMOTE_GATE_MEMORY_FLOOR_MB``. The floor must be a positive
     integer number of MiB; zero, negative, or malformed values are refused as
     unmeasured. The PID floor likewise requires a positive integer.
-    For unlimited cgroups,
-    ``MemAvailable`` from ``/proc/meminfo`` supplies a host bound. An operator
-    may bypass that bound only with ``WORKBAY_REMOTE_GATE_ALLOW_UNLIMITED_MEMORY=1``;
-    the resulting admission reason names the exemption. The ``oom_kill`` value
-    is cumulative; a delta needs a prior sample, so decisions record that the
-    delta is unavailable without persistent state.
+    For unlimited cgroups, ``MemAvailable`` from ``/proc/meminfo`` supplies a
+    host bound. The legacy ``WORKBAY_REMOTE_GATE_ALLOW_UNLIMITED_MEMORY`` setting
+    is reported for compatibility but no longer bypasses this bound or the
+    co-tenant reserve. The ``oom_kill`` value is cumulative; a delta needs a
+    prior sample, so decisions record that the delta is unavailable without
+    persistent state.
     """
     uid = os.getuid()
     pids_root = Path(os.environ.get("WORKBAY_REMOTE_GATE_PIDS_ROOT", f"/sys/fs/cgroup/user.slice/user-{uid}.slice"))

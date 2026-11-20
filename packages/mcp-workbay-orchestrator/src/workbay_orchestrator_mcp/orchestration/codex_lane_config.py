@@ -26,6 +26,8 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from workbay_orchestrator_mcp.orchestration.offload_timeout_ssot import CODEX_TIMEOUT_CAP
 from workbay_orchestrator_mcp.orchestration.resolved_role_config import (
     CodexLaneTimeoutError,  # noqa: F401  # re-exported for existing importers
@@ -55,7 +57,11 @@ CODEX_PATH_PREPEND = ".local/bin"
 # availability probe fail-closed on drift from 0.155.1 until this pin landed.
 # Live sandbox/auth remeasurement follows landing; the 0.155.1 measurements
 # above stay historical.
-CODEX_CLI_VERSION = "0.159.2"
+# 2026-11-18 04:33Z: the lane VM binary at
+# ~/.local/lib/node_modules/@openai/codex was upgraded to 0.170.0; preflight
+# refused every codex-remote lane (rc 7 executable_version_mismatch) until
+# this pin landed. gpt-6.2-astra requires >= 0.170.0.
+CODEX_CLI_VERSION = "0.170.0"
 
 # One-shot S1a observation that `command -v timeout` succeeded. Not durable —
 # S2/S6 must re-probe ([FM-08], [RES-02]).
@@ -69,7 +75,7 @@ INSTALL_DISK_DELTA_BUDGET_BYTES = 1_073_741_824
 # WORKBAY_CODEX_MODEL overrides. Discovery (M2) publishes onto
 # BACKENDS[].allowed_model / the offload profile only — DEFAULT_* stays
 # the flock/CLI snapshot by design.
-TRACKED_CODEX_MODEL = "gpt-6-luna"
+TRACKED_CODEX_MODEL = model_routing.MODEL_ROUTING_DEFAULTS["codex"]
 WORKBAY_CODEX_MODEL_ENV = "WORKBAY_CODEX_MODEL"
 
 
@@ -105,14 +111,14 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
         CodexModelTier(
             # Preserve the former tracked pin as an explicit model after
             # moving the product default to gpt-6-luna.
-            slug="gpt-5.6-sol",
+            slug=model_routing.ModelId.CODEX_LEGACY_SENIOR,
             tier="senior",
             allowed_efforts=frozenset({"low", "medium", "high", "xhigh", "max"}),
             default_effort="high",
             allowed_service_tiers=frozenset({"default", "fast"}),
             roles=frozenset({"implement", "review", "adjudicate"}),
             entitled=True,
-            default_model="gpt-6.1-sol",
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_senior"],
         ),
         CodexModelTier(
             # Historical observation (2026-10-01 through 2026-10-03): about 125
@@ -126,17 +132,17 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
             # (2026-10-07): escalate a lane after a third-dispatch stop using
             # gpt-6.1-sol xhigh on the standard tier; explicit advertised
             # requests are admitted by the catalogue, with an override warning.
-            slug="gpt-6.1-sol",
+            slug=model_routing.ModelId.CODEX_SENIOR,
             tier="senior",
             allowed_efforts=frozenset({"medium", "high"}),
             default_effort="medium",
             allowed_service_tiers=frozenset({"default"}),
             roles=frozenset({"implement", "review", "adjudicate"}),
             entitled=True,
-            default_model="gpt-6.1-sol",
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_senior"],
         ),
         CodexModelTier(
-            slug="gpt-5.6-luna",
+            slug=model_routing.ModelId.CODEX_LEGACY_JUNIOR,
             # Luna degrades quietly below max: the lane still completes and the
             # output still reads plausible. The operator directive is that every
             # Luna lane runs at max, and effort_policy.MAX_EFFORT_MODELS encodes
@@ -156,10 +162,11 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
             allowed_service_tiers=frozenset({"default", "fast"}),
             roles=frozenset({"implement"}),
             entitled=True,
-            default_model="gpt-5.6-luna",
+            # Each entitled junior row carries the preference for filtered tables.
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_junior"],
         ),
         CodexModelTier(
-            slug="gpt-6-luna",
+            slug=model_routing.ModelId.CODEX_JUNIOR,
             # Same envelope as gpt-5.6-luna, and the same max-only directive
             # (effort_policy.MAX_EFFORT_MODELS). The catalogue advertises
             # low..max without ultra; low stays out, as for gpt-5.6-luna.
@@ -176,9 +183,10 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
             allowed_service_tiers=frozenset({"default", "fast"}),
             roles=frozenset({"implement"}),
             entitled=True,
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_junior"],
         ),
         CodexModelTier(
-            slug="gpt-5.3-sparx",
+            slug=model_routing.ModelId.CODEX_UNENTITLED,
             tier="junior",
             allowed_efforts=frozenset({"medium", "high", "xhigh"}),
             default_effort="xhigh",
@@ -230,12 +238,9 @@ def resolve_tracked_or_env_codex_model() -> str:
 
 
 DEFAULT_CODEX_MODEL = resolve_tracked_or_env_codex_model()
-# The default is a selection fallback, not an exclusive model restriction: an
-# explicit operator env pin must stay admissible even with no curated tier row.
-# Union it onto the tier projection above rather than restating the boundary as
-# a second literal -- a literal here silently shadowed the projection and
-# re-narrowed CODEX_ALLOWED_MODELS to the entitled slugs, which collapses the
-# unentitled/unknown distinction the tier table exists to draw (MERGEDEAD-H-01).
+# Include the configured Codex default in the registry projection. The Codex
+# resolver checks the selected model against the observed catalogue and policy.
+# For backends with curated admission, an environment pin must be a member.
 CODEX_ALLOWED_MODELS = CODEX_ALLOWED_MODELS | {DEFAULT_CODEX_MODEL}
 
 # --- Sandbox posture ---------------------------------------------------------

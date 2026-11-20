@@ -21,6 +21,7 @@
 #   TAG     — monorepo tag (vX.Y.Z) for release-monorepo
 #   FLAGS   — extra flags forwarded to scripts/release.sh
 #   DOGFOOD_SOURCE         — git_overlay (default), package, or worktree
+#   DOGFOOD_STUDIO         — 0 (default) or 1; install Studio after worktree install/status
 #   DOGFOOD_BOOTSTRAP_SPEC — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
 #   DOGFOOD_SYSTEM_SPEC    — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
 #   DOGFOOD_PROTOCOL_SPEC  — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name).
@@ -59,6 +60,7 @@ $(foreach p,$(PACKAGES),$(if $(wildcard $(JUDGE_ROOT)/packages/$(p)/pyproject.to
 RELEASE  := scripts/release.sh
 FLAGS    ?=
 DOGFOOD_SOURCE ?= git_overlay
+DOGFOOD_STUDIO ?= 0
 # Package-mode uvx specs must resolve from the git mirror, never a bare dist name
 # (bare names hit PyPI and can silently install stale unyanked 0.2.x releases).
 # Shape mirrors workbay_bootstrap.gitonly_closure.git_member_spec:
@@ -1041,7 +1043,16 @@ shell-quote = '$(subst ','"'"',$(1))'
 
 .PHONY: dogfood
 dogfood: ## Install latest/TAG git overlay, package (git-mirror uv specs), or worktree into this repo
-	@source="$(DOGFOOD_SOURCE)"; \
+	@studio=$(call shell-quote,$(DOGFOOD_STUDIO)); \
+	case "$$studio" in \
+	    0|1) ;; \
+	    *) echo "DOGFOOD_STUDIO must be '0' or '1' (got '$$studio')" >&2; exit 2 ;; \
+	esac; \
+	source="$(DOGFOOD_SOURCE)"; \
+	if [ "$$studio" = "1" ] && [ "$$source" != "worktree" ]; then \
+	    echo "DOGFOOD_STUDIO=1 requires DOGFOOD_SOURCE=worktree" >&2; \
+	    exit 2; \
+	fi; \
 	if [ "$$source" = "package" ] && [ -e "$(CURDIR)/packages/workbay-bootstrap/pyproject.toml" ]; then \
 	    echo "refuse: package dogfood into the source monorepo is a self-target install." >&2; \
 	    exit 2; \
@@ -1062,7 +1073,10 @@ dogfood: ## Install latest/TAG git overlay, package (git-mirror uv specs), or wo
 	if [ "$$source" = "worktree" ]; then \
 	    echo "==> dogfood installing worktree overlay into $(CURDIR)"; \
 	    uv run --project packages/workbay-bootstrap workbay-bootstrap install --source worktree --target "$(CURDIR)" $(DOGFOOD_INSTALL_FLAGS) && \
-	    uv run --project packages/workbay-bootstrap workbay-bootstrap status --target "$(CURDIR)"; \
+	    uv run --project packages/workbay-bootstrap workbay-bootstrap status --target "$(CURDIR)" || exit $$?; \
+	    if [ "$$studio" = "1" ]; then \
+	        bash "$(CURDIR)/scripts/install-workbay-studio.sh" "$(CURDIR)"; \
+	    fi; \
 	    exit $$?; \
 	fi; \
 	if [ "$$source" != "git_overlay" ]; then \

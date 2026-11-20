@@ -20,11 +20,13 @@ import re
 import sqlite3
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from pathlib import Path
-from threading import Lock
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Literal, cast
 
 import yaml
@@ -1829,6 +1831,62 @@ def _build_semantic_reinjection_for_refresh(
         }
 
 
+# A slow provider may outlive its caller; cap outstanding optional work rather
+# than starting an unbounded number of orphaned threads on repeated resumes.
+_RESUME_SEMANTIC_SLOT = BoundedSemaphore(1)
+_RESUME_SEMANTIC_WAIT_SECONDS = 2.0
+
+
+def _bounded_semantic_for_refresh(
+    *,
+    task_ref: str,
+    compaction_id: str,
+    visible_texts: Sequence[str],
+    semantic_content_budget_chars: int | None,
+) -> dict[str, object]:
+    """Try optional semantic enrichment without allowing it to block resume."""
+    if not _RESUME_SEMANTIC_SLOT.acquire(blocking=False):
+        return {"status": "degraded", "skip_reason": "busy", "retry_tool": "semantic_reinjection_packet"}
+
+    completion: Queue[dict[str, object]] = Queue(maxsize=1)
+    context = copy_context()
+    texts = tuple(visible_texts)
+
+    def analyze() -> None:
+        try:
+            from .embeddings.reinjection import ReinjectionConfig
+
+            budget = (
+                semantic_content_budget_chars
+                if semantic_content_budget_chars is not None
+                else ReinjectionConfig.from_env().refresh_budget_chars
+            )
+            with _get_db_connection() as conn:
+                result = _build_semantic_reinjection_for_refresh(
+                    conn,
+                    task_ref=task_ref,
+                    compaction_id=compaction_id,
+                    visible_texts=texts,
+                    semantic_content_budget_chars=int(budget),
+                )
+            completion.put_nowait(result)
+        except Exception as exc:  # noqa: BLE001 — optional analysis is a named degradation
+            completion.put_nowait({"status": "degraded", "skip_reason": "error", "detail": str(exc)})
+        finally:
+            _RESUME_SEMANTIC_SLOT.release()
+
+    try:
+        Thread(target=context.run, args=(analyze,), daemon=True, name="workbay-resume-semantic").start()
+    except Exception as exc:  # noqa: BLE001 — thread creation must not fail the baseline
+        _RESUME_SEMANTIC_SLOT.release()
+        return {"status": "degraded", "skip_reason": "error", "detail": str(exc)}
+
+    try:
+        return completion.get(timeout=_RESUME_SEMANTIC_WAIT_SECONDS)
+    except Empty:
+        return {"status": "degraded", "skip_reason": "timeout", "retry_tool": "semantic_reinjection_packet"}
+
+
 def _relevant_lines_from_reinjection_payload(payload: dict[str, object]) -> list[str]:
     from .embeddings.reinjection import SelectedConcept, render_readable_relevant_lines
 
@@ -1981,7 +2039,7 @@ def build_context_refresh_packet(
     visible_texts: Sequence[str] | None = None,
     semantic_content_budget_chars: int | None = None,
 ) -> dict[str, object]:
-    """Build an opt-in same-session context refresh packet from the latest compaction."""
+    """Build a refresh packet; semantic enrichment has a bounded wait for every caller."""
     with _get_db_connection() as conn:
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         loaded = _load_latest_compaction_summary(conn, resolved_task_ref)
@@ -2005,29 +2063,12 @@ def build_context_refresh_packet(
 
         semantic_reinjection: dict[str, object] | None = None
         if visible_texts is not None:
-            try:
-                from .embeddings.reinjection import ReinjectionConfig
-
-                budget = (
-                    semantic_content_budget_chars
-                    if semantic_content_budget_chars is not None
-                    else ReinjectionConfig.from_env().refresh_budget_chars
-                )
-                semantic_reinjection = _build_semantic_reinjection_for_refresh(
-                    conn,
-                    task_ref=resolved_task_ref,
-                    compaction_id=latest.compaction_id,
-                    visible_texts=visible_texts,
-                    semantic_content_budget_chars=int(budget),
-                )
-            except ImportError:
-                budget = max(0, int(semantic_content_budget_chars or 0))
-                semantic_reinjection = {
-                    "status": "degraded",
-                    "skip_reason": "error",
-                    "model_id": None,
-                    "chars_budget": budget,
-                }
+            semantic_reinjection = _bounded_semantic_for_refresh(
+                task_ref=resolved_task_ref,
+                compaction_id=latest.compaction_id,
+                visible_texts=visible_texts,
+                semantic_content_budget_chars=semantic_content_budget_chars,
+            )
 
         rendered = render_cold_start_compaction(task_ref=resolved_task_ref)
         packet = _build_refresh_packet_body(

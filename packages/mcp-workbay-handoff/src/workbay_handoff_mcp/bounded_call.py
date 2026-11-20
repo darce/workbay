@@ -19,6 +19,21 @@ _abandoned_threads: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
 _abandoned_lock = threading.Lock()
 
 
+class BoundedCallDeadlineError(ValueError):
+    """The caller supplied a deadline that cannot bound a call."""
+
+
+def validate_timeout_seconds(value: float | str, *, name: str = "timeout_seconds") -> float:
+    """Return a finite, positive deadline or raise a distinguishable error."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BoundedCallDeadlineError(f"{name} must be a finite positive number, got {value!r}") from exc
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise BoundedCallDeadlineError(f"{name} must be a finite positive number, got {value!r}")
+    return timeout
+
+
 def abandoned_thread_count() -> int:
     """Return how many timed-out daemon workers are still alive.
 
@@ -99,9 +114,7 @@ def run_with_daemon_timeout(
     raises ``TimeoutError`` without joining the worker; any exception raised by
     the callable is re-raised in the caller thread once the worker finishes.
     """
-    timeout = float(timeout_seconds)
-    if not math.isfinite(timeout) or timeout <= 0.0:
-        raise ValueError(f"timeout_seconds must be a finite positive number, got {timeout_seconds!r}")
+    timeout = validate_timeout_seconds(timeout_seconds)
 
     result: list[_ResultT] = []
     error: list[BaseException] = []

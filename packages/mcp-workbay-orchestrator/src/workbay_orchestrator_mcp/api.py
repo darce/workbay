@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Mapping, ca
 
 from fastmcp import FastMCP
 from pydantic import Field
+from workbay_handoff_mcp.bounded_call import BoundedCallDeadlineError, validate_timeout_seconds
+from workbay_handoff_mcp.coordination_declaration import ExecutionDomain
 from workbay_protocol import BRAND_NAME, HARNESS_CONTRACT_RELPATH, INSTRUCTIONS_RELPATH
 
 from workbay_orchestrator_mcp import lanes as _lanes
@@ -348,6 +350,9 @@ def manage_worktree_lane(
     tier: str | None = None,
     test_cmd: str | None = None,
     lane_kind: str | None = None,
+    execution_domain: ExecutionDomain | None = None,
+    event_id: str | None = None,
+    coordination_owner_proof: dict | None = None,
     status: Literal[*tuple(sorted(_lanes.LANE_STATUSES | {"all"}))] | None = None,
     notes: str | None = None,
     task_ref: str | None = None,
@@ -405,6 +410,7 @@ def manage_worktree_lane(
             )
     return _lanes.manage_worktree_lane(
         operation=operation,
+        **({"event_id": event_id} if event_id is not None else {}),
         lane_id=lane_id,
         worktree_path=worktree_path,
         branch=branch,
@@ -419,6 +425,11 @@ def manage_worktree_lane(
         tier=tier,
         test_cmd=test_cmd,
         lane_kind=lane_kind,
+        **(
+            {"execution_domain": execution_domain, "coordination_owner_proof": coordination_owner_proof}
+            if execution_domain is not None
+            else {}
+        ),
         status=status,
         notes=notes,
         task_ref=task_ref,
@@ -589,8 +600,12 @@ _register_dashboard_extensions()
 # One sentence for the MCP tool description and run_offload_pass.__doc__.
 # The contract test reads both; a second copy would drift.
 _RUN_OFFLOAD_PASS_GUIDANCE_CONTRACT = (
-    "When that needs_guidance result carries at least one substantive blocker and a commit landed, "
-    "next_lane_action is {action: provide_guidance, task_ref, lane_id, blockers}. Advisory floor notes "
+    "When that needs_guidance result carries at least one substantive blocker, whether or not a commit landed, "
+    "next_lane_action is {action: review|requeue|escalate|provide_guidance, task_ref, lane_id, blockers, "
+    "resolution: {kind, reason, evidence}}. The resolution reports the classifier's kind, a non-empty reason, "
+    "and a JSON evidence object; review puts landed work in review with blocker notes, environment blockers "
+    "requeue once through a durable claim then escalate, and residual provide_guidance leaves the lane active. "
+    "guidance_consumption reports the pass snapshot consumed only after an ok durable next-action record. Advisory floor notes "
     "are not substantive blockers and do not produce provide_guidance. Optional handoff_stderr_head is "
     "present on a terminal payload only when the handoff submit wrote stderr; it is that stderr head "
     "bounded to 500 characters. "
@@ -1862,6 +1877,12 @@ def worker_start(
     timeout_error = _optional_positive_int_error(timeout_seconds, "timeout_seconds")
     if timeout_error is not None:
         return core._json_response({"ok": False, "error": timeout_error})
+    from workbay_handoff_mcp.coordination_declaration import PROOF_ERRORS, pending_error, reserve_native_execution
+
+    try:
+        reserve_native_execution(task_ref, lane_id)
+    except PROOF_ERRORS as exc:
+        return core._json_response({**pending_error(exc), "error": str(exc), "outcome": "coordination_execution_held"})
     paths = _worker_paths()
     try:
         backend_registry = _import_orchestration_module("backend_registry")
@@ -2738,9 +2759,7 @@ def _run_structured_turn_with_timeout(
     Completed calls still propagate the runner's result or exception exactly
     once, while a timed-out call abandons only the daemon worker.
     """
-    timeout = float(timeout_seconds)
-    if not math.isfinite(timeout) or timeout <= 0.0:
-        raise ValueError(f"timeout_seconds must be a finite positive number, got {timeout_seconds!r}")
+    timeout = validate_timeout_seconds(timeout_seconds)
 
     result: list[Any] = []
     error: list[BaseException] = []
@@ -2772,6 +2791,11 @@ def run_structured_turn(
     env: dict[str, str] | None = None,
     timeout_seconds: float = 120.0,
 ) -> dict:
+    try:
+        timeout = validate_timeout_seconds(timeout_seconds)
+    except BoundedCallDeadlineError as exc:
+        return core._json_response({"ok": False, "error": str(exc), "backend": backend})
+    deadline = time.monotonic() + timeout
     try:
         backend_registry = _import_orchestration_module("backend_registry")
         backend_name = backend_registry.validate_backend(backend)
@@ -2816,21 +2840,22 @@ def run_structured_turn(
             return runner(**retry_kwargs)
 
     timeout_error = f"Structured turn timed out after {timeout_seconds} seconds."
-    if math.isfinite(timeout_seconds) and timeout_seconds <= 0.0:
-        return core._json_response(
-            {
-                "ok": False,
-                "error": timeout_error,
-                "backend": backend,
-            }
-        )
-
     try:
-        payload = _run_structured_turn_with_timeout(
-            _invoke_runner,
-            timeout_seconds=timeout_seconds,
-            timeout_message=timeout_error,
-        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(timeout_error)
+        if getattr(runner, "__workbay_deadline_contract__", None) == 1:
+            # An opted-in bridge takes the remaining budget as its whole-call
+            # deadline and empties the child's process group before reporting
+            # a timeout.
+            runner_kwargs["timeout_seconds"] = remaining
+            payload = runner(**runner_kwargs)
+        else:
+            payload = _run_structured_turn_with_timeout(
+                _invoke_runner,
+                timeout_seconds=remaining,
+                timeout_message=timeout_error,
+            )
     except concurrent.futures.TimeoutError:
         # Python 3.12 aliases concurrent.futures.TimeoutError to builtin TimeoutError,
         # which is the exception raised by _run_structured_turn_with_timeout on deadline expiry.
@@ -2841,12 +2866,6 @@ def run_structured_turn(
                 "backend": backend,
             }
         )
-    except ValueError as exc:
-        # The helper rejects non-finite deadlines before starting a worker. Keep
-        # runner ValueErrors observable for valid deadlines by re-raising them.
-        if math.isfinite(timeout_seconds):
-            raise
-        return core._json_response({"ok": False, "error": str(exc), "backend": backend})
     except RuntimeError as exc:
         return core._json_response({"ok": False, "error": str(exc), "backend": backend})
     except TypeError as exc:
@@ -3305,6 +3324,14 @@ def dispatch_lane_work(
     timeout_error = _optional_positive_int_error(timeout_seconds, "timeout_seconds")
     if timeout_error is not None:
         return core._json_response({"ok": False, "error": timeout_error})
+    from workbay_handoff_mcp.coordination_declaration import PROOF_ERRORS, pending_error, reserve_native_execution
+
+    try:
+        with core._get_db_connection() as conn:
+            declared_task = core._resolve_task_ref(conn, task_ref)
+        reserve_native_execution(declared_task, lane_id)
+    except PROOF_ERRORS as exc:
+        return core._json_response({**pending_error(exc), "error": str(exc), "outcome": "coordination_execution_held"})
     if start_worker:
         try:
             _ensure_daemons_enabled()
@@ -4608,7 +4635,10 @@ def run_offload_pass(
         assert pass_id is not None
         paths = _worker_paths()
         resume_engine = _import_orchestration_module("offload_pass")
-        previous_pass = resume_engine.read_pass_state(paths["state_dir"], pass_id)
+        try:
+            previous_pass = resume_engine.read_pass_state(paths["state_dir"], pass_id, strict=True)
+        except resume_engine.PassStateUnreadable as exc:
+            return core._json_response(exc.hold())
         if (
             isinstance(previous_pass, dict)
             and isinstance(previous_pass.get("job_id"), str)
@@ -4693,25 +4723,46 @@ def _run_offload_preview(run_args: dict) -> dict:
             with _offload_lane_admission(paths["state_dir"], prepared["task_ref"], run_args["lane_id"]):
                 routing = prepared["routing"]
                 result = _import_orchestration_module("offload_pass").run_offload_pass_engine(
-                    orchestrator_root=paths["workspace_root"], task_ref=prepared["task_ref"],
-                    lane_id=run_args["lane_id"], worktree_path=prepared["worktree_path"],
-                    backend=prepared["resolved_backend"], model=routing["model"] or prepared["lane_row"].get("model"),
-                    reasoning_effort=routing["reasoning_effort"], speed=routing["speed"], tier=routing["tier"],
-                    token_budget=run_args["token_budget"], timeout_seconds=run_args["timeout_seconds"],
-                    max_review_cycles=run_args["max_review_cycles"], turn_timeout_seconds=run_args["turn_timeout_seconds"],
+                    orchestrator_root=paths["workspace_root"],
+                    task_ref=prepared["task_ref"],
+                    lane_id=run_args["lane_id"],
+                    worktree_path=prepared["worktree_path"],
+                    backend=prepared["resolved_backend"],
+                    model=routing["model"] or prepared["lane_row"].get("model"),
+                    reasoning_effort=routing["reasoning_effort"],
+                    speed=routing["speed"],
+                    tier=routing["tier"],
+                    token_budget=run_args["token_budget"],
+                    timeout_seconds=run_args["timeout_seconds"],
+                    max_review_cycles=run_args["max_review_cycles"],
+                    turn_timeout_seconds=run_args["turn_timeout_seconds"],
                     session=run_args["session"] or f"{prepared['task_ref']}-{run_args['lane_id']}",
-                    session_mode=run_args["session_mode"], dry_run=True, pass_id=pass_id, state_dir=paths["state_dir"],
-                    test_cmd=prepared["lane_row"].get("test_cmd"), grok_max_turns=run_args["grok_max_turns"],
+                    session_mode=run_args["session_mode"],
+                    dry_run=True,
+                    pass_id=pass_id,
+                    state_dir=paths["state_dir"],
+                    test_cmd=prepared["lane_row"].get("test_cmd"),
+                    grok_max_turns=run_args["grok_max_turns"],
                     canon_proposal_path=run_args["canon_proposal_path"],
                 )
         return core._json_response(result)
     except (OSError, ValueError, RuntimeError, NonexecutionHold) as exc:
-        return core._json_response({"ok": False, "outcome": "preview_refused", "mode": "preview",
-                                    "reason": str(exc), "pass_id": pass_id, "model_dispatched": False})
+        return core._json_response(
+            {
+                "ok": False,
+                "outcome": "preview_refused",
+                "mode": "preview",
+                "reason": str(exc),
+                "pass_id": pass_id,
+                "model_dispatched": False,
+            }
+        )
 
 
 def reconcile_offload_nonexecution(
-    pass_id: str, operation: str = "inspect", expected_record_sha256: str | None = None,
+    pass_id: str,
+    operation: str = "inspect",
+    expected_record_sha256: str | None = None,
     expected_attestation_sha256: str | None = None,
 ) -> dict:
     """Classify/reconcile exact historical constructors using existing operator authority.
@@ -4722,8 +4773,16 @@ def reconcile_offload_nonexecution(
     from workbay_orchestrator_mcp.orchestration.nonexecution_history import reconcile  # noqa: PLC0415
 
     config = get_runtime_config()
-    return core._json_response(reconcile(config.workspace_root, config.state_dir, pass_id, operation=operation,
-        expected_record_sha256=expected_record_sha256, expected_attestation_sha256=expected_attestation_sha256))
+    return core._json_response(
+        reconcile(
+            config.workspace_root,
+            config.state_dir,
+            pass_id,
+            operation=operation,
+            expected_record_sha256=expected_record_sha256,
+            expected_attestation_sha256=expected_attestation_sha256,
+        )
+    )
 
 
 class _OffloadInvocationBusy(RuntimeError):
@@ -5427,7 +5486,10 @@ def _multipass_snapshot_one(
             "terminal": True,
             "failed": True,
         }
-    state = offload_pass.read_pass_state(state_dir, normalized)
+    try:
+        state = offload_pass.read_pass_state(state_dir, normalized, strict=True)
+    except offload_pass.PassStateUnreadable as exc:
+        return {**exc.hold(), "failed": False}
     if state is None:
         return {
             "pass_id": normalized,
@@ -6313,17 +6375,22 @@ def lane_dag(task_ref: str) -> dict[str, Any]:
 
     from workbay_orchestrator_mcp.orchestration.lane_dag_render import (  # noqa: PLC0415
         render_lane_dag,
+        with_plan_source_status,
     )
     from workbay_orchestrator_mcp.orchestration.lane_manifest import (  # noqa: PLC0415
+        ADVISORY_GRAPH_SCHEMA,
         load_manifest,
+        manifest_schema,
     )
+    from workbay_orchestrator_mcp.orchestration.plan_graph import read_plan_source_status
     from workbay_orchestrator_mcp.orchestration.wave_dispatch import (  # noqa: PLC0415
         resolve_wave_max_width,
     )
 
     workspace_root = _orchestrator_paths()["workspace_root"]
     try:
-        manifest = load_manifest(normalized_task_ref, orchestrator_root=str(workspace_root))
+        manifest = load_manifest(normalized_task_ref, orchestrator_root=str(workspace_root), allow_advisory=True)
+        schema = manifest_schema(manifest, Path(f"<task {normalized_task_ref}>"))
     except FileNotFoundError as exc:
         return core._json_response(
             {
@@ -6343,6 +6410,7 @@ def lane_dag(task_ref: str) -> dict[str, Any]:
             }
         )
 
+    source_status = read_plan_source_status(workspace_root, manifest)
     raw_lanes = manifest.get("lanes")
     lane_ids = {str(lane_id) for lane_id in raw_lanes} if isinstance(raw_lanes, Mapping) else set()
     try:
@@ -6352,6 +6420,7 @@ def lane_dag(task_ref: str) -> dict[str, Any]:
             wave_lane_ids=lane_ids,
         )
         rendered = render_lane_dag(manifest, admitted_width=admitted_width)
+        with_plan_source_status(rendered, source_status)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return core._json_response(
             {
@@ -6361,14 +6430,18 @@ def lane_dag(task_ref: str) -> dict[str, Any]:
                 "task_ref": normalized_task_ref,
             }
         )
-    return core._json_response(
-        {
-            "ok": True,
-            "task_ref": normalized_task_ref,
-            "ascii": rendered["ascii"],
-            "json": rendered["json"],
-        }
-    )
+    response = {
+        "ok": True,
+        "task_ref": normalized_task_ref,
+        "manifest_kind": "advisory" if schema == ADVISORY_GRAPH_SCHEMA else "execution",
+        "manifest_schema": schema,
+        "ascii": rendered["ascii"],
+        "json": rendered["json"],
+    }
+    if schema == ADVISORY_GRAPH_SCHEMA:
+        response["executable"] = False
+        response["admission"] = "not_applicable"
+    return core._json_response(response)
 
 
 def _tier_dispatch_receipts(state_dir: Path, task_ref: str, tier: str) -> list[dict[str, Any]]:

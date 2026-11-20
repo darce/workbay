@@ -14,6 +14,19 @@ a reviewer re-runs by hand today, and writes ``validation.json`` (schema
 4. ``acceptance``: :func:`acceptance_contract.run_contract` observes external
    frozen Python cases on both exact revisions, or a legacy tip command.
 
+Legacy invocations default to the merge gate. Use ``--phase lane`` or
+``WORKBAY_VALIDATION_PHASE=lane`` for frozen acceptance, hunk revert and targeted
+regressions, in that order. The lane stops at the first failed or unknown stage.
+Its Codemap fallback runs the supplied package selection and records the cause.
+
+For cache reuse the supervisor configures an external ``WORKBAY_BASE_RESULT_CACHE_DIR``
+and pins the harness's hex Ed25519 public key in ``WORKBAY_BASE_RESULT_VERIFY_KEY``.
+Only closure receives ``WORKBAY_BASE_RESULT_SIGNING_FD``, a seekable descriptor
+for its 32-byte raw private key. Lane commands read the cache and measure misses
+locally. Keep private key access outside candidate processes and their filesystem
+view. A configured store with unreadable or unauthenticated evidence yields unknown.
+The merge gate keeps its independent matched suite and A/A base control.
+
 The explicit ``--profile full40377`` additionally runs actual qualified252r2
 MODEL/property checks before candidate commands and selected regressions from
 held regression-selection@1 JSON. All six categories are required: missing or
@@ -73,6 +86,7 @@ PASS must check execution_evidence.qualification, not exit 0 alone.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
@@ -93,12 +107,15 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from workbay_handoff_mcp.verified_tests import lookup_base_result, measure_harness_base_result
+
 from . import acceptance_contract
 from .red_green_gate import (
     _harness_failure_type,
     _is_test_path,
     _isolated_base_command,
     _lane_check_timeout_seconds,
+    _revision_test_environment,
     _run_test_command,
     _site_roots_without_candidate_hooks,
     verify_red_green,
@@ -635,6 +652,726 @@ def _junit_outcomes(report: Path) -> dict[str, str] | None:
     return outcomes
 
 
+# Receive actual pytest node IDs after plugins, tier filters and parametrization.
+# A separate descriptor keeps test output out of the collection/result protocol.
+_LANE_PYTEST_SETUP = r"""
+import hashlib, json, os, sys
+from importlib import metadata
+from pathlib import Path
+import pytest
+
+class Observer:
+    def __init__(self):
+        self.nodes = []
+        self.outcomes = {}
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_finish(self, session):
+        self.nodes = [item.nodeid for item in session.items]
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        self.nodes = list(ids)
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" or report.skipped:
+            self.outcomes[report.nodeid] = report.outcome
+        elif report.failed:
+            self.outcomes[report.nodeid] = "error"
+
+def distribution_id(dist):
+    record = dist.read_text("RECORD")
+    return (dist.metadata["Name"], dist.version, hashlib.sha256(record.encode()).hexdigest() if record else None)
+
+"""
+
+_LANE_PYTEST_RUN = r"""runtime = {
+    "executable": str(Path(sys.executable).resolve()),
+    "prefix": str(Path(sys.prefix).resolve()),
+    "base_prefix": str(Path(sys.base_prefix).resolve()),
+    "version": sys.version,
+    "distributions": sorted(distribution_id(dist) for dist in metadata.distributions()),
+}
+request = json.loads(sys.argv[3])
+code = pytest.main(request["args"], plugins=[observer])
+with os.fdopen(int(sys.argv[4]), "w") as stream:
+    json.dump(dict(nodes=observer.nodes, outcomes=observer.outcomes, runtime=runtime), stream)
+sys.exit(code)
+"""
+
+# Keep the BASE observer byte-identical: its digest is part of the signed key.
+_LANE_PYTEST_OBSERVER = _LANE_PYTEST_SETUP + "observer = Observer()\n" + _LANE_PYTEST_RUN
+# xdist collects in its workers. Load this hook there as well so the controller
+# can distinguish a returned collection from a worker unwinding through finish.
+_TIP_WORKER_COLLECTION_PLUGIN = """import pytest
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtestloop(session):
+    if hasattr(session.config, "workeroutput"):
+        session.config.workeroutput["workbay_collection_returned"] = True
+    return (yield)
+"""
+_TIP_PACKAGE_OBSERVER = (
+    _LANE_PYTEST_SETUP
+    + r"""class PackageObserver(Observer):
+    def __init__(self):
+        super().__init__()
+        self.nodes = None
+        self.pending_nodes = None
+        self.pending_workers = set()
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_configure_node(self, node):
+        self.pending_workers.add(node)
+        self.nodes = None
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node, ids):
+        self.pending_nodes = list(ids)
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error):
+        if error or node.workeroutput.get("workbay_collection_returned") is not True:
+            return
+        self.pending_workers.remove(node)
+        if not self.pending_workers:
+            self.nodes = self.pending_nodes
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_finish(self, session):
+        # pytest also calls this hook while unwinding an interrupted collection.
+        self.pending_nodes = [item.nodeid for item in session.items]
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtestloop(self):
+        # Entry here means the top-level collection hook returned normally.
+        if not self.pending_workers:
+            self.nodes = self.pending_nodes
+        return (yield)
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.outcomes[report.nodeid] = "error"
+
+    def pytest_sessionfinish(self, session):
+        # pytest node IDs are relative to its selected config root. The
+        # invocation directory is the repository root of the observed tip.
+        repo_id = session.config.cwd_relative_nodeid
+        if self.nodes is not None:
+            self.nodes = [repo_id(node) for node in self.nodes]
+        self.outcomes = {repo_id(node): outcome for node, outcome in self.outcomes.items()}
+
+observer = PackageObserver()
+"""
+    + _LANE_PYTEST_RUN
+)
+
+
+# Pytest options whose arity and effect on selection are known. Ambiguous
+# filters and output destinations cannot define an exact cache input.
+_PYTEST_SUITE_FLAGS = frozenset({"-q", "-v", "-vv", "-s", "-ra", "-rfE", "--disable-warnings"})
+_PYTEST_SUITE_VALUES = frozenset({"-p", "-n", "--numprocesses", "--tb", "--color"})
+_LOCK_NAMES = frozenset({"uv.lock", "poetry.lock", "Pipfile.lock", "requirements.lock", "pylock.toml"})
+
+
+def _lane_pytest_command(
+    repository: Path, command: str
+) -> tuple[list[str], list[str], list[str], dict[str, Any]] | None:
+    try:
+        tokens = shlex.split(command)
+        isolated = _isolated_base_command(command, cwd=repository)
+        runtime = _check_interpreter(command, repository)
+    except (OSError, ValueError):
+        return None
+    if isolated is None or runtime["status"] != "resolved_command":
+        return None
+    module = next(
+        index for index, token in enumerate(tokens) if token == "-m" and tokens[index + 1 : index + 2] == ["pytest"]
+    )
+    # Resolve the environment directory, keeping the interpreter entry inside
+    # it. Resolving the final symlink alone would collapse independent venvs.
+    interpreter = isolated[1].parent.resolve() / isolated[1].name
+    runner = [*tokens[: module - 1], str(interpreter), "-m", "pytest"]
+    runtime = _binary_identity(interpreter)
+    config = interpreter.parent.parent / "pyvenv.cfg"
+    runtime["venv_config"] = _file_sha256(config) if config.is_file() else "system_or_launcher"
+    options: list[str] = []
+    nodes: list[str] = []
+    args = iter(tokens[module + 2 :])
+    for arg in args:
+        option, equals, _ = arg.partition("=")
+        if arg in _PYTEST_SUITE_FLAGS:
+            options.append(arg)
+        elif option in _PYTEST_SUITE_VALUES:
+            options.append(arg)
+            if not equals:
+                value = next(args, None)
+                if not value or value.startswith("-"):
+                    return None
+                options.append(value)
+        else:
+            path, marker, suffix = arg.partition("::")
+            if not re.fullmatch(r"[A-Za-z0-9_./-]+", path) or path.startswith(("/", "-")):
+                return None
+            normalized = PurePosixPath(path)
+            if ".." in normalized.parts or not (repository / normalized).resolve().is_relative_to(repository):
+                return None
+            node = normalized.as_posix() + marker + suffix
+            if marker:
+                try:
+                    _node_path(node)
+                except ValueError:
+                    return None
+            nodes.append(node)
+    return runner, options, sorted(set(nodes or ["."])), runtime
+
+
+def _python_symbols(body: list[ast.stmt], prefix: str = "") -> tuple[dict[str, str], list[str]]:
+    functions: dict[str, str] = {}
+    structure = []
+    for item in body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = prefix + item.name
+            if name in functions:
+                # Overloads/redefinitions need wider coverage.
+                raise ValueError("ambiguous definition")
+            functions[name] = ast.dump(item)
+            structure.append(name)
+        elif isinstance(item, ast.ClassDef):
+            methods, class_structure = _python_symbols(item.body, prefix + item.name + ".")
+            if methods.keys() & functions.keys():
+                raise ValueError("ambiguous class definition")
+            functions.update(methods)
+            class_header = ast.ClassDef(**{**dict(ast.iter_fields(item)), "body": []})
+            structure.append(ast.dump(class_header))
+            structure.extend(class_structure)
+        else:
+            structure.append(ast.dump(item))
+    return functions, structure
+
+
+def _source_ast(repository: Path, revision: str, path: str) -> ast.Module:
+    return ast.parse(_git(repository, "show", f"{revision}:{path}").stdout, filename=path)
+
+
+def _package_test_dir(path: str) -> str:
+    parts = PurePosixPath(path).parts
+    return f"packages/{parts[1]}/tests" if len(parts) >= 2 and parts[0] == "packages" else "tests"
+
+
+def _changed_paths(repository: Path, base: str, tip: str) -> list[str]:
+    paths = _git(repository, "diff", "--no-renames", "--name-only", "-z", base, tip).stdout
+    return [path for path in paths.split("\0") if path]
+
+
+def committed_test_directories(repository: Path, base: str, tip: str, paths: list[str] | None = None) -> list[str]:
+    """Discover package tests in committed trees, including revision-only directories."""
+    if paths is None:
+        paths = _changed_paths(repository, base, tip)
+    candidates = sorted({_package_test_dir(path) for path in paths})
+    if not candidates:
+        return []
+    directories: set[str] = set()
+    for revision in (base, tip):
+        entries = _git(repository, "ls-tree", "-dz", "--name-only", revision, "--", *candidates)
+        directories.update(path for path in entries.stdout.split("\0") if path)
+    return sorted(directories)
+
+
+def _intersect_suite(node: str, suite: list[str]) -> set[str]:
+    if any(_pytest_selector_contains(target, node) for target in suite):
+        return {node}
+    return {target for target in suite if _pytest_selector_contains(node, target)}
+
+
+def _codemap_test_nodes(
+    repository: Path, base: str, tip: str, paths: list[str], suite: list[str]
+) -> tuple[set[str], dict[str, str]] | None:
+    """Select positive inbound evidence; an incomplete graph uses suite fallback."""
+    from .lane_context_packet import project_key_for_worktree, run_codemap_cli
+
+    project = project_key_for_worktree(repository)
+    deadline = time.monotonic() + 15
+
+    def query(tool: str, **extra: Any) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        result = run_codemap_cli(tool, {"project": project, **extra}, timeout_seconds=min(remaining, 5))
+        data = result.get("data")
+        return data if result["ok"] and isinstance(data, dict) else {}
+
+    status = query("index_status")
+    git_status = status.get("git")
+    graph_root = status.get("root_path") or status.get("repo_path")
+    if (
+        status.get("status") not in {"ready", "indexed", "ok", "fresh"}
+        or status.get("stale")
+        or not isinstance(graph_root, str)
+        or Path(graph_root).resolve() != repository
+        or not isinstance(git_status, dict)
+        or git_status.get("head_sha") != tip
+        or _resolve_commit(repository, "HEAD") != tip
+        or _git(repository, "diff", *_DIFF_OPTIONS, "HEAD").stdout
+    ):
+        return None
+    # The installed transport publishes a live HEAD probe in git.head_sha.
+    # Check its index-to-worktree delta as well when it reports root_path.
+    if "root_path" in status:
+        delta = query("detect_changes")
+        if (
+            delta.get("status") not in {"ok", "ready", "success"}
+            or delta.get("changed_files") != []
+            or (type(delta.get("changed_count")) is not int or delta["changed_count"] != 0 or delta.get("stale"))
+        ):
+            return None
+
+    gaps: dict[str, str] = {}
+    nodes: set[str] = set()
+    test_symbols: dict[str, dict[str, str]] = {}
+    try:
+        for path in filter(None, paths):
+            if not path.endswith(".py") or Path(path).name == "conftest.py":
+                return None
+            if _is_test_path(path):
+                _node_path(path)
+                nodes.update(_intersect_suite(path, suite))
+                continue
+            before, before_structure = _python_symbols(_source_ast(repository, base, path).body)
+            after, after_structure = _python_symbols(_source_ast(repository, tip, path).body)
+            if before_structure != after_structure or before.keys() != after.keys():
+                return None
+            for symbol in (name for name in after if before[name] != after[name]):
+                module = path.partition("/src/")[2] or path
+                target = module[:-3].replace("/", ".") + "." + symbol
+                trace = query(
+                    "trace_path", function_name=target, direction="inbound", include_tests=True, depth=5, limit=100
+                )
+                callers = trace.get("callers")
+                if (
+                    not isinstance(callers, list)
+                    or len(callers) >= 100
+                    or any(trace.get(flag) for flag in ("truncated", "has_more", "next_cursor"))
+                ):
+                    return None
+                matches_in_suite: set[str] = set()
+                for caller in callers:
+                    if not isinstance(caller, dict):
+                        return None
+                    test_path = caller.get("file_path")
+                    name = caller.get("name")
+                    if not isinstance(test_path, str) or not isinstance(name, str):
+                        return None
+                    if not name.rsplit(".", 1)[-1].startswith("test_") or not _is_test_path(test_path):
+                        continue
+                    _node_path(test_path)
+                    if test_path not in test_symbols:
+                        test_symbols[test_path], _ = _python_symbols(_source_ast(repository, tip, test_path).body)
+                    qualified = caller.get("qualified_name") or name
+                    if not isinstance(qualified, str):
+                        return None
+                    matches = [
+                        test for test in test_symbols[test_path] if qualified == test or qualified.endswith("." + test)
+                    ]
+                    if not matches:
+                        return None
+                    node = test_path + "::" + max(matches, key=len).replace(".", "::")
+                    _node_path(node)
+                    matches_in_suite.update(_intersect_suite(node, suite))
+                if matches_in_suite:
+                    nodes.update(matches_in_suite)
+                else:
+                    gaps[target] = "codemap_no_callers_in_suite"
+                    nodes.update(_intersect_suite(_package_test_dir(path), suite) or suite)
+    except (SyntaxError, ValueError, subprocess.CalledProcessError):
+        return None
+    return nodes, gaps
+
+
+def _base_result_key(
+    repository: Path,
+    base: str,
+    tip: str,
+    environment: dict[str, str],
+    options: list[str],
+    nodes: list[str],
+    runtime: dict[str, Any],
+    seed: int,
+) -> tuple[str, str]:
+    # Blob object IDs bind raw lock contents without decoding or touching
+    # the lane worktree. Lock changes at either revision change the environment.
+    locks: dict[str, dict[str, str]] = {}
+    for arm, revision in (("base", base), ("tip", tip)):
+        locks[arm] = {}
+        entries = _git(repository, "ls-tree", "-rz", revision).stdout.split("\0")
+        for entry in filter(None, entries):
+            header, path = entry.split("\t", 1)
+            if Path(path).name in _LOCK_NAMES:
+                locks[arm][path] = header.rsplit(" ", 1)[-1]
+    env_digest = _sha256(
+        _canonical(
+            {
+                "runtime": runtime,
+                "platform": platform.platform(),
+                "locks": locks,
+                "pytest_options": options,
+                "environment": environment,
+                "seed": seed,
+            }
+        )
+    )
+    return _sha256(
+        _canonical(
+            {
+                "base_tree": _revision_identity(repository, base)["tree"],
+                "env_digest": env_digest,
+                "test_nodes": nodes,
+            }
+        )
+    ), env_digest
+
+
+def _pytest_selector_contains(target: str, node: str) -> bool:
+    return target == "." or node == target or node.startswith((target + "::", target + "/", target + "["))
+
+
+def _lane_selection(repository: Path, base: str, tip: str, paths: list[str], fallback: list[str]) -> dict[str, Any]:
+    traced = _codemap_test_nodes(repository, base, tip, paths, fallback)
+    nodes, gaps = traced if traced is not None else (set(), {})
+    reason = "codemap_unavailable" if traced is None else "codemap_callers"
+    if traced is not None and (gaps or not nodes):
+        reason = "codemap_no_callers_in_suite"
+    if not nodes:
+        # A broad suite argument (including ".") still falls back to the
+        # packages in the committed diff. Explicit narrower selectors survive.
+        for package in committed_test_directories(repository, base, tip, paths):
+            nodes.update(_intersect_suite(package, fallback))
+    selected = set(nodes or fallback)
+    tip_only_dirs: set[str] = set()
+
+    # A new test must run at tip. A common parent directory lets pytest
+    # collect each revision's own nodes without giving BASE a tip-only path.
+    for node in sorted(selected):
+        path, marker, _ = node.partition("::")
+        if path == ".":
+            continue
+        at_base, at_tip = (_git(repository, "ls-tree", rev, "--", path).stdout for rev in (base, tip))
+        if not (at_base and at_tip):
+            parent = _package_test_dir(path)
+            base_dir, tip_dir = (_git(repository, "ls-tree", "-d", rev, "--", parent).stdout for rev in (base, tip))
+            if tip_dir and not base_dir and at_tip and _pytest_selector_contains(parent, path):
+                tip_only_dirs.add(parent)
+            elif not (base_dir and tip_dir):
+                return {"reason": "no_common_test_directory", "node_ids": [], "path": path}
+            selected.remove(node)
+            selected.add(parent)
+            gaps[node] = reason = "revision_specific_tests"
+        elif marker and path in paths and path not in selected:
+            # The file exists on both arms, but the test name or its parameter
+            # IDs may have changed. Collect the file separately at each commit.
+            selected.remove(node)
+            selected.add(path)
+            gaps[node] = reason = "revision_specific_tests"
+    selectors = sorted(
+        n for n in selected if not any(other != n and _pytest_selector_contains(other, n) for other in selected)
+    )
+    return {
+        "reason": reason,
+        "node_ids": selectors,
+        "base_node_ids": [node for node in selectors if node not in tip_only_dirs],
+        "fallbacks": gaps,
+    }
+
+
+def _lane_regressions(
+    repository: Path,
+    base: str,
+    tip: str,
+    suite_cmd: str | None,
+    *,
+    seed: int,
+    timeout: float,
+    timing: _Timing,
+    cache_root: Path | None,
+    cache_writer: bool,
+) -> dict[str, Any]:
+    paths = _changed_paths(repository, base, tip)
+    if suite_cmd is None:
+        packages = committed_test_directories(repository, base, tip, paths)
+        if not packages:
+            return _category("unknown", "package_selection_unavailable", changed_paths=paths)
+        executable = repository / ".venv" / "bin" / "python"
+        suite_cmd = shlex.join(
+            [
+                str(executable if executable.exists() else sys.executable),
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                *packages,
+            ]
+        )
+    parsed = _lane_pytest_command(repository, suite_cmd)
+    if parsed is None:
+        return _category("unknown", "suite_cmd_not_pytest_shaped")
+    runner, options, fallback, runtime = parsed
+    selection = _lane_selection(repository, base, tip, paths, fallback)
+    evidence: dict[str, Any] = {"selection": selection}
+    nodes = selection["node_ids"]
+    if not nodes:
+        return _category("unknown", selection["reason"], **evidence)
+    base_selectors = selection["base_node_ids"]
+
+    # Freeze the exact child environment before lookup. The only arm-specific
+    # substitution is PYTHONPATH, derived from the corresponding clean tree.
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("WORKBAY_BASE_RESULT_")}
+    for assignment in runner[:-3]:
+        name, _, value = assignment.partition("=")
+        environment[name] = value
+    # The subprocess changes directory into a detached revision. Do not carry
+    # the invoking shell's logical working directory or activation aliases.
+    environment.pop("PWD", None)
+    environment.pop("OLDPWD", None)
+    if environment.get("VIRTUAL_ENV"):
+        environment["VIRTUAL_ENV"] = str(Path(environment["VIRTUAL_ENV"]).resolve())
+    if "PATH" in environment:
+        environment["PATH"] = os.pathsep.join(
+            str(Path(entry).resolve()) if Path(entry).is_absolute() else entry
+            for entry in environment["PATH"].split(os.pathsep)
+        )
+    environment.pop("PYTHONPATH", None)
+    environment.update(PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED=str(seed))
+
+    with tempfile.TemporaryDirectory(prefix="workbay-targeted-") as directory:
+        artifacts = Path(directory)
+        expected_runtime: dict[str, Any] | None = None
+        base_nodes: list[str] | None = None
+
+        def observe(
+            revision: str,
+            arm: str,
+            selectors: list[str],
+            *,
+            collect: bool = False,
+            tip_package: bool = False,
+        ) -> dict[str, Any] | None:
+            label = f"regression_suite.{arm}"
+            with _scratch_worktree(repository, revision, f"targeted-{arm}") as worktree:
+                paths_in_tree = (worktree / node.split("::", 1)[0] for node in selectors)
+                if any(not path.resolve().is_relative_to(worktree) for path in paths_in_tree):
+                    return None
+                args = [*options, *selectors, "--maxfail=0"]
+                if collect:
+                    args.append("--collect-only")
+                pythonpath = _revision_test_environment(worktree)["PYTHONPATH"]
+                if tip_package:
+                    plugin = artifacts / "_workbay_tip_worker_collection.py"
+                    plugin.write_text(_TIP_WORKER_COLLECTION_PLUGIN, encoding="utf-8")
+                    args.extend(["-p", plugin.stem])
+                    pythonpath = str(artifacts) + os.pathsep + pythonpath
+                run, payload = _supervised_revision(
+                    worktree,
+                    _revision_identity(repository, revision),
+                    mode="lane",
+                    request={"args": args},
+                    seed=seed,
+                    timeout=timeout,
+                    artifacts=artifacts,
+                    label=label,
+                    observer=_TIP_PACKAGE_OBSERVER if tip_package else _LANE_PYTEST_OBSERVER,
+                    interpreter=Path(runner[-3]),
+                    environment={**environment, "PYTHONPATH": pythonpath},
+                )
+                timing.record_run(label, run)
+                if (
+                    run.observation["cleanup_errors"]
+                    or not payload
+                    or run.observation["runtime"]["binary_sha256"] != runtime["binary_sha256"]
+                    or not payload.get("runtime")
+                    or (expected_runtime is not None and expected_runtime != payload["runtime"])
+                ):
+                    return None
+                failure_type = run.harness_failure
+                observed_nodes = payload.get("nodes")
+                if (
+                    tip_package
+                    and failure_type == "pytest_no_tests_collected"
+                    and observed_nodes == []
+                    and payload.get("outcomes") == {}
+                ):
+                    return payload
+                if failure_type or not observed_nodes or len(observed_nodes) != len(set(observed_nodes)):
+                    return None
+                if collect:
+                    return payload if run.returncode == 0 else None
+                outcomes = payload.get("outcomes")
+                if (
+                    not isinstance(outcomes, dict)
+                    or set(outcomes) != set(payload["nodes"])
+                    or "error" in outcomes.values()
+                    or not any(value in ("passed", "failed") for value in outcomes.values())
+                    or (run.returncode == 1) != ("failed" in outcomes.values())
+                ):
+                    return None
+                return payload
+
+        def measure() -> dict[str, str] | None:
+            nonlocal expected_runtime
+            payload = observe(base, "base", base_selectors)
+            if payload is None or (base_nodes is not None and sorted(payload["nodes"]) != base_nodes):
+                return None
+            expected_runtime = payload["runtime"]
+            return payload["outcomes"]
+
+        baseline: dict[str, str] | None
+        if not base_selectors:
+            # Git confirmed that every selected test directory was introduced at tip.
+            evidence["base_result_cache"] = {"status": "not_applicable", "reason": "tip_only_test_directories"}
+            baseline = {}
+        elif cache_root is None:
+            evidence["base_result_cache"] = {"status": "disabled"}
+            baseline = measure()
+        else:
+            if not cache_root.is_absolute() or cache_root.resolve().is_relative_to(repository):
+                evidence["base_result_cache"] = {"status": "unknown"}
+                return _category("unknown", "base_result_cache_root_not_held", **evidence)
+            collection = observe(base, "base_collection", base_selectors, collect=True)
+            if collection is None:
+                evidence["base_result_cache"] = {"status": "unknown"}
+                return _category("unknown", "base_collection_unavailable", **evidence)
+            base_nodes = sorted(collection["nodes"])
+            expected_runtime = collection["runtime"]
+            if any(not record for _, _, record in collection["runtime"]["distributions"]):
+                evidence["base_result_cache"] = {"status": "unknown"}
+                return _category("unknown", "base_environment_unidentified", **evidence)
+            key, env_digest = _base_result_key(
+                repository,
+                base,
+                tip,
+                environment,
+                options,
+                base_nodes,
+                {**runtime, "interpreter": expected_runtime, "observer": _sha256(_LANE_PYTEST_OBSERVER.encode())},
+                seed,
+            )
+            if cache_writer:
+                result = measure_harness_base_result(cache_root, key, measure, lock_timeout=timeout)
+            else:
+                result = lookup_base_result(cache_root, key)
+            cache_evidence: dict[str, Any] = {
+                "status": result.status,
+                "key": key,
+                "env_digest": env_digest,
+                "base_node_count": len(base_nodes),
+            }
+            evidence["base_result_cache"] = cache_evidence
+            if result.reason is not None:
+                return _category("unknown", result.reason, **evidence)
+            if not cache_writer and result.status == "miss":
+                cache_evidence["write_status"] = "base_result_write_refused"
+                baseline = measure()
+            else:
+                baseline = result.outcomes
+        if baseline is None:
+            return _category("unknown", "base_result_measurement_unknown", **evidence)
+        common_outcomes: dict[str, str] = {}
+        if base_selectors:
+            common = observe(tip, "tip", base_selectors)
+            if common is None:
+                return _category("unknown", "tip_result_measurement_unknown", **evidence)
+            common_outcomes = common["outcomes"]
+
+        base_failures = {node for node, outcome in baseline.items() if outcome == "failed"}
+        new = {node for node, outcome in common_outcomes.items() if outcome == "failed"} - base_failures
+        missing = sorted(baseline.keys() - common_outcomes.keys())
+        skipped = {
+            node
+            for node, outcome in common_outcomes.items()
+            if outcome == "skipped" and baseline.get(node) != "skipped"
+        }
+
+        # Each first test directory needs its own pytest config and module namespace.
+        package_results: dict[str, dict[str, Any]] = {}
+        first_unobserved = None
+        for index, directory in enumerate(sorted(set(nodes) - set(base_selectors))):
+            arm = f"tip_package_{index}"
+            fault: dict[str, Any] = {}
+            try:
+                package = observe(tip, arm, [directory], tip_package=True)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                package = None
+                fault["error_type"] = type(exc).__name__
+            observation = timing.observations.get(f"regression_suite.{arm}", {})
+            exit_code = observation.get("exit_code")
+            if package is None:
+                fault["exit_code"] = exit_code
+                if observation.get("timed_out"):
+                    fault["error_type"] = "timeout"
+                package_results[directory] = {"status": "unobserved", **fault}
+                if first_unobserved is None:
+                    # Keep the existing single-package diagnostic for readers of UNKNOWN.
+                    first_unobserved = {"package_test_directory": directory, **fault}
+                continue
+            package_results[directory] = {
+                "status": "observed",
+                "test_count": len(package["nodes"]),
+                "exit_code": exit_code,
+            }
+            # These tests had no BASE counterpart, even if a common package
+            # used the same package-relative pytest ID.
+            for node, outcome in package["outcomes"].items():
+                if outcome == "failed":
+                    new.add(node)
+                elif outcome == "skipped":
+                    skipped.add(node)
+
+    if package_results:
+        evidence["tip_only_packages"] = package_results
+    if new:
+        return _category(
+            "fail", "new_failures", base_failures=sorted(base_failures), new_failures=sorted(new), **evidence
+        )
+    if first_unobserved is not None:
+        return _category("unknown", "tip_result_measurement_unknown", **first_unobserved, **evidence)
+    if missing or skipped:
+        return _category("unknown", "suite_coverage_incomplete", missing=missing, skipped=sorted(skipped), **evidence)
+    return _category("pass", "no_new_failures", base_failures=sorted(base_failures), new_failures=[], **evidence)
+
+
+def _run_regressions(
+    repository: Path, base: str, tip: str, suite_cmd: str, *, timeout: float, cache_writer: bool
+) -> dict[str, Any]:
+    """Read harness baseline evidence or run an uncached lane comparison."""
+    timing = _Timing()
+    cache_dir = os.environ.get("WORKBAY_BASE_RESULT_CACHE_DIR")
+    return _guarded(
+        "regression_suite",
+        timing,
+        lambda: _lane_regressions(
+            repository.resolve(),
+            _resolve_commit(repository, base),
+            _resolve_commit(repository, tip),
+            suite_cmd,
+            seed=0,
+            timeout=timeout,
+            timing=timing,
+            cache_root=Path(cache_dir) if cache_dir else None,
+            cache_writer=cache_writer,
+        ),
+    )
+
+
+def run_lane_regressions(repository: Path, base: str, tip: str, suite_cmd: str, *, timeout: float) -> dict[str, Any]:
+    """Consume a signed baseline or run a fresh comparison without publication."""
+    return _run_regressions(repository, base, tip, suite_cmd, timeout=timeout, cache_writer=False)
+
+
+def run_closure_regressions(repository: Path, base: str, tip: str, suite_cmd: str, *, timeout: float) -> dict[str, Any]:
+    """Publish a measured baseline when the closure holds the configured signing capability."""
+    return _run_regressions(repository, base, tip, suite_cmd, timeout=timeout, cache_writer=True)
+
+
 def _matched_suite(
     repository: Path,
     base: str,
@@ -1037,16 +1774,19 @@ def _supervised_revision(
     timeout: float,
     artifacts: Path,
     label: str,
+    interpreter: Path = Path(sys.executable),
+    environment: dict[str, str] | None = None,
+    observer: str = _REVISION_OBSERVER,
 ) -> tuple[_Run, dict[str, Any] | None]:
     before = _observed_source(worktree)
     if any(before.get(key) != value for key, value in expected.items()) or before["diff_sha256"] != _sha256(b""):
         raise _SourceIdentityMismatch("revision observer did not start at the exact clean source")
     argv = [
-        sys.executable,
-        "-S",
+        str(interpreter),
+        *(["-S"] if environment is None else []),
         "-P",
         "-c",
-        _REVISION_OBSERVER,
+        observer,
         str(worktree),
         mode,
         json.dumps(request, allow_nan=False),
@@ -1056,8 +1796,8 @@ def _supervised_revision(
         source=before,
         seed=seed,
         timeout_seconds=timeout,
-        runtime=_binary_identity(Path(sys.executable)),
-        observer_sha256=_sha256(_REVISION_OBSERVER.encode()),
+        runtime=_binary_identity(interpreter),
+        observer_sha256=_sha256(observer.encode()),
     )
     started = time.monotonic()
     timed_out = False
@@ -1068,7 +1808,14 @@ def _supervised_revision(
     ):
         argv.append(str(channel.fileno()))
         observation["command"] = list(argv)
-        env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+        if environment is None:
+            environment = {
+                **{key: value for key, value in os.environ.items() if not key.startswith("PYTHON")},
+                "PYTHONHASHSEED": str(seed),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTEST_ADDOPTS": "",
+            }
         process = subprocess.Popen(
             argv,
             cwd=worktree,
@@ -1076,13 +1823,7 @@ def _supervised_revision(
             stderr=stderr,
             start_new_session=True,
             pass_fds=(channel.fileno(),),
-            env={
-                **env,
-                "PYTHONHASHSEED": str(seed),
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-                "PYTEST_ADDOPTS": "",
-            },
+            env=environment,
         )
         try:
             process.wait(timeout=timeout)
@@ -1100,6 +1841,8 @@ def _supervised_revision(
         },
     )
     after = observation["source_after"]
+    if _binary_identity(interpreter) != observation["runtime"]:
+        observation["identity_mismatch"] = "runtime_identity_mismatch"
     if before != after:
         observation["identity_mismatch"] = "source_identity_mismatch"
     payload = None
@@ -1370,6 +2113,7 @@ def run_battery(
     regression_selection: Path | str | None = None,
     regression_expected_digest: str | None = None,
     regression_catalog: Path | str | None = None,
+    phase: str | None = None,
 ) -> dict[str, Any]:
     """Run exact-source controls; see module docstring for binding and qualification.
 
@@ -1379,6 +2123,11 @@ def run_battery(
     if profile not in _PROFILES:
         raise ValueError(f"profile must be one of {_PROFILES}")
     full = profile == "full40377"
+    if phase is None:
+        phase = "merge_gate" if full else os.environ.get("WORKBAY_VALIDATION_PHASE", "merge_gate")
+    if phase not in {"lane", "merge_gate"} or (full and phase == "lane"):
+        raise ValueError("phase must be lane or merge_gate; full40377 requires merge_gate")
+    lane = phase == "lane"
     if full:
         for name, value in (("model_max_depth", model_max_depth), ("model_max_states", model_max_states)):
             if type(value) is not int or value <= 0:
@@ -1544,10 +2293,40 @@ def run_battery(
         builders["acceptance"] = lambda: _acceptance(
             repository, tip, acceptance_cmd, seed=seed, timeout=timeout, timing=timing
         )
+    if lane:
+        cache_dir = os.environ.get("WORKBAY_BASE_RESULT_CACHE_DIR")
+        builders = {
+            **({"acceptance": builders["acceptance"]} if not bound else {}),
+            "hunk_revert": builders["hunk_revert"],
+            "red_on_base": (
+                (lambda: _category("not_applicable", "covered_by_frozen_fix"))
+                if categories.get("acceptance", {}).get("reason") == "fix_observed"
+                else builders["red_on_base"]
+            ),
+            "regression_suite": lambda: _lane_regressions(
+                repository,
+                base,
+                tip,
+                suite_cmd,
+                seed=seed,
+                timeout=timeout,
+                timing=timing,
+                cache_root=Path(cache_dir) if cache_dir else None,
+                cache_writer=False,
+            ),
+        }
+        categories["matched_suite"] = _category("not_applicable", "merge_gate_only")
+    acceptance = categories.get("acceptance", {})
+    stopped_at = "acceptance" if lane and acceptance.get("status") in {"fail", "unknown"} else None
     for name, build in builders.items():
+        if stopped_at is not None:
+            categories[name] = _category("not_applicable", "earlier_stage_stopped_run", stage=stopped_at)
+            continue
         started = time.monotonic()
         categories[name] = _guarded(name, timing, build)
         timing.durations[f"category.{name}"] = round(time.monotonic() - started, 6)
+        if lane and categories[name]["status"] in {"fail", "unknown"}:
+            stopped_at = name
 
     if full:
         if "regression_suite" not in categories:
@@ -1627,6 +2406,9 @@ def run_battery(
         "timing": timing.as_dict(),
     }
     document["profile"] = profile
+    if lane:
+        document["phase"] = phase
+        document["stopped_at"] = stopped_at
     document["required_categories"] = list(FULL40377_REQUIRED) if full else []
     document["coverage"] = dict(
         partial=True,
@@ -1714,6 +2496,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--acceptance-cases-root", type=Path)
     parser.add_argument("--acceptance-expected-digest")
     parser.add_argument("--evidence-role", choices=_EVIDENCE_ROLES)
+    parser.add_argument("--phase", choices=("lane", "merge_gate"))
     parser.add_argument("--profile", choices=_PROFILES, default="legacy")
     parser.add_argument("--model-max-depth", type=int)
     parser.add_argument("--model-max-states", type=int)
@@ -1741,6 +2524,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             max_hunks=args.max_hunks,
             profile=args.profile,
+            phase=args.phase,
             model_max_depth=args.model_max_depth,
             model_max_states=args.model_max_states,
             model_deadline_seconds=args.model_deadline_seconds,

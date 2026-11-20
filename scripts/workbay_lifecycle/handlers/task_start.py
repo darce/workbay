@@ -1607,6 +1607,81 @@ def _resolve_plan_glob(
     return str(matches[-1].relative_to(repo)), None
 
 
+_PLAN_GRAPH_TIMEOUT_SECONDS = 30.0
+
+
+def _start_plan_graph(root: Path, task_ref: str, plan_path: str) -> dict[str, Any]:
+    """Reach the optional provider in a bounded subprocess, never import it."""
+    unknown: dict[str, Any] = {
+        "outcome": "unknown",
+        "reason": "plan_graph_unavailable",
+        "manifest_path": str(root / "config" / "lane-orchestration" / f"{task_ref}.json"),
+        "decomposition_digest": None,
+    }
+    adapter_detail = ""
+    try:
+        proc = _common.run_subprocess(
+            [
+                sys.executable,
+                "-m",
+                "workbay_orchestrator_mcp.orchestration.plan_graph",
+                "--root",
+                str(root),
+                "--task",
+                task_ref,
+                "--plan",
+                plan_path,
+            ],
+            cwd=str(root),
+            timeout=_PLAN_GRAPH_TIMEOUT_SECONDS,
+        )
+        adapter_detail = f"rc={proc.returncode}: {proc.stderr[:300]}"
+        # Providers may emit diagnostics before their final JSON receipt.
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        if not isinstance(result, dict):
+            raise ValueError("adapter receipt is not an object")
+        outcome = result.get("outcome")
+        success = outcome in {"generated", "matched", "drifted", "untracked"}
+        success |= outcome == "skipped" and result.get("reason") == "no_decomposition"
+        failed = outcome == "failed" and result.get("reason") in {
+            "invalid_decomposition",
+            "manifest_publication_failed",
+        }
+        if not isinstance(result.get("manifest_path"), str) or not result["manifest_path"]:
+            raise ValueError("adapter receipt has no manifest_path")
+        if "decomposition_digest" not in result:
+            raise ValueError("adapter receipt has no decomposition_digest")
+        digest = result.get("decomposition_digest")
+        if outcome in {"generated", "matched", "drifted"} and (
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValueError("adapter receipt has no valid decomposition_digest")
+        if not ((success and proc.returncode == 0) or failed):
+            raise ValueError(f"adapter outcome unavailable (rc={proc.returncode}): {proc.stderr[:300]}")
+        return result
+    except Exception as exc:
+        return {**unknown, "detail": f"{type(exc).__name__}: {exc}; {adapter_detail}"[:500]}
+
+
+def _terminal_plan_cursor_disposition(root: Path, task_ref: str) -> dict[str, Any]:
+    """Optional task-scoped dry run; failure belongs only to its own receipt."""
+    try:
+        from workbay_handoff_mcp import configure_runtime
+        from workbay_handoff_mcp.import_export import expire_terminal_plan_cursors
+
+        configure_runtime(_procurement_runtime(root))
+        result = expire_terminal_plan_cursors(task_ref=task_ref)
+        if not isinstance(result, dict) or not result:
+            return {"ok": False, "reason": "empty_disposition_result"}
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "terminal_cursor_disposition_unavailable",
+            "detail": f"{type(exc).__name__}: {exc}"[:500],
+        }
+
+
 def run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="lifecycle task-start", add_help=True)
     parser.add_argument("--task", dest="task", default="")
@@ -2180,6 +2255,12 @@ def run(argv: list[str]) -> int:
     if claimed_plan_path is not None:
         plan_path = claimed_plan_path
 
+    plan_graph = None
+    plan_cursor_disposition = None
+    if plan_path is not None:
+        plan_graph = _start_plan_graph(worktree_path, task_ref, plan_path)
+        plan_cursor_disposition = _terminal_plan_cursor_disposition(worktree_path, task_ref)
+
     # Forward the objective so the first ``set`` for a brand-new task_ref can
     # INSERT the handoff_state row. Without it ``set_handoff_state`` rejects the
     # insert (objective required) yet the CLI still exits 0, so the projection
@@ -2495,6 +2576,13 @@ def run(argv: list[str]) -> int:
         },
     }
 
+    if plan_graph is not None:
+        receipt["plan_graph"] = plan_graph
+        receipt["plan_cursor_disposition"] = plan_cursor_disposition
+        if plan_graph.get("outcome") == "failed":
+            receipt["ok"] = False
+            receipt["reason"] = plan_graph["reason"]
+
     if provisioning_reason is not None:
         profile = _primary_bootstrap_manifest(primary_root).get("profile") or "all"
         recovery = shlex.join([
@@ -2675,11 +2763,17 @@ def run(argv: list[str]) -> int:
             # path that still raised before attempt bookkeeping). Keep the
             # failed token visible.
             line += f" drain_failed={drain_error}"
+        if plan_graph is not None:
+            line += f" plan_graph={plan_graph['outcome']}"
+            if plan_graph.get("reason"):
+                line += f" plan_graph_reason={plan_graph['reason']}"
         if provisioning_reason is not None:
             line += f" reason={provisioning_reason}; run `{receipt['recovery']}`"
         sys.stderr.write(line + "\n")
 
     _common.emit(receipt)
+    if plan_graph is not None and plan_graph.get("outcome") == "failed":
+        return 5
     if provisioning_reason == "lifecycle_surfaces_missing":
         return 3
     if provisioning_reason == "bootstrap_cli_missing":

@@ -480,17 +480,12 @@ def maybe_reap_stale_dev_temp(
     *,
     warnings: list[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Best-effort stale dev-tree age-out (internal / [RES-07]).
+    """Reclaim explicitly released private scratch through the native helper.
 
-    Imports ``workbay_bootstrap.dev_temp.reap_stale_dev_temp`` and runs with
-    ``apply=True``. On any import/runtime failure degrades to None — never
-    raises, never fails the host lifecycle command. ``repo`` selects the
-    second root (``<repo>/.workbay/scratch``) alongside the global ``/tmp``
-    scan; without it only ``/tmp`` is reclaimed.
-
-    When ``warnings`` is provided, each degradation path appends the same
-    cause string written to stderr so receipt consumers can see why the
-    sub-step failed without reading stderr [OBS-08][AGT-10].
+    Automatic context/finish work has no ambient temp authority. The scope
+    keyword is mandatory, including without a repo; version skew holds rather
+    than retrying an older helper with unknown deletion scope. Degradation is
+    visible in stderr and the lifecycle warnings/receipt.
     """
 
     def _degrade(cause: str) -> None:
@@ -505,28 +500,18 @@ def maybe_reap_stale_dev_temp(
         _degrade(f"import {type(exc).__name__}: {exc}")
         return None
     try:
-        report = (
-            reap_stale_dev_temp(apply=True, repo=repo)
-            if repo is not None
-            else reap_stale_dev_temp(apply=True)
-        )
+        report = reap_stale_dev_temp(apply=True, repo=repo, scope="lifecycle")
     except TypeError as exc:
-        # scripts/ and the installed workbay_bootstrap are versioned
-        # separately and this import is dynamic. An older package has no
-        # ``repo`` parameter; losing the scratch arm is acceptable, losing
-        # the /tmp arm that already worked is not.
-        _degrade(f"repo-scoped scratch arm unavailable ({exc}); retrying /tmp only")
-        try:
-            report = reap_stale_dev_temp(apply=True)
-        except Exception as retry_exc:  # noqa: BLE001 — never-raise
-            _degrade(f"{type(retry_exc).__name__}: {retry_exc}")
-            return None
+        _degrade(f"lifecycle scope unavailable or failed ({exc}); no unscoped retry")
+        return None
     except Exception as exc:  # noqa: BLE001 — never-raise
         _degrade(f"{type(exc).__name__}: {exc}")
         return None
     if not isinstance(report, dict):
         _degrade(f"non-dict report type {type(report).__name__}")
         return None
+    if report.get("ok") is False or report.get("errors"):
+        _degrade(f"native helper reported errors: {report.get('errors') or report.get('ok')}")
     removed = report.get("removed") or []
     stale_count = report.get("stale_count", 0)
     try:
@@ -1019,9 +1004,14 @@ def run_handoff_json(
     ``warning is None`` as success, so the warning channel is the
     structural place to surface envelope degradation [OBS-08][ARCH-13].
     """
-    proc = run_handoff_subprocess(
-        repo, handoff_command_argv(repo, *argv), timeout=timeout_seconds
-    )
+    try:
+        proc = run_handoff_subprocess(
+            repo, handoff_command_argv(repo, *argv), timeout=timeout_seconds
+        )
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        return None, ReceiptWarning(field=field, reason="unavailable")
     if proc.returncode == 124:
         return None, ReceiptWarning(
             field=field,
@@ -1189,20 +1179,31 @@ def read_handoff_rows(
     deadline = time.monotonic() + timeout if timeout is not None else None
 
     def invoke(argv: list[str], page_timeout: float | None) -> subprocess.CompletedProcess[str]:
-        if runner is not None:
-            return runner(argv, timeout=page_timeout)
-        return run_handoff_subprocess(repo, argv, timeout=page_timeout)
+        try:
+            if runner is not None:
+                return runner(argv, timeout=page_timeout)
+            return run_handoff_subprocess(repo, argv, timeout=page_timeout)
+        except ValueError as exc:
+            if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+                raise
+            return subprocess.CompletedProcess(argv, 127, stdout="", stderr=str(exc))
 
-    base_argv = handoff_command_argv(
-        repo,
-        "handoff-rows",
-        "--status",
-        *statuses,
-        "--limit",
-        str(HANDOFF_ROWS_PAGE_LIMIT),
-        "--response-budget-bytes",
-        str(HANDOFF_ROWS_RESPONSE_BUDGET_BYTES),
-    )
+    try:
+        base_argv = handoff_command_argv(
+            repo,
+            "handoff-rows",
+            "--status",
+            *statuses,
+            "--limit",
+            str(HANDOFF_ROWS_PAGE_LIMIT),
+            "--response-budget-bytes",
+            str(HANDOFF_ROWS_RESPONSE_BUDGET_BYTES),
+        )
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        proc = subprocess.CompletedProcess([], 127, stdout="", stderr=str(exc))
+        return HandoffRowsReadResult([], "nonzero_exit", proc)
     for attempt in range(3):
         all_rows: list[dict[str, Any]] = []
         seen_task_refs: set[str] = set()
@@ -1233,7 +1234,13 @@ def read_handoff_rows(
                         return HandoffRowsReadResult([], "timeout", proc)
                     assert timeout is not None
                     legacy_timeout = min(timeout, remaining)
-                legacy_argv = handoff_command_argv(repo, "handoff-rows", "--status", *statuses)
+                try:
+                    legacy_argv = handoff_command_argv(repo, "handoff-rows", "--status", *statuses)
+                except ValueError as exc:
+                    if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+                        raise
+                    failed = subprocess.CompletedProcess([], 127, stdout="", stderr=str(exc))
+                    return HandoffRowsReadResult([], "nonzero_exit", failed)
                 proc = invoke(legacy_argv, legacy_timeout)
                 if proc.returncode == 124:
                     return HandoffRowsReadResult([], "timeout", proc)
@@ -1534,13 +1541,18 @@ def derive_workspace_summary_view(repo: Path) -> WorkspaceSummaryView:
       ``WorkspaceSummaryParseError`` at every reader site; the derived
       path mirrors that contract).
     """
-    proc = run_handoff_subprocess(
-        repo,
-        handoff_command_argv(
-            repo, "render-handoff", "--kind=current_task", "--no-write"
-        ),
-        timeout=handoff_read_timeout(),
-    )
+    try:
+        proc = run_handoff_subprocess(
+            repo,
+            handoff_command_argv(
+                repo, "render-handoff", "--kind=current_task", "--no-write"
+            ),
+            timeout=handoff_read_timeout(),
+        )
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in ("native_runtime_unqualified", "native_runtime_unverified"):
+            raise
+        return _NONE_VIEW
     try:
         envelope = json.loads(proc.stdout)
     except (ValueError, json.JSONDecodeError):

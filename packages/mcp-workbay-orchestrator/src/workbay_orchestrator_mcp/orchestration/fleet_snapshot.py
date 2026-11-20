@@ -11,17 +11,20 @@ import json
 import math
 import os
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from workbay_handoff_mcp.config import RuntimeConfig
 from workbay_handoff_mcp.shared_schema import bounded_handoff_read
+from workbay_protocol import reasoning_effort as model_routing
 
 from . import host_resources as host
 from .fleet_lineage import build_lineage_tree as build_lineage_tree
@@ -36,6 +39,12 @@ _TERMINAL_LANES = frozenset({"merged", "closed", "closed_stale"})
 _OBSERVER_SLOT = threading.Lock()
 _VM_OBSERVER_SLOT = threading.Lock()
 _NATIVE_VM_RUNNER = subprocess.run
+# Process groups _run_vm_command started and has not yet retired; see
+# retire_native_groups. Once retired, this process starts no further group.
+_NATIVE_GROUPS_LOCK = threading.Lock()
+_NATIVE_GROUPS: set[int] = set()
+_native_retired = False
+NATIVE_RETIRE_FAILED_EXIT = 70
 
 
 def _iso(epoch: float | None = None) -> str:
@@ -63,6 +72,36 @@ def _state(observed_at, *, now=None, age=CACHE_FRESH_SECONDS):
 
 def _unknown(reason="not_observed"):
     return {"state": "unknown", "observed_at": None, "reason": reason}
+
+
+def _dispatch_defaults(root, budget):
+    """Top-level backend-ID map of repository defaults, separate from pass history.
+
+    Known entries carry the resolver's mode, backend_id, source, repo_root and
+    config_identity, plus state="known" and a UTC observed_at read time. Failed
+    policy reads retain backend/repository/read identity with state="unknown",
+    null mode/source/config_identity and error={type, code, message}.
+    """
+    from .backend_registry import get_backend_choices
+    from .remote_exec_mode import RemoteExecModeError, resolve_remote_exec_mode
+
+    defaults = {}
+    for backend in get_backend_choices():
+        budget.check()
+        observed_at = _iso()
+        try:
+            selection = resolve_remote_exec_mode(backend, repo_root=root, effective_env={})
+        except RemoteExecModeError as exc:
+            defaults[backend] = dict(
+                state="unknown", mode=None, backend_id=backend, source=None,
+                repo_root=str(Path(root).resolve()), config_identity=None,
+                observed_at=observed_at,
+                error=dict(type=type(exc).__name__, code=exc.code, message=str(exc)),
+            )
+            budget.issues.add(f"dispatch_defaults:{backend}:{exc.code}")
+        else:
+            defaults[backend] = dict(selection.to_mapping(), state="known", observed_at=observed_at)
+    return defaults
 
 
 @dataclass
@@ -185,6 +224,112 @@ def _held_slots(root: Path, width: int, budget: _Budget) -> int:
     return held
 
 
+def _swap_disk_path(resources):
+    """Resolve the same measured swap directory as host_resources, read-only."""
+    try:
+        if resources.platform == "linux":
+            path, _ = host._parse_proc_swaps(Path("/proc/swaps").read_text())
+            return Path(path).parent if path else None
+        if resources.platform == "darwin":
+            try:
+                prefix = host._sysctl("vm.swapfileprefix")
+            except (OSError, subprocess.SubprocessError):
+                prefix = "/private/var/vm/swapfile"
+            return Path(prefix).parent
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _host_disk(root, resources, policy, budget):
+    identity = dict(kind="host", hostname=socket.gethostname())
+    loaded = dict(
+        values=asdict(policy),
+        source="host_resources.load_host_memory_policy",
+        source_path=str(host.HARNESS_CONTRACT_RELPATH),
+        observed_at=_iso(),
+        environment={
+            key: os.environ.get(key) for key in ("WORKBAY_HOSTGOV_DISABLE", "WORKBAY_LOCAL_STAGING_DISK_FLOOR_GIB")
+        },
+    )
+    swap = _swap_disk_path(resources)
+    state = RuntimeConfig.for_repo(root).state_dir
+    rows = []
+    for kind, path, free, source, key, classes in (
+        (
+            "repository",
+            root,
+            resources.repo_volume_free_gib * 1024**3 if _number(resources.repo_volume_free_gib) else None,
+            "host_resources.repo_volume_free_gib",
+            "local_staging_disk_floor_gib",
+            [host.COST_HEAVY, host.COST_SUITE, host.COST_REMOTE_API],
+        ),
+        (
+            "swap",
+            swap,
+            resources.swap_volume_free_bytes if resources.swap_volume_free_bytes > 0 else None,
+            "host_resources.swap_volume_free_bytes",
+            "swap_volume_disk_floor_gib",
+            [],
+        ),
+        ("state", state, None, "os.statvfs", None, []),
+    ):
+        budget.check()
+        volume, total = None, None
+        # No swap reading is reusable without a measured path/volume. The
+        # producer's legacy zero sentinel does not distinguish a failed probe.
+        if path is not None:
+            try:
+                resolved = path.resolve(strict=True)
+                device = resolved.stat().st_dev
+                mount = resolved
+                while mount.parent != mount and mount.parent.stat().st_dev == device:
+                    mount = mount.parent
+                volume = dict(device=device, mount=str(mount))
+            except OSError:
+                pass
+            try:
+                stats = os.statvfs(path)
+                total = stats.f_blocks * stats.f_frsize
+                if free is None:
+                    free = stats.f_bavail * stats.f_frsize
+            except OSError:
+                pass
+        if kind == "swap" and volume is None:
+            free = None
+        threshold = getattr(policy, key) if key else None
+        effect = "none"
+        if _number(free) and threshold is not None and free < threshold * 1024**3:
+            if kind == "swap":
+                effect = "warning"
+            elif policy.enforcement != "off":
+                effect = "refusal" if policy.enforcement == "enforce" else "warning"
+        rows.append(
+            dict(
+                kind=kind,
+                identity=identity,
+                observed_at=_iso(resources.probed_at) if kind != "state" and resources.probed_at else _iso(),
+                source=source,
+                path=str(path) if path is not None else None,
+                volume=volume,
+                free_bytes=free if _number(free) else None,
+                total_bytes=total if _number(total) else None,
+                free_quality="known" if _number(free) else "unknown",
+                total_quality="known" if _number(total) else "unknown",
+                policy=dict(
+                    key=key,
+                    threshold_gib=threshold,
+                    enforcement=policy.enforcement,
+                    cost_classes=classes,
+                    effect=effect,
+                    source=loaded["source"],
+                    source_path=loaded["source_path"],
+                ),
+            )
+        )
+    return dict(state=_state(resources.probed_at), observed_at=_iso(), identity=identity, disk=rows, policy=loaded)
+
+
 def _admission(root: Path, budget: _Budget) -> dict:
     answer = dict(_unknown(), decision="unknown", held_slots=None, width=None, stock="not_evaluated")
     try:
@@ -194,12 +339,14 @@ def _admission(root: Path, budget: _Budget) -> dict:
         )
         answer["snapshot"] = asdict(resources)
         answer["observed_at"] = _iso(resources.probed_at) if resources.probed_at else None
+        policy = host.load_host_memory_policy(root)
+        answer["host"] = _host_disk(root, resources, policy, budget)
+        answer["policy"] = answer["host"]["policy"]
         if resources.probe_error or resources.available_ram is None or resources.pressure == "unknown":
             raise ValueError(resources.probe_error or "host_resources_unknown")
         if resources.repo_volume_free_gib is None:
             raise ValueError("repo_volume_unknown")
         budget.check()
-        policy = host.load_host_memory_policy(root)
         width, _ = host.reported_width(resources, policy, host.COST_HEAVY)
         answer["width"] = width
         held = _held_slots(_locks_root_readonly(root, budget.deadline), width, budget) if width is not None else 0
@@ -467,6 +614,9 @@ def _passes(state, entries, budget, hours):
                     link="unknown",
                     phases=_unknown(),
                     tokens=_unknown(),
+                    remote_exec_mode=None,
+                    remote_exec_mode_quality="unknown",
+                    remote_exec_mode_source=None,
                 )
             )
             continue
@@ -499,6 +649,10 @@ def _passes(state, entries, budget, hours):
             test_cmd=config.get("test_cmd"),
             dispatch_id=payload.get("dispatch_id") or config.get("dispatch_id"),
         )
+        mode = payload.get("remote_exec_mode")
+        row.update(remote_exec_mode=mode if mode in ("attached", "detached") else None,
+                   remote_exec_mode_quality="known" if mode in ("attached", "detached") else "unknown",
+                   remote_exec_mode_source="pass_state.remote_exec_mode" if mode in ("attached", "detached") else None)
         matches = markers.get(pass_id, [])
         matches.sort(key=lambda pair: (pair[0] is None, pair[0] or 0, pair[1]))
         ordered = all(stamp is not None for stamp, _ in matches)
@@ -578,8 +732,17 @@ def _ledger(runtime, budget, hours):
         lanes = [
             dict(row)
             for row in conn.execute(
-                "SELECT * FROM worktree_lanes WHERE status NOT IN ('merged','closed','closed_stale') ORDER BY id LIMIT ?",
-                (MAX_FILES + 1,),
+                "SELECT * FROM worktree_lanes WHERE status NOT IN ('merged','closed','closed_stale') "
+                "OR julianday(updated_at) >= julianday(?) ORDER BY id LIMIT ?",
+                (cutoff, MAX_FILES + 1),
+            )
+        ]
+        # Attribution is independent of the display window. An old terminal
+        # lane can still identify an observed VM directory's repository.
+        roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT task_ref, lane_id, worktree_path FROM worktree_lanes ORDER BY id LIMIT ?", (MAX_FILES + 1,)
             )
         ]
         metrics = [
@@ -591,16 +754,16 @@ def _ledger(runtime, budget, hours):
                 (cutoff, MAX_FILES + 1),
             )
         ]
-        return lanes, metrics
+        return lanes, metrics, roots
 
     try:
-        lanes, metrics = bounded_handoff_read(runtime.db_path, read, deadline=budget.deadline)
-        if len(lanes) > MAX_FILES or len(metrics) > MAX_FILES:
+        lanes, metrics, roots = bounded_handoff_read(runtime.db_path, read, deadline=budget.deadline)
+        if len(lanes) > MAX_FILES or len(metrics) > MAX_FILES or len(roots) > MAX_FILES:
             budget.issues.add("db_rows")
         return (
             lanes[:MAX_FILES],
             metrics[:MAX_FILES],
-            dict(state="fresh", observed_at=_iso(), path=str(runtime.db_path)),
+            dict(state="fresh", observed_at=_iso(), path=str(runtime.db_path), worktree_roots=roots[:MAX_FILES]),
         )
     except Exception as exc:
         budget.issues.add(f"ledger:{type(exc).__name__}")
@@ -612,9 +775,185 @@ def _positive(value, name):
         raise ValueError(f"{name} must be finite and positive")
 
 
+def _held_unknown(reason="not_reported"):
+    return dict(
+        held_job_dirs=[],
+        held_job_dirs_count=None,
+        held_job_dirs_emitted=0,
+        held_job_dirs_state="unknown",
+        held_job_dirs_count_quality="unknown",
+        held_job_dirs_truncated=True,
+        held_job_dirs_truncation_reason=reason,
+    )
+
+
+def _repository_labels(vm, lanes=(), source=None, *, cached=False):
+    """Producer identity wins; only a complete exact task/lane join may fill it."""
+    roots = {}
+    if (
+        source
+        and source.get("state") == "fresh"
+        and _state(source.get("observed_at")) == "fresh"
+        and source.get("complete", True)
+    ):
+        for lane in source.get("worktree_roots", lanes):
+            key = (lane.get("task_ref"), lane.get("lane_id"))
+            path = lane.get("worktree_path")
+            if all(isinstance(v, str) and v for v in key) and isinstance(path, str) and Path(path).is_absolute():
+                roots.setdefault(key, set()).add(os.path.normpath(path))
+    for facet in ("sandboxes", "held_job_dirs"):
+        for row in vm.get(facet, []):
+            prior = row.get("repository_provenance", {})
+            if cached and isinstance(prior, dict) and prior.get("source") == "host_lane_worktree":
+                continue  # Retain the observation's join evidence; cached reads do no ledger I/O.
+            if (
+                isinstance(prior, dict)
+                and prior.get("source") == "producer"
+                and isinstance(row.get("repository"), str)
+                and row["repository"] != "unknown"
+            ):
+                continue
+            explicit = None
+            for key in ("repository", "repository_path", "repository_root", "repository_identity", "repo_root"):
+                value = row.get(key)
+                if isinstance(value, str) and value.strip() and value.strip() != "unknown":
+                    explicit = (key, os.path.normpath(value) if value.startswith("/") else value.strip())
+                    break
+            if explicit:
+                key, value = explicit
+                row.update(repository=value, repository_provenance=dict(state="known", source="producer", field=key))
+                continue
+            key = (row.get("task_ref"), row.get("lane_id"))
+            matches = roots.get(key, set())
+            if len(matches) == 1:
+                row.update(
+                    repository=next(iter(matches)),
+                    repository_provenance=dict(
+                        state="known",
+                        source="host_lane_worktree",
+                        task_ref=key[0],
+                        lane_id=key[1],
+                        field="worktree_lanes.worktree_path",
+                        path=source.get("path"),
+                        observed_at=source.get("observed_at"),
+                    ),
+                )
+            else:
+                row.update(repository="unknown", repository_provenance=dict(state="unknown", source="unknown"))
+
+
+def _normalize_held(doc, unknowns):
+    rows = doc.get("held_job_dirs")
+    count, emitted = doc.get("held_job_dirs_count"), doc.get("held_job_dirs_emitted")
+    quality = doc.get("held_job_dirs_count_quality")
+    valid = (
+        isinstance(rows, list)
+        and len(rows) <= 100
+        and all(
+            isinstance(row, dict)
+            and isinstance(row.get("path"), str)
+            and row["path"]
+            and isinstance(row.get("verdict"), str)
+            and row["verdict"].startswith("hold_")
+            and isinstance(row.get("reason"), str)
+            and row["reason"]
+            for row in rows
+        )
+        and type(emitted) is int
+        and emitted == len(rows)
+        and quality in ("exact", "lower_bound", "unknown")
+        and (
+            (quality == "unknown" and count is None)
+            or (quality != "unknown" and type(count) is int and count >= emitted)
+        )
+        and doc.get("held_job_dirs_state") in ("known", "unknown")
+        and type(doc.get("held_job_dirs_truncated")) is bool
+        and (
+            not doc["held_job_dirs_truncated"]
+            or isinstance(doc.get("held_job_dirs_truncation_reason"), str)
+            and bool(doc["held_job_dirs_truncation_reason"])
+        )
+        and (quality != "exact" or doc.get("held_job_dirs_state") == "known")
+        and (quality != "exact" or count == emitted or doc["held_job_dirs_truncated"])
+        and (quality == "exact" or doc.get("held_job_dirs_state") == "unknown" and doc["held_job_dirs_truncated"])
+    )
+    if not valid:
+        doc.update(_held_unknown("invalid_held_inventory" if rows is not None else "not_reported"))
+    else:
+        for row in rows:
+            if row.get("bytes_state") != "known" or not _number(row.get("bytes")):
+                row.update(bytes=None, bytes_state="unknown")
+            if not _number(row.get("age_seconds")):
+                row["age_seconds"] = None
+    if doc["held_job_dirs_state"] == "unknown":
+        unknowns.add("held_job_dirs")
+
+
+def _jobs_unknown(reason="not_reported"):
+    return dict(
+        jobs=[],
+        jobs_state="unknown",
+        jobs_reason=reason,
+        jobs_emitted=None,
+        jobs_quantity="unknown",
+        jobs_truncated=True,
+        jobs_truncation_reason=reason,
+        job_processes=[],
+        job_processes_state="unknown",
+    )
+
+
+def _normalize_jobs(doc):
+    """OBS-07 native job facet. Older inventory without it is a named unknown.
+
+    A cached unknown facet normalizes to itself; no count of zero is invented.
+    """
+    from .lane_lifecycle_contracts import JOB_ID_RE
+
+    rows = doc.get("jobs")
+    reason = doc.get("jobs_reason") or doc.get("jobs_truncation_reason")
+    if rows == [] and doc.get("jobs_state") == "unknown" and doc.get("jobs_emitted") is None:
+        doc.update(_jobs_unknown(reason if isinstance(reason, str) and reason else "jobs_not_reported"))
+        return
+    if (
+        not isinstance(rows, list)
+        or not all(isinstance(row, dict) and isinstance(row.get("job_id"), str) for row in rows)
+        or doc.get("jobs_state") not in ("known", "unknown")
+        or type(doc.get("jobs_emitted")) is not int
+        or doc["jobs_emitted"] != len(rows)
+        or type(doc.get("jobs_truncated")) is not bool
+    ):
+        doc.update(_jobs_unknown("jobs_not_reported" if rows is None else "invalid_jobs_inventory"))
+        return
+    if any(not JOB_ID_RE.fullmatch(row["job_id"]) for row in rows):
+        doc.update(jobs_state="unknown", jobs_reason="invalid_job_identity")
+    if doc["jobs_state"] == "known":
+        doc["jobs_reason"] = None
+    elif not (isinstance(doc.get("jobs_reason"), str) and doc["jobs_reason"]):
+        doc["jobs_reason"] = reason if isinstance(reason, str) and reason else "jobs_unavailable"
+    doc["jobs_quantity"] = "lower_bound" if doc["jobs_truncated"] or doc["jobs_state"] != "known" else "exact"
+    if "job_processes" in doc:
+        processes = doc["job_processes"]
+        if (
+            not isinstance(processes, list)
+            or any(
+                not isinstance(row, dict)
+                or type(row.get("pid")) is not int
+                or row["pid"] <= 0
+                or not isinstance(row.get("job_ids"), list)
+                or any(not isinstance(job, str) or not JOB_ID_RE.fullmatch(job) for job in row["job_ids"])
+                for row in processes
+            )
+            or doc.get("job_processes_state") not in ("known", "unknown")
+        ):
+            doc.update(job_processes=[], job_processes_state="unknown")
+
+
 def _vm_unknown(reason="not_observed"):
     return dict(
         _unknown(reason),
+        **_held_unknown(reason),
+        **_jobs_unknown(reason),
         sandboxes=[],
         processes=[],
         rows_emitted=None,
@@ -647,17 +986,23 @@ def _run_vm_command(argv, *, timeout, **kwargs):
     subprocess.run kills only its direct child on timeout and can then wait
     indefinitely on a descendant's pipe. The native runner owns a new session;
     only that session's process group is killed, never a remote job or sandbox.
+    The group is registered from its start until it is retired, so a stop
+    signal that kills this process first can still kill it (retire_native_groups).
     """
     reserve = min(0.1, timeout / 5)
     started = time.monotonic()
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    with _NATIVE_GROUPS_LOCK:
+        if _native_retired:
+            raise ChildProcessError("native runner retired by a stop signal")
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        _NATIVE_GROUPS.add(proc.pid)
     try:
         stdout, stderr = proc.communicate(timeout=max(0, timeout - reserve - (time.monotonic() - started)))
     except BaseException:
@@ -670,7 +1015,59 @@ def _run_vm_command(argv, *, timeout, **kwargs):
         proc.stderr.close()
         proc.wait(timeout=reserve)
         raise
+    finally:
+        with _NATIVE_GROUPS_LOCK:
+            _NATIVE_GROUPS.discard(proc.pid)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def retire_native_groups():
+    """SIGKILL every native group still registered; no group starts afterwards.
+
+    Returns one message per group a kill could not reach. Only ESRCH means the
+    group is already gone; every other failure is reported, never swallowed.
+    """
+    global _native_retired
+    failures = []
+    with _NATIVE_GROUPS_LOCK:
+        _native_retired = True
+        for pgid in sorted(_NATIVE_GROUPS):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                failures.append(f"native group {pgid}: {type(exc).__name__}: {exc}")
+    return failures
+
+
+def retire_native_groups_on_sigterm():
+    """Make SIGTERM retire this process's native groups, then exit at once.
+
+    For a process entry point, from the main thread. The kernel's SIGTERM
+    reaches a retirer thread through the wakeup fd, so retirement neither runs
+    inside an interrupted frame (which may hold the registry lock mid-spawn)
+    nor waits for the main thread. It exits 128 + SIGTERM, or
+    NATIVE_RETIRE_FAILED_EXIT after naming each failed kill on stderr; it never
+    joins threads or reads pipes. SIGKILL cannot be handled: a supervisor must
+    send SIGTERM and allow a grace first (FleetRefresher does).
+    """
+    wake, notify = os.pipe()
+    os.set_blocking(notify, False)
+
+    def retire():
+        while (signum := os.read(wake, 1)) != bytes([signal.SIGTERM]):
+            if not signum:
+                return
+        failures = retire_native_groups()
+        for failure in failures:
+            os.write(2, f"workbay fleet: stop: {failure}\n".encode())
+        os._exit(NATIVE_RETIRE_FAILED_EXIT if failures else 128 + signal.SIGTERM)
+
+    threading.Thread(target=retire, name="workbay-fleet-native-retirer", daemon=True).start()
+    # A Python handler installs the C handler; it writes the signal to the fd.
+    signal.signal(signal.SIGTERM, lambda signum, frame: None)
+    signal.set_wakeup_fd(notify)
 
 
 def _number(value):
@@ -716,6 +1113,9 @@ def _vm_document(doc, rc, *, cached=False):
     ):
         raise ValueError("invalid inventory row identity/count")
     unknowns = set(doc["unknowns"])
+    _normalize_jobs(doc)
+    _normalize_held(doc, unknowns)
+    _repository_labels(doc, cached=cached)
 
     def integer(value):
         return type(value) is int and value >= 0
@@ -1002,6 +1402,7 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
         passes=[],
         passes_quantity="exact",
         admission=dict(_unknown(), decision="unknown", held_slots=None, stock="not_evaluated"),
+        host=dict(_unknown(), identity=None, disk=[], policy=_unknown()),
         spool=dict(_unknown(), families={}, quantity="lower_bound"),
         ledger=_unknown(),
         turn_metrics=[],
@@ -1010,7 +1411,9 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
     def collect(budget, publish):
         runtime = RuntimeConfig.for_repo(root)
         publish(state_dir=str(runtime.state_dir))
-        publish(admission=_admission(root, budget))
+        publish(dispatch_defaults=_dispatch_defaults(root, budget))
+        admission = _admission(root, budget)
+        publish(admission=admission, host=admission.get("host", seed["host"]))
         entries = _entries(runtime.state_dir, budget)
         passes, owners = _passes(runtime.state_dir, entries, budget, hours)
         publish(passes=passes)
@@ -1027,6 +1430,11 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
             lane.update(
                 pass_ids=by_lane.get(key, []), observed_at=lane.get("updated_at"), state=_state(lane.get("updated_at"))
             )
+            updated = _timestamp(lane.get("updated_at"))
+            lane.update(last_updated_at=lane.get("updated_at"), time_basis="updated_at",
+                        last_updated_at_quality="known" if updated is not None else "unknown",
+                        last_updated_age_seconds=max(0, time.time() - updated) if updated is not None else None,
+                        waiting_since=None, waiting_since_quality="unknown", merged_at=None, merged_at_quality="unknown")
             lane_metrics = metrics_by_lane.get(key, [])
             values = [m.get("total_tokens") for m in lane_metrics]
             known = [v for v in values if isinstance(v, int) and v >= 0]
@@ -1037,8 +1445,10 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
                 quantity="exact" if values and len(known) == len(values) else "lower_bound",
                 observed_at=source["observed_at"],
             )
+        source = dict(source, complete=source["state"] == "fresh" and _state(source.get("observed_at")) == "fresh"
+                      and "db_rows" not in budget.issues and source.get("complete", True))
         publish(lanes=lanes, ledger=source, turn_metrics=metrics)
-        active_lane_keys = {(row["task_ref"], row["lane_id"]) for row in lanes}
+        active_lane_keys = {(row["task_ref"], row["lane_id"]) for row in lanes if row["status"] not in _TERMINAL_LANES}
         for row in passes:
             key = (row.get("task_ref"), row.get("lane_id"))
             for directory in row["remote_exec_dirs"]:
@@ -1047,7 +1457,8 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
                 elif (
                     row.get("terminality") == "terminal"
                     and source["state"] == "fresh"
-                    and "db_rows" not in budget.issues
+                    and source["complete"]
+                    and row.get("link_complete")
                 ):
                     owners[directory] = "terminal"
         publish(spool=_census(runtime.state_dir, entries, budget, census_days, owners))
@@ -1057,9 +1468,37 @@ def build_snapshot(root, *, hours=24, census_days=7, vm=True, runner=subprocess.
         done, result = vm_observer
         done.wait(max(0, deadline - time.monotonic()))
         snapshot["vm"] = result["vm"] if done.is_set() else _vm_unknown("timeout")
+        _repository_labels(snapshot["vm"], snapshot["lanes"], snapshot["ledger"])
         _apply_vm_headline(snapshot)
     else:
         snapshot["vm"] = _vm_unknown()
+    # OBS-07 S2: a derived plan projection rebuilt from its sources after the
+    # VM observation it joins, inside the same absolute deadline. Never cached.
+    snapshot["plan"] = dict(version=1, state="unknown", partial=True, limits_hit=["deadline"], sources=[], tasks=[])
+    if time.monotonic() < deadline:
+        completed = {}
+
+        def collect_plan(budget, publish):
+            # Module initialization is observation work too. Keep it inside
+            # the watchdog and never give a late phase a new absolute bound.
+            budget.deadline = min(budget.deadline, deadline)
+            budget.check()
+            from .fleet_plan import collect_plan_projection
+
+            plan = collect_plan_projection(
+                root, vm=snapshot["vm"], budget=budget, publish=lambda value: publish(**value)
+            )
+            if plan["partial"]:
+                budget.issues.update(plan["limits_hit"] or {"incomplete_plan_sources"})
+            publish(**plan)
+            completed["state"] = plan["state"]
+
+        plan = _bounded(snapshot["plan"], collect_plan, max(0, deadline - time.monotonic()))
+        # Collection duration is not part of the projected picture.
+        plan.pop("elapsed_s", None)
+        if completed and "deadline" not in plan["limits_hit"]:
+            plan["state"] = completed["state"]
+        snapshot["plan"] = plan
     snapshot["elapsed_s"] = time.monotonic() - started
     return snapshot
 
@@ -1088,29 +1527,105 @@ def read_snapshot_cache(root):
     return _apply_vm_headline(dict(payload, state=state, cache_state=cache_state, cache_observed_at=_iso()))
 
 
+class SnapshotWriterBusy(RuntimeError):
+    """Another Fleet publisher owns this cache's writer lease."""
+
+
+_SNAPSHOT_WRITER_GUARD = threading.RLock()
+_SNAPSHOT_WRITERS = {}
+
+
+class SnapshotWriterLease:
+    """An open directory flock, released explicitly or by process exit.
+
+    Descriptors are non-inheritable; collection children must not keep a server's
+    lease alive. The registry lets the holding process use the existing writer
+    signature while other processes must acquire the same kernel lock.
+    """
+
+    def __init__(self, directory, fd):
+        self.directory = directory
+        self.fd = fd
+        self.pid = os.getpid()
+
+    def close(self):
+        with _SNAPSHOT_WRITER_GUARD:
+            if self.fd is None:
+                return
+            if _SNAPSHOT_WRITERS.get(self.directory) is self:
+                del _SNAPSHOT_WRITERS[self.directory]
+            os.close(self.fd)
+            self.fd = None
+
+
+def _take_snapshot_writer(directory):
+    directory = directory.resolve()
+    with _SNAPSHOT_WRITER_GUARD:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise SnapshotWriterBusy(f"writer-busy: {directory / 'snapshot.json'}") from exc
+            raise
+        lease = SnapshotWriterLease(directory, fd)
+        _SNAPSHOT_WRITERS[directory] = lease
+        return lease
+
+
+def acquire_snapshot_writer(root):
+    """Take the per-cache, non-blocking writer lease; caller must release it."""
+    directory = RuntimeConfig.for_repo(Path(root)).state_dir / "fleet"
+    directory.mkdir(parents=True, exist_ok=True)
+    return _take_snapshot_writer(directory)
+
+
+def release_snapshot_writer(lease):
+    """Release a lease returned by acquire_snapshot_writer (idempotent)."""
+    lease.close()
+
+
+@contextmanager
+def _snapshot_write_access(directory):
+    # Keep an ephemeral lease through os.replace, rather than check then write:
+    # a Fleet session cannot acquire its lease between those two operations.
+    with _SNAPSHOT_WRITER_GUARD:
+        lease = _SNAPSHOT_WRITERS.get(directory.resolve())
+        if lease is not None and lease.pid == os.getpid():
+            yield
+        else:
+            lease = _take_snapshot_writer(directory)
+            try:
+                yield
+            finally:
+                release_snapshot_writer(lease)
+
+
 def write_snapshot_cache(root, snapshot):
     """Atomically replace only fleet/snapshot.json. Source and ledger stay authoritative."""
     runtime = RuntimeConfig.for_repo(Path(root))
     directory = runtime.state_dir / "fleet"
     directory.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=".snapshot-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(snapshot, stream, sort_keys=True, allow_nan=False)
-            stream.write("\n")
-        os.replace(name, directory / "snapshot.json")
-    finally:
+    with _snapshot_write_access(directory):
+        fd, name = tempfile.mkstemp(prefix=".snapshot-", suffix=".tmp", dir=directory)
         try:
-            os.unlink(name)
-        except FileNotFoundError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(snapshot, stream, sort_keys=True, allow_nan=False)
+                stream.write("\n")
+            os.replace(name, directory / "snapshot.json")
+        finally:
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
 
 
 # Offline summary jobs are seeded by the coordinator. This module never calls a model.
 MAX_BRIEF_BYTES = 64 * 1024
 MAX_SUMMARIES = 50
 MAX_SUMMARY_CHARS = 600
-SUMMARY_MODEL = "gpt-6.1-terra"  # Declared coordinator route; import is not provider telemetry.
+SUMMARY_MODEL = model_routing.MODEL_ROUTING_DEFAULTS["fleet_summary"]  # Declared coordinator route; import is not provider telemetry.
 
 
 def _open_directory_no_symlinks(path):

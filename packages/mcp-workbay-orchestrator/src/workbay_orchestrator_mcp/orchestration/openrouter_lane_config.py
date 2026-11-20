@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import os
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from .offload_timeout_ssot import (  # noqa: F401
     OPENROUTER_REMOTE_LANE_TIMEOUT_S,
     OPENROUTER_TIMEOUT_CAP,
@@ -32,18 +34,18 @@ from .offload_timeout_ssot import (  # noqa: F401
 # Operator's slug (VERIFY-1). The tracked default of the curated allow-list;
 # the set below also admits five hand-curated siblings.
 # MiMo capabilities checked against OpenRouter's models/endpoints APIs 2026-10-19.
-TRACKED_OPENROUTER_MODEL = "xiaomi/mimo-v2.6-pro"
+TRACKED_OPENROUTER_MODEL = model_routing.MODEL_ROUTING_DEFAULTS["openrouter"]
 # Six hand-curated slugs. Membership requires advertised structured_outputs
 # (openrouter-remote drives codex with --output-schema). Catalogue siblings
 # such as qwen/qwen3.8-2.4t-a95b are real and still refused.
 OPENROUTER_ALLOWED_MODELS: frozenset[str] = frozenset(
     {
-        TRACKED_OPENROUTER_MODEL,
-        "z-ai/glm-5.3-flash",
-        "deepseek/deepseek-v4-flash",
-        "qwen/qwen3.8-flash",
-        "qwen/qwen3.8-max",
-        "qwen/qwen3.8-27b",
+        model_routing.ModelId.OPENROUTER_MIMO,
+        model_routing.ModelId.OPENROUTER_GLM,
+        model_routing.ModelId.OPENROUTER_DEEPSEEK,
+        model_routing.ModelId.OPENROUTER_QWEN_FLASH,
+        model_routing.ModelId.OPENROUTER_QWEN_MAX,
+        model_routing.ModelId.OPENROUTER_QWEN_27B,
     }
 )
 WORKBAY_OPENROUTER_MODEL_ENV = "WORKBAY_OPENROUTER_MODEL"
@@ -55,12 +57,12 @@ WORKBAY_OPENROUTER_MODEL_ENV = "WORKBAY_OPENROUTER_MODEL"
 OPENROUTER_MODEL_ALLOWED_EFFORTS: dict[str, frozenset[str]] = {
     # MiMo advertises reasoning, but no named reasoning.supported_efforts.
     # Omit the override and preserve the provider's reasoning default.
-    "xiaomi/mimo-v2.6-pro": frozenset(),
-    "z-ai/glm-5.3-flash": frozenset({"max"}),
-    "deepseek/deepseek-v4-flash": frozenset({"xhigh", "high"}),
-    "qwen/qwen3.8-max": frozenset({"xhigh", "high", "medium", "low"}),
-    "qwen/qwen3.8-27b": frozenset({"xhigh", "medium", "low"}),
-    "qwen/qwen3.8-flash": frozenset(),
+    model_routing.ModelId.OPENROUTER_MIMO: frozenset(),
+    model_routing.ModelId.OPENROUTER_GLM: frozenset({"max"}),
+    model_routing.ModelId.OPENROUTER_DEEPSEEK: frozenset({"xhigh", "high"}),
+    model_routing.ModelId.OPENROUTER_QWEN_MAX: frozenset({"xhigh", "high", "medium", "low"}),
+    model_routing.ModelId.OPENROUTER_QWEN_27B: frozenset({"xhigh", "medium", "low"}),
+    model_routing.ModelId.OPENROUTER_QWEN_FLASH: frozenset(),
 }
 
 # The efforts reachable by at least one allow-listed model (union, never an

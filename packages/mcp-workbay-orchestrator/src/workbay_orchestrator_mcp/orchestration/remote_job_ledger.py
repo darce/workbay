@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -69,7 +70,9 @@ class LedgerLockTimeout(RemoteJobLedgerError):
 class RemoteCompletionDeferred(Exception):
     """Completion remains retryable without charging a wake handler failure."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, preserve_job: bool = False, store: str | None = None) -> None:
+        self.preserve_job = preserve_job
+        self.store = store
         self.reason = reason
         super().__init__(reason)
 
@@ -96,6 +99,30 @@ class InvalidWakeCursor:
     reason: str
     offset: int
     size: int
+
+
+def plan_review_failure(record: dict) -> dict | None:
+    """Read the immutable native failure. A successful native exit can still collect."""
+    receipt = record.get("native_failure")
+    if receipt is None:
+        return None
+    spec = record["spec"]
+    binding = spec.get("plan_review_binding")
+    if (
+        not isinstance(receipt, dict)
+        or not isinstance(binding, dict)
+        or binding.get("review_run_id") != spec["pass_id"]
+        or binding.get("job_id") != spec["job_id"]
+        or not isinstance(receipt.get("done_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["done_sha256"]) is None
+        or receipt.get("native_state") != "done"
+        or receipt.get("job_id") != spec["job_id"]
+        or type(receipt.get("native_rc")) is not int
+        or receipt["native_rc"] != record.get("rc")
+        or record["stage"] not in {"done", "completed"}
+    ):
+        raise RemoteJobLedgerError("native_receipt_identity_conflict")
+    return receipt if receipt["native_rc"] != 0 else None
 
 
 class RemoteJobLedger:
@@ -187,7 +214,7 @@ class RemoteJobLedger:
 
         return self._update_job(job_id, update)
 
-    def mark_done(self, job_id: str, rc: int, *, lost: bool = False) -> dict:
+    def mark_done(self, job_id: str, rc: int, *, lost: bool = False, native_failure: dict | None = None) -> dict:
         """Record the remote process exit code and any durable lost classification."""
         if isinstance(rc, bool) or not isinstance(rc, int):
             raise RemoteJobLedgerError("invalid_return_code")
@@ -195,6 +222,10 @@ class RemoteJobLedger:
             raise RemoteJobLedgerError("invalid_remote_state")
 
         def update(record: dict) -> None:
+            from .offload_pass import read_pass_state
+
+            spec = record["spec"]
+            read_pass_state(self.state_dir.parent, spec["pass_id"], strict=True)
             stage = record["stage"]
             if stage in {"intent", "submitted"}:
                 record["stage"] = "done"
@@ -202,11 +233,20 @@ class RemoteJobLedger:
                 record["done_at"] = _utc_now()
                 if lost:
                     record["remote_state"] = "lost"
+                    record["loss_cause"] = "vm_reported_lost"
             elif stage in {"done", "completed"}:
                 if record.get("rc") != rc:
                     raise RemoteJobLedgerError("return_code_conflict")
             else:
                 raise RemoteJobLedgerError("invalid_transition")
+
+            if native_failure is not None:
+                previous = record.setdefault("native_failure", self._copy_record(native_failure))
+                # Bind the first observation to the immutable native bytes. A
+                # later receive of that record cannot replace its diagnostics.
+                if previous.get("done_sha256") != native_failure.get("done_sha256"):
+                    raise RemoteJobLedgerError("native_receipt_conflict")
+                plan_review_failure(record)
 
         return self._update_job(job_id, update)
 
@@ -214,6 +254,8 @@ class RemoteJobLedger:
         """Mark a done job as fully collected and handled."""
 
         def update(record: dict) -> None:
+            if plan_review_failure(record) is not None:
+                raise RemoteJobLedgerError("plan_review_not_collected")
             if record["stage"] == "done":
                 record["stage"] = "completed"
                 record["completed_at"] = _utc_now()
@@ -234,15 +276,41 @@ class RemoteJobLedger:
         except FileNotFoundError as exc:
             raise RemoteJobLedgerError("job_not_found") from exc
 
-    def open_jobs(self) -> list[dict]:
-        """Return job records that have not completed or entered dead letter."""
+    def _deliver_wake(self, event: WakeEvent, saved: dict | None, handler: Callable[[WakeEvent], None]) -> None:
+        # Plan review consumes its own immutable packet and canonical review
+        # reservation. A VM wake cannot transfer that authority to a lane pass.
+        if saved is not None:
+            from .offload_pass import read_pass_state
+
+            read_pass_state(self.state_dir.parent, saved["spec"]["pass_id"], strict=True)
+        if saved is not None and "plan_review_binding" in saved["spec"]:
+            if plan_review_failure(saved) is None and saved["stage"] != "completed":
+                raise RemoteCompletionDeferred("plan_review_owner_pending", preserve_job=True)
+            return
+        handler(event)
+
+    def open_jobs(self, *, on_read_error: Callable[[str, Exception], None] | None = None) -> list[dict]:
+        """List jobs with outstanding native work, including uncollected lane exits."""
         self._ensure_layout()
         records = []
-        for path in sorted(self.ledger_dir.glob("j*.json")):
-            record = self._read_json(path)
-            if record.get("stage") not in {"completed", "dead_letter"}:
-                records.append(self._copy_record(record))
+        for path in sorted(self._job_record_paths()):
+            try:
+                record = self._read_json(path)
+                if record.get("stage") not in {"completed", "dead_letter"} and plan_review_failure(record) is None:
+                    records.append(self._copy_record(record))
+            except (OSError, ValueError, RecursionError, RemoteJobLedgerError) as exc:
+                if on_read_error is None:
+                    raise
+                on_read_error(path.stem, exc)
         return records
+
+    def job_ids(self) -> set[str]:
+        """List job identities, including terminal records still in custody."""
+        return {path.stem for path in self._job_record_paths() if JOB_ID_RE.fullmatch(path.stem)}
+
+    def _job_record_paths(self) -> Iterator[Path]:
+        # glob can suppress a directory read failure and return no jobs.
+        return (path for path in self.ledger_dir.iterdir() if path.name.startswith("j") and path.name.endswith(".json"))
 
     def deferred_jobs(self) -> dict[str, dict]:
         """Return a detached snapshot of jobs awaiting completion retry."""
@@ -375,9 +443,9 @@ class RemoteJobLedger:
                     event = self._wake_event_from_deferral(deferred)
                     budget_used += 1
                     try:
-                        handler(event)
+                        self._deliver_wake(event, saved, handler)
                     except RemoteCompletionDeferred as exc:
-                        self._record_completion_deferral(event, exc.reason)
+                        self._record_completion_deferral(event, exc)
                     except Exception as exc:
                         self._increment_deferred_attempts(job_id)
                         attempts = self._record_handler_failure(job_id, exc)
@@ -447,9 +515,9 @@ class RemoteJobLedger:
                         position = next_offset
                         continue
                     try:
-                        handler(event)
+                        self._deliver_wake(event, saved, handler)
                     except RemoteCompletionDeferred as exc:
-                        self._record_completion_deferral(event, exc.reason)
+                        self._record_completion_deferral(event, exc)
                         reexamined_ids.add(event.job_id)
                         # Persisting the deferral before this cursor move is the
                         # crash boundary: either the wake remains queued, or its
@@ -736,29 +804,33 @@ class RemoteJobLedger:
             self._remove_completion_deferral(job_id)
         return int(record["attempts"])
 
-    def _record_completion_deferral(self, event: WakeEvent, reason: str) -> dict:
+    def _record_completion_deferral(self, event: WakeEvent, hold: RemoteCompletionDeferred) -> dict:
         """Atomically retain a retryable wake before its cursor is advanced."""
 
         job_id = event.job_id
 
         def update(record: dict) -> None:
             record.setdefault("completion_deferred_at", _utc_now())
-            record["completion_deferred_reason"] = reason
+            record["completion_deferred_reason"] = hold.reason
 
-        job_record = self._update_job(job_id, update)
+        first_deferred_at = _utc_now()
+        if not hold.preserve_job:
+            first_deferred_at = self._update_job(job_id, update)["completion_deferred_at"]
         with self._locked(self.deferrals_lock_path):
             records = self._read_deferrals()
             previous = records.get(job_id, {})
             deferred = {
                 "job_id": job_id,
-                "reason": reason,
-                "first_deferred_at": previous.get("first_deferred_at", job_record["completion_deferred_at"]),
+                "reason": hold.reason,
+                "first_deferred_at": previous.get("first_deferred_at", first_deferred_at),
                 "last_attempt_at": _utc_now(),
                 "attempts": int(previous.get("attempts", 0)) + 1,
                 # Keep the original signal so a deferred job remains retryable
                 # after its wake bytes are compacted from the shared journal.
                 "event_json": event.to_json(),
             }
+            if hold.store is not None:
+                deferred["store"] = hold.store
             records[job_id] = deferred
             self._write_deferrals(records)
             return self._copy_record(deferred)

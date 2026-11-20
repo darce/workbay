@@ -14,6 +14,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from workbay_orchestrator_mcp.orchestration import backend_registry
 from workbay_orchestrator_mcp.orchestration._env import (
     STANDARD_WORKER_REASONING_EFFORT_CHOICES,
@@ -397,16 +399,16 @@ OFFLOAD_AGENT_PROFILES: dict[str, OffloadAgentProfile] = {
         agent="claude-remote",
         allowed_efforts=("low", "medium", "high", "xhigh", "max"),
         single_cycle_bound=BOUND_ADAPTER_TIMEOUT,
-        pinned_model="claude-sonnet-5-5",
-        default_model="claude-sonnet-5-5",
+        pinned_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
+        default_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         timeout_cap=BACKEND_TIMEOUT_BOUNDS["claude-remote"][1],
     ),
     "claude-api-remote": OffloadAgentProfile(
         agent="claude-api-remote",
         allowed_efforts=("low", "medium", "high", "xhigh", "max"),
         single_cycle_bound=BOUND_ADAPTER_TIMEOUT,
-        pinned_model="claude-sonnet-5-5",
-        default_model="claude-sonnet-5-5",
+        pinned_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
+        default_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         timeout_cap=BACKEND_TIMEOUT_BOUNDS["claude-api-remote"][1],
     ),
     # Muse Code on the VM: wall-clock-only bound (muse exec has no
@@ -415,8 +417,8 @@ OFFLOAD_AGENT_PROFILES: dict[str, OffloadAgentProfile] = {
         agent="muse-remote",
         allowed_efforts=("low", "medium", "high", "xhigh", "max"),
         single_cycle_bound=BOUND_ADAPTER_TIMEOUT,
-        pinned_model="muse-wonder-1.0",
-        default_model="muse-wonder-1.0",
+        pinned_model=model_routing.MODEL_ROUTING_DEFAULTS["muse"],
+        default_model=model_routing.MODEL_ROUTING_DEFAULTS["muse"],
         timeout_cap=BACKEND_TIMEOUT_BOUNDS["muse-remote"][1],
     ),
 }

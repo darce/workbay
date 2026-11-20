@@ -108,6 +108,7 @@ def execute_lane_change(
     operation: str,
     expected_row: dict | None,
     event_id: str | None = None,
+    execution_declaration: dict | None = None,
 ) -> tuple[sqlite3.Cursor, dict]:
     """Run native SQL unchanged, then retain its actual triggered row atomically.
 
@@ -124,6 +125,9 @@ def execute_lane_change(
         current is not None and any(current.get(k) != expected_row.get(k) for k in identity_columns)
     ):
         raise LaneResourceConflict("lane_resource_identity_changed")
+    from .coordination_declaration import install_dispatch_observation
+
+    install_dispatch_observation(conn)
     store = _event_store()
     reason = binding.reason
     if store is None:
@@ -164,6 +168,8 @@ def execute_lane_change(
                 "lane": lane,
                 "producer_host": binding.host,
             }
+            if execution_declaration is not None:
+                snapshot.update(execution_declaration)
             payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
             digest = "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
             evidence = EvidenceRef(ref="sqlite:lane-mutation/" + key.split(":", 1)[1], digest=digest)

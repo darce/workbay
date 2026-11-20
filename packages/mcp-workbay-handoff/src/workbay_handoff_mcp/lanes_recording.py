@@ -6,14 +6,22 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-from .enums import TERMINAL_LANE_STATUSES
+from .coordination_declaration import ExecutionDomain, declaration_errors
 from .lane_resource_producer import LaneResourceConflict, execute_lane_change, prepare_lane_binding, replay_receipt
-from .shared_primitives import _envelope, _normalize_optional_text, _resolve_task_ref, _row_to_dict
+from .shared_primitives import (
+    CLOSEABLE_LANE_STATUSES,
+    TERMINAL_LANE_STATUSES,
+    _envelope,
+    _normalize_optional_text,
+    _resolve_task_ref,
+    _row_to_dict,
+)
 from .shared_schema import WORKTREE_LANE_BRANCH_TIP_SOURCES, _get_db_connection
 from .shared_write_context import WriteActor, _resolve_write_actor, collect_target_context_warnings
 
@@ -24,7 +32,6 @@ _log = logging.getLogger(__name__)
 LANE_STATUSES = frozenset(
     {"planned", "active", "blocked", "review", "validated", "gated", "merged", "closed", "closed_stale"}
 )
-CLOSEABLE_LANE_STATUSES = frozenset({"closed", "merged"})
 # Non-close writes must not set closed|merged: only close_lane runs the
 # lane_messages reclaimer (pruned_lane_messages). closed_stale remains for the
 # reaper CAS path via update/open round-trip [cs0166-r12-16].
@@ -288,6 +295,7 @@ def _lane_replay(conn, *, tool: str, task_ref: str, lane_id: str, event_id: str 
     return _envelope(ok=True, tool=tool, entity="lane", data=data)
 
 
+@declaration_errors
 def open_lane(
     *,
     lane_id: str,
@@ -313,6 +321,8 @@ def open_lane(
     reopen_reason: str | None = None,
     expected_status: str | None = None,
     event_id: str | None = None,
+    execution_domain: ExecutionDomain | None = None,
+    coordination_owner_proof: dict | None = None,
 ) -> dict[str, Any]:
     """Insert or update a worktree lane row (upsert).
 
@@ -394,18 +404,98 @@ def open_lane(
             resolved_owner = owner_agent or ctx.agent
         prepared_row = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         prepared_row = dict(prepared_row) if prepared_row is not None else None
+        replay_values = dict(
+            branch=normalized_branch,
+            worktree_path=normalized_path,
+            owner_agent=resolved_owner,
+            branch_tip_sha=opened_tip or (prepared_row or {}).get("branch_tip_sha"),
+            status=status,
+            backend=backend,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            speed=speed,
+            tier=tier,
+        )
+        if execution_domain is not None:
+            replay = _lane_replay(
+                conn, tool="open_lane", task_ref=resolved_task_ref, lane_id=normalized_lane_id, event_id=event_id
+            )
+            if replay is not None:
+                if replay.get("ok") is True:
+                    from .coordination_declaration import verify_declaration_replay
+
+                    verify_declaration_replay(
+                        conn,
+                        replay["data"]["lifecycle_resource"]["snapshot"],
+                        prepared_row,
+                        domain=execution_domain,
+                        proof=coordination_owner_proof,
+                        values=replay_values,
+                    )
+                return replay
         from .validation_lane import policy_source_current
 
         validation_fresh = (
             policy_source_current(conn, prepared_row) if status == "merged" and prepared_row is not None else False
         )
     binding = prepare_lane_binding(normalized_path, normalized_branch)
+    adopting_retired = False
+    if (
+        execution_domain is not None
+        and prepared_row is not None
+        and prepared_row.get("status") == "merged"
+        and binding.reason
+    ):
+        from .coordination_declaration import retired_adoption_binding
+
+        if (
+            status != "merged"
+            or normalized_branch != prepared_row["branch"]
+            or normalized_path != prepared_row["worktree_path"]
+            or parsed_tip not in {None, prepared_row["branch_tip_sha"]}
+        ):
+            raise ValueError("coordination_retired_adoption_identity_changed")
+        binding = retired_adoption_binding(prepared_row, coordination_owner_proof)
+        adopting_retired = True
+    if execution_domain is not None:
+        from .coordination_declaration import CoordinationHold
+
+        if (
+            binding.reason
+            or binding.source is None
+            or binding.resource is None
+            or (
+                not adopting_retired
+                and binding.source.revision != (opened_tip or (prepared_row or {}).get("branch_tip_sha"))
+            )
+        ):
+            raise CoordinationHold("coordination_declaration_source_unknown")
+    # Keep actual process I/O outside SQLite's writer critical section.
+    execution_guard = nullcontext()
+    if execution_domain is not None:
+        from .coordination_declaration import probe_execution_process, worker_fence
+
+        observed_owner = prepared_row or dict(task_ref=resolved_task_ref, lane_id=normalized_lane_id)
+        probe_execution_process(observed_owner)
+        execution_guard = worker_fence(observed_owner)
     # Serialize the special same-terminal-status upsert case with its check.
-    with _get_db_connection(begin_immediate=True) as conn:
+    with execution_guard, _get_db_connection(begin_immediate=True) as conn:
         replay = _lane_replay(
             conn, tool="open_lane", task_ref=resolved_task_ref, lane_id=normalized_lane_id, event_id=event_id
         )
         if replay is not None:
+            if execution_domain is not None and replay.get("ok") is True:
+                from .coordination_declaration import verify_declaration_replay
+
+                current = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
+                verify_declaration_replay(
+                    conn,
+                    replay["data"]["lifecycle_resource"]["snapshot"],
+                    dict(current) if current is not None else None,
+                    domain=execution_domain,
+                    proof=coordination_owner_proof,
+                    values=replay_values,
+                )
             return replay
         existing_before_upsert = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         if expected_status is not None and (
@@ -443,7 +533,7 @@ def open_lane(
                     },
                     entity="lane",
                 )
-        if existing_before_upsert is not None and status == "merged":
+        if existing_before_upsert is not None and status == "merged" and not adopting_retired:
             from .validation_lane import transition_error
 
             error = transition_error(conn, existing_before_upsert, status, source_current=validation_fresh)
@@ -454,6 +544,30 @@ def open_lane(
                     data={"error": error, "error_kind": "native_validation_required"},
                     entity="lane",
                 )
+        declaration = None
+        if execution_domain is not None:
+            from .coordination_declaration import prepare_declaration
+
+            declaration = prepare_declaration(
+                conn,
+                current=existing_before_upsert,
+                values=dict(
+                    task_ref=resolved_task_ref,
+                    lane_id=normalized_lane_id,
+                    owner_agent=resolved_owner,
+                    branch=normalized_branch,
+                    worktree_path=normalized_path,
+                    branch_tip_sha=opened_tip or (prepared_row or {}).get("branch_tip_sha"),
+                    backend=backend,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    speed=speed,
+                    tier=tier,
+                ),
+                domain=execution_domain,
+                proof=coordination_owner_proof,
+                event_id=event_id,
+            )
         try:
             cursor, lifecycle_resource = execute_lane_change(
                 conn,
@@ -543,6 +657,7 @@ def open_lane(
                 operation="open_lane",
                 expected_row=prepared_row,
                 event_id=event_id,
+                execution_declaration=declaration,
             )
         except LaneResourceConflict as exc:
             return _lane_resource_conflict("open_lane", exc)
@@ -569,6 +684,17 @@ def open_lane(
                     "lane": _row_to_dict(row),
                 },
                 entity="lane",
+            )
+        if declaration is not None and lifecycle_resource.get("knowledge") != "observed":
+            conn.rollback()
+            return _envelope(
+                ok=False,
+                tool="open_lane",
+                entity="lane",
+                data={
+                    "error_kind": "coordination_declaration_held",
+                    "error": "coordination_declaration_authority_unknown",
+                },
             )
         lane_dict = _row_to_dict(row)
         if lifecycle_resource["knowledge"] == "unknown":
@@ -930,7 +1056,14 @@ def close_lane(
         return _envelope(
             ok=False,
             tool="close_lane",
-            data={"error": f"Invalid status. Valid: {', '.join(sorted(CLOSEABLE_LANE_STATUSES))}"},
+            data={
+                "error": f"handoff.close_lane: invalid public close status {status!r}",
+                "error_kind": "status_reserved_for_reaper"
+                if status in TERMINAL_LANE_STATUSES
+                else "lane_status_invalid",
+                "surface": "handoff.close_lane",
+                "allowed": sorted(CLOSEABLE_LANE_STATUSES),
+            },
             entity="lane",
         )
     parsed_landing, landing_error = _parse_full_commit_sha(landing_commit_sha, "landing_commit_sha")

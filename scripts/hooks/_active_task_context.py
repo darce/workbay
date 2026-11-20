@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 def _resolve_package_src() -> Path:
@@ -152,6 +152,9 @@ class ActiveTaskContext:
     # Values are short stable tokens (not prose) so callers can discriminate
     # without string-matching sentences [OBS-08].
     probe_error: str | None = None
+    # Additive identity classification: only an explicit successful empty
+    # identity response establishes "none". All unproven cases stay unknown.
+    identity_state: Literal["registered", "none", "unknown"] = "unknown"
 
 
 def _load_handoff_exports() -> tuple[Any, Any, Any, Any] | None:
@@ -271,6 +274,7 @@ def _context_from_task_entry(
         ),
         resolution_note=resolution_note,
         probe_error=None,
+        identity_state="registered" if isinstance(task_ref, str) and task_ref else "unknown",
     )
 
 
@@ -635,6 +639,7 @@ def _with_over_budget_probe_error(result: ActiveTaskContext) -> ActiveTaskContex
         task_plan_path=result.task_plan_path,
         resolution_note=result.resolution_note,
         probe_error="handoff_probe_over_budget",
+        identity_state=result.identity_state,
     )
 
 
@@ -759,6 +764,15 @@ def _load_active_task_via_handoff(workspace_root: Path) -> ActiveTaskContext:
             target_branch=None,
             primary_worktree=str(Path(runtime.workspace_root).resolve(strict=False)),
             probe_error="handoff_active_missing",
+            identity_state=(
+                "none"
+                if isinstance(parsed, dict)
+                and parsed.get("ok") is True
+                and isinstance(data, dict)
+                and "active" in data
+                and data["active"] is None
+                else "unknown"
+            ),
         )
 
     task_ref = active.get("task_ref")
@@ -785,6 +799,11 @@ def _load_active_task_via_handoff(workspace_root: Path) -> ActiveTaskContext:
         ),
         resolution_note=resolution_note,
         probe_error=None,
+        identity_state=(
+            "registered"
+            if isinstance(parsed, dict) and parsed.get("ok") is True and isinstance(task_ref, str) and task_ref
+            else "unknown"
+        ),
     )
 
 

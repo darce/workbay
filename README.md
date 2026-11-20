@@ -414,8 +414,8 @@ Optional install flags (`--with-codebase-graph`, `--with-remote`,
 ## Packages
 
 WorkBay ships from one public git mirror,
-[`darce/workbay`](https://github.com/darce/workbay). Seven runtime packages
-are tagged together. Consumers install from those git tags via the plugin
+[`darce/workbay`](https://github.com/darce/workbay). Eight runtime packages
+ship in this mirror. Consumers install from git tags via the plugin
 marketplace or `scripts/install-workbay-cli.sh`, then
 `workbay install --remote-ref vX.Y.Z`. Cross-cutting changes land atomically
 from this monorepo; building straight from source is for development.
@@ -437,11 +437,11 @@ workbay/
 │   ├── CONSUMER.md           # install, upgrade, drift workflow
 │   ├── UPGRADING.md          # standalone-repo era cutover
 │   └── RELEASING.md          # maintainer release playbook
-└── packages/                 # the seven packages above
+└── packages/                 # the eight packages above
 ```
 
-The private canvas member is built in this monorepo but is not part of the public
-mirror.
+The Canvas member is included in the public git mirror, as declared in
+[`config/release/packages.json`](config/release/packages.json).
 
 ### Which package do I install?
 
@@ -460,6 +460,28 @@ The component trees (`workbay-protocol`, `mcp-workbay-handoff`,
 the same git mirror; bootstrap installs their MCP binaries once during overlay
 setup. [`docs/CONSUMER.md`](docs/CONSUMER.md) walks through install, upgrade,
 and drift repair.
+
+For Studio from a full source checkout, run:
+
+```bash
+bash scripts/install-workbay-studio.sh "<checkout>"
+```
+
+The installer runs `npm ci` in the Canvas web app directory when `node_modules`
+is missing, builds the package data, then installs the `workbay` tool with
+Canvas and the handoff `[embeddings]` extra. Quote checkout paths containing
+spaces.
+
+From the checkout root, opt into the same Studio installation after successful
+worktree overlay install and status:
+
+```bash
+make dogfood DOGFOOD_SOURCE=worktree DOGFOOD_STUDIO=1
+```
+
+`DOGFOOD_STUDIO` defaults to `0`, which runs only the overlay stages. It accepts
+only `0` or `1`; `1` requires `DOGFOOD_SOURCE=worktree`. Any failed overlay or
+Studio stage fails the command.
 
 ## Developing in this repo
 

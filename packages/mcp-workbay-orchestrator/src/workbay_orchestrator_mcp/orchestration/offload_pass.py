@@ -35,6 +35,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -54,7 +55,9 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
+
+from workbay_protocol import reasoning_effort as model_routing
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +140,12 @@ from workbay_orchestrator_mcp.orchestration.offload_preflight import (
 )
 from workbay_orchestrator_mcp.orchestration.offload_profiles import OFFLOAD_AGENT_PROFILES
 from workbay_orchestrator_mcp.orchestration.remote_agent_root import resolve_remote_agent_root
-from workbay_orchestrator_mcp.orchestration.remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError
+from workbay_orchestrator_mcp.orchestration.remote_job_ledger import (
+    RemoteCompletionDeferred,
+    RemoteJobLedger,
+    RemoteJobLedgerError,
+    plan_review_failure,
+)
 from workbay_orchestrator_mcp.orchestration.remote_phase_budget import RemotePhaseBudget
 from workbay_orchestrator_mcp.orchestration.stop_reasons import (
     SALVAGE_STOP_REASONS as _SALVAGE_STOP_REASONS,
@@ -1106,6 +1114,10 @@ def _merge_pass_state(
         "orchestrator_root",
         # Audit of a reopened terminal receipt; must survive the engine's own rewrites.
         _REHARVEST_KEY,
+        # The begin's guidance inputs and their one settled receipt: a detached
+        # completion or its replay consumes exactly what the begin saw.
+        "guidance_snapshot",
+        "guidance_consumption",
     ):
         if previous.get(key) is not None and (key != "agent_stream_path" or not payload.get(key)):
             if key == "detached_checkpoint":
@@ -1319,7 +1331,11 @@ def write_pass_state(
                     raise LanePassPublicationRefused("native_pass_payload_nonfinite") from exc
                 tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
                 try:
-                    with tmp.open("w", encoding="utf-8") as stream:
+                    # Protect the new inode before replacement publishes it,
+                    # regardless of the process umask or a stale temporary.
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
                         stream.write(encoded)
                         stream.flush()
                         os.fsync(stream.fileno())
@@ -1348,12 +1364,40 @@ def write_pass_state(
             return True
 
 
-def read_pass_state(state_dir: Path, pass_id: str) -> dict[str, Any] | None:
-    from .invocation_disposition import _pass_path, administrative_view, read_record
+class PassStateUnreadable(RemoteCompletionDeferred):
+    """A failed execution-state read. The persisted bytes retain custody."""
 
+    def __init__(self, pass_id: str, store: str, cause: Exception) -> None:
+        super().__init__("pass_state_unreadable", preserve_job=True, store=store)
+        self.pass_id = pass_id
+        self.error_type = type(cause).__name__
+
+    def hold(self, job_id: str | None = None) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "terminal": False,
+            "state": "unknown",
+            "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value if job_id is not None else self.reason,
+            "reason": self.reason,
+            "pass_id": self.pass_id,
+            "job_id": job_id,
+            "store": self.store,
+            "error_type": self.error_type,
+        }
+
+
+def read_pass_state(state_dir: Path, pass_id: str, *, strict: bool = False) -> dict[str, Any] | None:
+    """Read the pass and its custody projection. Strict readers can distinguish absence from read doubt."""
+    from .invocation_disposition import _custody_dir, _pass_path, administrative_view, read_record
+
+    store = _pass_state_path(state_dir, pass_id).name
     try:
         path = _pass_path(state_dir, pass_id)
-        payload, raw = read_record(path)
+        try:
+            payload, raw = read_record(path)
+        except FileNotFoundError:
+            return None
+        store = str(_custody_dir(state_dir, pass_id).relative_to(state_dir))
         view = administrative_view(state_dir, pass_id, payload, raw)
         if view is not None:
             # A read projection only: submitted bytes, execution result and
@@ -1362,7 +1406,9 @@ def read_pass_state(state_dir: Path, pass_id: str) -> dict[str, Any] | None:
             payload["administration"] = view
             payload["observed_execution"] = "UNKNOWN"
             payload["native_admission"] = False
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if strict or _ACTIVE_COMPLETION_DEADLINE.get() is not None:
+            raise PassStateUnreadable(pass_id, store, exc) from exc
         return None
     return payload
 
@@ -3696,6 +3742,61 @@ def _open_dispatch_id(task_ref: str, lane_id: str) -> str | None:
     return dispatch_id or None
 
 
+def _select_pass_guidance_snapshot(task_ref: str, lane_id: str) -> tuple[list[int], list[int]]:
+    """Open worker asks and submitted reports of this task/lane: the pass inputs."""
+    from workbay_handoff_mcp.shared_schema import _get_db_connection  # noqa: PLC0415
+
+    with _get_db_connection() as conn:
+        message_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM lane_messages WHERE task_ref = ? AND lane_id = ? "
+                "AND direction = 'worker_to_orchestrator' AND status = 'open' ORDER BY id",
+                (task_ref, lane_id),
+            )
+        ]
+        report_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM worker_reports WHERE task_ref = ? AND lane_id = ? "
+                "AND status = 'submitted' ORDER BY id",
+                (task_ref, lane_id),
+            )
+        ]
+    return message_ids, report_ids
+
+
+def _durable_id_list(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        return None
+    return list(value)
+
+
+def _durable_pass_guidance_snapshot(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The begin snapshot a detached completion replays; None when absent or malformed."""
+    snapshot = record.get("guidance_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    message_ids = _durable_id_list(snapshot.get("message_ids"))
+    report_ids = _durable_id_list(snapshot.get("report_ids"))
+    error = snapshot.get("error")
+    if message_ids is None or report_ids is None or not (error is None or isinstance(error, str)):
+        return None
+    return {"message_ids": message_ids, "report_ids": report_ids, "error": error}
+
+
+def _durable_guidance_receipt(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The settled consumption receipt an earlier attempt of this pass wrote down."""
+    receipt = record.get("guidance_consumption")
+    if not isinstance(receipt, dict) or receipt.get("ok") is not True:
+        return None
+    message_ids = _durable_id_list(receipt.get("message_ids"))
+    report_ids = _durable_id_list(receipt.get("report_ids"))
+    if message_ids is None or report_ids is None:
+        return None
+    return {"ok": True, "message_ids": message_ids, "report_ids": report_ids}
+
+
 def _max_worker_report_id(task_ref: str, lane_id: str) -> int:
     with sqlite3.connect(_handoff_db_path()) as conn:
         row = conn.execute(
@@ -3744,7 +3845,7 @@ _UNPARSEABLE_SUMMARY = "grok produced no parseable JSON result"
 _UNPARSEABLE_BLOCKER_PREFIX = "grok output unparseable"
 _COMPOSER_VIOLATION_SUMMARY = "grok Composer-only guarantee not confirmed"
 _COMPOSER_VIOLATION_BLOCKER_MARKERS = (
-    "grok-build authored",
+    f"{model_routing.ModelId.GROK_BUILD} authored",
     "Composer-only guarantee violated",
     "Composer-only guarantee not confirmed",
 )
@@ -6304,6 +6405,11 @@ def _package_smoke_base_failures(
     return base_failures, None
 
 
+def _close_lane_regressions(worktree_path: Path, base_sha: str, tip_sha: str) -> tuple[bool, str | None]:
+    """Check reachable tests after execution, using the exact committed diff."""
+    return _package_smoke(worktree_path.resolve(), None, base_sha=base_sha, tip_sha=tip_sha)
+
+
 def _package_smoke(
     worktree_path: Path,
     changed_files: list[str] | None,
@@ -6311,6 +6417,7 @@ def _package_smoke(
     cap_seconds: int = _PACKAGE_SMOKE_WALL_CLOCK_CAP_SECONDS,
     python_bin: str | None = None,
     base_sha: str | None = None,
+    tip_sha: str | None = None,
 ) -> tuple[bool, str | None]:
     """Close-time package smoke; compare failures with the merge-base suite.
 
@@ -6318,7 +6425,16 @@ def _package_smoke(
     base also emits the exact path-guard marker. Normal rc=1 failures always
     use the failed-node comparison, regardless of marker-like output.
     """
-    packages = _touched_packages(changed_files, Path(worktree_path))
+    if tip_sha is not None and base_sha is not None:
+        from .validation_battery import committed_test_directories
+
+        try:
+            selectors = committed_test_directories(Path(worktree_path), base_sha, tip_sha)
+        except (OSError, subprocess.SubprocessError):
+            return False, "lane_regressions_unknown: source_diff_unavailable"
+        packages = {path: Path(worktree_path) / path for path in selectors}
+    else:
+        packages = _touched_packages(changed_files, Path(worktree_path))
     if not packages:
         return True, None
     if python_bin is None:
@@ -6365,6 +6481,18 @@ def _package_smoke(
         return True, f"smoke_skipped_suite_lock_timeout: {exc}; the scoped self-verify stands"
     notes: list[str] = []
     try:
+        if tip_sha is not None and base_sha is not None:
+            from .validation_battery import run_closure_regressions, run_lane_regressions
+
+            worktree = Path(worktree_path).resolve()
+            selectors = [path.relative_to(worktree).as_posix() for path in packages.values()]
+            command = shlex.join([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selectors])
+            compare = (
+                run_closure_regressions if os.environ.get("WORKBAY_BASE_RESULT_SIGNING_FD") else run_lane_regressions
+            )
+            result = compare(worktree, base_sha, tip_sha, command, timeout=cap_seconds)
+            evidence = json.dumps(result["evidence"], sort_keys=True)
+            return result["status"] == "pass", f"lane_regressions_{result['status']}: {result['reason']} {evidence}"
         for name, tests_dir in packages.items():
             proc, runner_fault = _run_package_smoke_suite(
                 Path(worktree_path),
@@ -7001,12 +7129,7 @@ def _record_worker_closure(
         changed_files_raw = []
     changed_files = [str(path) for path in changed_files_raw if isinstance(path, str)] or None
 
-    # implementation note R5: close-time package smoke. A slice that broke its own package
-    # (out-of-scope of the worker's scoped TEST_CMD) must fail at closure, not
-    # slip through to the merge gate. Blocking on a real red (no closure, commit
-    # preserved); the cap, environment-fault, and pre-existing-red notes are
-    # the non-blocking paths.
-    smoke_ok, smoke_note = _package_smoke(worktree_path, changed_files, base_sha=start_head)
+    smoke_ok, smoke_note = _close_lane_regressions(Path(worktree_path), start_head, head)
     if not smoke_ok:
         return None, smoke_note
 
@@ -8830,13 +8953,16 @@ def next_lane_close_action(*, task_ref: str, lane_id: str) -> dict[str, Any]:
     }
 
 
-def next_lane_guidance_action(*, task_ref: str, lane_id: str, blockers: list[str]) -> dict[str, Any]:
-    """Describe the follow-up needed for a landed worker result with open blockers."""
+def next_lane_guidance_action(
+    *, task_ref: str, lane_id: str, blockers: list[str], resolution: dict[str, Any]
+) -> dict[str, Any]:
+    """Report the classified follow-up for a worker result with open blockers."""
     return {
         "action": "provide_guidance",
         "task_ref": task_ref,
         "lane_id": lane_id,
         "blockers": list(blockers),
+        "resolution": resolution,
     }
 
 
@@ -9923,6 +10049,7 @@ def _mark_lane_review_on_handoff_ready(
     task_ref: str,
     lane_id: str,
     worktree_path: Path,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     """Transition the offload lane to status ``review`` after a green pass.
 
@@ -9982,7 +10109,11 @@ def _mark_lane_review_on_handoff_ready(
             reasoning_effort=reasoning_effort,
             test_cmd=test_cmd,
             status=LaneStatus.REVIEW,
-            notes="Offload pass handoff_ready; lane awaiting review-gate close (implementation note S13 / T26).",
+            notes=(
+                notes
+                if notes is not None
+                else "Offload pass handoff_ready; lane awaiting review-gate close (implementation note S13 / T26)."
+            ),
         )
     )
     if payload.get("ok") is True:
@@ -10408,6 +10539,7 @@ def run_offload_pass_engine(
     canon_proposal_path: str | None = None,
     native_validation_config: Path | str | None = None,
     native_validation_digest: str | None = None,
+    progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     # bool is a subclass of int; token_budget=True would pass isinstance(_, int) and
     # run a pass with an effective budget of 1 token. Reject it explicitly.
@@ -10421,6 +10553,28 @@ def run_offload_pass_engine(
         raise ValueError("max_review_cycles must be a positive integer (>=1).")
     if tier is not None and tier not in ("junior", "senior"):
         raise ValueError("tier must be 'junior' or 'senior'.")
+
+    from .remote_exec_mode import (
+        ACTIVE_REMOTE_EXEC_SELECTION,
+        RemoteExecModeError,
+        resolve_remote_exec_mode,
+    )
+
+    try:
+        mode_selection = resolve_remote_exec_mode(backend, repo_root=orchestrator_root)
+    except RemoteExecModeError as exc:
+        return {
+            "ok": False,
+            "outcome": "dispatch_refused",
+            "reason": exc.code,
+            "failure_reason": exc.code,
+            "error": str(exc),
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "pass_id": pass_id,
+            "typed_outcome": True,
+        }
+    remote_exec_selection = mode_selection.to_mapping()
 
     if dry_run:
         from .nonexecution_history import preview_pass
@@ -10450,12 +10604,29 @@ def run_offload_pass_engine(
         deadline = min(deadline, completion_deadline)
     wd = _worker_daemon_module()
     resolved_pass_id = pass_id or str(uuid.uuid4())
+    from workbay_handoff_mcp.shared_schema import _get_db_connection as guidance_db_connection  # noqa: PLC0415
+
+    guidance_message_ids: list[int] = []
+    guidance_report_ids: list[int] = []
+    guidance_snapshot_error: str | None = None
+    guidance_snapshot_reason = "pass_snapshot_failed"
+    guidance_receipt: dict[str, Any] | None = None
+
     from .offload_pass_recovery import OffloadProductionHistory
 
     production_history = OffloadProductionHistory(
         task_ref=task_ref, lane_id=lane_id, pass_id=resolved_pass_id, job_id=detached_completion_job_id
     )
-    from .review_cycle_dispatch import ACTIVE_DISPATCH, canonical_subject, prepare, settle_actual
+    from .review_cycle_dispatch import (
+        ACTIVE_DISPATCH,
+        SubjectAmbiguous,
+        SubjectResolutionHeld,
+        SubjectScopeUnauthenticated,
+        canonical_subject,
+        prepare,
+        settle_actual,
+        subject_resolution_details,
+    )
 
     review_cycle_receipt = None
     review_cycle_context_token = None
@@ -10469,9 +10640,7 @@ def run_offload_pass_engine(
     # .state_dir is a split-brain (recovery reads a directory nothing was written to).
     resolved_state_dir = Path(state_dir) if state_dir is not None else Path(orchestrator_root) / ".task-state"
     previous_production_result = (read_pass_state(resolved_state_dir, resolved_pass_id) or {}).get("result")
-    detached_begin = os.environ.get("WORKBAY_REMOTE_EXEC_MODE", "attached") == "detached" and backend.endswith(
-        "-remote"
-    )
+    detached_begin = mode_selection.mode == "detached" and backend.endswith("-remote")
     detached_job_id: str | None = None
     detached_job_attempt: int | None = None
     detached_completion_record: dict[str, Any] | None = None
@@ -10490,6 +10659,7 @@ def run_offload_pass_engine(
         except (OSError, RuntimeError, TypeError, ValueError):
             start_head_ref = None  # Early errors remain explicitly unbound.
     rescue_identity: dict[str, Any] = {
+        "remote_exec_selection": remote_exec_selection,
         "orchestrator_root": str(orchestrator_root),
         "started_at": pass_started_at,
         "dispatch_id": original_dispatch_id,
@@ -10527,6 +10697,32 @@ def run_offload_pass_engine(
     # Durable authority this callback accepted at its first source-bearing
     # publication. Engine rewrites never change these fields.
     accepted = read_pass_state(resolved_state_dir, resolved_pass_id) or {}
+    if detached_completion_job_id is None:
+        # Freeze the inputs before worker execution can append another ask/report.
+        # Failure leaves the snapshot unknown, never an apparently empty success.
+        try:
+            guidance_message_ids, guidance_report_ids = _select_pass_guidance_snapshot(task_ref, lane_id)
+        except Exception as exc:  # noqa: BLE001 — preserve the pass, withhold consumption
+            guidance_snapshot_error = f"{type(exc).__name__}: {exc}"
+        # Written ahead of the worker: every running publication carries it, the
+        # first one (before submission) wins, and later rewrites keep it.
+        rescue_identity["guidance_snapshot"] = {
+            "message_ids": guidance_message_ids,
+            "report_ids": guidance_report_ids,
+            "error": guidance_snapshot_error,
+        }
+    else:
+        # Completion and its crash replay read the begin's note, never the queues.
+        # A pass with no such note consumes nothing: unknown, not empty. [RES-17][CAL-02]
+        durable_snapshot = _durable_pass_guidance_snapshot(accepted)
+        if durable_snapshot is None:
+            guidance_snapshot_reason = "pass_snapshot_missing"
+            guidance_snapshot_error = "the pending pass record has no well-formed begin snapshot"
+        else:
+            guidance_message_ids = durable_snapshot["message_ids"]
+            guidance_report_ids = durable_snapshot["report_ids"]
+            guidance_snapshot_error = durable_snapshot["error"]
+        guidance_receipt = _durable_guidance_receipt(accepted)
     if accepted:
         from .nonexecution_history import authenticated_nonexecution
 
@@ -10913,6 +11109,8 @@ def run_offload_pass_engine(
                 "counts_complete": counts_complete,
             },
         )
+        if dispatch_receipt is not None:
+            dispatch_receipt["remote_exec_selection"] = remote_exec_selection
         if model_call_incomplete_reason is not None:
             tokens_payload["tokens_complete"] = False
             tokens_payload["tokens_incomplete_reason"] = dict(model_call_incomplete_reason)
@@ -11310,6 +11508,28 @@ def run_offload_pass_engine(
             trigger_result = _trigger_background_retire_sweep(Path(orchestrator_root))
         pass_sweep_state["trigger"] = dict(trigger_result)
         result["retire_sweep_trigger"] = dict(trigger_result)
+        # Drain after this pass's effects (including retirement), so terminal
+        # inputs arriving during execute do not depend on a running daemon.
+        try:
+            from workbay_orchestrator_mcp.lanes import drain_terminal_lane_queues  # noqa: PLC0415
+
+            drain_result = _lane_payload_dict(
+                drain_terminal_lane_queues(task_ref=task_ref, limit=TERMINAL_QUEUE_DRAIN_LIMIT, dry_run=False)
+            )
+            if drain_result.get("ok") is not True:
+                drain_result = {
+                    **drain_result,
+                    "ok": False,
+                    "reason": "terminal_queue_drain_failed",
+                    "error": str(drain_result.get("error") or "drain_terminal_lane_queues did not return ok"),
+                }
+        except Exception as exc:  # noqa: BLE001 — maintenance failure must not cost the pass outcome
+            drain_result = {
+                "ok": False,
+                "reason": "terminal_queue_drain_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        result["terminal_queue_drain"] = drain_result
         try:
             # Persist the spawn result too; the first terminal write remains
             # the ordering barrier observed by the detached sweep.
@@ -11517,19 +11737,19 @@ def run_offload_pass_engine(
         review_lane = lane_kind == "review"
         if backend.endswith("-remote") and not dry_run:
             try:
-                cycle_branch = _git_stdout(Path(worktree_path), "rev-parse", "--abbrev-ref", "HEAD")
-                cycle_subject = canonical_subject(
-                    Path(worktree_path),
-                    resolved_state_dir,
-                    task_ref=task_ref,
-                    branch=cycle_branch,
-                    pass_id=resolved_pass_id,
-                    orchestrator_root=Path(orchestrator_root),
-                )
                 cycle_id = detached_completion_job_id or detached_job_id or dispatch_id or resolved_pass_id
                 if detached_completion_job_id or detached_completion_record is not None:
                     from .review_cycle_dispatch import _receipt_path
 
+                    cycle_branch = _git_stdout(Path(worktree_path), "rev-parse", "--abbrev-ref", "HEAD")
+                    cycle_subject = canonical_subject(
+                        Path(worktree_path),
+                        resolved_state_dir,
+                        task_ref=task_ref,
+                        branch=cycle_branch,
+                        pass_id=resolved_pass_id,
+                        orchestrator_root=Path(orchestrator_root),
+                    )
                     review_cycle_receipt = json.loads(_receipt_path(Path(worktree_path), cycle_id).read_text())
                     if review_cycle_receipt["identity"]["subject_branch"] != cycle_subject:
                         raise ValueError("review_cycle_completion_subject_mismatch")
@@ -11537,7 +11757,9 @@ def run_offload_pass_engine(
                     review_cycle_receipt = prepare(
                         Path(worktree_path),
                         dispatch_id=cycle_id,
-                        subject_branch=cycle_subject,
+                        subject_branch=None,
+                        state_dir=resolved_state_dir,
+                        orchestrator_root=Path(orchestrator_root),
                         kind="gate" if review_lane else "implement",
                         canon_proposal_path=canon_proposal_path,
                         settlement_owner="engine",
@@ -11550,14 +11772,25 @@ def run_offload_pass_engine(
                     )
                 if review_cycle_receipt["decision"]["status"] != "reserved":
                     refused = review_cycle_receipt["decision"]
+                    hold = review_cycle_receipt.get("subject_resolution")
                     review_cycle_receipt = None
-                    return _payload("dispatch_refused", reason=refused["status"], error=refused["reason"])
+                    if hold is not None:
+                        return {**_payload("dispatch_refused", reason="subject_resolution_hold", error=refused["reason"]),
+                                "subject_resolution": hold}
+                    return {**_payload("dispatch_refused", reason=refused["status"], error=refused["reason"]),
+                            "review_cycle_refusal": refused}
+                cycle_subject = review_cycle_receipt["identity"]["subject_branch"]
                 review_cycle_context_token = ACTIVE_DISPATCH.set(review_cycle_receipt)
                 rescue_identity.update(
                     review_cycle_dispatch_id=cycle_id,
                     review_cycle_subject_branch=cycle_subject,
                     review_cycle=review_cycle_receipt["decision"],
                 )
+            except (SubjectResolutionHeld, SubjectScopeUnauthenticated, SubjectAmbiguous) as exc:
+                return {**_payload("dispatch_refused", reason="subject_resolution_hold", error=str(exc)),
+                        "subject_resolution": subject_resolution_details(
+                            Path(worktree_path), exc, kind="gate" if review_lane else "implement",
+                            orchestrator_root=Path(orchestrator_root))}
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
                 return _payload("dispatch_refused", reason="ledger_hold", error=str(exc))
         guidance_contract_invalid = False
@@ -12215,6 +12448,9 @@ def run_offload_pass_engine(
                 )
             else:
                 _require_publication_authority()
+                # The running pass already durably carries this selection.
+                if progress_callback is not None:
+                    progress_callback(event="remote_exec_selected", remote_exec_selection=dict(remote_exec_selection))
                 execute_succeeded = wd._execute_phase(run_ctx)
             # Capture process evidence at the execute return boundary, before
             # branching on success. A transport may start and emit usage/routing
@@ -13068,6 +13304,26 @@ def run_offload_pass_engine(
                         },
                     )
                     final_result = _safe_final_result(run_ctx)
+                    completion = _review_completion(final_result)
+                    publication = None
+                    if completion["complete"]:
+                        from .native_review_evidence import project_branch_judgment, publish_branch_judgment
+
+                        branch = str(rescue_identity.get("branch") or "")
+                        verdict = completion["verdict"] if completion["verdict"] in _REVIEW_COMPLETE_TOKENS else None
+                        if verdict is None and type(final_result.get("converged")) is bool:
+                            if final_result["converged"]:
+                                verdict = "pass_with_findings" if final_result.get("findings") else "pass"
+                            else:
+                                verdict = "fail"
+                        publication = publish_branch_judgment(
+                            resolved_pass_id, task_ref=task_ref, session=session, subject_path=branch,
+                            actor={"lane_id": lane_id, "branch": branch, "commit_sha": pre_exec_head},
+                            verdict=verdict, producer="managed", receipt=review_cycle_receipt,
+                            judge_pin={"backend": run_ctx.backend, "model": run_ctx.model,
+                                       "effort": getattr(run_ctx, "cycle_reasoning_effort", None)
+                                       or run_ctx.reasoning_effort},
+                        )
                     findings_harvest = _harvest_review_findings(
                         final_result,
                         _safe_latest_worker_report(task_ref, lane_id),
@@ -13084,77 +13340,26 @@ def run_offload_pass_engine(
                         },
                     )
                     review_product_harvest = True
-                    completion = _review_completion(final_result)
                     if (
                         _harvest_verdict(findings_harvest) in _PASSING_HARVEST_VERDICTS
                         and completion["complete"]
                         and not findings_harvest.get("unrecorded_ids")
                     ):
-                        # Every complete, fully recorded pass gets this durable
-                        # per-pass receipt, with or without findings. Harvest-written
-                        # finding rows name no pass, so they cannot prove this pass
-                        # alone. Receipt persistence is separate from the
-                        # findings block's review outcome; retirement still requires
-                        # its own durable evidence.
-                        from workbay_handoff_mcp.core import record_review_run  # noqa: PLC0415
-                        from workbay_handoff_mcp.shared_schema import _get_db_connection  # noqa: PLC0415
-
-                        branch = str(rescue_identity.get("branch") or "")
-                        verdict = completion["verdict"] if completion["verdict"] in _REVIEW_COMPLETE_TOKENS else None
-                        expected_run = {
-                            "task_ref": task_ref,
-                            "session": session,
-                            "subject_path": branch,
-                            "subject_kind": "branch",
-                            "review_mode": "branch",
-                            "branch": branch,
-                            "commit_sha": pre_exec_head,
-                            "verdict": verdict,
-                        }
-                        review_run_receipt: dict[str, str | None] = {"status": "recorded", "error": None}
-                        try:
-                            # Replays may reuse only this pass's matching row;
-                            # the writer rejects duplicate review_run_id values.
-                            with _get_db_connection() as conn:
-                                existing_run = conn.execute(
-                                    "SELECT * FROM review_runs WHERE review_run_id = ?", (resolved_pass_id,)
-                                ).fetchone()
-                            if existing_run is None:
-                                recorded_run = _lane_payload_dict(
-                                    record_review_run(
-                                        review_run_id=resolved_pass_id,
-                                        task_ref=task_ref,
-                                        session=session,
-                                        subject_path=branch,
-                                        subject_kind="branch",
-                                        review_mode="branch",
-                                        verdict=verdict,
-                                        actor={"lane_id": lane_id, "branch": branch, "commit_sha": pre_exec_head},
-                                    )
-                                )
-                                if recorded_run.get("ok") is not True:
-                                    review_run_receipt = {
-                                        "status": "refused",
-                                        "error": str(recorded_run.get("error") or "review run record refused"),
-                                    }
-                            elif any(existing_run[key] != value for key, value in expected_run.items()):
-                                review_run_receipt = {
-                                    "status": "identity_mismatch",
-                                    "error": "review run receipt identity mismatch",
-                                }
-                        except Exception as exc:  # noqa: BLE001 — receipt failure must not relabel findings
-                            review_run_receipt = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
-                        findings_harvest = {**findings_harvest, "review_run_receipt": review_run_receipt}
-                        if review_run_receipt["status"] != "recorded":
-                            logger.warning(
-                                "review run receipt %s task_ref=%s lane_id=%s: %s",
-                                review_run_receipt["status"],
-                                task_ref,
-                                lane_id,
-                                review_run_receipt["error"],
-                            )
+                        run = project_branch_judgment(
+                            publication, finding_ids=findings_harvest.get("recorded_ids")
+                            or findings_harvest.get("finding_ids") or [],
+                            blocking_ids=[row["finding_id"] for row in findings_harvest.get("blocking_findings", [])],
+                        )
+                        error = run.get("error") or run.get("reason")
+                        if run["status"] == "identity_mismatch":
+                            error = "review run receipt identity mismatch"
+                        findings_harvest["review_run_receipt"] = {"status": run["status"], "error": error}
+                        findings_harvest["judgment_receipt"] = publication
+                        if run["status"] == "recorded":
+                            findings_harvest["review_run_id"] = run["review_run_id"]
                         else:
-                            findings_harvest = {**findings_harvest, "review_run_id": resolved_pass_id}
+                            logger.warning("review run receipt %s task_ref=%s lane_id=%s: %s",
+                                           run["status"], task_ref, lane_id, error)
                     if _harvest_block_parsed(findings_harvest):
                         durable_output = True
                         if completion["complete"]:
@@ -13221,7 +13426,7 @@ def run_offload_pass_engine(
                         outcome = "composer_violation_quarantined"
                         failed_stage = "attestation"
                         error_reason = (
-                            "grok-build contamination after a self-verified checkpoint; "
+                            f"{model_routing.ModelId.GROK_BUILD} contamination after a self-verified checkpoint; "
                             f"branch={violation.get('branch')}; commit preserved for orchestrator review"
                         )
                     else:
@@ -13586,10 +13791,11 @@ def run_offload_pass_engine(
             error_reason = "needs_guidance handoff had no substantive blockers"
 
         # T26 / implementation note S13: handoff_ready → lane status "review" + expose
-        # one-call gate close. Error/needs_guidance leave status untouched
-        # (no false merged). [OBS-08][CON-04]
+        # one-call gate close. Settled guidance below can enter review or
+        # spend an environment retry, without a merged close. [OBS-08][CON-04]
         lane_status_transition: dict[str, Any] | None = None
         next_lane_action: dict[str, Any] | None = None
+        guidance_consumption: dict[str, Any] | None = None
         if outcome == "handoff_ready":
             if getattr(run_ctx, "native_validation_milestone", None) == "gated":
                 lane_status_transition = {
@@ -13604,12 +13810,153 @@ def run_offload_pass_engine(
                     worktree_path=Path(worktree_path),
                 )
             next_lane_action = next_lane_close_action(task_ref=task_ref, lane_id=lane_id)
-        elif outcome == "needs_guidance" and landed_before_salvage and _worker_requested_guidance(run_ctx):
+        elif outcome == "needs_guidance" and _worker_requested_guidance(run_ctx):
+            from workbay_orchestrator_mcp.orchestration.orchestrator_guidance import (  # noqa: PLC0415
+                GuidanceFacts,
+                decide_guidance,
+            )
+
+            blockers = _worker_guidance_blockers(run_ctx)
+            landed_commit = _git_stdout(Path(worktree_path), "rev-parse", "HEAD") if _compute_commit_landed() else None
+            facts = GuidanceFacts(
+                lane_id=lane_id,
+                # This pass has no durable guidance-message/report identity.
+                # The pure decision is reported only; no effects use this sentinel.
+                worker_message_id=0,
+                latest_report_id=None,
+                combined_text=" ".join(blockers).lower(),
+                has_pending_actions=True,
+                next_assignment=None,
+                redispatch_block_reason=None,
+                landed_commit=landed_commit,
+                unknown_ancestry=False,
+                landing_commit_sha=None,
+                branch_tip_sha=landed_commit,
+                close_dispatch_ids=(),
+                redispatch_close_dispatch_ids=(),
+            )
+            resolution = decide_guidance(facts)
             next_lane_action = next_lane_guidance_action(
                 task_ref=task_ref,
                 lane_id=lane_id,
-                blockers=_worker_guidance_blockers(run_ctx),
+                blockers=blockers,
+                resolution={
+                    "kind": resolution.kind.value,
+                    "reason": resolution.rationale or resolution.decision,
+                    "evidence": {"landed_commit": facts.landed_commit, "blockers": list(blockers)},
+                },
             )
+            guidance_consumption = {"ok": False, "reason": "guidance_unsettled"}
+            guidance_effect_error: str | None = None
+            if resolution.kind.value == "review":
+                next_lane_action["action"] = "review"
+                lane_status_transition = _mark_lane_review_on_handoff_ready(
+                    task_ref=task_ref,
+                    lane_id=lane_id,
+                    worktree_path=Path(worktree_path),
+                    notes="\n".join(blockers),
+                )
+                if lane_status_transition.get("ok") is not True:
+                    guidance_effect_error = str(lane_status_transition.get("error") or "lane review transition failed")
+            elif resolution.kind.value == "blocked":
+                from workbay_orchestrator_mcp.orchestration.environment_retry import (  # noqa: PLC0415
+                    claim_environment_retry,
+                    normalize_environment_cause,
+                )
+
+                cause = normalize_environment_cause(" ".join(blockers))
+                try:
+                    with guidance_db_connection(begin_immediate=True) as conn:
+                        retry = claim_environment_retry(
+                            conn,
+                            task_ref=task_ref,
+                            lane_id=lane_id,
+                            cause=cause,
+                            request_id=dispatch_id or resolved_pass_id,
+                        )
+                    if retry["granted"]:
+                        next_lane_action.update(
+                            action="requeue", dispatch_id=retry["dispatch_id"], attempt=retry["attempt"], cause=cause
+                        )
+                    else:
+                        next_lane_action.update(action="escalate", reason=retry["reason"])
+                except Exception as exc:  # noqa: BLE001 — a failed spend must never grant a retry
+                    guidance_effect_error = f"{type(exc).__name__}: {exc}"
+                    next_lane_action.update(action="escalate", reason="environment_retry_claim_failed")
+
+            if next_lane_action["action"] in {"review", "requeue", "escalate"} and guidance_receipt is not None:
+                # A replay of a settled completion repeats nothing: its receipt is
+                # the outcome, and no row is recorded or consumed twice. [RES-19]
+                guidance_consumption = dict(guidance_receipt)
+            elif next_lane_action["action"] in {"review", "requeue", "escalate"}:
+                # Import at the write boundary, as the daemon guidance path does.
+                # Only an acknowledged durable action permits consuming its inputs.
+                try:
+                    from workbay_handoff_mcp import record_decision  # noqa: PLC0415
+
+                    recorded = _lane_payload_dict(
+                        record_decision(
+                            session=session,
+                            task_ref=task_ref,
+                            decision=json.dumps(next_lane_action, sort_keys=True),
+                            rationale=resolution.rationale or resolution.decision,
+                            event_id=f"offload-guidance:{task_ref}:{lane_id}:{resolved_pass_id}",
+                        )
+                    )
+                    if recorded.get("ok") is not True:
+                        guidance_consumption = {
+                            "ok": False,
+                            "reason": "next_action_record_failed",
+                            "error": str(recorded.get("error") or "record_decision did not return ok"),
+                        }
+                    elif guidance_snapshot_error or guidance_effect_error:
+                        guidance_consumption = {
+                            "ok": False,
+                            "reason": guidance_snapshot_reason if guidance_snapshot_error else "guidance_effect_failed",
+                            "error": guidance_snapshot_error or guidance_effect_error,
+                        }
+                    else:
+                        from workbay_orchestrator_mcp.lanes import consume_lane_pass_snapshot  # noqa: PLC0415
+
+                        consumed = _lane_payload_dict(
+                            consume_lane_pass_snapshot(
+                                lane_id,
+                                task_ref=task_ref,
+                                message_ids=guidance_message_ids,
+                                report_ids=guidance_report_ids,
+                            )
+                        )
+                        if consumed.get("ok") is True:
+                            guidance_consumption = {
+                                "ok": True,
+                                "message_ids": sorted(consumed["closed_message_ids"]),
+                                "report_ids": sorted(consumed["acknowledged_report_ids"]),
+                            }
+                        else:
+                            guidance_consumption = {
+                                "ok": False,
+                                "reason": "pass_snapshot_consume_failed",
+                                "error": str(consumed.get("error") or "consume_lane_pass_snapshot did not return ok"),
+                            }
+                except Exception as exc:  # noqa: BLE001 — report the failed write without losing the pass outcome
+                    guidance_consumption = {
+                        "ok": False,
+                        "reason": "guidance_consumption_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                if detached_completion_job_id is not None and guidance_consumption.get("ok") is True:
+                    # Durable before anything later can fail, so a crash replay of
+                    # this completion reports this receipt instead of an empty one.
+                    rescue_identity["guidance_consumption"] = guidance_consumption
+                    try:
+                        _publish_running_state(
+                            {**rescue_identity, "status": "running", "task_ref": task_ref, "lane_id": lane_id}
+                        )
+                    except (LanePassPublicationRefused, OSError):
+                        # The terminal publication still carries the receipt.
+                        logger.warning(
+                            "guidance_consumption_receipt_unpublished pass_id=%s", resolved_pass_id, exc_info=True
+                        )
         # implementation note R2/R3: harvest review-lane GROK_REVIEW_FINDINGS_JSON before listing
         # so recorded rows appear in payload["findings"]. A review lane already
         # computed + reused this during outcome classification (do not re-run); every
@@ -13817,6 +14164,8 @@ def run_offload_pass_engine(
             payload["lane_status_transition"] = lane_status_transition
         if next_lane_action is not None:
             payload["next_lane_action"] = next_lane_action
+        if guidance_consumption is not None:
+            payload["guidance_consumption"] = guidance_consumption
         if escalation_details is not None:
             payload["escalation"] = escalation_details
         return payload
@@ -13831,6 +14180,7 @@ def run_offload_pass_engine(
         (resolved_state_dir, resolved_pass_id) if detached_completion_job_id is not None else None
     )
     production_history_token = _ACTIVE_PRODUCTION_HISTORY.set(production_history)
+    mode_selection_token = ACTIVE_REMOTE_EXEC_SELECTION.set(mode_selection)
     try:
         if not lock.acquire():
             if detached_completion_job_id is not None:
@@ -14049,12 +14399,17 @@ def run_offload_pass_engine(
         finally:
             lock.release()
     finally:
+        ACTIVE_REMOTE_EXEC_SELECTION.reset(mode_selection_token)
         _ACTIVE_PRODUCTION_HISTORY.reset(production_history_token)
         if review_cycle_context_token is not None:
             ACTIVE_DISPATCH.reset(review_cycle_context_token)
         _ACTIVE_DETACHED_CHECKPOINT_PASS.reset(checkpoint_pass_token)
         _ACTIVE_DETACHED_JOB_ID.reset(detached_job_context_token)
         _ACTIVE_OFFLOAD_PASS_SWEEP_STATE.reset(sweep_context_token)
+
+
+# Per-queue cap for terminal backlog maintenance at the end of an engine pass.
+TERMINAL_QUEUE_DRAIN_LIMIT = 128
 
 
 # Bound automatic custody retries across processes: eight failed receives or one
@@ -14119,7 +14474,10 @@ def complete_remote_pass(
     if completion_deadline is None:
         spec = job.get("spec") or {}
         spec = spec if isinstance(spec, dict) else {}
-        state = read_pass_state(Path(state_dir), str(spec.get("pass_id"))) or {}
+        try:
+            state = read_pass_state(Path(state_dir), str(spec.get("pass_id")), strict=True) or {}
+        except PassStateUnreadable as exc:
+            return exc.hold(job_id)
         completion_deadline = started + completion_timeout_seconds(state)
     token = _ACTIVE_COMPLETION_DEADLINE.set(completion_deadline)
     try:
@@ -14133,6 +14491,8 @@ def complete_remote_pass(
                 return _held_production_view(
                     _complete_remote_pass(job_id, state_dir=state_dir, orchestrator_root=orchestrator_root)
                 )
+        except PassStateUnreadable as exc:
+            return exc.hold(job_id)
         except RemoteJobReconcileError:
             _completion_remaining()
             raise
@@ -14179,7 +14539,10 @@ def reharvest_terminal_pass(job_id: str, *, pass_id: str, state_dir: Path, orche
             "pass_id": pass_id,
         }
     started = time.monotonic()
-    state = read_pass_state(Path(state_dir), pass_id) or {}
+    try:
+        state = read_pass_state(Path(state_dir), pass_id, strict=True) or {}
+    except PassStateUnreadable as exc:
+        return exc.hold(job_id)
     token = _ACTIVE_COMPLETION_DEADLINE.set(started + completion_timeout_seconds(state))
     try:
         with _locked(
@@ -14190,6 +14553,8 @@ def reharvest_terminal_pass(job_id: str, *, pass_id: str, state_dir: Path, orche
             return _reharvest_terminal_pass_locked(
                 job_id, pass_id=pass_id, state_dir=state_dir, orchestrator_root=orchestrator_root
             )
+    except PassStateUnreadable as exc:
+        return exc.hold(job_id)
     finally:
         _ACTIVE_COMPLETION_DEADLINE.reset(token)
 
@@ -14243,7 +14608,7 @@ def _reharvest_terminal_pass_locked(
     if job.get("stage") not in {"done", "completed"} or job.get("rc") != 0 or job.get("remote_state") == "lost":
         return refused("job_not_harvestable")
 
-    pass_state = read_pass_state(Path(state_dir), pass_id) or {}
+    pass_state = read_pass_state(Path(state_dir), pass_id, strict=True) or {}
     recorded = pass_state.get("result")
     if pass_state.get("job_id") != job_id or not isinstance(recorded, dict) or recorded.get("job_id") != job_id:
         return refused("pass_identity_mismatch")
@@ -14578,7 +14943,21 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
             "findings": [],
         }
 
-    pass_state = read_pass_state(resolved_state_dir, pass_id) or {}
+    pass_state = read_pass_state(resolved_state_dir, pass_id, strict=True) or {}
+    if "plan_review_binding" in spec:
+        # A plan review has no lane-pass configuration. Its original
+        # coordinator owns collection and the canonical review verdict.
+        failure = plan_review_failure(job)
+        if failure is not None:
+            return {"ok": False, "terminal": True, "outcome": "transport_failure", **failure}
+        return {
+            "ok": False,
+            "terminal": False,
+            "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+            "job_id": job_id,
+            "pass_id": pass_id,
+            "reason": "plan_review_owner_pending",
+        }
     if pass_state.get("job_id") not in (None, job_id):
         return {
             "ok": False,
@@ -14611,7 +14990,7 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
             "task_ref": task_ref,
             "lane_id": lane_id,
         }
-        latest_pass_state = read_pass_state(resolved_state_dir, pass_id) or pass_state
+        latest_pass_state = read_pass_state(resolved_state_dir, pass_id, strict=True) or pass_state
         if publish and "production_history" not in terminal:
             # A terminal that bypassed the engine (error, lost, deferred or exhausted
             # custody) must not drop the original open prepare; project it typed.
@@ -14627,24 +15006,36 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
         if publish:
             # ``publish=False`` finishes an already-published receipt whose approved
             # enrichment is bound to its exact bytes; those bytes are never rewritten.
-            write_pass_state(
-                resolved_state_dir,
-                pass_id,
-                {
-                    **latest_pass_state,
-                    "status": "done",
-                    "task_ref": task_ref,
-                    "lane_id": lane_id,
+            terminal_pass_state = {
+                **latest_pass_state,
+                "status": "done",
+                "task_ref": task_ref,
+                "lane_id": lane_id,
+                "job_id": job_id,
+                "attempt": attempt,
+                "result": terminal,
+                **(
+                    {"custody_hold": {**latest_pass_state["custody_hold"], "active": retain_custody}}
+                    if isinstance(latest_pass_state.get("custody_hold"), dict)
+                    else {}
+                ),
+            }
+            if not write_pass_state(resolved_state_dir, pass_id, terminal_pass_state):
+                # A refused publication is still open custody. In particular,
+                # the reconciler must release, rather than finalize, its claim.
+                return {
+                    "ok": True,
+                    "terminal": False,
+                    "status": "running",
+                    "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+                    "reason": "pass_disposition_not_durable",
                     "job_id": job_id,
                     "attempt": attempt,
-                    "result": terminal,
-                    **(
-                        {"custody_hold": {**latest_pass_state["custody_hold"], "active": retain_custody}}
-                        if isinstance(latest_pass_state.get("custody_hold"), dict)
-                        else {}
-                    ),
-                },
-            )
+                    "pass_id": pass_id,
+                    "task_ref": task_ref,
+                    "lane_id": lane_id,
+                    "summary": "Detached pass disposition was refused; retry the same job.",
+                }
         report_summary = str(terminal.get("summary") or terminal.get("error") or terminal.get("outcome"))
         _completion_remaining()
         _worker_daemon_module()._record_terminal_outcome(
@@ -14897,7 +15288,7 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
         collection_rc: int | None = None,
         permanent: bool = False,
     ) -> dict[str, Any]:
-        latest = read_pass_state(resolved_state_dir, pass_id) or pass_state
+        latest = read_pass_state(resolved_state_dir, pass_id, strict=True) or pass_state
         previous = latest.get("custody_hold")
         previous = previous if isinstance(previous, dict) and previous.get("job_id") == job_id else {}
         now = datetime.now(timezone.utc)
@@ -15114,7 +15505,7 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                             else:
                                 target.unlink(missing_ok=True)
                     collection = {"job_id": job_id, "artifacts": _detached_collection_manifest(paths), **provenance}
-                    latest = read_pass_state(resolved_state_dir, pass_id) or pass_state
+                    latest = read_pass_state(resolved_state_dir, pass_id, strict=True) or pass_state
                     write_pass_state(resolved_state_dir, pass_id, {**latest, "detached_collection": collection})
                     receive_cleanup.callback(shutil.rmtree, temporary)
                 except _DetachedCollectionUnavailable as exc:
@@ -15207,7 +15598,7 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
         )
 
     if resume_custody:
-        latest = read_pass_state(resolved_state_dir, pass_id) or pass_state
+        latest = read_pass_state(resolved_state_dir, pass_id, strict=True) or pass_state
         retained_hold = dict(latest["custody_hold"])
         superseded = list(retained_hold.get("superseded_results", []))
         if isinstance(recorded_result, dict) and recorded_result.get("reason") == "remote_collection_retry_exhausted":

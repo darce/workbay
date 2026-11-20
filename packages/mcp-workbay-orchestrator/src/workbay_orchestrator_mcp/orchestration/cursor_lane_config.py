@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 
+from workbay_protocol import reasoning_effort as model_routing
+
 from workbay_orchestrator_mcp.orchestration import offload_timeout_ssot
 
 # Wall-clock ceiling for one cursor cycle. The SSOT module owns the sole env
@@ -35,7 +37,7 @@ CURSOR_TIMEOUT_CAP = offload_timeout_ssot.CURSOR_TIMEOUT_CAP
 # Operator direction: cursor grok lanes default to the FAST variant. Effort
 # rewriting looks up the published (effort, fast) pair so a low/medium/high
 # swap stays fast only when that twin was listed.
-TRACKED_CURSOR_MODEL = "cursor-grok-4.5-high-fast"
+TRACKED_CURSOR_MODEL = model_routing.MODEL_ROUTING_DEFAULTS["cursor"]
 WORKBAY_CURSOR_MODEL_ENV = "WORKBAY_CURSOR_MODEL"
 # VM catalogue probe (implementation note M2). Fixture-driven in tests; never invent a slug.
 CURSOR_LIST_MODELS_ARGV: tuple[str, ...] = ("cursor-agent", "--list-models")
@@ -88,18 +90,18 @@ CURSOR_FAST_SUFFIX = "-fast"
 CursorEffortVariants = dict[str, dict[str, dict[bool, str]]]
 
 TRACKED_CURSOR_EFFORT_VARIANTS: CursorEffortVariants = {
-    "cursor-grok-4.5": {
+    model_routing.ModelId.CURSOR_GROK_45: {
         "low": {
-            False: "cursor-grok-4.5-low",
-            True: "cursor-grok-4.5-low-fast",
+            False: model_routing.ModelId.CURSOR_GROK_45_LOW,
+            True: model_routing.ModelId.CURSOR_GROK_45_LOW_FAST,
         },
         "medium": {
-            False: "cursor-grok-4.5-medium",
-            True: "cursor-grok-4.5-medium-fast",
+            False: model_routing.ModelId.CURSOR_GROK_45_MEDIUM,
+            True: model_routing.ModelId.CURSOR_GROK_45_MEDIUM_FAST,
         },
         "high": {
-            False: "cursor-grok-4.5-high",
-            True: "cursor-grok-4.5-high-fast",
+            False: model_routing.ModelId.CURSOR_GROK_45_HIGH,
+            True: model_routing.ModelId.CURSOR_GROK_45_HIGH_FAST,
         },
     },
     # Ported from the implementation note S5 hand-authored table on main (landed 14aa9258b,
@@ -109,19 +111,19 @@ TRACKED_CURSOR_EFFORT_VARIANTS: CursorEffortVariants = {
     #
     # Vendor publishes low|high|max only for kimi - no medium, and no -fast tail.
     # Orchestrator xhigh maps onto max.
-    "kimi-k3": {
-        "low": {False: "kimi-k3-low"},
-        "high": {False: "kimi-k3-high"},
-        "xhigh": {False: "kimi-k3-max"},
+    model_routing.ModelId.CURSOR_KIMI: {
+        "low": {False: model_routing.ModelId.CURSOR_KIMI_LOW},
+        "high": {False: model_routing.ModelId.CURSOR_KIMI_HIGH},
+        "xhigh": {False: model_routing.ModelId.CURSOR_KIMI_MAX},
     },
-    "cursor-grok-4.6": {
-        "low": {False: "cursor-grok-4.6-low"},
-        "medium": {False: "cursor-grok-4.6-medium"},
+    model_routing.ModelId.CURSOR_GROK_46: {
+        "low": {False: model_routing.ModelId.CURSOR_GROK_46_LOW},
+        "medium": {False: model_routing.ModelId.CURSOR_GROK_46_MEDIUM},
         "high": {
-            False: "cursor-grok-4.6-high",
-            True: "cursor-grok-4.6-high-fast",
+            False: model_routing.ModelId.CURSOR_GROK_46_HIGH,
+            True: model_routing.ModelId.CURSOR_GROK_46_HIGH_FAST,
         },
-        "xhigh": {False: "cursor-grok-4.6-xhigh"},
+        "xhigh": {False: model_routing.ModelId.CURSOR_GROK_46_XHIGH},
     },
 }
 
@@ -322,11 +324,11 @@ CURSOR_REMOTE_LANE_TIMEOUT_S = 900
 # The effort tables above ARE catalogue-refreshable; this allow-list is not.
 CURSOR_REMOTE_ALLOWED_MODELS: frozenset[str] = frozenset(
     {
-        "cursor-grok-4.5-high-fast",
-        "cursor-grok-4.6-high",
-        "cursor-grok-4.6-high-fast",
-        "kimi-k3-low",
-        "kimi-k3-high",
-        "kimi-k3-max",
+        model_routing.ModelId.CURSOR_GROK_45_HIGH_FAST,
+        model_routing.ModelId.CURSOR_GROK_46_HIGH,
+        model_routing.ModelId.CURSOR_GROK_46_HIGH_FAST,
+        model_routing.ModelId.CURSOR_KIMI_LOW,
+        model_routing.ModelId.CURSOR_KIMI_HIGH,
+        model_routing.ModelId.CURSOR_KIMI_MAX,
     }
 )

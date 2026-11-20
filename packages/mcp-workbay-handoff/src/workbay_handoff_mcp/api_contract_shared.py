@@ -16,7 +16,7 @@ class WriteActorInput(BaseModel):
     ] = None
     model: Annotated[
         str | None,
-        Field(description="Canonical model slug for the writing agent, for example 'gpt-5.4'."),
+        Field(description="Canonical model slug for the writing agent."),
     ] = None
     model_label: Annotated[
         str | None,

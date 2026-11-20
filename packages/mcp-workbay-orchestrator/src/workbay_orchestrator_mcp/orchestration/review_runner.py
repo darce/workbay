@@ -1975,8 +1975,16 @@ class DetachedExecutionSettingsResolutionError(ValueError):
         super().__init__(f"cannot resolve detached execution setting: {setting}")
 
 
-def _detached_execution_mode_enabled() -> bool:
-    return os.environ.get("WORKBAY_REMOTE_EXEC_MODE", "attached").strip().lower() == "detached"
+def _detached_execution_mode_enabled(backend_id: str, *, repo_root: Path) -> bool:
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import (
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    selection = current_remote_exec_selection(backend_id, repo_root=repo_root)
+    if selection is None:
+        selection = resolve_remote_exec_mode(backend_id, repo_root=repo_root)
+    return selection.mode == "detached"
 
 
 def _digest_setting_value(value: Any) -> Any:
@@ -2170,6 +2178,30 @@ def run_review(
             )
         except Exception:
             logger.warning("Lane manifest lookup failed; using fallback review base", exc_info=True)
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import (
+        RemoteExecModeError,
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    mode_repo_root = Path(orchestrator_root) if orchestrator_root is not None else Path(worktree_path)
+    mode_backend = str(lane_cfg.get("preferred_backend") or backend)
+    try:
+        mode_selection = current_remote_exec_selection(mode_backend, repo_root=mode_repo_root)
+        if mode_selection is None:
+            mode_selection = resolve_remote_exec_mode(mode_backend, repo_root=mode_repo_root)
+    except RemoteExecModeError as exc:
+        return {
+            "kind": "refused",
+            "review": "refused",
+            "refusal_cause": "policy_or_classifier_refusal",
+            "failure_reason": exc.code,
+            "retryable": False,
+            "findings": [],
+            "converged": False,
+            "summary": str(exc),
+            "excluded_findings_count": 0,
+        }
     committed_base = _resolve_committed_base(worktree_path, lane_cfg.get("base_sha"))
 
     # Priority: Manifest pin > starting backend (CLI/default). Pin-honor is Plan
@@ -2363,7 +2395,7 @@ def run_review(
                     reasoning_effort=reasoning_effort,
                     speed=speed,
                     dispatch_options=adapter_kwargs,
-                    require_resolved=_detached_execution_mode_enabled(),
+                    require_resolved=mode_selection.mode == "detached",
                 )
             except DetachedExecutionSettingsResolutionError as exc:
                 return {
@@ -2408,6 +2440,8 @@ def run_review(
         speed=speed,
         env=env,
         progress_callback=progress_callback,
+        orchestrator_root=mode_repo_root,
+        remote_exec_selection=mode_selection,
         **detached_identity,
     )
     raw_result = result.raw_payload
@@ -2553,10 +2587,17 @@ def run_review(
     if output.get("review") is not None:
         review_status = str(output["review"])
     operation_token = None
+    bounded_branch = review_subject.get("kind") == "bounded" and scope["review_kind"] != ReviewKind.PLANNING and branch
+    if bounded_branch:
+        prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
+        operation_token = hashlib.sha256(json.dumps([
+            task_ref, branch, review_subject["base_ref"], review_subject["tip_ref"], lane_id, session,
+            str(review_round) if review_round is not None else None, prompt_digest,
+        ]).encode()).hexdigest()
     if final_result_path is not None:
         import uuid
 
-        operation_token = uuid.uuid4().hex
+        operation_token = operation_token or uuid.uuid4().hex
         from workbay_orchestrator_mcp.orchestration.pass_rescue import _atomic_write
 
         # Publish the review product before any coordinator side effect. The
@@ -2582,6 +2623,37 @@ def run_review(
             raise RuntimeError("--session is required when --record-findings is set.")
         if not orchestrator_root:
             raise RuntimeError("--orchestrator-root is required when --record-findings is set.")
+        publication = None
+        if bounded_branch:
+            from workbay_handoff_mcp import RuntimeConfig, configure_runtime
+            from workbay_handoff_mcp.shared_write_context import build_write_actor
+
+            from .native_review_evidence import project_branch_judgment, publish_branch_judgment
+            from .review_cycle_dispatch import ACTIVE_DISPATCH
+
+            configure_runtime(RuntimeConfig.for_repo(Path(orchestrator_root)))
+            tip = review_subject["tip_ref"]
+            blockers = blocking_findings(in_scope_findings)
+            carried = output.get("unresolved_listed_finding_ids") or []
+            verdict = "fail" if blockers or carried else ("pass_with_findings" if in_scope_findings else "pass")
+            active_gate = ACTIVE_DISPATCH.get()
+            owner = (active_gate or {}).get("managed_identity") or {}
+            source = (active_gate or {}).get("managed_source") or {}
+            if ((active_gate or {}).get("identity", {}).get("kind") != "gate"
+                    or (owner.get("task_ref"), owner.get("lane_id")) != (task_ref, lane_id)
+                    or (source.get("branch"), source.get("head_sha")) != (branch, tip)):
+                active_gate = None
+            publication = publish_branch_judgment(
+                f"internal-review-{operation_token}", task_ref=task_ref, session=session,
+                subject_path=f"{review_subject['base_ref']}...{tip}",
+                actor=build_write_actor(lane_id=lane_id, branch=branch, commit_sha=tip,
+                                        model=model_name, reasoning_level=reasoning_effort),
+                verdict=verdict, producer="standalone", receipt=active_gate,
+                judge_pin={"backend": backend_name, "model": model_name, "effort": reasoning_effort,
+                           "prompt_digest": prompt_digest},
+                cycle_n=int(review_round) if str(review_round).isdigit() and int(review_round) > 0 else None,
+                parent_run_id=ratchet_context.preceding_pass_id if ratchet_context else None,
+            )
         try:
             persist = _record_findings(
                 findings,
@@ -2636,6 +2708,14 @@ def run_review(
                 "review finding persist shortfall: "
                 f"recorded_ids={recorded_ids} unrecorded_ids={unrecorded_ids} causes={causes}"
             )
+        if publication is not None:
+            run = project_branch_judgment(
+                publication, finding_ids=recorded_ids, blocking_ids=carried,
+                blocking_paths={item["file_path"] for item in blockers if item.get("file_path")},
+            )
+            output["review_run_receipt"] = run
+            if run["status"] == "recorded":
+                output["review_run_id"] = run["review_run_id"]
         if review_subject.get("kind") == "bounded" and final_result_path is not None and lane_id and branch:
             from workbay_orchestrator_mcp.orchestration.review_receipt_producer import publish_internal_receipt
 
@@ -2695,7 +2775,7 @@ def _parse_args() -> argparse.Namespace:
         choices=WORKER_REASONING_EFFORT_CHOICES,
         help="Optional reasoning effort hint for codex-subagent review turns.",
     )
-    run_parser.add_argument("--model", help="Explicit model to use (e.g. gpt-5.4-mini).")
+    run_parser.add_argument("--model", help="Explicit model to use.")
     run_parser.add_argument("--grok-bin", help="Explicit path to the grok binary.")
     run_parser.add_argument("--grok-args", help="Extra args for grok exec (space-separated).")
     run_parser.add_argument(

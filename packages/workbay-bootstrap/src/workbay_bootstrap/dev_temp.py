@@ -1,13 +1,10 @@
 """Steady-state reclaimer for sticky dev trees (implementation note S4).
 
-Two roots, one clock:
-
-* ``/tmp/workbay-*`` -- preflight Makefiles reuse a sticky ``PREFLIGHT_TMPDIR``;
-  killed mid-run leaves residue there.
-* ``<repo>/.workbay/scratch/*`` -- per-task driver scripts, gate logs and
-  captured patches accumulate the same class of residue. Scanned only when the
-  caller supplies ``repo``; every pre-existing call keeps its exact prior
-  behaviour.
+Explicit operator maintenance retains the historical two-root age scan.
+Automatic lifecycle calls use ``scope="lifecycle"``: only private repo scratch
+with existing native ownership/release evidence is eligible, never ambient
+``/tmp``, TMPDIR, or WORKBAY_DEV_TEMP_ROOT. Age is a scheduling threshold,
+not lifecycle deletion authority. No ownership or release records are created.
 
 Never raises ([RES-07]/[AGT-10]): permission errors and missing roots degrade
 to empty reports.
@@ -15,9 +12,13 @@ to empty reports.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
+import socket
+import stat
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,8 @@ def _scan_root(
     removed: "list[str]",
     fresh: "list[str]",
     errors: "list[str]",
+    held: list[dict[str, str]] | None = None,
+    root_fd: int | None = None,
 ) -> None:
     """Age out ``glob`` children of ``root``, recording into the caller's lists.
 
@@ -65,7 +68,9 @@ def _scan_root(
             return
         root_real = root.resolve()
         try:
-            candidates = sorted(root.glob(glob))
+            candidates = (
+                sorted(root / name for name in os.listdir(root_fd)) if root_fd is not None else sorted(root.glob(glob))
+            )
         except OSError as exc:
             errors.append(f"{root}: {exc}")
             return
@@ -90,18 +95,111 @@ def _scan_root(
                 if mtime >= cutoff:
                     fresh.append(str(path))
                     continue
-                stale.append(str(path))
-                if not apply:
-                    continue
-                try:
-                    shutil.rmtree(path)
-                    removed.append(str(path))
-                except OSError as exc:
-                    errors.append(f"{path}: {exc}")
+                # Selection precedes effect; names and age convey no authority.
+                with ExitStack() as ownership:
+                    if root_fd is not None:
+                        reason = _released_scratch_hold(path, root, root_fd, ownership)
+                        if reason:
+                            assert held is not None
+                            held.append({"path": str(path), "reason": reason})
+                            continue
+                    stale.append(str(path))
+                    if not apply:
+                        continue
+                    try:
+                        if root_fd is None:
+                            shutil.rmtree(path)
+                        else:
+                            # fd-relative rmtree pins the root across effect.
+                            shutil.rmtree(path.name, dir_fd=root_fd)
+                        removed.append(str(path))
+                    except OSError as exc:
+                        errors.append(f"{path}: {exc}")
             except Exception as exc:  # noqa: BLE001 -- per-path degrade
                 errors.append(f"{path}: {exc}")
     except Exception as exc:  # noqa: BLE001 -- per-root degrade, never raise
         errors.append(f"{root}: {exc}")
+
+
+def _private_scratch_fd(repo: Path | str, stack: ExitStack) -> tuple[Path, int]:
+    """Open the fixed hierarchy without following links or trusting env roots."""
+    base = Path(repo).absolute()
+    if base != base.resolve(strict=True):
+        raise ValueError("lifecycle repo has a symlink ancestor")
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    stack.callback(os.close, fd)
+    for name in (None, *SCRATCH_RELATIVE):
+        if name is not None:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            stack.callback(os.close, fd)
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise ValueError("lifecycle scratch hierarchy is foreign or writable by others")
+    if info.st_mode & 0o077:
+        raise ValueError("lifecycle scratch root must be private (0700)")
+    return base.joinpath(*SCRATCH_RELATIVE), fd
+
+
+def _released_scratch_hold(path: Path, root: Path, root_fd: int, stack: ExitStack) -> str | None:
+    """Consume the existing VM adapter's records and observations, never mint them.
+
+    Only scratch-class records in this private root are admitted. The adapter
+    holds active units, locks, cwd users, native lenders and unknown observations.
+    Its service probes are read-only. This is not the privileged late-consumer
+    fence and does not extend authority to VM jobs, archives or provider roots.
+    """
+    from workbay_system.payload.scripts.vm import workbay_vm_reclaim as owner
+
+    before = path.lstat()
+    if before.st_uid != os.geteuid() or before.st_mode & 0o077:
+        return "foreign_or_nonprivate_scratch"
+    for name in ("RETENTION.json", "RELEASE.json"):
+        try:
+            record = (path / name).lstat()
+        except FileNotFoundError:
+            return "ownership_or_release_missing"
+        if not stat.S_ISREG(record.st_mode) or record.st_uid != os.geteuid() or record.st_mode & 0o022:
+            return "unsafe_ownership_record"
+    retention = owner.manifest(path / "RETENTION.json")
+    released = owner.valid_release(path, retention)
+    if (
+        retention.get("schema") != 1
+        or retention.get("retention_class") != "scratch"
+        or retention.get("host") != socket.gethostname()
+        or released is None
+        or released.get("host") != socket.gethostname()
+    ):
+        return "ownership_or_release_unknown"
+    if not (
+        owner.released_time(retention["created_at"]) <= owner.released_time(released["released_at"]) <= time.time()
+    ):
+        return "ambiguous_release_generation"
+    if any(os.path.lexists(path / name) for name in (".git", *owner.SOURCE_PATHS, *owner.RUNTIME_PATHS)):
+        return "source_or_provider_custody"
+    row = owner.classify(path, root, read_only=True, deadline=time.monotonic() + 5)
+    if row["verdict"] != "reclaimable":
+        return row["reason"]
+    # Acquire the existing producer lock after its read-only observation, and
+    # retain it through effect. Never create a lock or an ownership record.
+    try:
+        lock = os.open(path / "job.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        pass
+    else:
+        stack.callback(os.close, lock)
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            return "unsafe_job_lock"
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "active_job_lock"
+    after = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        return "scratch_identity_changed"
+    root_now, root_opened = os.stat(root), os.fstat(root_fd)
+    if root.resolve() != root or (root_now.st_dev, root_now.st_ino) != (root_opened.st_dev, root_opened.st_ino):
+        return "scratch_root_changed"
+    return None
 
 
 def _resolve_tmp_root(tmp_root: Path | str | None) -> Path:
@@ -129,6 +227,7 @@ def reap_stale_dev_temp(
     max_age_h: float | int | str | None = DEFAULT_MAX_AGE_H,
     tmp_root: Path | str | None = None,
     repo: Path | str | None = None,
+    scope: str = "operator",
 ) -> dict[str, Any]:
     """Age out stale dev trees under ``tmp_root`` (and the ``repo`` scratch root).
 
@@ -146,9 +245,45 @@ def reap_stale_dev_temp(
         Omitted (the default) that arm does not run at all, so every
         pre-existing call keeps its exact prior behaviour.
 
+    scope:
+        ``operator`` retains explicit maintenance semantics. ``lifecycle``
+        ignores ambient roots and requires native released private repo scratch.
+        Unknown scope fails closed and reports an error.
+
     Returns a summary dict. Never raises.
     """
     max_age = _coerce_max_age_h(max_age_h)
+    if scope == "lifecycle":
+        report = _empty_report(apply=apply, max_age_h=max_age)
+        report.update(scope=scope, tmp_root=None, held=[])
+        if repo is None or not str(repo).strip():
+            report["errors"].append("lifecycle repo scope unavailable")
+            return report
+        try:
+            with ExitStack() as stack:
+                root, fd = _private_scratch_fd(repo, stack)
+                report["scratch_root"] = str(root)
+                _scan_root(
+                    root,
+                    SCRATCH_GLOB,
+                    cutoff=time.time() - max_age * 3600,
+                    apply=apply,
+                    stale=report["stale"],
+                    removed=report["removed"],
+                    fresh=report["fresh"],
+                    errors=report["errors"],
+                    held=report["held"],
+                    root_fd=fd,
+                )
+        except FileNotFoundError:
+            pass  # An absent fixed scratch hierarchy is an empty scope.
+        except Exception as exc:  # noqa: BLE001 -- visible best-effort failure
+            report["errors"].append(f"lifecycle scope: {type(exc).__name__}: {exc}")
+        report["stale_count"] = len(report["stale"])
+        report["would_remove"] = list(report["stale"]) if not apply else []
+        return report
+    if scope != "operator":
+        return _empty_report(apply=apply, max_age_h=max_age, error="unknown reaper scope")
     try:
         root = _resolve_tmp_root(tmp_root)
     except Exception as exc:  # noqa: BLE001 — never-raise

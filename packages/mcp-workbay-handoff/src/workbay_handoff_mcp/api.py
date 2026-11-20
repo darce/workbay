@@ -92,6 +92,7 @@ from .review_findings_api import (
 )
 from .review_findings_queries import cap_review_findings_response
 from .review_findings_queries import complete_review_run as _core_complete_review_run
+from .review_findings_support import _canonical_task_ref_from_handoff
 from .review_findings_updates import _attach_opportunistic_integrate_signal
 from .runtime import configure_runtime as _configure_runtime
 from .runtime import get_runtime_config, reset_runtime_config
@@ -108,6 +109,7 @@ from .shared_primitives import (
 )
 from .shared_schema import (
     _REVIEW_FINDINGS_FINDING_ID_INDEX,
+    DispatchAttemptReason,
     SchemaVersionMismatchError,
     _get_db_connection,
     _review_findings_finding_id_index_in_stat1,
@@ -115,6 +117,7 @@ from .shared_schema import (
     assert_boot_schema_compatible,
     bounded_resolve_active_task_ref,
     connect_handoff_db,
+    review_history_unavailable,
 )
 from .shared_tool_adapters import _unknown_argument_envelope
 from .shared_write_context import (
@@ -667,6 +670,9 @@ class ReviewRunsRecordOp(BaseModel):
     ] = None
     task_ref: TaskRefParam = None
     actor: ActorParam = None
+    cycle_n: Annotated[int | None, Field(ge=1, description="One-based review round.")] = None
+    parent_run_id: str | None = None
+    judge_pin_json: str | None = None
     subject_sha: Annotated[
         str | None,
         Field(
@@ -1040,7 +1046,7 @@ class ContinuationLoadOp(BaseModel):
     ] = None
     packet_id: Annotated[
         str | None,
-        Field(description="Optional specific packet id. When set, loads that packet (or empty if absent)."),
+        Field(description="Optional exact packet id. When set, loads that packet or reports a not_found outcome."),
     ] = None
 
 
@@ -2368,7 +2374,8 @@ def continuation(
         Field(
             description=(
                 "Typed continuation payload. operation selects 'save' (upsert schema'd sections "
-                "with supersedes-lineage) or 'load' (newest packet for task/lane, or by packet_id)."
+                "with supersedes-lineage) or 'load' (newest packet for task/lane, or by exact packet_id). "
+                "Results include phase_timings_ns; saves report a saved or refused outcome."
             )
         ),
     ],
@@ -2679,6 +2686,9 @@ def record_review_run(
     *,
     subject_sha: str | None = None,
     source_ref: str | None = None,
+    cycle_n: int | None = None,
+    parent_run_id: str | None = None,
+    judge_pin_json: str | None = None,
 ) -> dict:
     return _core_record_review_run(
         review_run_id=review_run_id,
@@ -2693,6 +2703,37 @@ def record_review_run(
         max_review_rounds=max_review_rounds,
         subject_sha=subject_sha,
         source_ref=source_ref,
+        cycle_n=cycle_n,
+        parent_run_id=parent_run_id,
+        judge_pin_json=judge_pin_json,
+    )
+
+
+def link_review_run_findings(
+    conn: sqlite3.Connection, review_run_id: str, finding_ids: list[str], *, session: str,
+) -> None:
+    """Correlate this run's recorded open findings without replaying finding writes.
+
+    A carried finding keeps the run that originally recorded it. The caller
+    supplies IDs returned by the findings writer, never IDs claimed by a judge.
+    """
+    if not finding_ids:
+        return
+    conn.execute(
+        """
+        UPDATE review_findings AS finding
+        SET review_run_id = run.review_run_id
+        FROM review_runs AS run
+        WHERE run.review_run_id = ? AND run.subject_kind = 'branch' AND run.verdict IS NOT NULL
+          AND finding.task_ref = run.task_ref AND finding.session = ?
+          AND finding.status = 'open'
+          AND (finding.review_run_id IS NULL OR finding.review_run_id = run.review_run_id OR EXISTS (
+              SELECT 1 FROM review_runs AS prior
+              WHERE prior.review_run_id = finding.review_run_id AND prior.session <> run.session
+          ))
+          AND finding.finding_id IN (SELECT value FROM json_each(?))
+        """,
+        (review_run_id, session, json.dumps(finding_ids)),
     )
 
 
@@ -2719,6 +2760,9 @@ def review_runs(
             max_review_rounds=review_payload.max_review_rounds,
             subject_sha=review_payload.subject_sha,
             source_ref=review_payload.source_ref,
+            cycle_n=review_payload.cycle_n,
+            parent_run_id=review_payload.parent_run_id,
+            judge_pin_json=review_payload.judge_pin_json,
         )
     if isinstance(review_payload, ReviewRunsCompleteOp):
         return _core_complete_review_run(
@@ -4197,6 +4241,9 @@ def _resource_view_query(tool: str, owner_repository: str, **options: Any) -> di
                 data = views.history(conn, owner=owner, resource=resource, correlation=correlation, **options)
             else:
                 data = views.status(conn, owner=owner, resource=resource, task_ref=task_ref, lane_id=lane_id)
+                native_task = data.get("native_task")
+                if tool == "task_status" and lane_id is None and native_task is not None:
+                    data["dispatch_attempts"] = _dispatch_attempt_rollup(conn, native_task["task_ref"])
     except ValueError:
         return core._envelope(
             ok=False,
@@ -4262,6 +4309,84 @@ def task_history(
 def task_status(owner_repository: str, task_ref: str, lane_id: str | None = None) -> dict:
     """Read lifecycle facts alongside the current native WorkBay task row."""
     return _resource_view_query("task_status", owner_repository, task_ref=task_ref, lane_id=lane_id)
+
+
+def _dispatch_attempt_rollup(conn: sqlite3.Connection, subject_key: str) -> dict:
+    # Status reads an existing authority without bootstrapping it. An old
+    # authority with no attempt table cannot attest to zero attempts.
+    if not conn.in_transaction:
+        conn.execute("BEGIN")  # Read completeness and counts at the same snapshot.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'dispatch_attempts'"
+    ).fetchone() is None:
+        return {"state": "unavailable", "reason": "dispatch_attempts_schema_missing"}
+    counts = dict(
+        conn.execute(
+            "SELECT reason, COUNT(*) FROM dispatch_attempts WHERE subject_key = ? GROUP BY reason",
+            (subject_key,),
+        ).fetchall()
+    )
+    if review_history_unavailable(conn, subject_key):
+        partial = {"known_by_reason": counts, "known_release_blocking": counts.get("real_defect", 0)} if counts else {}
+        return {"state": "unavailable", "reason": "dispatch_attempt_history_unavailable", **partial}
+    return {
+        "state": "available",
+        "by_reason": counts,
+        "release_blocking": counts.get(DispatchAttemptReason.REAL_DEFECT, 0),
+    }
+
+
+def record_dispatch_attempt(
+    *, subject_key: str, ordinal: int, lane_id: str, reason: DispatchAttemptReason, evidence_ref: str
+) -> dict:
+    """Record a classified failed release dispatch with its producer evidence."""
+    tool = "record_dispatch_attempt"
+    if (
+        type(ordinal) is not int
+        or not 1 <= ordinal <= 2**63 - 1
+        or any(not isinstance(value, str) or not value.strip() for value in (subject_key, lane_id, evidence_ref))
+    ):
+        return _envelope(ok=False, tool=tool, data={"error": "invalid_dispatch_attempt_identity"})
+    try:
+        reason = DispatchAttemptReason(reason)
+    except ValueError:
+        return _envelope(ok=False, tool=tool, data={"error": "invalid_dispatch_attempt_reason"})
+    try:
+        with _get_db_connection(begin_immediate=True) as conn:
+            task_ref = _canonical_task_ref_from_handoff(conn, subject_key)
+            if task_ref is None:
+                return _envelope(ok=False, tool=tool, data={"error": "unknown_dispatch_attempt_subject"})
+            identity = (task_ref, ordinal, lane_id.strip())
+            inserted = conn.execute(
+                """INSERT INTO dispatch_attempts (subject_key, ordinal, lane_id, reason, evidence_ref)
+                   VALUES (?, ?, ?, ?, ?) ON CONFLICT (subject_key, ordinal, lane_id) DO NOTHING""",
+                (*identity, reason.value, evidence_ref),
+            ).rowcount
+            if not inserted:
+                previous = conn.execute(
+                    """SELECT reason, evidence_ref FROM dispatch_attempts
+                       WHERE subject_key = ? AND ordinal = ? AND lane_id = ?""",
+                    identity,
+                ).fetchone()
+                if tuple(previous) != (reason.value, evidence_ref):
+                    return _envelope(
+                        ok=False, tool=tool, task_ref=task_ref, data={"error": "dispatch_attempt_evidence_conflict"}
+                    )
+    except (OSError, sqlite3.Error, SchemaVersionMismatchError):
+        return _envelope(ok=False, tool=tool, data={"error": "dispatch_attempt_authority_unavailable"})
+    return _envelope(
+        ok=True,
+        tool=tool,
+        task_ref=task_ref,
+        data={
+            "state": "recorded" if inserted else "replayed",
+            "subject_key": task_ref,
+            "ordinal": ordinal,
+            "lane_id": identity[2],
+            "reason": reason.value,
+            "evidence_ref": evidence_ref,
+        },
+    )
 
 
 def _resource_query_cli_entries() -> list[ToolEntry]:

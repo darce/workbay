@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -34,6 +35,15 @@ _DEFAULT_WIDTH = 4
 _DEFAULT_ATTEMPT_BUDGET = 2
 _MAX_WIDTH_ENV = "WORKBAY_WAVE_MAX_WIDTH"
 _MAX_ATTEMPT_BUDGET = 5
+_ADMISSION_MAX_BYTES = 2048
+_ADMISSION_MAX_STRING = 160
+_ADMISSION_MAX_ITEMS = 16
+_ADMISSION_DETAIL_KEYS = (
+    "resource_error_cells",
+    "pending_resource_costs",
+    "projected_resource_costs",
+    "pending_cost_estimates",
+)
 _EXIT_REFUSED = 2
 _EXIT_TERMINAL_FAILURE = 3
 _EXIT_INCOMPLETE = 4
@@ -59,6 +69,8 @@ _REPLAY_REQUIRED_FIELDS: dict[str, dict[str, type]] = {
     "wave.refused": {"reason": str},
 }
 _REPLAY_OPTIONAL_FIELDS: dict[str, dict[str, type]] = {
+    "lane.submitted": {"admission": dict},
+    "lane.admission_deferred": {"admission": dict},
     "lane.gated": {"probe": int},
     "lane.failed": {"detail": str},
     "lane.parked": {"detail": str, "blocker": str, "attempt": int, "ok": bool, "tip": str},
@@ -267,7 +279,7 @@ def step(ctx: SupervisorContext) -> list[SupervisorEvent]:
             break
         decision = _check_admission(ctx, wave, lane_id, pending)
         if decision is not None and not decision.admitted:
-            deferred = _record_admission_deferral(ctx, wave, lane_id, decision.reason, states)
+            deferred = _record_admission_deferral(ctx, wave, lane_id, decision, states)
             if deferred is not None:
                 new_events.append(deferred)
                 states = replay(ctx.repo, wave)
@@ -285,7 +297,14 @@ def step(ctx: SupervisorContext) -> list[SupervisorEvent]:
             new_events.append(_emit(ctx, wave, "lane.failed", {"lane_id": lane_id, "reason": "invalid_submit_result"}))
             states = replay(ctx.repo, wave)
             continue
-        new_events.append(_emit(ctx, wave, "lane.submitted", {"lane_id": lane_id, "attempt": attempt, "job": job}))
+        new_events.append(
+            _emit(
+                ctx,
+                wave,
+                "lane.submitted",
+                {"lane_id": lane_id, "attempt": attempt, "job": job, **_admission_fields(decision)},
+            )
+        )
         states = replay(ctx.repo, wave)
 
     for lane_id in spec.lanes:
@@ -325,7 +344,7 @@ def step(ctx: SupervisorContext) -> list[SupervisorEvent]:
                     continue
                 decision = _check_admission(ctx, wave, lane_id, pending)
                 if decision is not None and not decision.admitted:
-                    deferred = _record_admission_deferral(ctx, wave, lane_id, decision.reason, states)
+                    deferred = _record_admission_deferral(ctx, wave, lane_id, decision, states)
                     if deferred is not None:
                         new_events.append(deferred)
                         states = replay(ctx.repo, wave)
@@ -343,7 +362,12 @@ def step(ctx: SupervisorContext) -> list[SupervisorEvent]:
                             ctx,
                             wave,
                             "lane.submitted",
-                            {"lane_id": lane_id, "attempt": next_attempt, "job": retry_job},
+                            {
+                                "lane_id": lane_id,
+                                "attempt": next_attempt,
+                                "job": retry_job,
+                                **_admission_fields(decision),
+                            },
                         )
                     )
             states = replay(ctx.repo, wave)
@@ -605,16 +629,82 @@ def _check_admission(
         return wave_admission.AdmissionDecision(False, "vm_admission_unmeasured:admission_error")
 
 
+def _bounded_admission_value(value: object, budget: int, depth: int = 0) -> Any:
+    """Copy JSON-native evidence within a serialized budget, pruning from the end."""
+    # A depth cap also makes cyclic callback data safe to journal.
+    if depth >= 8:
+        return None
+    if isinstance(value, str):
+        text = value[:_ADMISSION_MAX_STRING]
+        while len(json.dumps(text)) > budget:
+            text = text[:-1]
+        return text
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in islice(value.items(), _ADMISSION_MAX_ITEMS):
+            if not isinstance(key, str):
+                continue
+            key = key[:_ADMISSION_MAX_STRING]
+            remaining = budget - len(json.dumps(result)) - len(json.dumps(key)) - 2 - (2 if result else 0)
+            if remaining < 4:
+                break
+            result[key] = _bounded_admission_value(item, remaining, depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        items: list[Any] = []
+        for item in islice(value, _ADMISSION_MAX_ITEMS):
+            remaining = budget - len(json.dumps(items)) - (2 if items else 0)
+            if remaining < 4:
+                break
+            items.append(_bounded_admission_value(item, remaining, depth + 1))
+        return items
+    if value is not None and type(value) not in {bool, int, float}:
+        return None
+    try:
+        return value if len(json.dumps(value, allow_nan=False)) <= budget else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _admission_fields(decision: wave_admission.AdmissionDecision | None) -> dict[str, Any]:
+    """Attach one bounded basis; legacy callers keep their original event fields."""
+    if decision is None:
+        return {}
+    admission: dict[str, Any] = {"admitted": decision.admitted, "reason": decision.reason[:_ADMISSION_MAX_STRING]}
+    try:
+        keys = [key for key in _ADMISSION_DETAIL_KEYS if key in decision.details]
+        for index, key in enumerate(keys):
+            remaining_keys = keys[index:]
+            # Default json.dumps escapes non-ASCII, so its length is also its
+            # byte size. Reserve each key and share space so a wide error cell
+            # cannot crowd out small pending/projected resource costs.
+            overhead = sum(len(json.dumps(name)) + 4 for name in remaining_keys)
+            budget = (_ADMISSION_MAX_BYTES - len(json.dumps(admission)) - overhead) // len(remaining_keys)
+            if budget < 4:
+                break
+            admission[key] = _bounded_admission_value(decision.details[key], budget)
+    except Exception:
+        # Malformed optional evidence must not prevent journaling the decision.
+        # Every field already copied is bounded independently.
+        return {"admission": admission}
+    return {"admission": admission}
+
+
 def _record_admission_deferral(
     ctx: SupervisorContext,
     wave: str,
     lane_id: str,
-    reason: str,
+    decision: wave_admission.AdmissionDecision,
     states: Mapping[str, Mapping[str, Any]],
 ) -> SupervisorEvent | None:
-    if states.get(lane_id, {}).get("admission_deferred_reason") == reason:
+    if states.get(lane_id, {}).get("admission_deferred_reason") == decision.reason:
         return None
-    return _emit(ctx, wave, "lane.admission_deferred", {"lane_id": lane_id, "reason": reason})
+    return _emit(
+        ctx,
+        wave,
+        "lane.admission_deferred",
+        {"lane_id": lane_id, "reason": decision.reason, **_admission_fields(decision)},
+    )
 
 
 def _is_commit(repo: str | os.PathLike[str], commit: str) -> bool:

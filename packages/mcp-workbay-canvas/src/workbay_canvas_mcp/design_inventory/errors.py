@@ -8,6 +8,7 @@ InventoryConfigCode = Literal[
     "unknown_version",
     "unknown_field",
     "invalid",
+    "missing",
     "escape",
     "oversized",
     "duplicate_id",
@@ -23,8 +24,10 @@ class InventoryConfigError(ValueError):
         pointer: str,
         code: InventoryConfigCode,
         message: str,
+        path: str | None = None,
     ) -> None:
         super().__init__(f"{code} at {pointer or '(root)'}: {message}")
         self.pointer = pointer
         self.code = code
         self.message = message
+        self.path = path

@@ -1305,6 +1305,9 @@ def _dispatch_from_task_plan(
     if not isinstance(manifest, dict):
         return None
     items = parse_task_plan(resolved_plan)
+    if "plan_source" in manifest:
+        # Generated plans opt in with [plan-dispatch]; review checkboxes are documentation.
+        items = [item for item in items if item.dispatch_designated]
     m_order = manifest.get("merge_order", [])
 
     def _sort_key(item) -> int:
@@ -4681,6 +4684,8 @@ def _complete_remote_wake(ctx: OrchestratorContext, event: Any) -> None:
         orchestrator_root=ctx.orchestrator_root,
     )
     if not isinstance(result, dict) or result.get("terminal") is not True:
+        if isinstance(result, dict) and result.get("reason") == "pass_state_unreadable":
+            raise RemoteCompletionDeferred(result["reason"], preserve_job=True, store=result.get("store"))
         if isinstance(result, dict) and result.get("reason") in {
             "lane_locked",
             "detached_collection_retryable",

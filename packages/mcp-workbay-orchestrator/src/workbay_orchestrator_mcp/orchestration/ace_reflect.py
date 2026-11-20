@@ -665,6 +665,24 @@ def _git_head_sha(worktree_path: Path) -> str | None:
     return proc.stdout.strip() or None
 
 
+def _remote_exec_repo_root(state_dir: Path) -> Path:
+    """Use the pass or configured repository, including external state dirs."""
+    from workbay_handoff_mcp.runtime import RuntimeNotConfiguredError, get_runtime_config
+
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import ACTIVE_REMOTE_EXEC_SELECTION
+
+    selection = ACTIVE_REMOTE_EXEC_SELECTION.get()
+    if selection is not None:
+        return selection.repo_root
+    try:
+        runtime = get_runtime_config()
+    except RuntimeNotConfiguredError:
+        return state_dir.resolve().parent
+    if Path(runtime.state_dir).resolve() == state_dir.resolve():
+        return Path(runtime.workspace_root).resolve()
+    return state_dir.resolve().parent
+
+
 def _run_model_curation(
     *,
     state_dir: Path,
@@ -678,7 +696,30 @@ def _run_model_curation(
     task_ref: str | None = None,
     lane_id: str | None = None,
     speed: str | None = None,
+    remote_exec_selection: Any = None,
 ) -> dict[str, Any]:
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import (
+        RemoteExecModeError,
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    worktree_path = _remote_exec_repo_root(state_dir)
+    mode_selection = remote_exec_selection
+    if backend and mode_selection is None:
+        try:
+            mode_selection = current_remote_exec_selection(backend, repo_root=worktree_path)
+            if mode_selection is None:
+                mode_selection = resolve_remote_exec_mode(backend, repo_root=worktree_path)
+        except RemoteExecModeError as exc:
+            return {
+                "status": "refused",
+                "kind": "refused",
+                "failure_reason": exc.code,
+                "refusal_cause": "policy_or_classifier_refusal",
+                "retryable": False,
+                "error": str(exc),
+            }
     pending_entries = (
         sum(1 for line in reflect_log.read_text(encoding="utf-8").splitlines() if line.strip())
         if reflect_log.exists()
@@ -765,15 +806,15 @@ def _run_model_curation(
                 ensure_grok_lane_config,
             )
 
-            ensure_grok_lane_config(Path.cwd(), model)
-    worktree_path = Path.cwd()
+            ensure_grok_lane_config(worktree_path, model)
     detached_identity: dict[str, str] = {}
     if task_ref and task_ref.strip() and lane_id and lane_id.strip():
         reviewed_head_sha = _git_head_sha(worktree_path)
-        if reviewed_head_sha:
+        # A detached request still validates settings and binds its identity
+        # when this target has no HEAD. Never borrow HEAD from the process cwd.
+        if reviewed_head_sha or mode_selection.mode == "detached":
             from workbay_orchestrator_mcp.orchestration.review_runner import (  # noqa: PLC0415
                 DetachedExecutionSettingsResolutionError,
-                _detached_execution_mode_enabled,
                 _detached_execution_settings_digest,
             )
 
@@ -784,7 +825,7 @@ def _run_model_curation(
                     reasoning_effort=reasoning_effort,
                     speed=speed,
                     dispatch_options=adapter_kwargs,
-                    require_resolved=_detached_execution_mode_enabled(),
+                    require_resolved=mode_selection.mode == "detached",
                 )
             except DetachedExecutionSettingsResolutionError as exc:
                 entry = {
@@ -806,7 +847,13 @@ def _run_model_curation(
             # The stable prompt and HEAD identify a curation round, so retries collect its same detached job.
             pass_digest = hashlib.sha256(
                 json.dumps(
-                    [task_ref.strip(), lane_id.strip(), reviewed_head_sha, prompt, execution_settings_digest],
+                    [
+                        task_ref.strip(),
+                        lane_id.strip(),
+                        reviewed_head_sha or {"repo_root": str(worktree_path), "head_sha": None},
+                        prompt,
+                        execution_settings_digest,
+                    ],
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()[:16]
@@ -820,6 +867,8 @@ def _run_model_curation(
         prompt=prompt,
         schema=schema,
         worktree_path=worktree_path,
+        orchestrator_root=worktree_path,
+        remote_exec_selection=mode_selection,
         model=model,
         reasoning_effort=reasoning_effort,
         **({"speed": speed} if speed is not None else {}),
@@ -887,6 +936,22 @@ def run_ace_reflect(
     task_ref: str | None = None,
     lane_id: str | None = None,
 ) -> int:
+    from workbay_orchestrator_mcp.orchestration.remote_exec_mode import (
+        RemoteExecModeError,
+        current_remote_exec_selection,
+        resolve_remote_exec_mode,
+    )
+
+    mode_repo_root = _remote_exec_repo_root(state_dir)
+    mode_selection = None
+    if model_curation_backend:
+        try:
+            mode_selection = current_remote_exec_selection(model_curation_backend, repo_root=mode_repo_root)
+            if mode_selection is None:
+                mode_selection = resolve_remote_exec_mode(model_curation_backend, repo_root=mode_repo_root)
+        except RemoteExecModeError as exc:
+            print(f"ace-reflect: refused ({exc.code}: {exc})")
+            return 1
     validate_playbook_files(playbook_files)
     reflect_log = state_dir / "ace_reflect_log.jsonl"
     summary = ace_apply_counters(
@@ -918,12 +983,13 @@ def run_ace_reflect(
             budget_tokens=max(1, model_curation_budget_tokens),
             task_ref=task_ref,
             lane_id=lane_id,
+            remote_exec_selection=mode_selection,
         )
         if curation.get("status") == "triggered":
             print(f"  model-curation: backend={curation.get('backend')} model={curation.get('model') or 'default'}")
         elif curation.get("status") == "refused":
             refusal_message = curation.get("refusal_cause") or "unknown cause"
-            if os.environ.get("WORKBAY_REMOTE_EXEC_MODE", "attached").strip().lower() == "detached":
+            if mode_selection is not None and mode_selection.mode == "detached":
                 missing_identity_flags = []
                 if not task_ref or not task_ref.strip():
                     missing_identity_flags.append("--task-ref")

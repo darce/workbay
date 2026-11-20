@@ -195,6 +195,14 @@ def _layer_rows(layers: list[list[str]]) -> list[dict[str, Any]]:
     return [{"layer": index, "lane_ids": layer, "width": len(layer)} for index, layer in enumerate(layers, start=1)]
 
 
+def with_plan_source_status(rendered: dict[str, Any], status: Mapping[str, str]) -> dict[str, Any]:
+    """Attach a source observation to a rendered graph without changing inputs."""
+    rendered["json"]["plan_source_status"] = dict(status)
+    if status.get("state") == "drifted":
+        rendered["ascii"] += "\nplan edited since manifest"
+    return rendered
+
+
 def _render_ascii(
     task_ref: str,
     width: int,
@@ -226,6 +234,7 @@ def render_lane_dag(
     manifest: Mapping[str, Any],
     *,
     admitted_width: int | None = None,
+    plan_source_status: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return ``{"ascii": str, "json": object}`` for a lane manifest.
 
@@ -240,7 +249,8 @@ def render_lane_dag(
     task_ref = str(manifest.get("task_ref") or "")
     if not lane_ids:
         graph = _empty_graph(task_ref, width)
-        return {"ascii": f"DAG empty: 0 lanes; admitted width {width}", "json": graph}
+        rendered = {"ascii": f"DAG empty: 0 lanes; admitted width {width}", "json": graph}
+        return with_plan_source_status(rendered, plan_source_status) if plan_source_status is not None else rendered
 
     layers = compute_layers(manifest)
     slack = compute_slack(manifest)
@@ -266,7 +276,8 @@ def render_lane_dag(
         "admitted_width": width,
     }
 
-    return {
+    rendered = {
         "ascii": _render_ascii(task_ref, width, lane_ids, layer_rows, path, edges, vertices),
         "json": graph,
     }
+    return with_plan_source_status(rendered, plan_source_status) if plan_source_status is not None else rendered

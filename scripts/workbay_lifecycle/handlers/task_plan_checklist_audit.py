@@ -61,16 +61,23 @@ def _discover_archived_plan_path(workspace_root: Path, task_ref: str) -> str | N
     discovery.
     """
     handoff_root = sync_handler.resolve_handoff_workspace_root(workspace_root)
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root",
-        str(handoff_root),
-        "archive",
-        "--operation",
-        "get",
-        "--task-ref",
-        task_ref,
-    ]
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root",
+            str(handoff_root),
+            "archive",
+            "--operation",
+            "get",
+            "--task-ref",
+            task_ref,
+        ]
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        return None
     proc = _common.run_subprocess(argv)
     if proc.returncode != 0:
         return None

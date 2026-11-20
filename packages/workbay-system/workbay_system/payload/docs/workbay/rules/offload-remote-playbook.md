@@ -128,7 +128,7 @@ pre-merge evidence.
 the PreToolUse(Bash) guard `guard-bash-remote-gate-routing.py` refuses every `make` call whose
 explicit goals are not all in its inert allowlist: `help`, `check-remote`, `lane-land`,
 `finalize-plan`, `handoff-write`, `offload-flock`, `lane-reap`, `plan-done`,
-`slice-commit`, `task-start` and `vm-reap`. It also refuses a `make`
+`slice-commit`, `task-start`, `vm-reap` and `doctor`. It also refuses a `make`
 call with no explicit goal, because the default goal may run tests. Numeric option values such
 as `-j 2` and `-l 1` are not goals. A `-n` / `--dry-run` call is allowed. Pytest, py.test and
 `run_named_tests.py` are refused as command text too. Not inspected: JS runners, unittest, tox,
@@ -147,6 +147,20 @@ not a complete control:
   pre-merge evidence.
 - **Registration and deployment.** Tracked registrations are present on the seven tracked settings surfaces in this change.
   Native and operator deployment is still pending, so until that lands the routing also rests on this section.
+
+The hook treats a script of ordinary literal assignments such as `a[0]=pytest`
+or `Q='pytest -q'` as data. It checks the entire script before admitting those
+stores. A later reader, a shell setting such as `PS4`, or syntax that Bash can
+evaluate keeps the runner-word check in force. The hook can resolve a literal
+command variable in a straight-line call such as `DB=sqlite3; $DB -version`.
+Unknown command words stay refused.
+
+A quoted heredoc passed to a data writer can contain runner names. The hook
+checks text supplied to a shell, including a script read from a file written
+inside a command substitution. A 3.5-second process deadline returns
+`unverified_deadline` with measured elapsed seconds and blocks the command.
+Diagnostics have bounded excerpts on every refusal. Shell syntax exceeding the
+structural scan budget can return `unverified_size`.
 
 The sibling rule — implementation lanes go to the VM, not to local subagents —
 is already structural (`guard-agent-remote-only-implementation.py`, *When

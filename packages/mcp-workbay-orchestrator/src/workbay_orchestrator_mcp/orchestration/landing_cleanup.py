@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +43,7 @@ _MUTABLE_FIELDS = frozenset(
         "next_attempt_at",
     }
 )
-_TERMINAL_CLEANUP_STATES = frozenset({"complete", "skipped"})
+_TERMINAL_CLEANUP_STATES = frozenset({"complete", "skipped", "not_required"})
 _INTENT_FILENAME = re.compile(r"^([0-9a-f]{64})\.json$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_INTENT_FILES = 50_000
@@ -158,20 +158,27 @@ def _validate_listed_intent(payload: Mapping[str, Any], *, filename_id: str) -> 
         raise CleanupIntentError("cleanup_intent_lane_snapshot_mismatch")
 
     statuses = (payload.get("local_status"), payload.get("remote_status"))
-    if any(not isinstance(status, str) or status not in {"pending", "complete", "skipped"} for status in statuses):
+    if any(
+        not isinstance(status, str) or status not in {"pending", "complete", "skipped", "not_required"}
+        for status in statuses
+    ):
         raise CleanupIntentError("cleanup_intent_status_invalid")
     if any(status == "skipped" for status in statuses):
         # No status-only or synthetic skip is completion evidence for cleanup.
         raise CleanupIntentError("cleanup_intent_skipped_unverified")
     results = (payload.get("local_result"), payload.get("remote_result"))
+    if statuses[0] == "not_required" or (statuses[1] == "not_required" and statuses[0] != "complete"):
+        raise CleanupIntentError("cleanup_intent_not_required_illegal")
     for status, result in zip(statuses, results, strict=True):
         if status == "pending":
             if result is not None and not isinstance(result, Mapping):
                 raise CleanupIntentError("cleanup_intent_result_invalid")
-        elif not isinstance(result, Mapping) or result.get("ok") is not True or result.get("status") != "complete":
+        elif not isinstance(result, Mapping) or result.get("ok") is not True or result.get("status") != status:
             raise CleanupIntentError("cleanup_intent_completion_unverified")
+    if statuses[1] == "not_required":
+        _verify_coordination_projection(payload)
     completed_at = payload.get("completed_at")
-    if all(status == "complete" for status in statuses):
+    if statuses[0] == "complete" and statuses[1] in {"complete", "not_required"}:
         if type(completed_at) is not int or completed_at <= 0:
             raise CleanupIntentError("cleanup_intent_completion_unverified")
     elif completed_at is not None:
@@ -551,6 +558,20 @@ def update_intent(
             if all(payload.get(key) == value for key, value in updates.items()):
                 return payload
             raise StaleIntentRevision("cleanup_intent_revision_changed")
+        for field in ("local_status", "remote_status"):
+            if (
+                payload.get(field) in {"complete", "not_required"}
+                and field in updates
+                and updates[field] != payload[field]
+            ):
+                raise CleanupIntentError("cleanup_intent_terminal_transition_illegal")
+        if updates.get("local_status") == "not_required":
+            raise CleanupIntentError("cleanup_intent_not_required_illegal")
+        if updates.get("remote_status", payload.get("remote_status")) == "not_required":
+            projected = {**payload, **updates}
+            if projected.get("local_status") != "complete":
+                raise CleanupIntentError("cleanup_intent_not_required_illegal")
+            _verify_coordination_projection(projected)
         payload.update(updates)
         payload["revision"] = expected_revision + 1
         payload["updated_at_ns"] = time.time_ns()
@@ -613,6 +634,94 @@ def _budgeted_remote_runner(root: Path, deadline: float):
     return run
 
 
+def _verify_coordination_projection(payload):
+    from workbay_handoff_mcp.coordination_declaration import PROOF_ERRORS, verify_terminal_authorization
+    from workbay_handoff_mcp.shared_schema import _get_db_connection
+
+    try:
+        with _get_db_connection() as conn:
+            verify_terminal_authorization(conn, payload, payload.get("remote_result"))
+    except PROOF_ERRORS as exc:
+        raise CleanupIntentError("cleanup_intent_not_required_unverified:" + type(exc).__name__) from exc
+
+
+def coordination_not_required(
+    root: Path,
+    intent: Mapping[str, Any],
+    rows: list[dict[str, Any]] | Callable[[], list[dict[str, Any]] | None] | None,
+) -> dict | None:
+    """Positive declaration + current authority + no execution; None is undeclared.
+
+    ``rows`` may be a loader: the full cross-task registry snapshot is read only
+    once a declaration exists, so undeclared lanes keep their native path even
+    when that listing is unavailable. A declared lane without it holds.
+    """
+    # Legacy cleanup callers without a durable journal identity cannot use the
+    # new terminal proof. Preserve their existing backend/reaper path, which
+    # still holds an unknown backend rather than inferring zero execution.
+    if not isinstance(intent.get("intent_id"), str) or not isinstance(intent.get("identity"), Mapping):
+        return None
+    from workbay_handoff_mcp.coordination_declaration import (
+        PROOF_ERRORS,
+        CoordinationHold,
+        authorize_not_required,
+        declaration,
+        pending_error,
+        probe_execution_process,
+        worker_fence,
+    )
+    from workbay_handoff_mcp.shared_schema import _get_db_connection
+
+    identity = intent["identity"]
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM worktree_lanes WHERE task_ref=? AND lane_id=?",
+                (identity["task_ref"], identity["lane_id"]),
+            ).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+            if declaration(conn, row) is None:
+                return None
+        # Local guarded retirement and its restore proof must already be durable.
+        if intent.get("local_status") != "complete":
+            raise CoordinationHold("coordination_local_retirement_pending")
+        if callable(rows):
+            rows = rows()
+        if rows is None:
+            raise CoordinationHold("coordination_registry_unknown")
+        refusal = _cleanup_remote_owner_refusal(intent, rows, root=root)
+        if refusal is not None:
+            raise CoordinationHold(refusal)
+        from workbay_orchestrator_mcp.lane_reaping import _verified_bundle_contains
+
+        local = intent.get("local_result") or {}
+        path = Path(row["worktree_path"])
+        if path.exists() or path.is_symlink():
+            raise CoordinationHold("coordination_local_retirement_pending")
+        tip, error = _commit_for_ref(root, row["branch"], error_prefix="coordination_branch")
+        if tip is not None or error != "coordination_branch_absent":
+            raise CoordinationHold(error or "coordination_local_retirement_pending")
+        if (
+            local.get("ok") is not True
+            or local.get("status") != "complete"
+            or local.get("bundle_tip_sha") != identity["expected_tip"]
+            or not isinstance(local.get("bundle_path"), str)
+            or not _verified_bundle_contains(root, Path(local["bundle_path"]), identity["expected_tip"])
+        ):
+            raise CoordinationHold("coordination_local_custody_unknown")
+        with worker_fence(row):
+            probe_execution_process(row)
+            with _get_db_connection(begin_immediate=True) as conn:
+                current_rows = [dict(r) for r in conn.execute("SELECT * FROM worktree_lanes LIMIT 10001").fetchall()]
+                if len(current_rows) > 10000:
+                    raise CoordinationHold("coordination_registry_incomplete")
+                return authorize_not_required(conn, intent, current_rows)
+    except PROOF_ERRORS as exc:
+        return pending_error(exc)
+
+
 def _remote_reap_result(
     root: Path,
     intent: Mapping[str, Any],
@@ -634,6 +743,9 @@ def _remote_reap_result(
     ):
         return {"ok": False, "status": "pending", "reason": "cleanup_intent_snapshot_incomplete"}
 
+    coordination = coordination_not_required(root, intent, rows)
+    if coordination is not None:
+        return coordination
     backend = lane_row.get("backend")
     if not isinstance(backend, str) or not backend.strip():
         current = next(
@@ -651,7 +763,7 @@ def _remote_reap_result(
         )
         backend = current.get("backend") if current is not None else None
     if not isinstance(backend, str) or not backend.strip():
-        return {"ok": False, "status": "pending", "reason": "lane_backend_unavailable"}
+        return {"ok": False, "status": "pending", "state": "unknown", "reason": "lane_backend_unavailable"}
     from .worker_daemon_ctl import is_remote_worker_backend
 
     remote_backend = is_remote_worker_backend(backend)
@@ -782,8 +894,10 @@ def _retired_ancestry_refusal(root: Path, tip: object, landing: object, integrat
 
     assert_no_write_lock_held("subprocess")
     if (
-        not isinstance(tip, str) or _FULL_SHA.fullmatch(tip) is None
-        or not isinstance(landing, str) or _FULL_SHA.fullmatch(landing) is None
+        not isinstance(tip, str)
+        or _FULL_SHA.fullmatch(tip) is None
+        or not isinstance(landing, str)
+        or _FULL_SHA.fullmatch(landing) is None
     ):
         return "retirement_commit_invalid"
     integration, error = _commit_for_ref(root, integration_ref, error_prefix="integration_tip")
@@ -793,7 +907,10 @@ def _retired_ancestry_refusal(root: Path, tip: object, landing: object, integrat
         for sha in (tip, landing, integration):
             proc = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha}^{{commit}}"],
-                capture_output=True, text=True, timeout=10, check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
             )
             if proc.returncode != 0:
                 return "retirement_git_probe_failed:commit_unresolved"
@@ -810,9 +927,7 @@ def _retired_ancestry_refusal(root: Path, tip: object, landing: object, integrat
     return None
 
 
-def settle_retired_local_intent(
-    root: Path | str, intent: Mapping[str, Any]
-) -> tuple[dict[str, Any], str | None, bool]:
+def settle_retired_local_intent(root: Path | str, intent: Mapping[str, Any]) -> tuple[dict[str, Any], str | None, bool]:
     """Settle only freshly proven retirement; return the intent, refusal and contention.
 
     Negative evidence leaves the journal untouched. Unavailable evidence saves a
@@ -827,7 +942,9 @@ def settle_retired_local_intent(
 
     def probe_failed(reason: str) -> tuple[dict[str, Any], str, bool]:
         refreshed, contended = _save_cleanup_replay(
-            root, intent, last_error=f"predecessor_retire_preflight_probe_failed:{reason}",
+            root,
+            intent,
+            last_error=f"predecessor_retire_preflight_probe_failed:{reason}",
         )
         return refreshed, reason, contended
 
@@ -851,23 +968,35 @@ def settle_retired_local_intent(
         rows = _registered_lane_rows()
     except Exception as exc:
         return probe_failed(f"cleanup_lane_registry_probe_failed:{type(exc).__name__}:{str(exc)[:200]}")
-    row = next((row for row in rows if row.get("task_ref") == identity["task_ref"]
-                and row.get("lane_id") == identity["lane_id"]), None)
+    row = next(
+        (
+            row
+            for row in rows
+            if row.get("task_ref") == identity["task_ref"] and row.get("lane_id") == identity["lane_id"]
+        ),
+        None,
+    )
     if row is None:
         return dict(intent), "predecessor_registry_row_missing", False
     if row.get("status") not in {"merged", "closed"}:
         return dict(intent), "cleanup_lane_owner_nonterminal", False
     refusal = _retired_ancestry_refusal(
-        repo, identity["expected_tip"], identity["landing_commit"], identity["integration_ref"],
+        repo,
+        identity["expected_tip"],
+        identity["landing_commit"],
+        identity["integration_ref"],
     )
     if refusal is not None:
         if "probe_failed" in refusal:
             return probe_failed(refusal)
         return dict(intent), refusal, False
     refreshed, contended = _save_cleanup_replay(
-        root, intent, local_status="complete",
+        root,
+        intent,
+        local_status="complete",
         local_result={"ok": True, "status": "complete", "outcome": "skipped", "reason": "predecessor_already_retired"},
-        last_error=None, next_attempt_at=None,
+        last_error=None,
+        next_attempt_at=None,
     )
     reason = None if refreshed.get("local_status") == "complete" else "predecessor_settlement_contended"
     return refreshed, reason, contended
@@ -935,11 +1064,16 @@ def _cleanup_remote_owner_refusal(
             (row_tip, row_landing),
         ):
             refusal = _retired_ancestry_refusal(
-                Path(root).expanduser().resolve(), tip, landing, identity["integration_ref"],
+                Path(root).expanduser().resolve(),
+                tip,
+                landing,
+                identity["integration_ref"],
             )
             if refusal is not None:
-                if (refusal.startswith("retirement_git_probe_failed:")
-                        and refusal != "retirement_git_probe_failed:commit_unresolved"):
+                if (
+                    refusal.startswith("retirement_git_probe_failed:")
+                    and refusal != "retirement_git_probe_failed:commit_unresolved"
+                ):
                     return f"cleanup_lane_owner_probe_failed:{refusal}"
                 return "cleanup_lane_owner_identity_mismatch"
     # Archived rows may be absent; the unchanged reaper still requires the
@@ -1041,7 +1175,9 @@ def drain_pending_cleanup_intents(
             )
 
     completed_records = [
-        item for item in pages if item.get("local_status") == "complete" and item.get("remote_status") == "complete"
+        item
+        for item in pages
+        if item.get("local_status") == "complete" and item.get("remote_status") in {"complete", "not_required"}
     ]
     pending_records = [
         item for item in pages if item.get("local_status") == "pending" or item.get("remote_status") == "pending"
@@ -1209,7 +1345,11 @@ def drain_pending_cleanup_intents(
             failed_attempts = latest_attempts + 1
             local_status = refreshed.get("local_status")
             remote_status = refreshed.get("remote_status")
-            fully_complete = local_status in {"complete", "skipped"} and remote_status in {"complete", "skipped"}
+            fully_complete = local_status in {"complete", "skipped"} and remote_status in {
+                "complete",
+                "skipped",
+                "not_required",
+            }
             if fully_complete:
                 save(
                     refreshed,
@@ -1265,10 +1405,10 @@ def drain_pending_cleanup_intents(
                 "reason": f"remote_cleanup_failed:{type(exc).__name__}:{message}",
             }
         result["replayed"] += 1
-        if remote_result.get("ok") is True and remote_result.get("status") == "complete":
+        if remote_result.get("ok") is True and remote_result.get("status") in {"complete", "not_required"}:
             save(
                 intent,
-                remote_status="complete",
+                remote_status=remote_result["status"],
                 remote_result=remote_result,
                 attempts=attempts + 1,
                 last_error=None,

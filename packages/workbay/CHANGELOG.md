@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.89] — 2026-11-20
+
+### Changed
+- Pin the v0.1.93 member versions: protocol 0.3.16, handoff 0.3.31, orchestrator 0.3.38, bootstrap 0.4.33, and system 0.4.34.
+
 ## [0.3.88] — 2026-11-12
 
 ### Changed

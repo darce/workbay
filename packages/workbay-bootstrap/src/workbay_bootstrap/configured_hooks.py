@@ -46,7 +46,7 @@ _IMPORTS = {
     "coherence-self-check.py": ("resolve_handoff_src.py",),
     "filter-test-output.py": ("_protocol.py",),
     "guard-agent-remote-only-implementation.py": (),
-    "guard-bash-lifecycle-primitives.py": (),
+    "guard-bash-lifecycle-primitives.py": ("_active_task_context.py",),
     "guard-bash-main-branch.py": ("_bash_isolation_guard.py", "_harness_protocol.py", "_interp.py", "_protocol.py", "_worktree_identity.py"),
     "guard-bash-remote-gate-routing.py": (),
     "guard-codemap-first.py": (),
@@ -70,7 +70,7 @@ _IMPORTS = {
 # build scrubs internal references from comments and docstrings, so docstring
 # text is elided while its slot stays. All other constants are fingerprinted.
 _PYTHON_AST = {
-    '_active_task_context.py': '593802ca364b3e2aa5976a2913afb24fe709e1783ad3ada0418b35e2d41c050e',
+    '_active_task_context.py': '8e582982153645037ced10e4194953044605a3b1cb56f0b56b7f6485df7895f8',
     '_bash_isolation_guard.py': '652df082f7a7b627c027be6fa50d8f41d2afc2a84a6b8bff7b2538ddae73d324',
     '_branch_isolation_guard.py': 'ac7f192ce28aa1e3884a83d31f65e5705bce451ae5d56bba6cd09a04ea53e682',
     '_guard_main_branch_inline.py': '078d97a2de9c1253e2b99823508d2fb5543c54d2210dd8ed596230d36fd29015',
@@ -88,7 +88,7 @@ _PYTHON_AST = {
     'coherence-self-check.py': 'd6e63d07499904be812104094821400dab70b9ed9f01feb1cb90ec80c77cb423',
     'filter-test-output.py': '2c2f918a400624a762ba59f1995698b48792da6e56c8fdf36534a6864891a6b8',
     'guard-agent-remote-only-implementation.py': '50a6fd8207093ebf972766025370faf10a4010d5cc6e25048983958255386763',
-    'guard-bash-lifecycle-primitives.py': '351e44fdfb1d2771bcef2ff08c02e40185a817643e853d9a7bebfa41299b47a6',
+    'guard-bash-lifecycle-primitives.py': '7cea79dc0ad53bb234fad2053972952465d09e691ca1b4d2c8e17f538a450d98',
     'guard-bash-main-branch.py': '7bef349ec2aa96566373131372be80491e340f0ca039a0136b0c1ba43f109e7b',
     'guard-bash-remote-gate-routing.py': '688a4d025f8dd31736ed0efcf2a3cc4c1a0314a82579b6c9726d398eafe31fb2',
     'guard-codemap-first.py': '023458859958e34652b8f2bcd8ecd9c16563fcc00b1cab71060349bf1e53da79',

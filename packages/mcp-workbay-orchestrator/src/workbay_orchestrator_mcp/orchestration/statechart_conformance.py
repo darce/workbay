@@ -32,7 +32,7 @@ ALLOWED_EVIDENCE_CLASSES: frozenset[str] = frozenset(
 
 # Schema'd keys on outer/child transition objects and guards. Cross-level child
 # refs are allowed only via child_evidence_sources / child_state_refs on guards.
-_TRANSITION_SCHEMA_KEYS: frozenset[str] = frozenset({"id", "from", "to", "guard", "guards"})
+_TRANSITION_SCHEMA_KEYS: frozenset[str] = frozenset({"id", "from", "event", "to", "guard", "guards"})
 _GUARD_SCHEMA_KEYS: frozenset[str] = frozenset(
     {
         "predicate_id",
@@ -135,19 +135,64 @@ def _clear_runtime_chart() -> None:
 load_runtime_chart.cache_clear = _clear_runtime_chart  # type: ignore[attr-defined]
 
 
-def assert_transition(chart: Mapping[str, Any], machine: str, source: str, target: str) -> None:
-    """Check edge membership only; guard predicates remain with their owners."""
-    definition = chart[machine]
-    if source == target and source in definition["states"]:
+def assert_transition(machine: Mapping[str, Any], source: str, event: str, target: str) -> None:
+    """Check a declared event and edge; guard predicates remain with their owners.
+
+    Same-state events may be declared as ordinary transitions or as machine-level
+    ``self_transitions`` entries containing a state and an event. The latter
+    describe state-preserving requests separately from the transition graph.
+    Validate every transition before matching, so a malformed machine cannot
+    authorize a write simply because an earlier transition happened to match.
+    """
+    if not isinstance(machine, Mapping) or not isinstance(machine.get("transitions"), list):
+        raise ConformanceError(["machine transitions must be a list"])
+    states = machine.get("states")
+    if not isinstance(states, list) or not states or not all(isinstance(state, str) and state for state in states):
+        raise ConformanceError(["machine states must be a nonempty list of nonempty strings"])
+    edges: list[tuple[str, str, str]] = []
+    for index, transition in enumerate(machine["transitions"]):
+        projected = _transition_edges(index, transition)
+        if any(src not in states or dest not in states for _, src, dest in projected):
+            raise ConformanceError([f"transitions[{index}]: endpoints must be declared states"])
+        edges.extend((src, transition["event"], dest) for _, src, dest in projected)
+    edges.extend(_self_transition_edges(machine))
+    if (source, event, target) in edges:
         return
-    if any(src == source and dest == target for _, src, dest in _machine_edges(definition["transitions"])):
-        return
-    raise IllegalTransition([f"{definition['id']}: illegal transition {source!r} -> {target!r}"])
+    raise IllegalTransition(
+        [f"{machine.get('id', '<unknown>')}: illegal transition {source!r} --{event!r}--> {target!r}"]
+    )
+
+
+def _self_transition_edges(machine: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """Expand a machine's explicit same-state event declarations."""
+    entries = machine.get("self_transitions", [])
+    if not isinstance(entries, list):
+        raise ConformanceError(["self_transitions must be a list"])
+    states = machine.get("states")
+    edges = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ConformanceError([f"self_transitions[{index}] must be an object"])
+        state, event = entry.get("state"), entry.get("event")
+        if not isinstance(state, str) or not isinstance(states, list) or state not in states:
+            raise ConformanceError([f"self_transitions[{index}]: state must be declared"])
+        if not isinstance(event, str) or not event:
+            raise ConformanceError([f"self_transitions[{index}]: event must be a nonempty string"])
+        edges.append((state, event, state))
+    return edges
+
+
+def lane_status_requested_event(target: str) -> str:
+    """Name the explicit request to set a lane status, independent of its current state."""
+    if not isinstance(target, str) or not target:
+        raise IllegalTransition(["lane status request requires a target"])
+    return f"request_lane_{target}"
 
 
 def assert_validation_transition(
     chart: Mapping[str, Any],
     source: str,
+    event: str,
     target: str,
     *,
     active_policy: bool,
@@ -160,7 +205,7 @@ def assert_validation_transition(
     consumer calls this before its guarded persisted write; the handoff port
     independently checks permit custody and current row order transactionally.
     """
-    assert_transition(chart, "child", source, target)
+    assert_transition(chart["child"], source, event, target)
     if target not in {"validated", "gated"}:
         return
     if not active_policy or not fresh_qualified:
@@ -227,7 +272,7 @@ def _iter_guards(transition: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _machine_edges(transitions: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
     """Return (transition_id, from_state, to_state) edges; raise ConformanceError for a transition with no edge.
 
-    A transition needs a string ``id`` and ``from`` and a ``to`` that is a string or a nonempty list of strings.
+    A transition needs a nonempty string ``event``, a string ``id`` and ``from``, and one or more string targets.
     validate_chart reports every transition that lacks one (check_machine_hygiene for a non-object, an absent key or
     an empty ``to``; check_chart_ids for a wrong type), so a chart that passed it never raises here.
     """
@@ -241,6 +286,7 @@ def _transition_edges(index: int, transition: object) -> list[tuple[str, str, st
     targets = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
     valid = {
         "id": isinstance(tid, str),
+        "event": isinstance(transition.get("event"), str) and bool(transition["event"]),
         "from": isinstance(src, str),
         "to": bool(targets) and all(isinstance(dest, str) for dest in targets),
     }
@@ -315,7 +361,7 @@ def _collect_transition_index(chart: Mapping[str, Any]) -> dict[str, dict[str, A
 
 
 def check_machine_hygiene(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHINE_KEYS) -> list[str]:
-    """Graph hygiene: initial ∈ states, terminals ⊆ states, every transition has id/from/to, endpoints ∈ states.
+    """Graph hygiene: initial ∈ states, terminals ⊆ states, every transition has id/from/event/to, endpoints ∈ states.
 
     Also the chart's own ``id`` and ``version``: both are required, and ``version`` is a nonempty string. A present
     ``id`` is check_chart_ids' to judge, so a malformed one is reported once.
@@ -335,6 +381,11 @@ def check_machine_hygiene(chart: Mapping[str, Any], *, machines: Sequence[str] =
         if not states:
             errors.append(f"{machine_id}: states list is empty")
             continue
+
+        try:
+            _self_transition_edges(machine)
+        except ConformanceError as exc:
+            errors.extend(f"{machine_id}: {error}" for error in exc.errors)
 
         initial = machine.get("initial")
         if not isinstance(initial, str):
@@ -357,8 +408,12 @@ def check_machine_hygiene(chart: Mapping[str, Any], *, machines: Sequence[str] =
                 errors.append(f"{where}: must be an object, got {type(transition).__name__}")
                 continue
             errors.extend(
-                f"{where}: missing required key {key!r}" for key in ("id", "from", "to") if key not in transition
+                f"{where}: missing required key {key!r}"
+                for key in ("id", "from", "event", "to")
+                if key not in transition
             )
+            if "event" in transition and not (isinstance(transition["event"], str) and transition["event"]):
+                errors.append(f"{where}: event must be a nonempty string")
             if transition.get("to") == []:
                 errors.append(f"{where}: to must name at least one state")
             tid = transition.get("id", "<unknown>")
@@ -749,8 +804,8 @@ def check_chart_ids(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHI
     """Every chart name is an identifier like ``predicate_id``, so no invisible or odd-shaped name renders or matches.
 
     Covers the chart's own ``id``, machine ``id``, ``states``, ``initial``, ``terminals``, ``projection`` keys,
-    transition ``id``/``from``/``to``, ``nested_region`` ``id``/``parent_states``/``child_machine`` and gate
-    ``id``/``transition_id``. A present value of any type is checked; absence and membership stay with the hygiene,
+    transition ``id``/``from``/``event``/``to``, self-transition ``state``/``event``, ``nested_region``
+    ``id``/``parent_states``/``child_machine`` and gate ``id``/``transition_id``. Absence and membership stay with the hygiene,
     nested-region and gate checks (a missing chart ``id`` or ``version`` with check_machine_hygiene).
     """
     errors: list[str] = []
@@ -784,6 +839,11 @@ def check_chart_ids(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHI
         region = machine.get("nested_region")
         if isinstance(region, Mapping):
             check_fields(f"{where} nested_region", region, ("id", "child_machine"), ("parent_states",))
+        self_transitions = machine.get("self_transitions")
+        if isinstance(self_transitions, list):
+            for index, entry in enumerate(self_transitions):
+                if isinstance(entry, Mapping):
+                    check_fields(f"{where} self_transitions[{index}]", entry, ("state", "event"), ())
         transitions = machine.get("transitions")
         if not isinstance(transitions, list):
             continue
@@ -794,7 +854,7 @@ def check_chart_ids(chart: Mapping[str, Any], *, machines: Sequence[str] = MACHI
             check_fields(
                 f"{where} transition {transition.get('id', '<unknown>')!r}",
                 transition,
-                ("id", "from") if to_list else ("id", "from", "to"),
+                ("id", "from", "event") if to_list else ("id", "from", "event", "to"),
                 ("to",) if to_list else (),
             )
     gates = chart.get("gates")
@@ -852,6 +912,7 @@ __all__ = [
     "MACHINE_KEYS",
     "assert_transition",
     "assert_validation_transition",
+    "lane_status_requested_event",
     "chart_path",
     "check_chart_ids",
     "check_evidence_classes",

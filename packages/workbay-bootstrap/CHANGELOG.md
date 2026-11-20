@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.33] — 2026-11-20
+
+### Fixed
+- Doctor exits with failure when it reports an embedding backfill gap.
+- Lifecycle temporary cleanup is confined to owned, released scratch.
+
+### Changed
+- Maintenance task start uses the lifecycle guard, and remote execution uses a visible, stamped mode selection.
+
 ## [0.4.32] — 2026-11-12
 
 ### Fixed

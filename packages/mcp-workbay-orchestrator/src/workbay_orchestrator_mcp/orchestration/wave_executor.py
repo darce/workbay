@@ -131,7 +131,10 @@ def _normalise_plan(raw: object, lane_id: str) -> LanePlan:
     timeout = raw.get("timeout_s")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise ExecutorError("invalid_execution_timeout")
-    timeout_s = float(timeout)
+    try:
+        timeout_s = float(timeout)
+    except OverflowError as exc:
+        raise ExecutorError("invalid_execution_timeout") from exc
     if not math.isfinite(timeout_s) or timeout_s <= 0 or timeout_s > _MAX_TIMEOUT_S:
         raise ExecutorError("invalid_execution_timeout")
 

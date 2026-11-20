@@ -34,16 +34,17 @@ opt-ins are audit-logged to ``.task-state/lifecycle_guard_bypass.jsonl`` with a
 from __future__ import annotations
 
 import datetime
-from collections import namedtuple
 import importlib.util
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
 import zlib
+from collections import namedtuple
 from pathlib import Path
 
 _BYPASS_ENV = "WORKBAY_ALLOW_RAW_GIT_LIFECYCLE"
@@ -224,24 +225,28 @@ def _remedy(primitive: str, why: str) -> str:
     return f"{why}\n  Use instead:  {primitive}"
 
 
-_COMMIT_REMEDY = _remedy(
+_COMMIT_GUIDANCE_SECONDS = 1.5
+_COMMIT_PRIMITIVE = "make slice-commit TASK='<task-ref>' MSG='<message>' PATHS='<owned paths>'"
+_COMMIT_REASON = "Raw `git commit` skips slice bookkeeping and the handoff projection."
+_COMMIT_REMEDY = _remedy(_COMMIT_PRIMITIVE, _COMMIT_REASON)
+_UNREGISTERED_COMMIT_REMEDY = _remedy(
     'For on-main maintenance with no registered task, first run '
     'make maint-start TASK=MAINT-... OBJECTIVE="<objective>".\n'
-    '  With a registered task, run make slice-commit TASK=<task-ref> MSG="<message>" PATHS="<owned paths>"',
-    "Raw `git commit` skips slice bookkeeping and the handoff projection.",
+    f'  With a registered task, run {_COMMIT_PRIMITIVE}',
+    _COMMIT_REASON,
 )
 _WORKTREE_ADD_REMEDY = _remedy(
-    'make task-start TASK=<task-ref> OBJECTIVE="<objective>"',
+    "make task-start TASK='<task-ref>' OBJECTIVE='<objective>'",
     "Raw `git worktree add` skips branch-grammar validation and leaves the "
     "worktree with no provisioned .venv (no editable installs).",
 )
 _BRANCH_CREATE_REMEDY = _remedy(
-    'make task-start TASK=<task-ref> OBJECTIVE="<objective>"',
+    "make task-start TASK='<task-ref>' OBJECTIVE='<objective>'",
     "Raw branch creation skips the branch-naming grammar. A non-conforming "
     "branch is only refused later, on the remote push, with no artifacts.",
 )
 _BRANCH_DELETE_REMEDY = _remedy(
-    "make task-finish TASK=<task-ref>\n"
+    "make task-finish TASK='<task-ref>'\n"
     "For one lane: land it if it has not landed (land retires it in the same call): "
     'manage_worktree_lane(operation="land", task_ref=<task-ref>, lane_id=<lane-id>, '
     "expected_tip=<40-hex lane tip>) or, once it has landed, retire it (a dry run unless "
@@ -252,7 +257,7 @@ _BRANCH_DELETE_REMEDY = _remedy(
     "Raw branch deletion strands the lane row from its ref; they must be reconciled together.",
 )
 _WORKTREE_REMOVE_REMEDY = _remedy(
-    "make task-finish TASK=<task-ref>\n"
+    "make task-finish TASK='<task-ref>'\n"
     "For one lane: land it if it has not landed (land retires it in the same call): "
     'manage_worktree_lane(operation="land", task_ref=<task-ref>, lane_id=<lane-id>, '
     "expected_tip=<40-hex lane tip>) or, once it has landed, retire it (a dry run unless "
@@ -264,7 +269,7 @@ _WORKTREE_REMOVE_REMEDY = _remedy(
     "Raw worktree removal strands the lane row and skips archival.",
 )
 _BRANCH_MOVE_REMEDY = _remedy(
-    'make task-start TASK=<task-ref> OBJECTIVE="<objective>"',
+    "make task-start TASK='<task-ref>' OBJECTIVE='<objective>'",
     "Renaming a branch cannot repair a name: the grammar is enforced at "
     "creation. Start the correctly-named task and move the work onto it.",
 )
@@ -276,7 +281,7 @@ _LAND_REMEDY = (
     'MCP: manage_worktree_lane(operation="land", task_ref=<task-ref>, lane_id=<lane-id>, '
     "expected_tip=<40-hex lane tip>)\n"
     "CLI: python -m workbay_orchestrator_mcp.orchestration.lane_land --workspace-root . "
-    "--task <task-ref> --lane <lane-id> --expected-tip <40-hex lane tip>"
+    "--task '<task-ref>' --lane '<lane-id>' --expected-tip '<40-hex lane tip>'"
 )
 
 _LANDING_PROTOCOL_MODULE = "_lifecycle_guard_harness_protocol"
@@ -445,7 +450,7 @@ def _anonymous_target_violation(ref: str) -> str | None:
     if _is_ancestor_of_head(sha) is True:
         return None
     return _remedy(
-        "git merge <branch-name>  (after make merge-gate SUBJECT=<branch>)",
+        "git merge '<branch-name>'  (after make merge-gate SUBJECT='<branch>')",
         f"Merging anonymous target `{ref}` would land commits that are not "
         "ancestors of HEAD and match no reviewed subject tip. Spell the merge "
         "as its branch name so the gate can check the adjudication artifact.\n\n"
@@ -513,7 +518,7 @@ def _merge_violation(args: list[str]) -> str | None:
         if allowed:
             continue
         return _remedy(
-            f'make review-adjudicate SUBJECT={subject} PATCH=<input patch> DOCS="<review docs>"'
+            f"make review-adjudicate SUBJECT={subject} PATCH='<input patch>' DOCS='<review docs>'"
             f"  then  make merge-gate SUBJECT={subject}",
             f"Merging `{ref}` (subject `{subject}`) without a current MERGE "
             f"adjudication ({why}). The pipeline requires the verdict "
@@ -1726,7 +1731,12 @@ def scan_command(command: str) -> str | None:
 
 
 def scan_command_with_bypass(command: str) -> tuple[str | None, list[str]]:
-    """Return (remedy, bypassed lifecycle segments) for the command.
+    remedy, bypassed, _ = _scan_command(command)
+    return remedy, bypassed
+
+
+def _scan_command(command: str) -> tuple[str | None, list[str], list[list[str]]]:
+    """Return the lexical decision, audited bypasses, and stages through the first git violation.
 
     A standalone ``export WORKBAY_ALLOW_RAW_GIT_LIFECYCLE=1`` segment opts the
     REST of the command out of enforcement; segments before it are still
@@ -1734,7 +1744,7 @@ def scan_command_with_bypass(command: str) -> tuple[str | None, list[str]]:
     lifecycle segments are returned for audit logging, not silence.
     """
     if not command or not command.strip():
-        return None, []
+        return None, [], []
     bypass_active = False
     bypassed: list[str] = []
     try:
@@ -1748,10 +1758,11 @@ def scan_command_with_bypass(command: str) -> tuple[str | None, list[str]]:
         if reason is None:
             continue
         if not bypass_active:
-            return _reap_remedy(reason), bypassed
+            return _reap_remedy(reason), bypassed, []
         bypassed.append(" ".join(words))
     bypass_active = False
-    for segment in _scan_segments(command):
+    segments = _scan_segments(command)
+    for index, segment in enumerate(segments):
         if segment[0] == "export" and _BYPASS_TOKEN in segment[1:]:
             bypass_active = True
             continue
@@ -1761,8 +1772,8 @@ def scan_command_with_bypass(command: str) -> tuple[str | None, list[str]]:
             continue
         remedy = _violation(segment)
         if remedy is not None:
-            return remedy, bypassed
-    return None, bypassed
+            return remedy, bypassed, segments[:index + 1]
+    return None, bypassed, []
 
 
 def _log_bypass(command: str, bypassed: list[str], source: str = "command") -> None:
@@ -1783,6 +1794,106 @@ def _log_bypass(command: str, bypassed: list[str], source: str = "command") -> N
             fh.write(json.dumps(record) + "\n")
     except OSError:
         pass
+
+
+def _commit_uses_payload_checkout(segments: list[list[str]]) -> bool:
+    # Earlier shell commands can change directory, branch or exported bindings.
+    # Recognize ordinary git staging/inspection before the matched commit.
+    for stage in segments[:-1]:
+        words = _strip_env_prefix(stage)
+        if len(words) < 2 or not _is_git(words[0]) or words[1] not in {"add", "diff", "status"}:
+            return False
+
+    segment = segments[-1]
+    words = _strip_env_prefix(segment)
+    if len(words) < 2 or not _is_git(words[0]) or words[1] != "commit":
+        return False  # Wrapped command or git global options (including -C).
+    prefix = segment[:len(segment) - len(words)]
+    checkout_vars = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
+    return not (
+        any(key in os.environ for key in checkout_vars)
+        or any(word.partition("=")[0] in checkout_vars for word in prefix)
+    )
+
+
+def _print_commit_identity(checkout: Path) -> None:
+    """Child process only. The parent bounds both the import and the query."""
+    from _active_task_context import _load_active_task, _load_active_task_via_handoff
+
+    context = _load_active_task(checkout)
+    if context.identity_state == "unknown" and context.probe_error is None and not context.task_ref:
+        # A clean negative snapshot lacks the explicit identity response.
+        context = _load_active_task_via_handoff(checkout)
+    print(json.dumps([context.identity_state, context.probe_error]))
+
+
+def _commit_lookup_unavailable(reason: str) -> str:
+    return (
+        f"{_UNREGISTERED_COMMIT_REMEDY}\n  Active task lookup unavailable ({reason}); "
+        "verify task state before registering."
+    )
+
+
+def _bounded_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run one guidance probe in its own session; expiry kills its whole group."""
+    with subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, start_new_session=True,
+    ) as proc:
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill before wait(): the unreaped leader keeps the group id ours.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, "")
+
+
+def _contextual_commit_remedy(segments: list[list[str]]) -> str:
+    """Best-effort guidance after the scanner has already refused the commit."""
+    if not _commit_uses_payload_checkout(segments):
+        return f"{_COMMIT_REMEDY}\n  Checkout context unavailable (checkout_context_unresolved); verify the target checkout."
+
+    deadline = time.monotonic() + _COMMIT_GUIDANCE_SECONDS
+
+    def probe(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        remaining = min(_COMMIT_GUIDANCE_SECONDS, deadline - time.monotonic())
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, 0)
+        return _bounded_probe(argv, remaining)
+
+    try:
+        root = str(_payload_workdir or _workspace_root())
+        branch = probe(["git", "-C", root, "branch", "--show-current"])
+        if branch.returncode:
+            return _commit_lookup_unavailable("branch_unavailable")
+        if branch.stdout.strip() not in {"main", "master"}:
+            return _COMMIT_REMEDY
+        top = probe(["git", "-C", root, "rev-parse", "--show-toplevel"])
+        checkout = top.stdout.removesuffix("\n")
+        if top.returncode or not checkout or "\n" in checkout:
+            return _commit_lookup_unavailable("checkout_root_unavailable")
+
+        reply = probe([sys.executable, __file__, "--commit-identity", checkout])
+        if reply.returncode:
+            return _commit_lookup_unavailable("active_task_probe_failed")
+        state, error = json.loads(reply.stdout)
+        if state == "registered" and error is None:
+            return _COMMIT_REMEDY
+        if state == "none" and error == "handoff_active_missing":
+            return _UNREGISTERED_COMMIT_REMEDY
+        if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]+", error):
+            return _commit_lookup_unavailable(error)
+        return _commit_lookup_unavailable("active_task_identity_unknown")
+    except subprocess.TimeoutExpired:
+        return _commit_lookup_unavailable("budget_exhausted")
+    except Exception:
+        # Probe startup, decoding and lookup failures only affect the advice.
+        return _commit_lookup_unavailable("active_task_probe_failed")
 
 
 def main() -> int:
@@ -1818,11 +1929,14 @@ def main() -> int:
             )
         return 0
 
-    remedy, bypassed = scan_command_with_bypass(command)
+    remedy, bypassed, matched_segments = _scan_command(command)
     if bypassed:
         _log_bypass(command, bypassed)
     if remedy is None:
         return 0
+
+    if remedy == _COMMIT_REMEDY:
+        remedy = _contextual_commit_remedy(matched_segments)
 
     if remedy.startswith(_REMOTE_REAP_REMEDY):
         print(remedy, file=sys.stderr)
@@ -1846,4 +1960,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) == 3 and sys.argv[1] == "--commit-identity":
+        _print_commit_identity(Path(sys.argv[2]))
+    else:
+        sys.exit(main())

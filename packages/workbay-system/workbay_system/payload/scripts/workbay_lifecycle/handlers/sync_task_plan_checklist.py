@@ -655,15 +655,22 @@ class _StoredPlanLookupResult:
 def _lookup_stored_plan_result(repo: Path, task_ref: str) -> _StoredPlanLookupResult:
     """Read the plan identity and the legacy path-only projection together."""
     handoff_root = resolve_handoff_workspace_root(repo)
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root",
-        str(handoff_root),
-        "state",
-        "--sections",
-        "identity",
-        task_ref,
-    ]
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root",
+            str(handoff_root),
+            "state",
+            "--sections",
+            "identity",
+            task_ref,
+        ]
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        return _StoredPlanLookupResult(UNKNOWN)
     proc = _common.run_subprocess(argv)
     if proc.returncode != 0:
         return _StoredPlanLookupResult(UNKNOWN)
@@ -799,36 +806,43 @@ def _query_handoff_evidence(
     # consume the positional ``task_ref`` argument if it followed.
     # Pass the positional FIRST and keep the variadic option last.
     handoff_root = resolve_handoff_workspace_root(repo)
-    decisions_argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root",
-        str(handoff_root),
-        "state",
-        task_ref,
-        "--sections",
-        "decisions_recent",
-        "--detail",
-        "full",
-        "--top-n-decisions",
-        "100",
-        "--decision-fields",
-        "decision",
-        "changed_files_json",
-        "slice_number",
-    ]
-    tests_argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root",
-        str(handoff_root),
-        "get-verified-tests",
-        "--task-ref",
-        task_ref,
-        "--passed",
-        "true",
-        "--exclude-never-passed",
-        "--limit",
-        "100",
-    ]
+    try:
+        decisions_argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root",
+            str(handoff_root),
+            "state",
+            task_ref,
+            "--sections",
+            "decisions_recent",
+            "--detail",
+            "full",
+            "--top-n-decisions",
+            "100",
+            "--decision-fields",
+            "decision",
+            "changed_files_json",
+            "slice_number",
+        ]
+        tests_argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root",
+            str(handoff_root),
+            "get-verified-tests",
+            "--task-ref",
+            task_ref,
+            "--passed",
+            "true",
+            "--exclude-never-passed",
+            "--limit",
+            "100",
+        ]
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        return Evidence(), "pending", f"handoff_evidence_unavailable: {exc.code}: {exc}"
     warnings: list[str] = []
     decisions_proc = _common.run_subprocess(decisions_argv)
     search_payload: dict[str, Any] | None = None
@@ -882,17 +896,24 @@ def _query_handoff_evidence(
 def _fetch_archive_envelope(handoff_root: Path, task_ref: str) -> dict[str, Any] | None:
     """Return the ``archive --operation get`` envelope when the task is archived."""
 
-    argv = [
-        _common.mcp_handoff_bin(),
-        "--workspace-root",
-        str(handoff_root),
-        "archive",
-        "--operation",
-        "get",
-        "--task-ref",
-        task_ref,
-        "--include-snapshot",
-    ]
+    try:
+        argv = [
+            _common.mcp_handoff_bin(),
+            "--workspace-root",
+            str(handoff_root),
+            "archive",
+            "--operation",
+            "get",
+            "--task-ref",
+            task_ref,
+            "--include-snapshot",
+        ]
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        return None
     proc = _common.run_subprocess(argv)
     if proc.returncode != 0:
         return None
@@ -1257,7 +1278,8 @@ def run(argv: list[str]) -> int:
         "plan_path": str(plan_path),
         "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    _write_sync_sidecar(_resolve_state_dir(handoff_root), args.task_ref, sidecar_entry)
+    if args.apply_changes:
+        _write_sync_sidecar(_resolve_state_dir(handoff_root), args.task_ref, sidecar_entry)
 
     if not args.quiet:
         prefix = "applied" if wrote else "dry-run"

@@ -267,6 +267,7 @@ to `[]`. Unknown top-level fields are rejected.
 | `compiled_css[].provenance` | Required `inputs` list of objects with string `path` and `sha256`, and string `output_digest`. Input hashes accept hex or `sha256:`-prefixed hex; the output digest uses `sha256:`-prefixed hex. Records which source bytes produced the CSS output for freshness checks. |
 | `examples` | Optional list of objects with required string `component_id` and workspace-relative string `path` linking an example to a component. |
 | `generated_dir` | Optional string: workspace-relative output directory, default `docs/design/generated`. Keep it separate from source inputs. |
+| `toolchain_root` | Optional string or null, default null: workspace-relative directory whose own `node_modules` holds `typescript` and `postcss` for the collector (see above). It follows the same path rules, reported at `/toolchain_root`, and does not change inventory source digests. |
 
 Inventory coverage declares four limitations: `css_custom_properties_only`
 (CSS custom properties only), `registered_components_only` (only components
@@ -330,10 +331,11 @@ those reasons; the inventory CLI prints collector diagnostics on stderr.
 | Code or collection reason | What the user sees | Fix |
 | --- | --- | --- |
 | `web_assets_missing` | "Web assets are missing. Reinstall the Canvas package, or pass --web-dist to a directory that contains index.html." | Install a package built with staged web assets, or pass a built web directory containing `index.html` with `--web-dist`. |
-| `config_invalid` | "invalid design-sources config"; `details.pointer` locates the field and `details.code` gives the config error. | An empty pointer usually means the file is missing or unreadable. Check the workspace root and file existence/access before debugging the schema; malformed JSON can also have an empty pointer. Missing-file stat failures currently use `details.code = invalid`. |
+| `config_missing` | "Create docs/design/design-sources.json to configure Studio." (or the requested `--config` path); `details.code = missing` and `details.path` names that workspace-relative file. | Create the named config for your real design sources. Review-bundle HTTP calls return 400; `ux-map bundle` exits 2. A failed missing-config call leaves the workspace unchanged. |
+| `config_invalid` | "invalid design-sources config"; `details.pointer` locates the field and `details.code` gives the config error. | Check file access, JSON and schema fields, and workspace confinement. Malformed JSON and stat access errors use `details.code = invalid`; an escaping path uses `escape`. An unreadable file is not `config_missing`. |
 | `collector_not_found` | "inventory collector not found: reinstall the Canvas package, or set WORKBAY_INVENTORY_COLLECTOR to a collect-design-inventory.mjs file" | Reinstall with staged collector data, or set `WORKBAY_INVENTORY_COLLECTOR` to that file. |
 | `node_not_found` | "node not found: install Node.js >=20 or set WORKBAY_NODE; viewing needs no Node, only Refresh collects sources" | Install Node.js >=20 or set `WORKBAY_NODE` to an executable. |
-| `deps_missing` | "install typescript and postcss in the workspace (`npm install -D typescript postcss`) or run from a checkout" | Make `typescript>=5` and `postcss>=8` resolvable beside the collector or in the consumer workspace. |
+| `deps_missing` | Generic typescript/postcss guidance, or "Install typescript and postcss: npm --prefix <toolchain_root> ci" when the configured `toolchain_root` is shell-safe and holds a `package-lock.json`. | Make `typescript>=5` and `postcss>=8` available together in one candidate above. With a remedy, `details.remedy` is `npm --prefix <toolchain_root> ci` and `details.dependency_root` is the configured `toolchain_root`; run the remedy from the workspace root. |
 | `remote_bind_refused` | "Refusing to bind to a non-loopback host." | Use `--host 127.0.0.1`, another loopback IP literal or `localhost`; remote bind is unsupported. |
 | `port_in_use` | "Port is already in use." | Select another port or use `--port 0` for a free port. |
 

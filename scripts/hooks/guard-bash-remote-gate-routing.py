@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402 -- start the deadline before the remaining imports.
 """Refuse host Python test execution when the repository requires remote gates.
 
 Under execution_mode=remote_only, this guard stops habitual and accidental
@@ -41,12 +42,61 @@ way to run a refused command in ``remote_only`` mode.
 
 from __future__ import annotations
 
+# Start the process-wide budget before the remaining imports and before stdin
+# is read. The enclosing harness has a five-second timeout of its own.
+import os
+import signal
+import time
+
+_HOOK_STARTED = time.monotonic()
+_HOOK_DEADLINE_SECONDS = 3.5
+
+
+def _deadline_expired(_signum: int, _frame: object) -> None:
+    elapsed = time.monotonic() - _HOOK_STARTED
+    # Use a fixed-size message and a direct write: the timeout may interrupt a
+    # buffered diagnostic, an import, or the read of an incomplete payload.
+    message = f"BLOCKED (unverified_deadline): elapsed_seconds={elapsed:.3f}\n".encode("ascii")
+    for fd in (2, 1):
+        try:
+            os.write(fd, message)
+            break
+        except OSError:
+            # A closed diagnostic stream must not turn a deadline into allow.
+            continue
+    raise SystemExit(2)
+
+
+def _process_age() -> float | None:
+    """Include interpreter startup on Linux; other systems use module entry."""
+    try:
+        # The command field may contain spaces or parentheses. Field 22 is
+        # the process start tick, relative to the same boot clock as BOOTTIME.
+        with open("/proc/self/stat", encoding="ascii") as stat:
+            fields = stat.read().rsplit(")", 1)[1].split()
+        started = int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        age = time.clock_gettime(time.CLOCK_BOOTTIME) - started
+        return age if age >= 0 else None
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGALRM, _deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, _HOOK_DEADLINE_SECONDS)
+    age = _process_age()
+    if age is not None:
+        _HOOK_STARTED = time.monotonic() - age
+        remaining = _HOOK_DEADLINE_SECONDS - age
+        if remaining <= 0:
+            _deadline_expired(0, None)
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+
 import datetime
 import fnmatch
 import importlib.util
 import ipaddress
 import json
-import os
 import re
 import shlex
 import socket
@@ -63,6 +113,8 @@ _MANIFEST_NAME_PRECEDENCE = (".workbay-bootstrap.json", ".workbay-overlay.json")
 _MAX_SHELL_DEPTH = 3
 _MAX_SUBSTITUTION_NESTING = 16
 _MAX_COMMAND_BYTES = 64 * 1024
+_MAX_DIAGNOSTIC_BYTES = 4096
+_MAX_WORD_BYTES = 256
 _UNPARSED_SHAPE = "unparsed_shape"
 
 _TEST_TARGETS = frozenset(
@@ -115,7 +167,7 @@ _TEST_TARGETS = frozenset(
 # A missing goal is an availability cost; adding an unproven goal is a bypass.
 _INERT_MAKE_GOALS = frozenset({
     "help", "check-remote", "lane-land", "finalize-plan", "handoff-write",
-    "offload-flock", "lane-reap", "plan-done", "slice-commit", "task-start", "vm-reap",
+    "offload-flock", "lane-reap", "plan-done", "slice-commit", "task-start", "vm-reap", "doctor",
 })
 
 # Drift-scan exemptions: operator flows with their own preflight, and a help
@@ -220,6 +272,17 @@ _IMPLICIT_MAKEFILES = frozenset({"GNUmakefile", "makefile", "Makefile"})
 # It never names the program; substitutions in its subscript or value are scanned on their own.
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=.*$", re.ASCII)
 _ENV_ASSIGNMENT = re.compile(rf"^{re.escape(_BYPASS_ENV)}=(.*)$", re.ASCII)
+# A deliberately smaller grammar than _ASSIGNMENT. Match the spelling before
+# shlex removes escapes or quotes from the name. Only the outer value quotes
+# can be removed; every byte inside them must already be literal.
+_PLAIN_CHARS = r"A-Za-z0-9_./:=,@%+\-"
+_LITERAL_STORE = re.compile(
+    r"(?P<name>[A-Za-z][A-Za-z0-9_]*)"
+    r"(?P<index>\[(?:[0-9]+|\$(?P<index_name>[A-Za-z_][A-Za-z0-9_]*))\])?="
+    rf"""(?P<value>'[{_PLAIN_CHARS} \t]*'|"[{_PLAIN_CHARS} \t]*"|[{_PLAIN_CHARS}]*)"""
+)
+_STORE_SEPARATOR = re.compile(r"[ \t]*(?:;[ \t]*)?[\n \t]*")
+_STORE_OUTPUT = re.compile(r"[ \t]*>[ \t]*[A-Za-z0-9_./-]+")
 _RUNNER_WORD = re.compile(
     r"(?<![\w.-])(?:pytest|py\.test|run_named_tests\.py)(?![\w.-])"
     # A runner attached to a short option: python -mpytest, git grep -Opytest.
@@ -585,6 +648,8 @@ class _Lexer:
         self.quote: str | None = None
         self.word_started = False
         self.depth = 0
+        self.heredoc_characters = 0
+        self.quoted_characters = 0
 
     def finish(self) -> _Segment | None:
         """Close a non-empty segment; an empty one keeps its pipeline input."""
@@ -606,6 +671,8 @@ class _Lexer:
         self.current.add(char)
         if char == self.quote:
             self.quote = None
+        else:
+            self.quoted_characters += len(char)
         self.index += 1
 
     def _escape(self) -> None:
@@ -613,6 +680,8 @@ class _Lexer:
         following = self.command[self.index + 1 : self.index + 2]
         if following != "\n":
             self.current.add(self.command[self.index] + following)
+            if self.quote == '"':
+                self.quoted_characters += 1 + len(following)
             self.word_started = True
         self.index += 2
 
@@ -713,10 +782,18 @@ class _Lexer:
         self.word_started = False
         self.index += 1
         if char == "\n" and self.pending:
+            body_start = self.index
             self.index = _read_heredoc_bodies(command, self.index, self.pending)
+            self.heredoc_characters += self.index - body_start
 
 
-def _lex(command: str, index: int = 0, *, closer: bool = False, nesting: int = 0) -> tuple[list[_Segment], int]:
+class _ShellTextTooLarge(Exception):
+    """The executable shell syntax exceeds the structural scan budget."""
+
+
+def _lex(
+    command: str, index: int = 0, *, closer: bool = False, nesting: int = 0, syntax_limit: int | None = None,
+) -> tuple[list[_Segment], int]:
     """Split shell text into simple-command segments.
 
     Separators are ``;``, ``&&``, ``||``, ``|``, ``&`` and newlines outside
@@ -728,10 +805,17 @@ def _lex(command: str, index: int = 0, *, closer: bool = False, nesting: int = 0
     if nesting > _MAX_SUBSTITUTION_NESTING:
         raise ValueError("command substitution nested too deeply")
     lexer = _Lexer(command, index, closer=closer, nesting=nesting)
+    start = index
     while lexer.index < len(command):
         if lexer.step():
             lexer.finish()
             return lexer.segments, lexer.index
+        # Heredoc bodies and quoted characters are data, not shell operators;
+        # the complete words remain available for the command classifier.
+        if syntax_limit is not None:
+            syntax = lexer.index - start - lexer.heredoc_characters - lexer.quoted_characters
+            if syntax > syntax_limit:
+                raise _ShellTextTooLarge
     if closer:
         raise ValueError("unterminated command substitution")
     lexer.finish()
@@ -1687,7 +1771,7 @@ class _Scan:
         # Set by any unbypassed text executor, even after a bypassed one marked first.
         self.text_executor_unbypassed = False
         # Normalized output-redirect targets of the whole command, and the text earlier segments produced.
-        self.written_files: frozenset[str] = frozenset()
+        self.written_files: set[str] = set()
         self.produced_words: set[str] = set()
         # The basenames of the written files and produced words.
         self.produced_names = _Names()
@@ -2498,7 +2582,7 @@ def _classify_make_call(
 
 def _classify_segment(
     segment: _Segment, tokens: list[str], depth: int, exported: bool, scan: _Scan,
-    *, redirect_argv: list[str] | None = None, fds: dict[int, _FdSource] | None = None
+    *, redirect_argv: list[str] | None = None, fds: dict[int, _FdSource] | None = None,
 ) -> None:
     """Decide ``test`` / ``inert`` / ``unknown`` for one parsed segment."""
     if fds is None:
@@ -2583,7 +2667,7 @@ def _classify_segment(
 
 def _scan_segments(
     segments: list[_Segment], depth: int, scan: _Scan, exported: bool = False,
-    *, inherited_fds: dict[int, _FdSource] | None = None,
+    *, inherited_fds: dict[int, _FdSource] | None = None, substitution: bool = False,
 ) -> None:
     """Classify segments with redirect data preserved before stripping syntax and prefixes."""
     entries: list[_RedirectCommand | None] = []
@@ -2610,7 +2694,7 @@ def _scan_segments(
             _remember_file_production(scan, entries[index - 1], previous_fds)
         sub_fds, _unknown = _segment_fds(entry, persistent)
         for inner in segment.substitutions:
-            _scan_segments(inner, depth, scan, exported, inherited_fds=dict(sub_fds))
+            _scan_segments(inner, depth, scan, exported, inherited_fds=dict(sub_fds), substitution=True)
         previous_fds = {}
         if entry is None:
             via = "export" if exported else None
@@ -2657,11 +2741,137 @@ def _scan_segments(
             _classify_segment(segment, tokens, depth, exported, scan, redirect_argv=entry.argv, fds=fds)
         finally:
             segment.upstream = upstream
+    if substitution and entries:
+        # Expansion-local argv and descriptors expire here. Files created
+        # during expansion, including by its final command, outlive it.
+        _remember_file_production(scan, entries[-1], previous_fds)
+        new_paths = scan.file_production.paths - outer_files.paths
+        scan.written_files.update(scan.file_production.paths)
+        for path in new_paths:
+            outer_files.add_path(path)
+            outer_names.add(path)
+        outer_aliases.update(scan.written_aliases)
+        outer_files.protected_writer |= scan.file_production.protected_writer
     scan.prior.rewind(outer_prior)
     scan.produced_words = outer_words
     scan.produced_names = outer_names
     scan.file_production = outer_files
     scan.written_aliases = outer_aliases
+
+
+def _ordinary_store_name(name: str) -> bool:
+    # Admit application variables, keeping Bash's uppercase settings and
+    # its two special lowercase names outside the proof.
+    if name[0].islower():
+        return name not in {"auto_resume", "histchars"}
+    return len(name) == 1 or name in {"ARGS", "CMD", "COMMAND", "DATA", "DB", "MOD", "RUNNER"}
+
+
+def _only_literal_stores(command: str) -> bool:
+    """Match a whole script of literal assignments and optional literal output redirects."""
+    pos = len(command) - len(command.lstrip(" \t\n"))
+    count = 0
+    indexed_by_name = False
+    while pos < len(command):
+        store = _LITERAL_STORE.match(command, pos)
+        if store is None or not _ordinary_store_name(store["name"]):
+            return False
+        count += 1
+        if store["index_name"]:
+            # An index can read a name recursively. Admit a simple $key
+            # only on an isolated store, with no value supplied for that key.
+            if store["name"] == store["index_name"]:
+                return False
+            indexed_by_name = True
+        output = _STORE_OUTPUT.match(command, store.end())
+        end = output.end() if output else store.end()
+        separator = _STORE_SEPARATOR.match(command, end)
+        assert separator is not None
+        pos = separator.end()
+        if pos == end and pos < len(command):
+            return False
+    return count > 0 and (count == 1 or not indexed_by_name)
+
+
+def _literal_command_call(command: str, segments: list[_Segment]) -> str | None:
+    """Resolve one straight-line literal assignment followed by its command word.
+
+    Only a complete two-segment script is proved: no intervening command,
+    control flow, expansions, globbing, or shell metacharacters in the value,
+    and no expansion after the call that could read the dropped value.
+    Everything else keeps the existing unknown-command refusal. The resulting
+    argv is sent back through the ordinary classifier, including runner and
+    make checks; this function does not grant an executable an exemption.
+    """
+    if len(segments) != 2:
+        return None
+    first, second = segments
+    if first.bodies or first.substitutions or first.opaque or second.from_prior:
+        return None
+    first_text = "".join(first.raw)
+    if not command.startswith(first_text):
+        return None
+    assignment = _LITERAL_STORE.fullmatch(first_text.strip(" \t"))
+    if assignment is None or assignment["index"] or not _ordinary_store_name(assignment["name"]):
+        return None
+    name = assignment.group("name")
+    rest = command[len(first_text):]
+    call = re.match(r";[ \t]*\$(?:" + re.escape(name) + r"|\{" + re.escape(name) + r"\})(?=$|[ \t\n])", rest)
+    if call is None:
+        return None
+    remainder = rest[call.end():]
+    if "$" in remainder or "`" in remainder:
+        # The rewrite drops the assignment. A later expansion would then read
+        # an unset name where the shell reads the stored value.
+        return None
+    value = assignment.group("value")
+    if value[:1] in {"'", '"'}:
+        value = value[1:-1]
+    words = value.split()
+    if not words:
+        return None
+    # Preserve the unknown-shape route for protected programs and for unknown
+    # programs with protected argument text. Inert commands still classify
+    # their arguments and heredoc bodies as data in the ordinary scanner.
+    if _basename(words[0]) in _RUNNER_NAMES or (
+        _command_name(words[0]) not in _INERT_COMMANDS
+        and _raw_test_word(" ".join(words) + remainder)
+    ):
+        return None
+    return " ".join(shlex.quote(word) for word in words) + remainder
+
+
+def _collapse_consecutive_noops(segments: list[_Segment]) -> list[_Segment]:
+    """Avoid reclassifying consecutive `true` commands with no shell effects."""
+    result: list[_Segment] = []
+    previous_noop = False
+    for segment in segments:
+        noop = (
+            not segment.bodies and not segment.substitutions and not segment.upstream and not segment.opaque
+            and "".join(segment.raw).strip() == "true"
+        )
+        if not (noop and previous_noop):
+            result.append(segment)
+        previous_noop = noop
+    return result
+
+
+def _oversized_direct_test(segments: list[_Segment]) -> _Finding | None:
+    """Find a proven direct runner without indexing a large data body first.
+
+    This is used only when no command-text override is present. A finding is
+    already enough to refuse, just as the former oversized raw fallback chose
+    one finding; otherwise the complete structural scan still runs.
+    """
+    for segment in segments:
+        try:
+            tokens = _strip_shell_group_tokens(_RedirectCommand(segment).argv)
+            command, _assignments, understood, stdin_args = _strip_prefixes(tokens)
+        except ValueError:
+            continue
+        if understood and not stdin_args and command and _runs_host_tests(command):
+            return ("test", "test-files", None, _basename(command[0]))
+    return None
 
 
 def _scan_command(
@@ -2670,7 +2880,23 @@ def _scan_command(
 ) -> _Scan:
     """Scan shell text; ``stdin`` is data a ``-c`` script may read and run."""
     scan = _Scan()
-    if len(command.encode("utf-8")) + len(stdin.encode("utf-8")) > _MAX_COMMAND_BYTES:
+    # Preserve the original command's targets even if it is later rewritten
+    # or proved to contain only stores. Substitutions add their parsed writes.
+    if ">" in command:
+        scan.written_files.update(_redirect_targets(command))
+    top_level = depth == 0 and parent is None and not stdin and not stdin_unprovable
+    if top_level and _only_literal_stores(command):
+        return scan
+    # Stdin is data until the classified command actually runs it. Counting it
+    # as shell syntax would send even `bash -c 'cat'` through the raw fallback.
+    oversized = len(command.encode("utf-8")) > _MAX_COMMAND_BYTES
+    # The lexer cannot reliably locate command boundaries after an ANSI-C quote
+    # or a dollar followed by a line continuation. Keep the raw fallback there.
+    if oversized and (
+        not any(marker in command for marker in ("<<", "'", '"'))
+        or "$'" in command
+        or "$\\\n" in command
+    ):
         # The bounded fallback deliberately proves no command-text override.
         # Ambient overrides still use the mandatory receipt path.
         # Default make goals must remain refused when structural parsing is skipped.
@@ -2678,7 +2904,28 @@ def _scan_command(
         if word is not None:
             scan.findings.append((_UNPARSED_SHAPE, word[1], None, word[0]))
         return scan
-    scan.written_files = _redirect_targets(command)
+    try:
+        # A large quoted heredoc may be data for an inert writer or executable
+        # input for a shell. Let the lexer associate it with its consumer while
+        # keeping a separate bound on the surrounding shell syntax.
+        segments, _ = _lex(command, syntax_limit=_MAX_COMMAND_BYTES if oversized else None)
+    except _ShellTextTooLarge:
+        scan.findings.append(("unverified_size", "test-files", None, "shell syntax"))
+        return scan
+    except ValueError as exc:
+        _record_unknown(scan, "\n".join((command, stdin)), None, parse_error=str(exc), include_default_make=True)
+        return scan
+    if oversized and depth == 0 and not stdin and parent is None and _BYPASS_ENV not in command:
+        direct_test = _oversized_direct_test(segments)
+        if direct_test is not None:
+            scan.findings.append(direct_test)
+            return scan
+    if top_level:
+        resolved = _literal_command_call(command, segments)
+        if resolved is not None:
+            command = resolved
+            segments, _ = _lex(command)
+    segments = _collapse_consecutive_noops(segments)
     scan.written_aliases = {fd for path in scan.written_files if (fd := _descriptor_fd(path)) is not None}
     if parent is not None:
         # A nested script can run what the outer command wrote or printed before it.
@@ -2692,11 +2939,6 @@ def _scan_command(
         scan.file_production = parent.file_production
     for path in scan.written_files:
         scan.produced_names.add(path)
-    try:
-        segments, _ = _lex(command)
-    except ValueError as exc:
-        _record_unknown(scan, "\n".join((command, stdin)), None, parse_error=str(exc), include_default_make=True)
-        return scan
     if stdin:
         inherited = _Segment()
         inherited.raw.append(stdin)
@@ -2763,6 +3005,7 @@ def _blocked_message(targets: set[str]) -> str:
 def _refusal_message(findings: list[_Finding]) -> str:
     targets = {target for _reason, target, _via, _word in findings}
     for reason, prefix in (
+        ("unverified_size", "executable shell syntax exceeds the structural scan limit"),
         ("make_argv_unparsed", "the hook could not parse the whole make argv"),
         ("make_makefile_unprovable", "makefile source or parse-time text is unprovable"),
         ("make_goal_missing", "make requires an explicit inert goal; the default goal may run tests"),
@@ -2772,6 +3015,8 @@ def _refusal_message(findings: list[_Finding]) -> str:
     ):
         word = next((word for kind, _target, _via, word in findings if kind == reason), None)
         if word is not None:
+            if reason == "unverified_size":
+                return f"BLOCKED (unverified_size): {prefix}.\n\n{_blocked_message(targets)}"
             if reason == "make_goal_not_allowlisted" and word == "maint-start":
                 return (
                     f"BLOCKED ({reason}): {prefix}; refused word '{word}'.\n"
@@ -2783,6 +3028,7 @@ def _refusal_message(findings: list[_Finding]) -> str:
                     "Then run make slice-commit TASK=<task-ref> MSG=\"<message>\" PATHS=\"<owned paths>\" "
                     "and make plan-done TASK=<task-ref>.\n"
                 )
+            word = _bounded_text(word, _MAX_WORD_BYTES)
             if reason.startswith("make_"):
                 admission = ""
                 if reason == "make_goal_not_allowlisted":
@@ -2807,8 +3053,22 @@ def _refusal_message(findings: list[_Finding]) -> str:
     return _blocked_message(targets)
 
 
+def _bounded_text(value: str, limit: int) -> str:
+    """Cap encoded output, preserving UTF-8 boundaries and marking truncation."""
+    data = value.encode("utf-8", errors="backslashreplace")
+    if len(data) <= limit:
+        return data.decode("utf-8")
+    suffix = b"...[truncated]"
+    return data[: limit - len(suffix)].decode("utf-8", errors="ignore") + suffix.decode("ascii")
+
+
+def _emit_diagnostic(message: str) -> None:
+    # Every emitted diagnostic uses this boundary, including recovery paths.
+    print(_bounded_text(message, _MAX_DIAGNOSTIC_BYTES - 1), file=sys.stderr)
+
+
 def _diagnostic(message: str) -> int:
-    print(message, file=sys.stderr)
+    _emit_diagnostic(message)
     return 0
 
 
@@ -2826,21 +3086,21 @@ def _apply_findings(command: str, findings: list[_Finding], ledger_error: str | 
         # Its receipt is best-effort; the workstation override remains strict.
         audit_error = _log_bypass(command=command, via="lane_sandbox", root=root)
         if audit_error is not None:
-            print(f"ALLOW: lane_sandbox; {audit_error}", file=sys.stderr)
+            _emit_diagnostic(f"ALLOW: lane_sandbox; {audit_error}")
         return 0
     ambient_bypass = os.environ.get(_BYPASS_ENV) == "1"
     unbypassed = [finding for finding in findings if finding[2] is None]
     message = _policy_refusal(findings, ledger_error)
     if unbypassed and not ambient_bypass:
-        print(message, file=sys.stderr)
+        _emit_diagnostic(message)
         return 2
     via = "env" if ambient_bypass else (findings[0][2] or "")
     if not via:
-        print(message, file=sys.stderr)
+        _emit_diagnostic(message)
         return 2
     audit_error = _log_bypass(command=command, via=via, root=root)
     if audit_error is not None:
-        print(f"BLOCKED: {audit_error}.\n\n{message}", file=sys.stderr)
+        _emit_diagnostic(f"BLOCKED: {audit_error}.\n\n{message}")
         return 2
     return 0
 
@@ -2975,7 +3235,7 @@ def _run() -> int:
                     mode = "ledger_unreadable"
                     ledger_error = f"policy read failed ({type(policy_exc).__name__}): {policy_exc}"
                 if mode in {"remote_only", "ledger_unreadable"} and word is not None:
-                    print(f"ERROR: {error}; checking raw test-run text", file=sys.stderr)
+                    _emit_diagnostic(f"ERROR: {error}; checking raw test-run text")
                     # Failure to prove an inline override refuses that override,
                     # rather than dropping into the second-look fail-open arm.
                     try:
@@ -2991,15 +3251,20 @@ def _run() -> int:
             return _diagnostic(f"ALLOW: {error}")
         except Exception as second_exc:  # noqa: BLE001 - the recovery path is bounded too.
             if command is not None and word is not None:
-                print(
+                _emit_diagnostic(
                     f"BLOCKED (ledger_unreadable): {error}; second look failed "
                     f"({type(second_exc).__name__}): {second_exc}\n\n"
                     + _refusal_message([(_UNPARSED_SHAPE, word[1], None, word[0])]),
-                    file=sys.stderr,
                 )
                 return 2
             return _diagnostic(f"ALLOW: {error}; second look failed ({type(second_exc).__name__}): {second_exc}")
 
 
 if __name__ == "__main__":
-    sys.exit(_run())
+    try:
+        result = _run()
+    finally:
+        # Do not leave an alarm armed while Python is tearing down its signal
+        # handlers after a successful decision or a handled deadline.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    sys.exit(result)

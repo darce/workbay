@@ -1,5 +1,6 @@
 """Effort default resolution for both lane and wave dispatch."""
 
+from workbay_protocol import reasoning_effort as model_routing
 from workbay_protocol.reasoning_effort import validate_reasoning_effort
 
 from workbay_orchestrator_mcp.orchestration.backend_registry import BACKENDS
@@ -15,7 +16,7 @@ from workbay_orchestrator_mcp.orchestration.openrouter_lane_config import OPENRO
 # Omission resolves to max, and concrete lower efforts are refused by
 # resolve_dispatch_effort below. Selection modes (auto/inherit) remain
 # execution-time choices and are not concrete dispatch efforts.
-MAX_EFFORT_MODELS = frozenset({"gpt-5.6-luna", "gpt-6-luna"})
+MAX_EFFORT_MODELS = frozenset({model_routing.ModelId.CODEX_LEGACY_JUNIOR, model_routing.ModelId.CODEX_JUNIOR})
 
 DEFAULT_EFFORT = "high"
 _MODEL_EFFORT_CAPABILITY_TABLES = (OPENROUTER_MODEL_ALLOWED_EFFORTS,)

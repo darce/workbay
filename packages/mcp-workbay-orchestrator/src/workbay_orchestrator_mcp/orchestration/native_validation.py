@@ -549,6 +549,7 @@ def _publish(
         ChartUnavailable,
         ConformanceError,
         assert_validation_transition,
+        lane_status_requested_event,
         load_runtime_chart,
     )
 
@@ -562,6 +563,7 @@ def _publish(
         assert_validation_transition(
             chart,
             row["data"]["lane"]["status"],
+            lane_status_requested_event(target),
             target,
             active_policy=result.applicable,
             fresh_qualified=fresh_qualified(result, Path(ctx.config.worktree_path)),

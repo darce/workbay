@@ -15,12 +15,14 @@ close authority [SECD-01].
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
@@ -61,6 +63,7 @@ _RECOVERY_CONFIG = (
 
 DeleteReason = Literal[
     "deleted",
+    "already_absent",
     "would_delete",
     "invalid_authorized_sha",
     "invalid_branch",
@@ -117,6 +120,16 @@ class BranchDeleteResult:
     #: ``released``, ``not_ours`` or ``release_failed`` once the act ran under the row's reclaim fence;
     #: ``""`` when no fence was claimed. Never folded into ``deleted`` or ``reason`` [AGT-10].
     fence_release: str = ""
+    #: Evidence after a failed delete is independent of that command's exit status.
+    observed_ref: str | None = None
+    command_error: str = ""
+    effect_provenance: Literal["this_operation", "external_or_unknown_effect", "unresolved"] = "unresolved"
+    deleted_by_this_operation: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "deleted_by_this_operation", self.deleted)
+        if self.deleted:
+            object.__setattr__(self, "effect_provenance", "this_operation")
 
 
 _T = TypeVar("_T")
@@ -1017,6 +1030,132 @@ def _retry_guarded_branch_delete(root: Path, plan: _AuthorizedDeletePlan) -> sub
     return _run_guarded_branch_delete(root, plan)
 
 
+def _reconcile_failed_delete(
+    root: Path,
+    plan: _AuthorizedDeletePlan,
+    deleted: subprocess.CompletedProcess[str],
+    lock_recovery: dict[str, object],
+) -> BranchDeleteResult:
+    """Keep the command error, exact ref observation and effect attribution separate."""
+    current = _resolve_ref(root, plan.branch_ref)
+    command_error = _detail(deleted)
+    detail = command_error
+    if current.probe_failed:
+        reason: DeleteReason = "probe_failed"
+        detail = f"{command_error}; ref_probe: {_detail(current.proc)}"
+    elif current.missing:
+        reason = "already_absent"
+    elif current.sha != plan.sha:
+        reason = "authorized_sha_changed"
+    else:
+        reason = "delete_failed"
+    return replace(
+        _delete_result(plan, deleted=False, reason=reason, detail=detail, lock_recovery=lock_recovery),
+        observed_ref=current.sha,
+        command_error=command_error,
+        effect_provenance="external_or_unknown_effect" if current.missing else "unresolved",
+    )
+
+
+def _effect_identity(plan: _AuthorizedDeletePlan) -> list[str | None]:
+    return [plan.short_branch, plan.sha, plan.reclaim_ref, plan.requested_disposition]
+
+
+def _effect_binding(binding: CloseAuthorityBinding) -> dict[str, object]:
+    generation = dict(zip(_ROW_GENERATION_KEYS, binding.generation, strict=True)) if binding.generation else None
+    if generation is not None and binding.authority is not None:
+        # Claim/release changes these two columns itself. All owner, status and
+        # close-identity columns must still match, in addition to binding anew.
+        generation.pop("reclaim_fence")
+        generation.pop("updated_at")
+    return {"task_ref": binding.task_ref, "lane_id": binding.lane_id, "generation": generation}
+
+
+def _effect_receipt_path(root: Path, plan: _AuthorizedDeletePlan) -> Path:
+    key = hashlib.sha256(json.dumps(_effect_identity(plan)).encode()).hexdigest()
+    located = _git(root, "rev-parse", "--git-path", f"workbay-branch-effects/{key}.json")
+    if located.returncode != 0 or not (located.stdout or "").strip():
+        raise OSError(f"effect_receipt_location: {_detail(located)}")
+    path = Path(located.stdout.strip())
+    return path if path.is_absolute() else root / path
+
+
+def _record_absence(root: Path, plan: _AuthorizedDeletePlan, result: BranchDeleteResult) -> BranchDeleteResult:
+    """Atomically retain the settled result, including any fence release receipt."""
+    if result.reason != "already_absent" or plan.binding is None:
+        return result
+    temporary: str | None = None
+    try:
+        path = _effect_receipt_path(root, plan)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema": 1,
+            "identity": _effect_identity(plan),
+            "binding": _effect_binding(plan.binding),
+            "result": asdict(result),
+        }
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = handle.name
+            json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError) as exc:
+        return replace(result, reason="probe_failed", detail=f"{result.detail}; effect_receipt: {exc}")
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+    return result
+
+
+def _replay_absence(
+    root: Path,
+    plan: _AuthorizedDeletePlan,
+    *,
+    task_ref: str | None,
+    lane_id: str,
+) -> BranchDeleteResult | None:
+    """Replay only recorded external/unknown absence under the same durable owner."""
+    try:
+        path = _effect_receipt_path(root, plan)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        if (
+            not isinstance(record, dict)
+            or record.get("schema") != 1
+            or record.get("identity") != _effect_identity(plan)
+        ):
+            raise ValueError("invalid settled identity")
+        result = BranchDeleteResult(**record["result"])
+        if (
+            result.deleted
+            or result.reason != "already_absent"
+            or result.observed_ref is not None
+            or result.effect_provenance != "external_or_unknown_effect"
+            or [result.branch, result.authorized_sha, result.reclaim_ref, result.requested_disposition]
+            != _effect_identity(plan)
+            or not isinstance(result.command_error, str)
+            or not isinstance(result.detail, str)
+        ):
+            raise ValueError("invalid settled absence")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        return _delete_result(plan, deleted=False, reason="probe_failed", detail=f"effect_receipt: {exc}")
+    binding = bind_close_authority(task_ref=task_ref, lane_id=lane_id, branch=plan.short_branch, tip=plan.sha)
+    refusal = binding.refusal or reprove_close_authority(binding)
+    if not refusal and record.get("binding") != _effect_binding(binding):
+        refusal = "row_changed_after_close"
+    if refusal:
+        return _delete_result(plan, deleted=False, reason=refusal, detail=refusal)  # type: ignore[arg-type]
+    current = _resolve_ref(root, plan.branch_ref)
+    if current.probe_failed:
+        return replace(result, reason="probe_failed", detail=f"{result.detail}; ref_probe: {_detail(current.proc)}")
+    if not current.missing:
+        return replace(result, reason="authorized_sha_changed", observed_ref=current.sha)
+    return result
+
+
 def _apply_authorized_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchDeleteResult:
     pinned = _pin_authorized_tip(root, plan)
     if pinned is not None:
@@ -1051,17 +1190,7 @@ def _apply_authorized_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchD
         )
     if deleted.returncode == 0:
         return _delete_result(plan, deleted=True, reason="deleted", lock_recovery=lock_recovery)
-    current = _resolve_ref(root, plan.branch_ref)
-    if current.probe_failed:
-        return _delete_result(
-            plan,
-            deleted=False,
-            reason="probe_failed",
-            detail=_detail(current.proc) or _detail(deleted),
-            lock_recovery=lock_recovery,
-        )
-    reason: DeleteReason = "authorized_sha_changed" if current.sha not in (None, plan.sha) else "delete_failed"
-    return _delete_result(plan, deleted=False, reason=reason, detail=_detail(deleted), lock_recovery=lock_recovery)
+    return _reconcile_failed_delete(root, plan, deleted, lock_recovery)
 
 
 def _apply_force_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchDeleteResult:
@@ -1137,17 +1266,7 @@ def _apply_force_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchDelete
         )
     if deleted.returncode == 0:
         return _delete_result(plan, deleted=True, reason="deleted", lock_recovery=lock_recovery)
-    current = _resolve_ref(root, plan.branch_ref)
-    if current.probe_failed:
-        return _delete_result(
-            plan,
-            deleted=False,
-            reason="probe_failed",
-            detail=_detail(current.proc) or _detail(deleted),
-            lock_recovery=lock_recovery,
-        )
-    reason: DeleteReason = "authorized_sha_changed" if current.sha not in (None, plan.sha) else "delete_failed"
-    return _delete_result(plan, deleted=False, reason=reason, detail=_detail(deleted), lock_recovery=lock_recovery)
+    return _reconcile_failed_delete(root, plan, deleted, lock_recovery)
 
 
 def _pre_mutation_guards(
@@ -1238,13 +1357,13 @@ def _decide_and_act_bound(
     if refusal or result is None:
         reason = refusal or "reclaim_fence_unavailable"
         return _delete_result(plan, deleted=False, reason=reason, detail=reason)  # type: ignore[arg-type]
-    if not release:
-        return result
-    detail = result.detail
-    if release != "released":
-        marker = f"{FENCE_RELEASE_DETAIL}{release}"
-        detail = f"{detail};{marker}" if detail else marker
-    return replace(result, fence_release=release, detail=detail)
+    if release:
+        detail = result.detail
+        if release != "released":
+            marker = f"{FENCE_RELEASE_DETAIL}{release}"
+            detail = f"{detail};{marker}" if detail else marker
+        result = replace(result, fence_release=release, detail=detail)
+    return _record_absence(root, plan, result)
 
 
 def delete_authorized_branch(
@@ -1270,6 +1389,10 @@ def delete_authorized_branch(
     parsed.requested_disposition = requested_disposition
     refused = _pre_mutation_guards(root, parsed)
     if refused is not None:
+        if apply and refused.reason == "branch_missing":
+            settled = _replay_absence(root, parsed, task_ref=task_ref, lane_id=lane_id)
+            if settled is not None:
+                return settled
         return refused
     if not apply:
         observed = _decide(root, parsed, integration_ref)

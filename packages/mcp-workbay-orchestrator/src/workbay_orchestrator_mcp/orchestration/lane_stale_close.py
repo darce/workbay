@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -20,6 +23,7 @@ from workbay_orchestrator_mcp.lanes_support import (
     _workspace_root,
 )
 
+from . import landing_cleanup
 from . import lane_completion as lc
 from . import lane_completion_gate as gate
 from . import lane_completion_receipt as receipts
@@ -194,6 +198,7 @@ def _envelope(
 ) -> dict[str, Any]:
     return {
         "ok": ok,
+        "surface": "orchestrator.close_lane_stale",
         "lane": lane,
         "status": status,
         "error": error,
@@ -306,6 +311,85 @@ def _repair_closed_warning(lane: dict[str, Any], reason: StaleReason) -> dict[st
     return result
 
 
+def _stale_generation_result(
+    lane: dict[str, Any],
+    *,
+    expected_row: Mapping[str, Any],
+    expected_status: str | None,
+    expected_updated_at: str,
+    reason: StaleReason,
+) -> dict[str, Any]:
+    """Retain the first rejected probe in the repository owner's residue store.
+
+    No lane effect is attempted here. The event key binds the probed generation,
+    so retries (even after further drift) read the original failed fence rather
+    than rewriting its evidence. Call only outside the lane write transaction.
+    """
+    root = _workspace_root()
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+
+    resource_id = digest([str(root), lane["task_ref"], lane["lane_id"], expected_row.get("id")])
+    generation = digest({"row": dict(expected_row), "status": expected_status, "updated_at": expected_updated_at})
+    event_id = digest([resource_id, generation, "stale_close"])
+    directory = landing_cleanup._cleanup_dir(root) / "residue"
+    directory.mkdir(exist_ok=True)
+    path = directory / f"{event_id}.json"
+    lock = landing_cleanup._locked(path)
+    try:
+        if path.exists():
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                record.get("event_id") != event_id
+                or record.get("resource_id") != resource_id
+                or record.get("generation") != generation
+                or record.get("state") != "refused"
+                or record.get("reason") != "stale_generation"
+            ):
+                raise ValueError("Stale-close residue identity mismatch")
+        else:
+            record = {
+                "schema": "workbay/residue@1",
+                "resource_id": resource_id,
+                "generation": generation,
+                "kind": "lane",
+                "task_ref": lane["task_ref"],
+                "lane_id": lane["lane_id"],
+                "state": "refused",
+                "reason": "stale_generation",
+                "event_id": event_id,
+                "effect_id": event_id,
+                "effect_status": "not_attempted",
+                "last_error": "Lane status or updated_at changed before stale close CAS",
+                "expected_status": expected_status,
+                "expected_updated_at": expected_updated_at,
+                "expected_row": dict(expected_row),
+                "observed_row": lane,
+                "event_sequence": [{"event_id": event_id, "state": "refused", "reason": "stale_generation"}],
+            }
+            landing_cleanup._atomic_write(path, record)
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
+    return {
+        **_envelope(
+            ok=False,
+            lane=lane,
+            status=lane["status"],
+            error=record["last_error"],
+            error_kind="lane_stale_close_conflict",
+            stale_reason=reason,
+        ),
+        "cause": "stale_generation",
+        "residue": record,
+    }
+
+
 def close_lane_stale(
     *,
     task_ref: str,
@@ -333,6 +417,19 @@ def close_lane_stale(
             error=f"Invalid stale reason {reason!r}. Valid: {valid}",
             error_kind="stale_reason_invalid",
         )
+
+    if expected_status is not None and (
+        not isinstance(expected_status, str) or expected_status.strip().lower() not in _KNOWN_LANE_STATUSES
+    ):
+        return {
+            **_envelope(
+                ok=False,
+                error="Invalid expected lane status",
+                error_kind="lane_status_invalid",
+                stale_reason=reason,
+            ),
+            "allowed": sorted(_KNOWN_LANE_STATUSES),
+        }
 
     normalized_task_ref = task_ref.strip() if isinstance(task_ref, str) else ""
     normalized_lane_id = lane_id.strip() if isinstance(lane_id, str) else ""
@@ -382,13 +479,12 @@ def close_lane_stale(
             or lane["updated_at"] != expected_updated_at
             or lane["status"] != expected
         ):
-            return _envelope(
-                ok=False,
-                lane=lane,
-                status=lane["status"],
-                error="Lane status or updated_at changed before stale close CAS",
-                error_kind="lane_stale_close_conflict",
-                stale_reason=reason,
+            return _stale_generation_result(
+                lane,
+                expected_row=expected_row,
+                expected_status=expected_status,
+                expected_updated_at=expected_updated_at,
+                reason=reason,
             )
         terminal = _terminal_lane_result(lane, reason)
         if terminal is not None:
@@ -478,6 +574,14 @@ def close_lane_stale(
                 error=str(outcome.refusal) if outcome.refusal else "Completion operation held; re-probe lane",
                 error_kind=error_kind or "completion_authority_stale",
                 stale_reason=reason,
+            )
+        if close_result.get("error_kind") == "lane_stale_close_conflict" and close_result.get("lane") is not None:
+            close_result = _stale_generation_result(
+                close_result["lane"],
+                expected_row=expected_row,
+                expected_status=expected_status,
+                expected_updated_at=expected_updated_at,
+                reason=reason,
             )
         return _completion_fields(
             close_result,

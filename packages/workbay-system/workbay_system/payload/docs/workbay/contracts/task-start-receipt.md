@@ -1,4 +1,4 @@
-# `task-start` receipt contract (spool drain)
+# `task-start` receipt contract
 
 Additive JSON keys on the success-path `task-start` receipt. Early
 `ok:false` exits never reach this block and omit `spool_drain`.
@@ -9,6 +9,43 @@ Fixture exemplars:
   `packages/workbay-system/tests/lifecycle/fixtures/receipts/task_start_spool_drain.json`.
 - Unreadable counters cell (both type-strict flags true; no null-only never-read):
   `packages/workbay-system/tests/lifecycle/fixtures/receipts/task_start_spool_drain_unreadable.json`.
+
+## Plan-backed start
+
+Once the selected plan is present in the started worktree, the receipt adds
+`plan_graph` and `plan_cursor_disposition`. Planless objective starts omit both.
+Existing task/branch and receipt fields remain present on graph failure.
+
+`plan_graph` contains `outcome`, `manifest_path` (absolute), and
+`decomposition_digest` (SHA-256 of the exact first decomposition JSON fence
+interior, including CRLF and trailing whitespace; null when unavailable).
+
+| Outcome | Reason | Exit / `ok` | Meaning |
+| --- | --- | --- | --- |
+| `generated` | — | 0 / true | Manifest was atomically published under its writer lock. |
+| `skipped` | `no_decomposition` | 0 / true | No decomposition heading; no manifest generated. |
+| `matched` | — | 0 / true | Existing manifest digest matches current plan bytes. |
+| `drifted` | — | 0 / true | Existing manifest digest differs; manifest bytes preserved. |
+| `untracked` | — | 0 / true | Existing manifest lacks source provenance; bytes preserved. |
+| `failed` | `invalid_decomposition` | 5 / false | JSON, decomposition schema or dependencies refused; no manifest generated. |
+| `failed` | `manifest_publication_failed` | 5 / false | Writer lock or atomic publication failed; no manifest generated. |
+| `unknown` | `plan_graph_unavailable` | unchanged | Optional adapter missing, timed out after 30 seconds, or emitted an unusable receipt; bounded `detail` explains the failure. |
+
+Successful graph outcomes preserve other task-start provisioning failures.
+Existing manifests are compared without regeneration. `plan_source.path` must
+match `task_plan_path`; generated live and compacted lanes retain unique
+`plan_item_id` values. `lane_dag` recomputes source status at read time and reports
+`plan edited since manifest` only on drift.
+
+`plan_cursor_disposition` is the task-scoped dry-run terminal-cursor envelope
+(`ok`, with `would_expire`, `expired`, `raced`, `failed` row lists under `data`).
+Only dispatched cursors on same-task lanes whose status is merged or closed
+qualify, irrespective of age. A failure or empty collaborator result is reported
+inside this object and never changes task-start's exit status or `ok`.
+Apply is explicit through
+`python -m workbay_orchestrator_mcp.orchestration.plan_graph --root R --task T --dispose-terminal-cursors --apply`.
+Generated manifests require `[plan-dispatch]` on a checklist row before the daemon
+considers it for dispatch; review checkboxes have no such designation.
 
 ## `spool_drain` object
 

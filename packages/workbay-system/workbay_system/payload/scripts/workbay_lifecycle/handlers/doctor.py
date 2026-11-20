@@ -255,15 +255,30 @@ def _probe_mcp(repo: Path) -> tuple[DoctorMcp, list[ReceiptWarning]]:
     warnings: list[ReceiptWarning] = []
     latencies: dict[str, float] = {}
 
-    mcp_status, handoff_warning = _probe_with_retry(
-        repo,
-        binary=_common.mcp_handoff_bin(),
-        runner=_common.run_handoff_json,
-        argv=["state", "--sections", "identity", "--detail", "summary"],
-        field="mcp.handoff",
-        latency_key="handoff",
-        latencies=latencies,
-    )
+    try:
+        handoff_binary = _common.mcp_handoff_bin()
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        mcp_status = "unreachable"
+        handoff_warning = ReceiptWarning(
+            field="mcp.handoff",
+            reason=f"unavailable: {exc}",
+            exception_type=type(exc).__name__,
+        )
+        latencies["handoff"] = 0.0
+    else:
+        mcp_status, handoff_warning = _probe_with_retry(
+            repo,
+            binary=handoff_binary,
+            runner=_common.run_handoff_json,
+            argv=["state", "--sections", "identity", "--detail", "summary"],
+            field="mcp.handoff",
+            latency_key="handoff",
+            latencies=latencies,
+        )
     if handoff_warning is not None:
         warnings.append(handoff_warning)
 
@@ -1350,12 +1365,27 @@ def _probe_venv(repo: Path) -> tuple[DoctorVenv, list[ReceiptWarning]]:
         except (OSError, ValueError):
             outside = None
 
-    handoff_bin = _common.mcp_handoff_bin(repo)
-    handoff_path = Path(handoff_bin)
-    if handoff_path.is_file():
-        resolved_handoff = str(handoff_path.resolve())
+    try:
+        handoff_bin = _common.mcp_handoff_bin(repo)
+    except ValueError as exc:
+        if getattr(exc, "code", None) not in (
+            "native_runtime_unqualified", "native_runtime_unverified"
+        ):
+            raise
+        resolved_handoff = None
+        venv_warnings.append(
+            ReceiptWarning(
+                field="venv.handoff",
+                reason=f"unavailable: {exc}",
+                exception_type=type(exc).__name__,
+            )
+        )
     else:
-        resolved_handoff = shutil.which(handoff_bin)
+        handoff_path = Path(handoff_bin)
+        if handoff_path.is_file():
+            resolved_handoff = str(handoff_path.resolve())
+        else:
+            resolved_handoff = shutil.which(handoff_bin)
 
     handoff_outside: bool | None
     if resolved_handoff is None:

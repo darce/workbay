@@ -114,6 +114,14 @@ def _lifecycle_paths(paths: list[str]) -> tuple[str | None, str | None]:
     return " ".join(f'"{path}"' if " " in path or path.startswith("-") else path for path in paths), None
 
 
+# The release build rewrites MAINT- followed by uppercase/digit segments as an
+# internal reference; a lowercase slug keeps the example runnable in wheels.
+MAINTENANCE_TASK_EXAMPLE = "MAINT-workbay-install"
+MAINTENANCE_START_EXAMPLE = (
+    f"make maint-start TASK={MAINTENANCE_TASK_EXAMPLE} OBJECTIVE='Record the WorkBay installation'"
+)
+
+
 @dataclass
 class TrackedChangeReport:
     status: str
@@ -166,9 +174,9 @@ class TrackedChangeReport:
             recipe = {
                 "kind": "lifecycle",
                 "commands": [
-                    'make maint-start TASK=<ref> OBJECTIVE="..."',
-                    f'make slice-commit TASK=<ref> MSG="..." PATHS={shlex.quote(lifecycle_paths)}',
-                    "make plan-done TASK=<ref>",
+                    MAINTENANCE_START_EXAMPLE,
+                    f'make slice-commit TASK={MAINTENANCE_TASK_EXAMPLE} MSG="..." PATHS={shlex.quote(lifecycle_paths)}',
+                    f"make plan-done TASK={MAINTENANCE_TASK_EXAMPLE}",
                 ],
             }
         else:
