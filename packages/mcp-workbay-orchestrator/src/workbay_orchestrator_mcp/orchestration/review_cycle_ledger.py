@@ -780,13 +780,16 @@ class ReviewCycleLedger:
             return None
 
     def reserve(
-        self, dispatch_id: str, subject_branch: str, kind: str, *, canon_proposal_path: Path | None = None
+        self, dispatch_id: str, subject_branch: str, kind: str, *, canon_proposal_path: Path | None = None,
+        _verify_close: Callable[[dict], None] | None = None,
     ) -> LedgerDecision:
         """Reserve before spawn, checking the allowance and repeated gate state."""
         if not dispatch_id or not subject_branch or kind not in KINDS:
             return LedgerDecision("ledger_hold", "invalid_identity")
 
         def operation(data):
+            if _verify_close is not None:
+                _verify_close(data)
             old = data["rows"].get(dispatch_id)
             if old is not None:
                 if (old["subject_branch"], old["kind"]) != (subject_branch, kind):

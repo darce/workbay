@@ -338,6 +338,7 @@ def evaluate_payload(
     payload: dict[str, Any],
     *,
     workspace_root: Path | None = None,
+    edit_deadline: float | None = None,
     active_task: ActiveTaskContext
     | tuple[str | None, str | None]
     | tuple[str | None, str | None, str | None]
@@ -394,7 +395,10 @@ def evaluate_payload(
             )
     else:
         try:
-            context = _load_active_task(root)
+            if edit_deadline is None:
+                context = _load_active_task(root)
+            else:
+                context = _load_active_task(root, edit_deadline=edit_deadline)
         except ValueError as exc:
             return DriftDecision(
                 outcome="block",
@@ -591,7 +595,7 @@ def _build_block_reason(decision: DriftDecision) -> str:
     )
 
 
-def main() -> int:
+def main(edit_deadline: float = 1.0) -> int:
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -606,7 +610,7 @@ def main() -> int:
     except ImportError:
         pass
 
-    decision = evaluate_payload(payload)
+    decision = evaluate_payload(payload, edit_deadline=edit_deadline)
     if decision is None:
         return 0
     if decision.outcome != "silent":
@@ -630,4 +634,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(*(float(arg) for arg in sys.argv[1:])))

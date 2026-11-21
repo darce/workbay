@@ -30,6 +30,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from workbay_orchestrator_mcp.lanes_support import TERMINAL_LANE_STATUSES
+from workbay_orchestrator_mcp.orchestration.remote_job_ledger import (
+    REMOTE_JOB_LOSS_STATES,
+    REMOTE_JOB_TERMINAL_STATES,
+    UNIT_DEAD_NO_RECEIPT,
+    remote_status_state,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -4470,7 +4476,6 @@ def _worker_admission_phase(ctx: OrchestratorContext) -> None:
 _REMOTE_COMPLETE_PER_TICK_DEFAULT = 2
 _REMOTE_HEARTBEAT_STALE_S = 300
 _REMOTE_STATUS_TIMEOUT_S = 30.0
-_REMOTE_TERMINAL_STATES = frozenset({"done", "lost"})
 
 
 def _remote_complete_per_tick() -> int:
@@ -4566,7 +4571,7 @@ def _wake_backlog(ledger: Any) -> bool:
 
 
 def _observer_error_skips_row(ctx: OrchestratorContext, row: Any) -> bool:
-    """Warn once for observer_error. Skip only a non-terminal row (OBS-08)."""
+    """Warn once for observer_error and require confirmation of unit absence."""
     observer_error = row.extras.get("observer_error")
     if observer_error is None:
         return False
@@ -4577,7 +4582,7 @@ def _observer_error_skips_row(ctx: OrchestratorContext, row: Any) -> bool:
         job_id=row.job_id,
         observer_error=observer_error,
     )
-    return row.state not in _REMOTE_TERMINAL_STATES
+    return row.state != "done"
 
 
 def _warn_queue_stale(ctx: OrchestratorContext, row: Any) -> None:
@@ -4609,7 +4614,7 @@ def _enqueue_one_terminal_wake(
 ) -> bool:
     from workbay_orchestrator_mcp.orchestration.lane_lifecycle_contracts import WakeEvent  # noqa: PLC0415
 
-    if row.state not in _REMOTE_TERMINAL_STATES or row.job_id not in pass_by_job or row.job_id in pending:
+    if row.state not in REMOTE_JOB_TERMINAL_STATES or row.job_id not in pass_by_job or row.job_id in pending:
         return False
     if row.state == "done" and (isinstance(row.rc, bool) or not isinstance(row.rc, int)):
         ctx.log("ERROR", "remote_job_status_missing_rc", job_id=row.job_id, error_type="ValueError")
@@ -4619,7 +4624,7 @@ def _enqueue_one_terminal_wake(
         WakeEvent(
             job_id=row.job_id,
             pass_id=pass_by_job[row.job_id],
-            kind=row.state,
+            kind=remote_status_state(row.state, row.extras.get("loss_cause")),
             rc=rc,
             observed_at=row.observed_at,
         )
@@ -4641,8 +4646,6 @@ def _enqueue_terminal_jobs(
     rows: list[Any],
     pending: set[str],
 ) -> int:
-    # Terminal done/lost still enqueues. observer_error only skips a
-    # non-terminal row; dropping a finished job stalls the pass (OBS-08).
     enqueued = 0
     seen: set[str] = set()
     for row in rows:
@@ -4671,13 +4674,14 @@ def _complete_remote_wake(ctx: OrchestratorContext, event: Any) -> None:
     if stage == "dead_letter":
         return
     if stage not in {"done", "completed"}:
-        rc = event.rc
+        rc = 1 if event.kind == UNIT_DEAD_NO_RECEIPT else event.rc
+        lost = event.kind in REMOTE_JOB_LOSS_STATES
         if isinstance(rc, bool) or not isinstance(rc, int):
-            if event.kind == "lost":
+            if lost:
                 rc = 1
             else:
                 raise RuntimeError(f"remote_job_missing_rc job_id={event.job_id}")
-        ledger.mark_done(event.job_id, rc, lost=event.kind == "lost")
+        ledger.mark_done(event.job_id, rc, lost=event.kind if lost else False)
     result = offload_pass.complete_remote_pass(
         event.job_id,
         state_dir=ctx.state_dir,

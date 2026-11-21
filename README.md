@@ -428,6 +428,7 @@ from this monorepo; building straight from source is for development.
 | `workbay-bootstrap` | Consumer install/update/doctor CLI |
 | `workbay-system` | Shared skills, hooks, generators |
 | `workbay-codex-bridge` | Codex subagent backend for the orchestrator |
+| Canvas | Studio/Canvas MCP server and local review UI |
 | `workbay` | Front door: one-command install and runtime version anchor |
 
 ```text

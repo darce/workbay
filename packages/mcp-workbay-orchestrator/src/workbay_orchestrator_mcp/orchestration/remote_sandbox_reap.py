@@ -49,6 +49,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -120,7 +122,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _LISTING_RE = re.compile(
     r"^SANDBOX (?P<key>.+?) tip=(?P<tip>\S+) occupant=(?P<occupant>live|idle) "
     r"lock=(?P<lock>held|free)(?: tree=(?P<tree>\S+))?"
-    r"(?: idle=(?P<idle>[0-9]+))?(?: bytes=(?P<bytes>[0-9]+))?$"
+    r"(?: idle=(?P<idle>[0-9]+))?(?: bytes=(?P<bytes>[0-9]+))?(?P<rescue> rescue=present)?$"
 )
 _REAP_LINE_RE = re.compile(
     r"^(?P<status>RELEASE_READY|REAPED|SKIPPED_LIVE|SKIPPED_LOCK|SKIPPED_GONE_FAILED|SKIPPED_UNMARKED|SKIPPED_CHANGED) (?P<key>\S+)(?: (?P<detail>[A-Za-z0-9_.:-]+))?$"
@@ -180,6 +182,7 @@ class _RowlessProof:
     artifacts: str = ""
     translated_source_commit: str = ""
     delta: str = ""
+    rescue: str = ""
 
 
 @dataclass(frozen=True)
@@ -312,6 +315,7 @@ class _ListedSandbox:
     lock_held: bool
     idle_seconds: int
     bytes_used: int | None
+    rescue_present: bool = False
 
 
 class _RemoteSandboxListing(list[_ListedSandbox | _ListedEvidence]):
@@ -1452,6 +1456,31 @@ def _classify(
             tip_sha=item.tip_sha,
             reason="excluded invoking-pass identity",
         )
+    if item.rescue_present:
+        row = mapped if isinstance(mapped, _MappedRow) else None
+        eligible = row is not None and (row.status or "").strip().lower() in TERMINAL_ROW_STATUSES
+        if not eligible:
+            eligible = (
+                mapped is None and item.idle_seconds >= idle_seconds
+                and (rowless_branch is not None if not retired_branches
+                     else retired_pin is not None and retired_pin.commit_sha is not None)
+            )
+        raw, error = _run_ssh(
+            ssh_runner, _build_rowless_probe_script(sandbox_root, item.key, rescue_only=True)
+        )
+        if raw.strip() != "ORDINARY" or error is not None:
+            _, proof, clean, parse_error = _parse_rowless_probe(raw)
+            branch = row.branch if row else rowless_branch or (retired_pin.branch if retired_pin else None)
+            if (
+                eligible and error is None and parse_error is None and clean and proof is not None and proof.rescue
+                and proof.key == item.key
+            ):
+                if rowless_proofs is not None:
+                    rowless_proofs[item.key] = proof
+                return SandboxVerdict(item.key, row.lane_id if row else None, branch, KIND_SANDBOX_HARVESTED,
+                                      proof.tip, "rescue_verified")
+            return SandboxVerdict(item.key, row.lane_id if row else None, branch, KIND_SANDBOX_UNHARVESTED,
+                                  item.tip_sha, "rescue_pending")
     if isinstance(mapped, _AmbiguousRows):
         alias = _terminal_alias_product(mapped.rows, item, repo, target_tip_sha)
         if alias is not None:
@@ -1855,6 +1884,8 @@ def _parse_rowless_probe(raw: str) -> tuple[TreeEntries | None, _RowlessProof | 
         artifacts=lines[5].split()[1],
     )
     tree_start = 6
+    if len(lines) == 7 and re.fullmatch(r"RESCUE [0-9a-f]{64}", lines[6]):
+        return {}, replace(proof, rescue=lines[6].split()[1]), True, None
     if len(lines) > 6 and lines[6].startswith("SOURCE_COMMIT "):
         if not re.fullmatch(r"SOURCE_COMMIT [0-9a-f]{40}", lines[6]):
             return None, None, False, "malformed synthetic source translation"
@@ -2276,6 +2307,7 @@ def _list_remote_sandboxes(
                 lock_held=match.group("lock") == "held",
                 idle_seconds=int(match.group("idle") or 0),
                 bytes_used=int(match.group("bytes")) if match.group("bytes") is not None else None,
+                rescue_present=match.group("rescue") is not None,
             )
         )
     return listed, None
@@ -3477,6 +3509,44 @@ fi
 """
 
 
+@lru_cache(maxsize=1)
+def _rescue_custody_source() -> str:
+    # Use the same verifier as the VM's final revalidator, shipped by the
+    # workbay-system dependency. An unreadable payload holds lanes with evidence.
+    try:
+        payload = (resources.files("workbay_system") / "payload/scripts/vm/workbay_vm_reclaim.py").read_text()
+        return payload.split("# BEGIN SANDBOX_RESCUE_CUSTODY\n", 1)[1].split("# END SANDBOX_RESCUE_CUSTODY", 1)[0]
+    except (OSError, ImportError, IndexError):
+        return ""
+
+
+def _rescue_custody_probe() -> str:
+    return r"""
+_rescue_custody() {
+  _rescue_present || return 0
+  _remaining=$(_guard_remaining) || return 1
+  timeout --foreground --signal=KILL "$_remaining" python3 - "$ROOT" "$_sk" "$_guard_deadline" <<'WORKBAY_RESCUE_PROOF'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import time
+
+""" + _rescue_custody_source() + r"""
+try:
+    proof = rescue_custody(Path(sys.argv[1]), sys.argv[2], float(sys.argv[3]))
+    if proof is not None:
+        print(proof["digest"], proof["head"], proof["tree"])
+except (NameError, OSError, KeyError, TypeError, ValueError):
+    sys.exit(1)
+WORKBAY_RESCUE_PROOF
+}
+"""
+
+
 def _remote_helpers(root: str, *, operation_timeout: float | None = None, mapped_proof: bool = False) -> str:
     """Shared remote shell helpers.
 
@@ -3960,6 +4030,25 @@ def release_remote_lane_lease(
     }
 
 
+_RESCUE_PRESENCE_SH = r"""
+_rescue_present() {
+  local _rescue_path _jobs="$ROOT/.jobs"
+  for _rescue_path in "$ROOT/.workbay-rescue-binding-$_sk" "$ROOT/.workbay-rescue-custody-$_sk.json"; do
+    [ ! -e "$_rescue_path" ] && [ ! -L "$_rescue_path" ] || return 0
+  done
+  # An empty job spool has no custody evidence. Let the verifier inspect
+  # nonempty or suspect spools, including symlinks and unreadable directories.
+  [ ! -L "$_jobs" ] || return 0
+  [ -e "$_jobs" ] || return 1
+  [ -d "$_jobs" ] && [ -r "$_jobs" ] && [ -x "$_jobs" ] || return 0
+  for _rescue_path in "$_jobs"/* "$_jobs"/.[!.]* "$_jobs"/..?*; do
+    [ ! -e "$_rescue_path" ] && [ ! -L "$_rescue_path" ] || return 0
+  done
+  return 1
+}
+"""
+
+
 def _build_list_script(
     root: str,
     *,
@@ -3989,6 +4078,7 @@ done
         return f"""{_HEADER_LIST}
 set -eu
 {helpers}
+{_RESCUE_PRESENCE_SH}
 _process_snapshot=$(mktemp /tmp/workbay-process-cwds.XXXXXX)
 trap 'rm -f "$_process_snapshot"' EXIT
 for _cwd in /proc/[0-9]*/cwd; do
@@ -4022,8 +4112,10 @@ for _sd in {directories}; do
   _now=$(date +%s)
   _idle=$((_now - _marker_mtime))
   [ "$_idle" -ge 0 ] || _idle=0
-  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s\\n' \\
-    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle"
+  _rescue_field=
+  if _rescue_present; then _rescue_field=' rescue=present'; fi
+  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s%s\\n' \\
+    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle" "$_rescue_field"
 done
 """
     directory_loop = (
@@ -4034,6 +4126,7 @@ done
     return f"""{_HEADER_LIST}
 set -eu
 {helpers}
+{_RESCUE_PRESENCE_SH}
 _evidence_candidates=$(mktemp "${{TMPDIR:-/tmp}}/workbay-evidence-candidates.XXXXXX")
 _evidence_sorted="$_evidence_candidates.sorted"
 _process_snapshot=$(mktemp /tmp/workbay-process-cwds.XXXXXX)
@@ -4084,8 +4177,10 @@ for _sd in {directory_loop}; do
   _now=$(date +%s)
   _idle=$((_now - _marker_mtime))
   [ "$_idle" -ge 0 ] || _idle=0
-  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s\\n' \\
-    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle"
+  _rescue_field=
+  if _rescue_present; then _rescue_field=' rescue=present'; fi
+  printf 'SANDBOX %s tip=%s occupant=%s lock=%s tree=%s idle=%s%s\\n' \\
+    "$_sk" "$_tip" "$_occupant" "$_lock" "$_tree" "$_idle" "$_rescue_field"
 done
 _evidence_count=$(awk 'END {{print NR + 0}}' "$_evidence_candidates")
 if [ "$_evidence_count" -gt 0 ]; then
@@ -4164,13 +4259,28 @@ fi
 """
 
 
-def _build_rowless_probe_script(root: str, key: str, *, host_tip: str = "", mapped_product: bool = False) -> str:
+def _build_rowless_probe_script(
+    root: str, key: str, *, host_tip: str = "", mapped_product: bool = False, rescue_only: bool = False
+) -> str:
     if not _LANE_KEY_RE.fullmatch(key):
         raise ValueError("unsafe sandbox proof key")
     quoted_key = _sh_single_quote(key)
+    rescue_probe = r"""
+_rescue=$(_rescue_custody) || { echo 'DIRTY rescue_pending'; exit 0; }
+if [ -z "$_rescue" ]; then
+  echo ORDINARY
+  exit 0
+fi
+read -r _digest _tip _tree <<< "$_rescue"
+printf 'CLEAN\nTREE %s\nGENERATION %s\nKEY %s\nHEAD %s\nARTIFACTS %s\nRESCUE %s\n' \
+  "$_tree" "$_generation" "$_sk" "$_tip" "$_digest" "$_digest"
+exit 0
+""" if rescue_only else ""
     payload = f"""{_HEADER_PROBE_PREFIX}{key}
 set -eu
 {_remote_helpers(root, mapped_proof=True)}
+{_RESCUE_PRESENCE_SH if rescue_only else ""}
+{_rescue_custody_probe() if rescue_only else ""}
 _sk={quoted_key}
 _proof_domain={"mapped" if mapped_product else "rowless"}
 _sd="$ROOT/$_sk"
@@ -4182,6 +4292,7 @@ if [ ! -f "$_sd/.workbay-lane-sandbox" ] || [ -L "$_sd/.workbay-lane-sandbox" ] 
   exit 0
 fi
 _generation=$(_sandbox_generation "$_sd") || {{ echo PROBE_FAILED; exit 0; }}
+{rescue_probe}
 _rowless_worktree_safe "$_sd" || {{ echo "PROBE_FAILED $_worktree_reason"; exit 0; }}
 _rowless_index_safe "$_sd" || {{ echo "DIRTY index_flags"; exit 0; }}
 _content_reason=$(_rowless_content_safe "$_sd" {_sh_single_quote(host_tip)}) || {{
@@ -4235,7 +4346,14 @@ def _locked_reap_custody_checks(idle_seconds: int, *, exclusion_receipt: bool = 
       echo "SKIPPED_CHANGED $_sk missing_source_proof:_proven_key"
       exit 0
     fi
-    if [ -n "$_proven_tree" ]; then
+    _rescue=$(_rescue_custody) || {{ echo "SKIPPED_CHANGED $_sk rescue_pending"; exit 0; }}
+    if [ -n "$_rescue" ] || [ -n "${{_proven_rescue:-}}" ]; then
+      [ "$_rescue" = "${{_proven_rescue:-}} $_proven_tip $_proven_tree" ] || {{
+        echo "SKIPPED_CHANGED $_sk rescue_changed"; exit 0;
+      }}
+      _generation=$(_sandbox_generation "$_sd") || {{ echo "SKIPPED_CHANGED $_sk"; exit 0; }}
+      [ "$_generation" = "$_proven_generation" ] || {{ echo "SKIPPED_CHANGED $_sk rescue_changed"; exit 0; }}
+    elif [ -n "$_proven_tree" ]; then
       # Retain the dispatch lock across proof revalidation and release readiness.
       _rowless_worktree_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk $_worktree_reason"; exit 0; }}
       _rowless_index_safe "$_sd" || {{ echo "SKIPPED_CHANGED $_sk index_flags"; exit 0; }}
@@ -4281,11 +4399,16 @@ def _locked_reap_custody_checks(idle_seconds: int, *, exclusion_receipt: bool = 
     if _lane_occupant_live "$_sk"; then
       echo "SKIPPED_LIVE $_sk held_live_lease"; exit 0
     fi
-    _fresh=$(_artifact_identity inventory) || {{ echo "SKIPPED_CHANGED $_sk artifact_inventory"; exit 0; }}
-    [ "$_fresh" = "$_proven_artifacts" ] || {{ echo "SKIPPED_CHANGED $_sk artifact_changed"; exit 0; }}
-    if [ -n "$_proven_delta" ]; then
-      _fresh_delta=$(_mapped_delta_safe "$_sd") || {{ echo "SKIPPED_CHANGED $_sk ${{_fresh_delta:-delta_unknown}}"; exit 0; }}
-      [ "$_fresh_delta" = "$_proven_delta" ] || {{ echo "SKIPPED_CHANGED $_sk delta_changed"; exit 0; }}
+    if [ -n "${{_proven_rescue:-}}" ]; then
+      _fresh_rescue=$(_rescue_custody) || {{ echo "SKIPPED_CHANGED $_sk rescue_pending"; exit 0; }}
+      [ "$_fresh_rescue" = "$_rescue" ] || {{ echo "SKIPPED_CHANGED $_sk rescue_changed"; exit 0; }}
+    else
+      _fresh=$(_artifact_identity inventory) || {{ echo "SKIPPED_CHANGED $_sk artifact_inventory"; exit 0; }}
+      [ "$_fresh" = "$_proven_artifacts" ] || {{ echo "SKIPPED_CHANGED $_sk artifact_changed"; exit 0; }}
+      if [ -n "$_proven_delta" ]; then
+        _fresh_delta=$(_mapped_delta_safe "$_sd") || {{ echo "SKIPPED_CHANGED $_sk ${{_fresh_delta:-delta_unknown}}"; exit 0; }}
+        [ "$_fresh_delta" = "$_proven_delta" ] || {{ echo "SKIPPED_CHANGED $_sk delta_changed"; exit 0; }}
+      fi
     fi
     # Reclaim owns the closed-domain incoming-source dependency census.
     # All checks provable here passed; readiness never authorizes a delete.
@@ -4319,12 +4442,15 @@ def _build_reap_script(
             proof.tip if proof else "",
             proof.artifacts if proof else "",
             proof.delta if proof else "",
+            proof.rescue if proof else "",
         ]
         calls_list.append("_reap_one " + " ".join(_sh_single_quote(arg) for arg in args))
     calls = "\n".join(calls_list)
     payload = f"""{header}
 set -eu
 {helpers}
+{_RESCUE_PRESENCE_SH}
+{_rescue_custody_probe()}
 [ ! -L "$ROOT/.reap.lock" ] && {{ [ ! -e "$ROOT/.reap.lock" ] || [ -f "$ROOT/.reap.lock" ]; }} || {{ echo LOCK_HELD; exit 0; }}
 exec 8>>"$ROOT/.reap.lock" || {{ echo LOCK_HELD; exit 0; }}
 if ! flock -n 8; then
@@ -4341,6 +4467,7 @@ _reap_one() {{
   _proven_tip="$7"
   _proven_artifacts="$8"
   _proven_delta="$9"
+  _proven_rescue="${{10}}"
   _sd="$ROOT/$_sk"
   _llf="$ROOT/.lane-lock-$_sk"
   [ ! -L "$_llf" ] && {{ [ ! -e "$_llf" ] || [ -f "$_llf" ]; }} || {{ echo "SKIPPED_LOCK $_sk held_lock"; return; }}

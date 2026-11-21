@@ -1270,6 +1270,239 @@ def lane_hold(summary, key, kind, reason, **detail):
     })
 
 
+# BEGIN SANDBOX_RESCUE_CUSTODY
+# Shipped verbatim to the host's remote proof probe and the rescue transport.
+# This check runs under the dispatch lock. Atime is excluded because observation
+# itself can change it. Ctime plus inode, size and mode exposes any later write
+# or metadata change, including an index or ref replacement.
+def rescue_fingerprint(directory, deadline=None):
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(directory, flags)
+    try:
+        def record(name, info):
+            digest.update(os.fsencode(name))
+            digest.update(b"\0")
+            digest.update(repr((info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                info.st_mtime_ns, info.st_ctime_ns)).encode() + b"\0")
+
+        for relative, dirs, files, child in os.fwalk(".", dir_fd=fd, onerror=_rescue_walk_error):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("rescue verification deadline")
+            dirs.sort()
+            for name in sorted(dirs + files):
+                record(os.path.join(relative, name), os.stat(name, dir_fd=child, follow_symlinks=False))
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def _rescue_walk_error(error):
+    raise error
+
+
+def _rescue_regular(path, limit, *, digest=False, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("invalid rescue file")
+        data = stream.read(limit + 1)
+        if len(data) != info.st_size or os.fstat(stream.fileno()).st_ctime_ns != info.st_ctime_ns:
+            raise ValueError("rescue file changed")
+    return hashlib.sha256(data).hexdigest() if digest else data
+
+
+# Minted by snapshot() after the bounded stash walk, inside the archive's
+# receipt and the fingerprinted capture confirmed by its host.
+_RESCUE_SCOPE = "named-stash-stack-v1"
+
+
+def _rescue_stash_covered(directory, receipt):
+    if "capture_scope" in receipt:
+        return receipt["capture_scope"] == _RESCUE_SCOPE
+    # Earlier captures measured ref tips only. They remain usable where
+    # there is no named stack. Inspect literal paths without running Git.
+    import contextlib
+    import io
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as stack:
+        def open_dir(path, parent=None):
+            fd = os.open(path, flags, dir_fd=parent)
+            stack.callback(os.close, fd)
+            return fd
+
+        git = open_dir(".git", open_dir(directory))
+        for parents in (("refs",), ("logs", "refs")):
+            fd = git
+            try:
+                for part in parents:
+                    fd = open_dir(part, fd)
+                os.stat("stash", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return False
+        try:
+            packed = _rescue_regular("packed-refs", 16 * 1024 * 1024, dir_fd=git)
+        except FileNotFoundError:
+            return True
+        for line in io.BytesIO(packed):
+            if line.startswith((b"#", b"^")):
+                continue
+            match = re.fullmatch(rb"[0-9a-f]{40} (refs/[^\x00\s]+)\n?", line)
+            if match is None or match[1] == b"refs/stash":
+                return False
+        return True
+
+
+def _rescue_artifact(work, receipt):
+    stem = receipt["job_id"]
+    if "supersedes_capture" in receipt:
+        previous = receipt["supersedes_capture"]
+        if receipt.get("capture_scope") != _RESCUE_SCOPE or not re.fullmatch(r"[0-9a-f]{64}", previous):
+            raise ValueError("invalid replacement capture")
+        stem += "." + previous
+    return work / (stem + ".tar")
+
+
+def _rescue_ordinary_exit(job):
+    try:
+        done = json.loads(_rescue_regular(job / "done.json", 8192))
+    except FileNotFoundError:
+        return False
+    return (isinstance(done, dict) and done.get("job_id") == job.name and type(done.get("rc")) is int
+            and "reason" in done and done["reason"] is None)
+
+
+def _rescue_unbound_job_required(root, key, job):
+    if _rescue_ordinary_exit(job):
+        return False
+    # A retired capture and a new synchronous sandbox can coexist until
+    # the native retention sweep visits the old job.
+    saved = root / ".workbay-rescue" / (job.name + ".json")
+    try:
+        capture = json.loads(_rescue_regular(saved, 4096))
+    except FileNotFoundError:
+        return True
+    if not isinstance(capture, dict) or capture.get("job_id") != job.name or capture.get("lane_key") != key:
+        raise ValueError("rescue generation unavailable")
+    return _rescue_generation_matches(root / key, capture)
+
+
+def _rescue_check_unbound(root, key, deadline, starting_job):
+    """Pre-binding jobs still own their source through their native unit identity."""
+    jobs = root / ".jobs"
+    if not os.path.lexists(jobs):
+        return
+    if jobs.is_symlink():
+        raise ValueError("invalid rescue job directory")
+    for job in jobs.iterdir():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("rescue verification deadline")
+        if not re.fullmatch(r"j[0-9a-f]{20}", job.name) or job == starting_job:
+            continue
+        if job.is_symlink():
+            raise ValueError("invalid rescue job directory")
+        if not os.path.lexists(job / "started"):
+            continue
+        state = json.loads(_rescue_regular(job / "state.json", 8192))
+        units = (f"workbay-lane-{key}-job-{job.name}.service", f"grok-lane-{key}-job-{job.name}.service")
+        if not isinstance(state, dict) or not isinstance(state.get("unit"), str):
+            raise ValueError("rescue job identity unavailable")
+        if state["unit"] in units and _rescue_unbound_job_required(root, key, job):
+            raise ValueError("rescue pending")
+
+
+def rescue_custody(root, key, deadline=None, *, retiring_job=None, starting_job=None):
+    """Return a verified rescue or None for a lane using ordinary custody."""
+    bound_path = root / (".workbay-rescue-binding-" + key)
+    proof_path = root / (".workbay-rescue-custody-" + key + ".json")
+    directory = root / key
+    if retiring_job is not None and not os.path.lexists(directory):
+        return None
+    try:
+        bound = json.loads(_rescue_regular(bound_path, 4096))
+        if not isinstance(bound, dict):
+            raise ValueError("invalid rescue binding")
+    except FileNotFoundError:
+        bound = None
+    if bound is not None:
+        job_id = bound["job_id"]
+        if not re.fullmatch(r"j[0-9a-f]{20}", job_id):
+            raise ValueError("invalid rescue job")
+        if not _rescue_generation_matches(directory, bound):
+            raise ValueError("rescue generation changed")
+    if retiring_job is not None:
+        # The generation still uses the native record for ordinary receipt
+        # verification or for capture/confirmation replay after a crash.
+        if bound is None:
+            if _rescue_unbound_job_required(root, key, root / ".jobs" / retiring_job):
+                raise ValueError("rescue pending")
+        elif bound["job_id"] == retiring_job:
+            raise ValueError("rescue pending")
+        return None
+    try:
+        raw = _rescue_regular(proof_path, 4096)
+    except FileNotFoundError:
+        if bound is None:
+            _rescue_check_unbound(root, key, deadline, starting_job)
+            return None
+        # Successful or failed normal exits use the pre-existing artifact and
+        # source checks. A missing or supervisor receipt keeps the new hold.
+        job = root / ".jobs" / job_id
+        if (root / ".jobs").is_symlink() or job.is_symlink():
+            raise ValueError("invalid rescue job directory")
+        if _rescue_ordinary_exit(job):
+            return None
+        raise ValueError("rescue pending") from None
+    receipt = json.loads(raw)
+    if (receipt["schema_version"] != 1 or receipt["lane_key"] != key
+            or receipt.get("confirmed") is not True or receipt["partial"] is not False
+            or type(receipt["skipped_files_count"]) is not int or receipt["skipped_files_count"] != 0
+            or type(receipt["work_found"]) is not bool or type(receipt["attempt"]) is not int
+            or not re.fullmatch(r"j[0-9a-f]{20}", receipt["job_id"])
+            or not re.fullmatch(r"[0-9a-f]{40}", receipt["head"])
+            or not re.fullmatch(r"[0-9a-f]{40}", receipt["tree"])
+            or not _rescue_generation_matches(directory, receipt)
+            or not _rescue_stash_covered(directory, receipt)):
+        raise ValueError("rescue pending or stale")
+    if bound is not None and any(bound[k] != receipt[k] for k in ("job_id", "attempt", "base")):
+        raise ValueError("rescue job changed")
+    artifacts = root / ".workbay-rescue"
+    if artifacts.is_symlink():
+        raise ValueError("invalid rescue directory")
+    if receipt.get("capture_scope") == _RESCUE_SCOPE:
+        # Resolve the active native capture and host acknowledgment together.
+        # An old lane witness cannot designate a replacement by itself.
+        job_id = receipt["job_id"]
+        capture = _rescue_regular(artifacts / (job_id + ".json"), 4096)
+        acknowledged = json.loads(_rescue_regular(artifacts / (job_id + ".confirmed"), 4096))
+        if receipt != {**json.loads(capture), "confirmed": True} or acknowledged != {
+            "job_id": job_id, "lane_key": key, "attempt": receipt["attempt"],
+            "capture_sha256": hashlib.sha256(capture).hexdigest(),
+        }:
+            raise ValueError("rescue capture not confirmed")
+    if receipt["work_found"]:
+        artifact = _rescue_artifact(artifacts, receipt)
+        if _rescue_regular(artifact, 24 * 1024 * 1024, digest=True) != receipt["artifact_sha256"]:
+            raise ValueError("rescue artifact changed")
+    if rescue_fingerprint(directory, deadline) != receipt["fingerprint"]:
+        raise ValueError("sandbox changed since rescue")
+    return {"digest": hashlib.sha256(raw).hexdigest(), "head": receipt["head"], "tree": receipt["tree"]}
+
+
+def _rescue_generation_matches(directory, receipt):
+    locations = (("sandbox", directory, stat.S_ISDIR),
+                 ("marker", directory / ".workbay-lane-sandbox", stat.S_ISREG))
+    for field, path, expected in locations:
+        info = path.lstat()
+        if not expected(info.st_mode) or [info.st_dev, info.st_ino] != receipt[field]:
+            return False
+    return True
+# END SANDBOX_RESCUE_CUSTODY
+
+
 def lane_record(path, root):
     data = json.loads(read_regular(path))
     if not isinstance(data, dict):
@@ -1293,6 +1526,8 @@ def lane_record(path, root):
     if not isinstance(data.get("released_at"), str):
         raise ValueError("release time missing")
     released_time(data["released_at"])
+    if not re.fullmatch(r"(?:[0-9a-f]{64})?", data.get("proven_rescue", "")):
+        raise ValueError("release rescue proof invalid")
     paths = data["paths"]
     allowed = {str(root / key), str(root / f".venv-lane-{key}"), str(root / f".venv-sync-stamp-{key}")}
     if (not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths)
@@ -1332,6 +1567,19 @@ def lane_locks(root, key, stack, read_only):
 
 def lane_revalidate(record, root, deadline=None):
     directory = root / record["key"]
+    try:
+        rescue = rescue_custody(root, record["key"], deadline)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Refusal("hold_release_unknown", "rescue_pending") from exc
+    if rescue is not None:
+        if (rescue["digest"], rescue["head"], rescue["tree"]) != (
+            record.get("proven_rescue"), record["proven_tip"], record["proven_tree"]
+        ):
+            raise Refusal("hold_release_stale", "rescue_changed")
+        return
+    if record.get("proven_rescue"):
+        raise Refusal("hold_release_unknown", "rescue_missing")
+
     def probe(*args):
         left = 30 if deadline is None else min(30, deadline - time.monotonic())
         if left <= 0:

@@ -34,6 +34,8 @@ from .current_task_rendering import (
 )
 from .enums import LIVE_LANE_STATUSES, TERMINAL_LANE_STATUSES, HandoffStatus
 from .git_merge import branch_is_merged
+from .lane_close_evidence import OPENINGS as _PRIVATE_CLOSE_OPENINGS_TABLE
+from .lane_close_evidence import TABLE as _PRIVATE_CLOSE_EVIDENCE_TABLE
 from .lifecycle_resource_producer import ProducerBinding, _git, prepare_binding, stage_change
 from .review_findings_support import _validate_impact_origin
 from .runtime import get_runtime_config
@@ -1877,6 +1879,12 @@ def import_handoff_state(
     if not isinstance(snapshot, dict):
         return _envelope(
             ok=False, tool="import_handoff_state", data={"error": "Invalid import payload: snapshot must be an object."}
+        )
+    private_tables = {_PRIVATE_CLOSE_EVIDENCE_TABLE, _PRIVATE_CLOSE_OPENINGS_TABLE}
+    if private_tables.intersection(payload) or private_tables.intersection(snapshot):
+        return _envelope(
+            ok=False, tool="import_handoff_state",
+            data={"error": "Lane close evidence is private to the local handoff database."},
         )
     task_ref = payload.get("task_ref") or snapshot.get("task_ref")
     if not task_ref:

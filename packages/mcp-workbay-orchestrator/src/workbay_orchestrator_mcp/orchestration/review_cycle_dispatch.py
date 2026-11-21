@@ -451,7 +451,7 @@ def runtime_ledger(repo: Path) -> ReviewCycleLedger:
     return ledger
 
 
-def dispatch(request: dict, *, repo: Path | None = None) -> LedgerDecision | dict:
+def dispatch(request: dict, *, repo: Path | None = None, _verify_close=None) -> LedgerDecision | dict:
     """Frozen stdin protocol; root/policy/threshold are never request fields."""
     try:
         operation = request["operation"]
@@ -475,7 +475,8 @@ def dispatch(request: dict, *, repo: Path | None = None) -> LedgerDecision | dic
                 if held is not None:
                     return held
             proposal = request.get("canon_proposal_path")
-            return ledger.reserve(**identity, canon_proposal_path=Path(proposal) if proposal else None)
+            return ledger.reserve(**identity, canon_proposal_path=Path(proposal) if proposal else None,
+                                  **({"_verify_close": _verify_close} if _verify_close is not None else {}))
         return ledger.settle(**identity, **{key: value for key, value in request.items()
                                           if key not in {"operation", *identity}})
     except (_Hold, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -551,7 +552,7 @@ def _matches_issuer_binding(issuer: object, task_ref: str, lane_id: str) -> bool
 
 def _dispatch_subject(repo: Path, branch: str, *, registered, dispatch_id: str,
                       managed_identity: dict | None = None, state_dir: Path | None = None,
-                      orchestrator_root: Path | None = None) -> tuple[str, dict | None]:
+                      orchestrator_root: Path | None = None, close_releases: list | None = None) -> tuple[str, dict | None]:
     """Return the resolved account and the producer proof used at admission."""
     root = orchestrator_root or authority(repo).parent.parent
     if registered is not None:
@@ -566,10 +567,12 @@ def _dispatch_subject(repo: Path, branch: str, *, registered, dispatch_id: str,
     elif state_dir is not None and managed_identity is not None:
         task_ref = managed_identity["task_ref"]
     else:
-        return retained_subject(repo, branch, orchestrator_root=root), None
+        return _require_resolved_subject(retained_subject_resolution(
+            repo, branch, orchestrator_root=root, close_releases=close_releases,
+        )), None
     resolution, proof = _canonical_source(repo, state_dir, task_ref=task_ref, branch=branch,
                                           pass_id=(managed_identity or {}).get("pass_id") or dispatch_id,
-                                          orchestrator_root=root)
+                                          orchestrator_root=root, close_releases=close_releases)
     return _require_resolved_subject(resolution), proof
 
 
@@ -589,6 +592,7 @@ def prepare(repo: Path, *, dispatch_id: str, subject_branch: str | None, kind: s
             orchestrator_root: Path | None = None) -> dict:
     """Resolve the engine or adapter's worktree identity before issuing a round."""
     source = scope = registered = None
+    close_releases = []
     try:
         if managed_identity is not None or kind in {"implement", "gate"}:
             branch_ref = _subject_probe(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -601,7 +605,8 @@ def prepare(repo: Path, *, dispatch_id: str, subject_branch: str | None, kind: s
             with at_review_source(repo, source["head_sha"]):
                 expected, _ = _dispatch_subject(repo, branch, registered=registered,
                                                 dispatch_id=dispatch_id, managed_identity=managed_identity,
-                                                state_dir=state_dir, orchestrator_root=orchestrator_root)
+                                                state_dir=state_dir, orchestrator_root=orchestrator_root,
+                                                close_releases=close_releases)
             if subject_branch != expected and not (subject_branch is None and state_dir and managed_identity):
                 raise ValueError("review_cycle_canonical_subject_mismatch")
             subject_branch = expected
@@ -614,14 +619,26 @@ def prepare(repo: Path, *, dispatch_id: str, subject_branch: str | None, kind: s
                 "identity": dict(dispatch_id=dispatch_id, subject_branch=subject_branch, kind=kind)}
     return _reserve_resolved(repo, dispatch_id=dispatch_id, subject_branch=subject_branch, kind=kind,
                              canon_proposal_path=canon_proposal_path, settlement_owner=settlement_owner,
-                             managed_identity=managed_identity, managed_source=source, scope=scope, registered=registered)
+                             managed_identity=managed_identity, managed_source=source, scope=scope, registered=registered,
+                             close_releases=close_releases)
 
 
 def _reserve_resolved(repo: Path, *, dispatch_id: str, subject_branch: str, kind: str,
                       canon_proposal_path: str | None, settlement_owner: str, scope: dict | None,
-                      managed_identity: dict | None = None, managed_source: dict | None = None, registered=None) -> dict:
-    decision = dispatch(dict(operation="reserve", dispatch_id=dispatch_id, subject_branch=subject_branch,
-                             kind=kind, canon_proposal_path=canon_proposal_path), repo=repo)
+                      managed_identity: dict | None = None, managed_source: dict | None = None, registered=None,
+                      close_releases: list | None = None) -> dict:
+    request = dict(operation="reserve", dispatch_id=dispatch_id, subject_branch=subject_branch,
+                   kind=kind, canon_proposal_path=canon_proposal_path)
+    if close_releases:
+        from .lane_close_release import close_admission_verifier
+
+        try:
+            with close_admission_verifier(repo, close_releases) as verify:
+                decision = dispatch(request, repo=repo, _verify_close=verify)
+        except _Hold as exc:
+            decision = LedgerDecision("ledger_hold", str(exc))
+    else:
+        decision = dispatch(request, repo=repo)
     receipt = {"decision": asdict(decision), "identity": dict(dispatch_id=dispatch_id,
                 subject_branch=subject_branch, kind=kind)}
     if decision.status != "reserved" or decision.reason == "replay":
@@ -1568,13 +1585,16 @@ def shell_reserve(repo: Path, spec_path: Path, *, dispatch_id: str, subject_bran
     try:
         spec = json.loads(spec_path.read_text())
         registered = source_proof = None
+        close_releases = []
         if kind != "analysis":
-            registered, source_proof = _shell_subject_registration(repo, spec, subject_branch, dispatch_id)
+            registered, source_proof = _shell_subject_registration(
+                repo, spec, subject_branch, dispatch_id, close_releases=close_releases,
+            )
         if not token:
             scope = source_review_scope(repo, spec, subject_branch, registered=registered) if kind == "gate" else None
             receipt = _reserve_resolved(repo, dispatch_id=dispatch_id, subject_branch=subject_branch, kind=kind,
                                         canon_proposal_path=canon_proposal_path, settlement_owner="shell",
-                                        scope=scope, registered=registered)
+                                        scope=scope, registered=registered, close_releases=close_releases)
             if receipt["decision"]["status"] != "reserved":
                 return receipt
             enforce_route(spec, receipt["decision"]["row"])
@@ -1637,10 +1657,11 @@ def shell_reserve(repo: Path, spec_path: Path, *, dispatch_id: str, subject_bran
                            source_tree=_git(repo, "rev-parse", spec["head_sha"] + "^{tree}"))
             if source_proof is not None:
                 receipt["source_task_subject"] = source_proof
-            elif kind != "analysis":
-                unproven = _source_task_subject_unproven(repo, spec, subject_branch, registered=registered)
-                if unproven is not None:
-                    receipt["source_task_subject_unproven"] = unproven
+            elif kind != "analysis" and registered is not None:
+                integration = _registered_integration(*registered)
+                receipt["source_integration_branch"] = integration
+                receipt["source_task_subject_unproven"] = _source_task_subject_unproven(
+                    repo, spec, subject_branch, registered=registered, integration=integration)
             _save(path, receipt)
             return receipt
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
@@ -2230,7 +2251,7 @@ def canonical_subject_resolution(repo: Path, state_dir: Path, *, task_ref: str, 
 
 
 def _canonical_source(repo: Path, state_dir: Path, *, task_ref: str, branch: str, pass_id: str,
-                      orchestrator_root: Path) -> tuple[SubjectResolution, dict | None]:
+                      orchestrator_root: Path, close_releases: list | None = None) -> tuple[SubjectResolution, dict | None]:
     from workbay_handoff_mcp.config import RuntimeConfig
     from workbay_handoff_mcp.runtime import configure_runtime
 
@@ -2240,7 +2261,9 @@ def _canonical_source(repo: Path, state_dir: Path, *, task_ref: str, branch: str
                            orchestrator_root=orchestrator_root, initial_context=False)
     configure_runtime(RuntimeConfig.for_repo(orchestrator_root))
     proof = proven_task_subject(repo, orchestrator_root, task_ref, branch=branch)
-    retained = retained_subject_resolution(repo, branch, proof, orchestrator_root=orchestrator_root)
+    retained = retained_subject_resolution(
+        repo, branch, proof, orchestrator_root=orchestrator_root, close_releases=close_releases,
+    )
     if context is None or not context.preceding_pass_id:
         return retained, proof
     resolved = _preceding_subject(repo, state_dir, context.preceding_pass_id, branch, orchestrator_root, retained, proof)
@@ -2523,6 +2546,21 @@ def _feature_target_landed(repo: Path, orchestrator_root: Path, task: dict, row:
     The source binding identifies the work unit; registry/manifest agreement,
     typed landings and Git establish completion without finishing the task.
     """
+    from .review_ratchet import _short_branch, task_subject_binding
+
+    binding = task_subject_binding(row)
+    if (_short_branch(task.get("target_branch")) != subject
+            or binding is None or binding.get("task_ref") != row["task_ref"]
+            or binding.get("subject_branch") != subject or binding.get("tip_sha") != head
+            or binding.get("base_sha") == head):
+        return False
+    return _feature_members_landed(repo, orchestrator_root, task, row, subject=subject, source=source,
+                                   head=head, integration=integration, landed=landed)
+
+
+def _feature_members_landed(repo: Path, orchestrator_root: Path, task: dict, row: dict, *,
+                            subject: str, source: str, head: str, integration: str, landed: str) -> bool:
+    """Check all of a live feature task's lanes, including its unfinished siblings."""
     from workbay_handoff_mcp.lanes_api import list_lanes
 
     from .review_ratchet import (
@@ -2537,12 +2575,6 @@ def _feature_target_landed(repo: Path, orchestrator_root: Path, task: dict, row:
         task_subject_binding,
     )
 
-    binding = task_subject_binding(row)
-    if (_short_branch(task.get("target_branch")) != subject
-            or binding is None or binding.get("task_ref") != row["task_ref"]
-            or binding.get("subject_branch") != subject or binding.get("tip_sha") != head
-            or binding.get("base_sha") == head):
-        return False
     result = list_lanes(task_ref=row["task_ref"], limit=1000)
     data = result.get("data") or {}
     members = data.get("lanes")
@@ -2881,20 +2913,40 @@ def _landed_continuation_tip(repo: Path, head: str, rows: list[dict], landed: st
     return None
 
 
+def _ref_exists(repo: Path, ref: str) -> bool:
+    """Read the exact ref through Git, including packed refs and dangling symrefs."""
+    for args in (("show-ref", "--verify", "--quiet"), ("symbolic-ref", "--quiet", "--no-recurse")):
+        result = _subject_probe(repo, *args, ref)
+        if result.stderr or result.returncode not in (0, 1):
+            raise ValueError("review_cycle_subject_unresolvable")
+        if result.returncode == 0:
+            return True
+
+    # Both probes also answer 1 for a directory/file name conflict. Veto
+    # those lookup errors before accepting Git's negative answer.
+    location = _subject_probe(repo, "rev-parse", "--path-format=absolute", "--git-path", ref)
+    loose_path = Path(location.stdout.rstrip("\n"))
+    if location.returncode != 0 or location.stderr or not loose_path.is_absolute():
+        raise ValueError("review_cycle_subject_unresolvable")
+    try:
+        loose_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError("review_cycle_subject_unresolvable") from exc
+    raise ValueError("review_cycle_subject_unresolvable")
+
+
 def _terminal_refs_landed(repo: Path, names: set[str], landed: str) -> bool:
     """Every surviving source ref must be on main; only a genuinely gone ref is absent."""
     from .review_ratchet import _commit, _subject_is_ancestor
 
     for name in names:
-        tip = _commit(repo, f"refs/heads/{name}")
+        ref = f"refs/heads/{name}"
+        tip = _commit(repo, ref)
         if tip is None:
-            # Only a ref that is really gone is deleted; a dangling one is unreadable.
-            result = _subject_probe(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{name}")
-            if result.returncode == 0:
+            if _ref_exists(repo, ref):
                 return False
-            if result.returncode != 1:
-                _ancestry(repo, f"refs/heads/{name}", landed)
-                raise ValueError("review_cycle_subject_unresolvable")
         elif not _subject_is_ancestor(repo, tip, landed):
             return False
     return True
@@ -3153,6 +3205,10 @@ class SubjectResolution:
     holders: tuple[dict, ...] = ()
 
 
+class HolderLedgerUnavailable(ValueError):
+    """The canonical ledger could not be authenticated for this walk."""
+
+
 class SubjectAmbiguous(ValueError):
     """Multiple retained subjects are an explicit hold with all their receipts."""
 
@@ -3291,7 +3347,8 @@ def _holder_scope_binds(repo: Path, proof: dict, receipt: dict, row: dict, orche
 
 
 def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None, *,
-                             orchestrator_root: Path | None = None, metrics: bool = False) -> dict:
+                             orchestrator_root: Path | None = None, metrics: bool = False,
+                             close_releases: list | None = None) -> dict:
     """One decision table for retained subjects and their holding receipts.
 
     Inspect direct-branch and ancestor receipts in the same walk. A direct
@@ -3310,7 +3367,9 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
     holding, recorded, absent, scope_refusals = [], {}, [], []
     report = dict(holding=holding, source_head_absent=absent)
     candidates, released_direct = [], set()
+    landed_candidates = {}
     admitted_original = False
+    from .lane_close_release import verified_close_release
     from .review_cycle_reconciliation import EvidenceHold, HolderReleaseWalk, _read
 
     holder_release_walk = HolderReleaseWalk(repo)
@@ -3456,6 +3515,11 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
                 root = orchestrator_root or repo
                 owner = _receipt_holder(root, receipt, source_branch)
                 source_lane = owner.lane
+                close_release = verified_close_release(repo, path, receipt, receipt_sha256, proof, holder=owner)
+                if close_release is not None:
+                    if close_releases is not None:
+                        close_releases.append(close_release)
+                    continue
                 if (original is None and source_lane is not None and not owner.mismatch
                         and holder_release_walk.terminal_issuer_releases(path, receipt, receipt_sha256, owner, proof)):
                     continue
@@ -3485,6 +3549,9 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
                         row.update(holder_task=owner.task_ref, holder_lane=owner.lane_id)
                     holding.append(row)
                     continue
+                if (source_lane is not None and source_lane.get("status") == "merged" and subject == source_branch
+                        and branch in {"", proof["subject_branch"]}):
+                    landed_candidates[path.name] = (path, receipt, receipt_sha256)
             if (proof is not None and source_lane is not None and source_lane.get("status") != "closed"
                     and isinstance(original, dict) and original.get("subject_branch") == subject
                     and original.get("tip_sha") == head and original.get("base_sha") != head
@@ -3540,6 +3607,13 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
                     binds = True
                 if binds:
                     holding.append(row)
+    # A later landing is an additional proof for a remaining holder. Preserve
+    # earlier releases and never revisit direct matches, recovery or ownership holds.
+    released = {row["receipt"] for row in holding if row["receipt"] in landed_candidates
+                and holder_release_walk.landed_self_source_releases(*landed_candidates[row["receipt"]], proof)}
+    if released:
+        holding[:] = [row for row in holding if row["receipt"] not in released]
+        scope_refusals = [error for error in scope_refusals if error.receipt not in released]
     if scope_refusals:
         if len({row["subject"] for row in holding}) > 1:
             raise SubjectAmbiguous(holding)
@@ -3548,9 +3622,11 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
 
 
 def subject_hold_report(repo: Path, branch: str, proof: dict | None = None, *,
-                        orchestrator_root: Path | None = None) -> list[dict]:
+                        orchestrator_root: Path | None = None, close_releases: list | None = None) -> list[dict]:
     """Holding rows only: absent-head diagnostics must never bind a subject."""
-    holding = subject_hold_diagnostics(repo, branch, proof, orchestrator_root=orchestrator_root)["holding"]
+    holding = subject_hold_diagnostics(
+        repo, branch, proof, orchestrator_root=orchestrator_root, close_releases=close_releases,
+    )["holding"]
     if len({row["subject"] for row in holding}) > 1 and any(row.get("missing_proof") == "holder_task_unknown" for row in holding):
         raise SubjectAmbiguous(holding)
     for row in holding:
@@ -3608,10 +3684,16 @@ def _named_subject_holders(repo: Path, root: Path, rows: list[dict], error: Valu
 
 
 def retained_subject_resolution(repo: Path, branch: str, proof: dict | None = None, *,
-                                orchestrator_root: Path | None = None) -> SubjectResolution:
+                                orchestrator_root: Path | None = None,
+                                close_releases: list | None = None) -> SubjectResolution:
     """Classify the aggregate; a retained edge to a foreign subject never proves continuation."""
     try:
-        holding = subject_hold_report(repo, branch, proof, orchestrator_root=orchestrator_root)
+        holding = subject_hold_report(
+            repo, branch, proof, orchestrator_root=orchestrator_root,
+            **({"close_releases": close_releases} if close_releases is not None else {}),
+        )
+    except HolderLedgerUnavailable as exc:
+        return SubjectResolution("held_missing_proof", None, missing_proof=str(exc))
     except (SubjectAmbiguous, SubjectScopeUnauthenticated) as exc:
         holding = getattr(exc, "holding", [])
         named = _named_subject_holders(repo, orchestrator_root or repo, holding, exc)
@@ -3672,7 +3754,7 @@ def subject_resolution_details(repo: Path, error: ValueError, *, kind: str, orch
         policy = replace(trusted_policy(), routes=config.get("routes", {}),
                          approval_thresholds=config.get("approval_thresholds", {}))
         ledger = ReviewCycleLedger(authority(repo) / "review_cycle_ledger.json", policy, repo=repo)
-        data = ledger._read() if ledger.path.exists() else {"rows": {}, "subjects": {}}
+        data = ledger._read() if subjects and ledger.path.exists() else {"rows": {}, "subjects": {}}
         for subject in sorted(subjects):
             account = subject_accounting(data, subject, policy)
             accounts.append(dict(subject_branch=subject, round=account["charged_rows"][kind] + 1))
@@ -3692,7 +3774,15 @@ def subject_resolution_details(repo: Path, error: ValueError, *, kind: str, orch
 _REGISTRY_NOT_READ = object()
 
 
-def _source_task_subject_unproven(repo: Path, spec: dict, subject: str, *, registered=_REGISTRY_NOT_READ) -> dict | None:
+def _registered_integration(config, lane: dict) -> str:
+    from .review_ratchet import _manifest_lane, _short_branch
+
+    located = _manifest_lane(config.workspace_root, lane["task_ref"], lane["lane_id"])
+    return (_short_branch(located[0].get("integration_branch")) if located else None) or "main"
+
+
+def _source_task_subject_unproven(repo: Path, spec: dict, subject: str, *, registered=_REGISTRY_NOT_READ,
+                                  integration: str | None = None) -> dict | None:
     """Source-time evidence only; this record alone never releases a retained receipt.
 
     Together with a typed landing of its source, re-read on each call, it lets
@@ -3702,7 +3792,7 @@ def _source_task_subject_unproven(repo: Path, spec: dict, subject: str, *, regis
     A missing integration ref stays unproven without preventing an otherwise
     valid mint; operational Git failures still raise through the usual boundary.
     """
-    from .review_ratchet import _commit, _manifest_lane, _short_branch, _subject_is_ancestor, proven_task_subject
+    from .review_ratchet import _commit, _subject_is_ancestor, proven_task_subject
 
     branch = spec.get("branch") or _git(repo, "symbolic-ref", "--short", "HEAD")
     if registered is _REGISTRY_NOT_READ:
@@ -3713,8 +3803,7 @@ def _source_task_subject_unproven(repo: Path, spec: dict, subject: str, *, regis
     with at_review_source(repo, spec["head_sha"]):
         candidate = proven_task_subject(repo, config.workspace_root, lane["task_ref"], branch=subject)
     reason = "proof_subject_mismatch" if candidate is not None and candidate["subject_branch"] != subject else "no_producer_proof"
-    located = _manifest_lane(config.workspace_root, lane["task_ref"], lane["lane_id"])
-    integration = (_short_branch(located[0].get("integration_branch")) if located else None) or "main"
+    integration = integration or _registered_integration(config, lane)
     landed = _commit(repo, f"refs/heads/{integration}")
     record = dict(reason=reason, head_on_integration=landed is not None and _subject_is_ancestor(repo, spec["head_sha"], landed),
                   integration_sha=landed)
@@ -3762,7 +3851,8 @@ def validate_shell_subject(repo: Path, spec: dict, subject: str, dispatch_id: st
     return proof
 
 
-def _shell_subject_registration(repo: Path, spec: dict, subject: str, dispatch_id: str):
+def _shell_subject_registration(repo: Path, spec: dict, subject: str, dispatch_id: str, *,
+                                close_releases: list | None = None):
     branch, head = spec.get("branch"), spec.get("head_sha")
     if (not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9/_.-]+", branch)
             or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head)):
@@ -3774,13 +3864,16 @@ def _shell_subject_registration(repo: Path, spec: dict, subject: str, dispatch_i
         raise ValueError("review_cycle_source_identity_unproven")
     registered = _issuing_lane(repo, branch)
     with at_review_source(repo, head):
-        return registered, _validated_source_proof(repo, branch, subject, dispatch_id, registered)
+        return registered, _validated_source_proof(repo, branch, subject, dispatch_id, registered, close_releases)
 
 
-def _validated_source_proof(repo: Path, branch: str, subject: str, dispatch_id: str, registered) -> dict | None:
+def _validated_source_proof(repo: Path, branch: str, subject: str, dispatch_id: str, registered,
+                            close_releases: list | None = None) -> dict | None:
     from .review_ratchet import proven_task_subject, source_task_subject_holds
 
-    expected, proof = _dispatch_subject(repo, branch, registered=registered, dispatch_id=dispatch_id)
+    expected, proof = _dispatch_subject(
+        repo, branch, registered=registered, dispatch_id=dispatch_id, close_releases=close_releases,
+    )
     if subject != expected:
         raise ValueError("review_cycle_canonical_subject_mismatch")
     # Stamp only a producer proof consumed by this boundary, never a value

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import redirect_stdout
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -126,7 +129,7 @@ def _handoff_fallback_budget_s() -> float:
         value = float(raw)
     except ValueError:
         return _HANDOFF_FALLBACK_BUDGET_S
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         return _HANDOFF_FALLBACK_BUDGET_S
     return value
 
@@ -807,7 +810,52 @@ def _load_active_task_via_handoff(workspace_root: Path) -> ActiveTaskContext:
     )
 
 
-def _load_active_task(workspace_root: Path) -> ActiveTaskContext:
+def _load_bounded_handoff(workspace_root: Path, deadline: float) -> ActiveTaskContext:
+    """Run the cold identity probe in a worker that can be interrupted."""
+
+    def failed_context(probe_error: str) -> ActiveTaskContext:
+        primary = _primary_workspace_root(workspace_root) or str(workspace_root)
+        return _empty_context(primary, probe_error=probe_error)
+
+    separate_group = os.name == "posix"
+    try:
+        with subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), str(workspace_root)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=separate_group,
+        ) as worker:
+            try:
+                output, _ = worker.communicate(timeout=deadline)
+            except subprocess.TimeoutExpired:
+                if separate_group:
+                    try:
+                        os.killpg(worker.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    worker.kill()
+                return failed_context("handoff_probe_deadline_exceeded")
+    except OSError:
+        return failed_context("handoff_probe_failed")
+
+    if worker.returncode == 0:
+        try:
+            response = json.loads(output)
+            if isinstance(response, dict) and "context" in response:
+                return ActiveTaskContext(**response["context"])
+        except (ValueError, TypeError):
+            pass
+        else:
+            if isinstance(response, dict) and isinstance(response.get("error"), str):
+                raise ValueError(response["error"])
+    return failed_context("handoff_probe_failed")
+
+
+def _load_active_task(
+    workspace_root: Path, *, edit_deadline: float | None = None
+) -> ActiveTaskContext:
     # Cheap snapshot cache first (freshness-checked against handoff.db); never
     # import the package when the snapshot already answered — including clean
     # negatives for a finished worktree task. Stale/missing snapshot → None
@@ -815,6 +863,11 @@ def _load_active_task(workspace_root: Path) -> ActiveTaskContext:
     snapshot = _try_load_active_task_from_snapshot(workspace_root)
     if snapshot is not None:
         return snapshot
+
+    if edit_deadline is not None:
+        return _load_bounded_handoff(
+            workspace_root, min(edit_deadline, _handoff_fallback_budget_s())
+        )
 
     # Absent/unusable snapshot: measure the whole handoff fallback (import +
     # get_handoff_state). Cannot preempt an in-process import, so over-budget
@@ -852,3 +905,14 @@ def _canonical_target_worktree(target_worktree_path: str | None) -> str | None:
         return str(Path(target_worktree_path).expanduser().resolve(strict=False))
     except (RuntimeError, OSError, ValueError):
         return None
+
+
+if __name__ == "__main__":
+    # Keep import/probe diagnostics out of the worker's JSON response.
+    try:
+        with redirect_stdout(sys.stderr):
+            context = _load_active_task_via_handoff(Path(sys.argv[1]))
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+    else:
+        print(json.dumps({"context": asdict(context)}))

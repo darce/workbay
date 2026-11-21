@@ -38,7 +38,9 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     grant = commands.add_parser("grant")
     listing = commands.add_parser("list")
-    for command in (grant, listing):
+    backfill = commands.add_parser("backfill-close")
+    backfill.add_argument("--record", type=Path, required=True)
+    for command in (grant, listing, backfill):
         command.add_argument("--repo", type=Path, required=True)
     grant.add_argument("--subject", required=True)
     listing.add_argument("--subject")
@@ -46,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     grant.add_argument("--round", type=int, required=True)
     grant.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
+    if args.command == "backfill-close":
+        from .lane_close_backfill import backfill_close
+
+        status, result = backfill_close(args.repo, args.record, local_tty=sys.stdin.isatty())
+        print(json.dumps(result, sort_keys=True))
+        return status
     if args.command == "grant":
         if not sys.stdin.isatty():
             parser.error("operator approval requires a TTY on stdin")

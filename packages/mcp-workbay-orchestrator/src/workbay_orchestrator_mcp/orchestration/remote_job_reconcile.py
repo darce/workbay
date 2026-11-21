@@ -79,6 +79,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
+from . import lane_lifecycle_contracts, remote_job_ledger
 from .lane_lifecycle_contracts import JOB_ID_RE
 from .remote_job_ledger import RemoteJobLedger, RemoteJobLedgerError, plan_review_failure
 
@@ -88,7 +89,8 @@ SWEEP_TIMEOUT_SECONDS = 30.0
 QUARANTINE_RETENTION_SECONDS = 7 * 24 * 3600
 ORPHAN_KIND = "vm_job_missing_from_ledger"
 SWEEP_UNREADABLE = "sweep_unreadable"
-_TERMINAL_STATES = frozenset({"done", "lost"})
+# Inventory rows can contain unhashable JSON values in the state field.
+_TERMINAL_STATES = tuple(remote_job_ledger.REMOTE_JOB_TERMINAL_STATES)
 _LEGACY_ATTACHED_KINDS = frozenset({"attached", "attached_sandbox", "legacy_attached"})
 _LOCK_WAIT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.01
@@ -442,6 +444,14 @@ def _ingest_known_report(
     if identity is None:
         _refuse(result, job_id=job_id, attempt=_presented_attempt(report, 0), reason="spec_identity_missing")
         return
+    # A legacy native row cannot invert its job digest on the VM. Verify its
+    # preimage against the retained spec before presenting the recovered fence.
+    if report.get("legacy_attempt") is True and report.get("attempt") is None:
+        spec = record["spec"]
+        task, lane = spec.get("task_ref"), spec.get("lane_id")
+        if isinstance(task, str) and isinstance(lane, str):
+            if lane_lifecycle_contracts.job_id_for(task, lane, spec["pass_id"], spec["attempt"]) == job_id:
+                report = {**report, "attempt": spec["attempt"]}
     _job_id, pass_id, attempt = identity
     if "plan_review_binding" in record["spec"]:
         # This reservation has its own producer and no lane pass fence.
@@ -458,6 +468,8 @@ def _ingest_known_report(
     if not _record_adoption(state_dir, result, job_id=job_id, pass_id=pass_id, attempt=attempt, now=now):
         return
     if report.get("state") not in _TERMINAL_STATES:
+        return
+    if report.get("state") != "done" and report.get("observer_error") is not None:
         return
     _apply_once(
         job_id,

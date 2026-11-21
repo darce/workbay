@@ -559,6 +559,10 @@ hooks:
       cursor_matcher: ApplyPatch|Edit|Write
       status_message: Guarding worktree drift
       timeout: 5
+      # A cold identity probe that expires is unknown and blocks drift checks.
+      task_probe: &edit_task_probe
+        deadline_seconds: 1.0
+        expired_outcome: handoff_probe_deadline_exceeded
       claude_command: bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-worktree-drift.sh"
       vscode_command: python3 .github/hooks/guard-worktree-drift.py
       codex_command: python3 .github/hooks/guard-worktree-drift.py
@@ -569,6 +573,8 @@ hooks:
       cursor_matcher: ApplyPatch|Edit|Write
       status_message: Guarding main branch edits
       timeout: 5
+      # The shell guard's task probe is advisory. The Python adapter has no advisory probe.
+      task_probe: *edit_task_probe
       claude_command: bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh"
       vscode_command: python3 .github/hooks/guard-main-branch.py
       codex_command: python3 .github/hooks/guard-main-branch.py

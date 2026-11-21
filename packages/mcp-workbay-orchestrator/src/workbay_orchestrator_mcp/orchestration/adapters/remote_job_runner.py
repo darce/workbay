@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from workbay_orchestrator_mcp.orchestration.lane_lifecycle_contracts import (
     ContractError,
     RemoteJobIdentity,
 )
+from workbay_orchestrator_mcp.orchestration.remote_job_ledger import RemoteJobLedger, UNIT_DEAD_NO_RECEIPT, remote_status_state
 
 _HOST_ONLY_ENV_KEYS = (
     "WORKBAY_REMOTE_JOB_TASK_REF",
@@ -998,7 +1000,17 @@ def run_status(
 def _build_command(cmd: list[str], identity: RemoteJobIdentity) -> list[str] | None:
     if len(cmd) < 2 or cmd[1] != "build":
         return None
-    return [cmd[0], "submit", "--job-id", identity.job_id, *cmd[2:]]
+    # Keep one authenticated identity even when the build carries review flags.
+    fence = {"--job-id": identity.job_id, "--job-attempt": str(identity.attempt)}
+    submit = [cmd[0], "submit", "--job-id", identity.job_id, "--job-attempt", str(identity.attempt)]
+    args = iter(cmd[2:])
+    for arg in args:
+        if arg in fence:
+            if next(args, None) != fence[arg]:
+                return None
+        else:
+            submit.append(arg)
+    return submit
 
 
 def _operation_command(cmd: list[str], operation: str, identity: RemoteJobIdentity) -> list[str]:
@@ -1107,6 +1119,7 @@ class _TimeoutContext:
     env: dict[str, str] | None
     work_deadline: float  # submit, poll and collect stop here, leaving the cancel reserve
     total_deadline: float  # the authorized total; a cancel may not run past it
+    observe_supervisor: bool = False
     resume_only: bool = False  # recovery never owns cancellation of the existing VM job
 
 
@@ -1114,6 +1127,30 @@ class _TimeoutContext:
 class _JobStatus:
     completed: subprocess.CompletedProcess[str]
     payload: dict[str, Any]
+
+
+class UnitDeadNoReceipt(subprocess.CompletedProcess[str]):
+    """A verified terminal observation, distinguishable from a child's own exit 69."""
+
+    def __init__(self, cmd: list[str], job_id: str, stdout: str = "") -> None:
+        detail = json.dumps({"state": UNIT_DEAD_NO_RECEIPT, "job_id": job_id})
+        super().__init__(cmd, 69, stdout, detail)
+
+
+class SupervisorFailure(subprocess.CompletedProcess[str]):
+    """The native supervisor published a failed execution receipt."""
+
+
+class ResumeHold(subprocess.CompletedProcess[str]):
+    """Retryable resume outcome retaining the observation that prevented collection."""
+
+    def __init__(self, observation: subprocess.CompletedProcess[str]) -> None:
+        detail = "remote_job_resume_hold " + (observation.stderr or "")
+        # Preserve the status child's native exit for transport diagnostics.
+        # A hold from a valid status receipt still has the retryable exit.
+        rc = observation.returncode if observation.args[1:2] == ["status"] else 75
+        super().__init__(observation.args, rc, observation.stdout, detail)
+        self.observation = observation
 
 
 def _status_payload(
@@ -1128,10 +1165,15 @@ def _status_payload(
         return value
 
     try:
-        payload: Any = json.loads(completed.stdout, object_pairs_hook=fields if strict else None)
+        payload: Any = json.loads(completed.stdout, object_pairs_hook=fields)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
+        return None
+    payload["state"] = remote_status_state(payload["state"], payload.get("loss_cause"))
+    strict = strict or payload["state"] == UNIT_DEAD_NO_RECEIPT
+    attempt = payload.get("attempt")
+    if attempt is not None and (type(attempt) is not int or attempt != identity.attempt):
         return None
     if payload.get("job_id") != identity.job_id:
         return None
@@ -1275,14 +1317,24 @@ def _poll_job(
             return status
         payload = status.payload
         state = payload["state"]
+        if state == UNIT_DEAD_NO_RECEIPT and payload.get("observer_error") is None:
+            return UnitDeadNoReceipt(context.cmd, context.identity.job_id, status.completed.stdout or "")
         if context.resume_only and (
             payload.get("observer_error") is not None
             or state not in {"claiming", "submitted", "queued", "running", "done"}
         ):
             return _refusal(context.cmd, f"state={state} observer_error={payload.get('observer_error')}")
         if state == "lost":
-            return subprocess.CompletedProcess(context.cmd, 1, "", f"remote_job_lost job_id={context.identity.job_id}")
+            if payload.get("observer_error") is None:
+                return subprocess.CompletedProcess(
+                    context.cmd, 1, "", f"remote_job_lost job_id={context.identity.job_id}"
+                )
         if state == "done":
+            if context.observe_supervisor and payload.get("supervisor_failure") is True:
+                rc = payload.get("rc")
+                if type(rc) is not int or not 0 < rc <= 255:
+                    return _refusal(context.cmd, "invalid supervisor exit")
+                return SupervisorFailure(context.cmd, rc, status.completed.stdout, "supervisor_failure")
             return None
         if state == "unknown" and payload.get("observer_error") is None:
             return subprocess.CompletedProcess(
@@ -1328,6 +1380,7 @@ def run_detached(
     cwd: str,
     env: dict[str, str] | None,
     timeout: float,
+    observe_supervisor: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run a remote build through submit, bounded status polling, and collect."""
     identity, refusal = _identity_refusal(cmd, env)
@@ -1353,6 +1406,7 @@ def run_detached(
         env,
         work_deadline=total_deadline - _cancel_reserve(timeout),
         total_deadline=total_deadline,
+        observe_supervisor=observe_supervisor,
     )
     stderr_parts: list[str] = []
     submit_error = _submit_job(context, submit_cmd, stderr_parts)
@@ -1370,6 +1424,7 @@ def resume_pending(
     cwd: str,
     env: dict[str, str] | None,
     timeout: float,
+    observe_supervisor: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Observe, poll and collect an existing identity; never submit or cancel.
 
@@ -1382,23 +1437,248 @@ def resume_pending(
     if refusal is not None:
         return refusal
     assert identity is not None
-    if _build_command(cmd, identity) is None:
-        return _refusal(cmd, "remote_job_invalid_command expected=build")
     job_flags = [i for i, arg in enumerate(cmd) if arg == "--job-id"]
     if job_flags and (len(job_flags) != 1 or cmd[job_flags[0] + 1 : job_flags[0] + 2] != [identity.job_id]):
         return _refusal(cmd, "remote_job_resume_hold reason=identity_conflict")
+    if _build_command(cmd, identity) is None:
+        return _refusal(cmd, "remote_job_invalid_command expected=build")
     deadline = time.monotonic() + timeout
     if isinstance(cmd, _AuthenticatedTransportCommand) and cmd.deadline is not None:
         deadline = min(deadline, cmd.deadline)
-    context = _TimeoutContext(cmd, timeout, identity, cwd, env, deadline, deadline, resume_only=True)
+    context = _TimeoutContext(cmd, timeout, identity, cwd, env, deadline, deadline, observe_supervisor=observe_supervisor, resume_only=True)
     stderr_parts: list[str] = []
     if _remaining(context) <= 0:
         _timed_out(context, stderr_parts)
     polled = _poll_job(context, stderr_parts)
-    if polled is not None:
-        polled.stderr = "remote_job_resume_hold " + (polled.stderr or "")
+    if isinstance(polled, (UnitDeadNoReceipt, SupervisorFailure)):
         return polled
+    if polled is not None:
+        return ResumeHold(polled)
     return _collect_job(context, stderr_parts)
+
+
+def rescued_archive_matches(path: Path, *, size: int, sha256: str) -> bool:
+    """Check the bounded regular archive before publishing or replaying custody."""
+    if type(size) is not int or not 0 < size <= 24 * 1024 * 1024:
+        return False
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+            return False
+        data = stream.read(size + 1)
+        return (
+            len(data) == size
+            and before.st_ctime_ns == os.fstat(stream.fileno()).st_ctime_ns
+            and hashlib.sha256(data).hexdigest() == sha256
+        )
+
+
+def rescue_only(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    lane_key: str,
+    base: str,
+    rescue_dir: Path,
+    confirm: str | None = None,
+    base_tree: str = "",
+) -> dict[str, Any]:
+    """Receive the dead job's snapshot into a durable, job-keyed host file."""
+    identity, refusal = _identity_refusal(cmd, env)
+    if refusal is not None or identity is None or _build_command(cmd, identity) is None:
+        raise ValueError("invalid rescue identity")
+    arguments = ["--attempt", str(identity.attempt), "--lane-key", lane_key, "--base", base]
+    if confirm is not None:
+        command = _operation_command(cmd, "rescue-confirm", identity)
+        command.insert(2, "--require-stash-coverage")
+        command.extend([*arguments, confirm])
+        completed = _run_child(command, cwd=cwd, env=env, timeout=timeout)
+        if completed.returncode != 0:
+            raise ValueError(f"VM rescue confirmation unavailable (exit {completed.returncode})")
+        return {}
+    rescue_dir.mkdir(mode=0o700, exist_ok=True)
+    parent_fd = os.open(rescue_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    artifact = rescue_dir / f"{identity.job_id}.tar"
+    with tempfile.TemporaryDirectory(prefix=".receive-", dir=rescue_dir) as staging:
+        received = Path(staging) / "receipt"
+        command = _operation_command(cmd, "rescue", identity)
+        command.extend([*arguments, str(received)])
+        completed = _run_child(command, cwd=cwd, env=env, timeout=timeout)
+        if completed.returncode != 0:
+            raise ValueError(f"VM rescue unavailable (exit {completed.returncode})")
+        with received.open("rb") as stream:
+            summary = json.loads(stream.readline(4096))
+            data = stream.read(24 * 1024 * 1024 + 1)
+        if (
+            not isinstance(summary, dict)
+            or type(summary.get("schema_version")) is not int
+            or summary["schema_version"] != 1
+            or summary.get("job_id") != identity.job_id
+            or type(summary.get("attempt")) is not int
+            or summary["attempt"] != identity.attempt
+            or summary.get("lane_key") != lane_key
+            or (base_tree and summary.get("base_tree") != base_tree)
+            or not isinstance(summary.get("capture_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", summary["capture_sha256"]) is None
+            or type(summary.get("work_found")) is not bool
+            or type(summary.get("skipped_files_count")) is not int
+            or summary["skipped_files_count"] < 0
+            or summary.get("partial") is not bool(summary["skipped_files_count"])
+        ):
+            raise ValueError("invalid rescue receipt")
+        result = {key: summary[key] for key in ("work_found", "skipped_files_count", "partial", "capture_sha256")}
+        if "capture_scope" in summary:
+            # The VM hashes the exact persisted capture, including generation,
+            # source, measured scope and archive digest, before framing it.
+            token = summary.pop("capture_sha256")
+            if (
+                summary["capture_scope"] != "named-stash-stack-v1"
+                or hashlib.sha256(json.dumps(summary, sort_keys=True).encode()).hexdigest() != token
+            ):
+                raise ValueError("invalid scoped capture")
+            result["capture_scope"] = summary["capture_scope"]
+        if "supersedes_capture" in summary:
+            previous = summary["supersedes_capture"]
+            if (
+                "capture_scope" not in result
+                or not isinstance(previous, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", previous)
+            ):
+                raise ValueError("invalid replacement capture")
+            result["supersedes_capture"] = previous
+            artifact = rescue_dir / f"{identity.job_id}.{previous}.tar"
+        if not result["work_found"]:
+            if data or result["partial"] or "artifact_sha256" in summary or "artifact_bytes" in summary:
+                raise ValueError("unexpected clean rescue artifact")
+            return result
+        digest = hashlib.sha256(data).hexdigest()
+        if (
+            not data
+            or len(data) > 24 * 1024 * 1024
+            or type(summary.get("artifact_bytes")) is not int
+            or len(data) != summary["artifact_bytes"]
+            or digest != summary.get("artifact_sha256")
+        ):
+            raise ValueError("rescue archive integrity mismatch")
+        staged = Path(staging) / "artifact"
+        with staged.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(staged, artifact, follow_symlinks=False)
+        except FileExistsError:
+            if not rescued_archive_matches(artifact, size=len(data), sha256=digest):
+                raise ValueError("rescue archive conflict") from None
+        fd = os.open(rescue_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        result.update(rescue_artifact={"path": str(artifact), "sha256": digest, "bytes": len(data)})
+        return result
+
+
+def persist_dead_job_rescue(
+    ledger: RemoteJobLedger, record: dict[str, Any], argv: list[str], *,
+    cwd: str, env: dict[str, str], base: str, base_tree: str, remaining: Callable[[], float],
+) -> dict[str, Any]:
+    """Publish and verify the job-keyed host artifact before either owner settles the loss."""
+    spec = record["spec"]
+    job_id = spec["job_id"]
+    rescue_dir = ledger.state_dir.parent.resolve() / "remote-job-rescues"
+    rescue_args = dict(cwd=cwd, env=env, lane_key=spec["lane_key"], base=base,
+                       base_tree=base_tree, rescue_dir=rescue_dir)
+
+    def validate_artifact(observation: dict[str, Any]) -> None:
+        if not isinstance(observation, dict) or type(observation.get("work_found")) is not bool:
+            raise ValueError("rescue observation unavailable")
+        if observation["work_found"]:
+            artifact = observation["rescue_artifact"]
+            stem = job_id
+            if "supersedes_capture" in observation:
+                previous = observation["supersedes_capture"]
+                if not re.fullmatch(r"[0-9a-f]{64}", previous):
+                    raise ValueError("invalid replacement capture")
+                stem += "." + previous
+            expected = rescue_dir / (stem + ".tar")
+            if artifact["path"] != str(expected) or not rescued_archive_matches(
+                expected, size=artifact["bytes"], sha256=artifact["sha256"]
+            ):
+                raise ValueError("rescue archive changed")
+
+    def confirm(observation: dict[str, Any]) -> None:
+        rescue_only(
+            argv, timeout=min(30.0, remaining()), confirm=observation["capture_sha256"],
+            **rescue_args,
+        )
+        remaining()
+
+    observation = record.get("rescue")
+    if observation is not None:
+        validate_artifact(observation)
+    confirmed = record.get("rescue_confirmed") is True
+    if observation is not None and "capture_scope" not in observation and not observation["partial"]:
+        # A legacy receipt can still cover a stash-free lane, or acknowledge
+        # an already retired one. Only the upgraded verifier may decide.
+        try:
+            confirm(observation)
+        except ValueError:
+            replacement = rescue_only(argv, timeout=min(30.0, remaining()), **rescue_args)
+            if replacement.get("supersedes_capture") != observation["capture_sha256"]:
+                raise ValueError("rescue replacement does not match original capture")
+            validate_artifact(replacement)
+            remaining()
+
+            def replace(current: dict) -> None:
+                if (
+                    current["stage"] != record["stage"] or current["stage"] not in {"done", "completed"}
+                    or current["spec"] != spec or current.get("rescue") != observation
+                    or current.get("rescue_confirmed") != record.get("rescue_confirmed")
+                    or (current.get("loss_cause") != UNIT_DEAD_NO_RECEIPT and current.get("supervisor_failure") is not True)
+                ):
+                    raise ValueError("rescue changed before replacement")
+                current["superseded_rescue"] = {"receipt": observation, "confirmed": confirmed}
+                current["rescue"] = replacement
+                current["rescue_confirmed"] = False
+
+            ledger._update_job(job_id, replace)
+            observation = replacement
+            confirmed = False
+        else:
+            if not confirmed:
+                ledger.confirm_rescue(job_id, observation["capture_sha256"])
+            confirmed = True
+    if observation is None:
+        observation = rescue_only(argv, timeout=min(30.0, remaining()), **rescue_args)
+        validate_artifact(observation)
+        remaining()
+        ledger.record_rescue(job_id, observation)
+    if not observation["partial"] and not confirmed:
+        confirm(observation)
+        if record["stage"] == "completed":
+            # A completed disposition is immutable. Only the confirmation
+            # for this exact replacement can advance under the ledger lock.
+            def acknowledge(current: dict) -> None:
+                if (
+                    current["stage"] != "completed" or current["spec"] != spec
+                    or current.get("rescue") != observation or "supersedes_capture" not in observation
+                ):
+                    raise ValueError("rescue changed before acknowledgment")
+                current["rescue_confirmed"] = True
+
+            ledger._update_job(job_id, acknowledge)
+        else:
+            ledger.confirm_rescue(job_id, observation["capture_sha256"])
+    internal = {"capture_sha256", "capture_scope", "supersedes_capture"}
+    return {key: value for key, value in observation.items() if key not in internal}
 
 
 def materialize_only(

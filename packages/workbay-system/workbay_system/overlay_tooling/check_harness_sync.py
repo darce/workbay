@@ -94,6 +94,7 @@ FIXTURE_COPY_FILES = (
     # guards' sibling imports.
     Path("scripts/hooks/_interp.py"),
     Path("scripts/hooks/_worktree_drift.py"),
+    Path("scripts/hooks/_worktree_identity.py"),
     Path("scripts/hooks/guard-main-branch.sh"),
     Path("scripts/hooks/guard-worktree-drift.sh"),
 )
@@ -410,6 +411,12 @@ def _load_claude_generator_module(repo_root: Path = REPO_ROOT):
     return module
 
 
+def _render_hook_command(item: dict, command_key: str, repo_root: Path) -> str | None:
+    if "task_probe" not in item:
+        return item.get(command_key)
+    return _load_claude_generator_module(repo_root).render_hook_command(item, command_key)
+
+
 def _discover_claude_override_root(repo_root: Path) -> Path | None:
     candidate = repo_root / CLAUDE_OVERRIDE_ROOT_REL
     if (candidate / "overrides.yaml").is_file():
@@ -661,10 +668,10 @@ def _check_hooks(contract: dict, *, repo_root: Path = REPO_ROOT) -> CheckFinding
             claude_matcher = item.get("claude_matcher", matcher)
             vscode_matcher = item.get("vscode_matcher", matcher)
             codex_matcher = item.get("codex_matcher", matcher)
-            claude_command = item.get("claude_command")
-            vscode_command = item.get("vscode_command")
-            cursor_command = item.get("cursor_command")
-            codex_command = item.get("codex_command")
+            claude_command = _render_hook_command(item, "claude_command", repo_root)
+            vscode_command = _render_hook_command(item, "vscode_command", repo_root)
+            cursor_command = _render_hook_command(item, "cursor_command", repo_root)
+            codex_command = _render_hook_command(item, "codex_command", repo_root)
             has_claude_command = isinstance(claude_command, str) and bool(claude_command.strip())
             has_vscode_command = isinstance(vscode_command, str) and bool(vscode_command.strip())
             has_cursor_command = isinstance(cursor_command, str) and bool(cursor_command.strip())
@@ -885,7 +892,7 @@ def _check_grok_plugin_hooks(
         if not isinstance(item, dict):
             continue
         hook_id = item.get("id", "<unknown>")
-        grok_command = item.get("grok_command")
+        grok_command = _render_hook_command(item, "grok_command", repo_root)
         if not isinstance(grok_command, str) or not grok_command.strip():
             # grok_command opt-out, symmetric with vscode/codex/cursor: a
             # pre_tool_use guard may omit `grok_command` only by declaring
@@ -945,7 +952,7 @@ def _check_cursor_plugin_hooks(
         for item in hook_spec.get(stage) or []:
             if not isinstance(item, dict):
                 continue
-            cursor_command = item.get("cursor_command")
+            cursor_command = _render_hook_command(item, "cursor_command", repo_root)
             if not isinstance(cursor_command, str) or not cursor_command.strip():
                 continue
             matcher = item.get("cursor_matcher", item.get("matcher", ""))
@@ -1342,6 +1349,11 @@ def _check_branch_isolation(
     except (OSError, json.JSONDecodeError) as exc:
         errors.append(f"branch_isolation: unable to load `.github/hooks/terminal-guard.json`: {exc}")
         return errors
+    main_guard = next(
+        (row for row in contract.get("hooks", {}).get("pre_tool_use", []) if row.get("id") == "main-branch"),
+        {},
+    )
+    claude_command = _render_hook_command(main_guard, "claude_command", repo_root)
     if claude_payload is not None:
         claude_main_guard_entry = next(
             (
@@ -1349,7 +1361,9 @@ def _check_branch_isolation(
                 for entry in claude_payload.get("hooks", {}).get("PreToolUse", [])
                 if any(
                     isinstance(hook, dict)
-                    and hook.get("command") == 'bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh"'
+                    and hook.get("command") == (
+                        claude_command or 'bash "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh"'
+                    )
                     for hook in entry.get("hooks", [])
                 )
             ),
@@ -1601,7 +1615,9 @@ def _seed_active_task(
                 "import json; "
                 "from pathlib import Path; "
                 "from workbay_handoff_mcp import RuntimeConfig, configure_runtime, get_handoff_state, set_handoff_state; "
-                f"configure_runtime(RuntimeConfig.for_repo(Path({str(repo)!r}))); "
+                # Exercise resolved identity without relying on cold import speed
+                # on shared CI workers. The contract separately bounds cold probes.
+                f"configure_runtime(RuntimeConfig.for_repo(Path({str(repo)!r}), current_task_auto_regen=True)); "
                 "identity = get_handoff_state(sections='identity'); "
                 "parsed = json.loads(identity) if isinstance(identity, str) else identity; "
                 "data = parsed.get('data') if isinstance(parsed, dict) else None; "

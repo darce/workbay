@@ -810,7 +810,12 @@ def test_find_dirty_protected_paths_tag_map_unavailable_degrades(
     _git("add", "apps/ok.py", cwd=repo)
     _git("commit", "-q", "-m", "track", cwd=repo)
 
-    monkeypatch.setattr(guard, "_batch_ls_files_v_tags", lambda *_a, **_k: None)
+    run_git = guard._run_git_degraded
+
+    def missing_index(args, **kwargs):
+        return None if "ls-files" in args else run_git(args, **kwargs)
+
+    monkeypatch.setattr(guard, "_run_git_degraded", missing_index)
 
     result = guard.find_dirty_protected_paths(
         branch="main",
@@ -1144,34 +1149,11 @@ def test_find_dirty_protected_paths_r9_clean_with_symlink_and_ignored_allows(
 ) -> None:
     """R9: clean main + gitignored + symlink-dir file must ALLOW.
 
-    Pins both round-9 defects together:
-
-    1. Ignored untracked paths (``.venv-x``) must drop via
-       ``ls-files --others --ignored`` inventory, not ``check-ignore --stdin``
-       (which exits 128 when any pathspec traverses a symlink dir).
-    2. Files only reachable through a symlinked directory under a code root
-       must not be nominated by the on-disk walk.
+    The ignored directory and paths reachable only through a tracked symlink
+    are absent from the dirty candidates Git reports.
     """
     repo = _init_repo(tmp_path)
     _r9_symlink_and_ignored_fixture(repo)
-
-    # Control: single-path ignore still works for the venv file.
-    assert guard._is_untracked_ignored_path(repo, "apps/.venv-x/lib/foo.py") is True
-    # Control: batch helper must also classify it ignored (defect-1 instrument).
-    batch = guard._batch_untracked_ignored_paths(
-        repo,
-        [
-            "apps/ok.py",
-            "apps/.venv-x/lib/foo.py",
-            "apps/linked_hooks/token_budget.py",
-        ],
-    )
-    assert "apps/.venv-x/lib/foo.py" in batch, batch
-
-    # Walk must not emit the symlink-dir path (defect-2 instrument).
-    on_disk = guard._collect_on_disk_protected_relpaths(repo, _protected_code_policy())
-    assert "apps/linked_hooks/token_budget.py" not in on_disk, on_disk
-    assert "apps/.venv-x/lib/foo.py" in on_disk, on_disk  # present before ignore filter
 
     result = guard.find_dirty_protected_paths(
         branch="main",
@@ -1248,10 +1230,6 @@ def test_find_dirty_protected_paths_r9_symlink_code_root_not_walked(
         state_dirty_surfaces=(),
         first_edit_protected_surfaces=(),
     )
-    on_disk = guard._collect_on_disk_protected_relpaths(repo, policy)
-    assert "apps/ok.py" in on_disk, on_disk
-    assert "apps/hooks_link/token_budget.py" not in on_disk, on_disk
-
     result = guard.find_dirty_protected_paths(
         branch="main",
         repo_root=str(repo),
@@ -1262,56 +1240,33 @@ def test_find_dirty_protected_paths_r9_symlink_code_root_not_walked(
 
 
 # ---------------------------------------------------------------------------
-# ROUND 10 — ignored inventory degrade is fail-closed (not empty-set allow)
+# ROUND 10 — an incomplete inventory cannot prove cleanliness
 # ---------------------------------------------------------------------------
 
 
 def test_find_dirty_protected_paths_inventory_degrade_returns_degraded(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """R10 pin: ignored-inventory degrade -> DirtyProtectedDegraded, not paths.
-
-    Pre-fix returned an empty set on inventory timeout/non-zero, which the
-    caller treated as "nothing ignored" and false-blocked clean trees with
-    thousands of gitignored candidates. Only the inventory call degrades;
-    toplevel / dirty-paths / tag-map probes stay healthy so this gate is
-    reached.
-    """
+    """Partial output from the index inventory is also a degraded probe."""
     repo = _init_repo(tmp_path)
-    (repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
-    (repo / "apps" / ".venv" / "lib").mkdir(parents=True)
-    (repo / "apps" / ".venv" / "lib" / "x.py").write_text("x = 1\n", encoding="utf-8")
-    (repo / "apps" / "ok.py").write_text("x = 1\n", encoding="utf-8")
-    _git("add", ".gitignore", "apps/ok.py", cwd=repo)
-    _git("commit", "-q", "-m", "r10 inventory degrade fixture", cwd=repo)
+    run_git = guard._run_git_degraded
+    oid = _git("hash-object", "seed", cwd=repo).encode()
 
-    real_degraded = guard._run_git_degraded
+    def truncated_index(args, **kwargs):
+        if "ls-files" in args:
+            return subprocess.CompletedProcess(
+                args, 0, stdout=b"H 100644 " + oid + b" 0\tseed\0S 100644 " + oid + b" 0\ttruncated.py"
+            )
+        return run_git(args, **kwargs)
 
-    def _degrade_inventory_only(args, **kwargs):  # noqa: ANN001, ANN003
-        # Inventory is the argv-only ls-files --others --ignored batch.
-        if (
-            "ls-files" in args
-            and "--others" in args
-            and "--ignored" in args
-            and "--exclude-standard" in args
-        ):
-            return None
-        return real_degraded(args, **kwargs)
-
-    monkeypatch.setattr(guard, "_run_git_degraded", _degrade_inventory_only)
-
+    monkeypatch.setattr(guard, "_run_git_degraded", truncated_index)
     result = guard.find_dirty_protected_paths(
         branch="main",
         repo_root=str(repo),
         policy=_protected_code_policy(),
         protected_branches=frozenset({"main", "master"}),
     )
-    assert result is not None, "inventory degrade must not allow (None)"
-    assert isinstance(result, guard.DirtyProtectedDegraded), (
-        f"inventory degrade must be DirtyProtectedDegraded, not ordinary "
-        f"dirty-paths tuple; got {result!r}"
-    )
-    assert not isinstance(result, tuple), result
+    assert isinstance(result, guard.DirtyProtectedDegraded), result
     assert result.branch == "main"
 
 
@@ -1328,12 +1283,6 @@ def test_find_dirty_protected_paths_inventory_success_gitignored_allows(
     _git("commit", "-q", "-m", "r10 allow fixture", cwd=repo)
     porcelain = _git("status", "--porcelain=v1", cwd=repo)
     assert porcelain == "", porcelain
-
-    batch = guard._batch_untracked_ignored_paths(
-        repo, ["apps/ok.py", "apps/.venv/lib/x.py"]
-    )
-    assert batch is not None, "healthy inventory must not degrade"
-    assert "apps/.venv/lib/x.py" in batch, batch
 
     result = guard.find_dirty_protected_paths(
         branch="main",
@@ -1379,38 +1328,26 @@ def test_find_dirty_protected_paths_inventory_fix_tracked_modified_still_blocks(
 
 
 def test_find_dirty_protected_paths_symlink_dir_ancestor_filter_is_the_gate(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path
 ) -> None:
-    """R10: ``_path_has_symlink_ancestor`` is the only gate for symlink-dir paths.
-
-    Existing R9 symlink tests stayed green when this helper was neutered to
-    ``return False``. Fixture: a tracked symlink *directory* under a real
-    code root, with a root-protected path that exists only through that
-    link. Real helper -> ALLOW; neutered helper -> ordinary BLOCK.
-    """
+    """Keep the index nomination even when its parent becomes a symlink."""
     repo = _init_repo(tmp_path)
     real = repo / "payload" / "hooks"
     real.mkdir(parents=True)
     (real / "evil.py").write_text("evil = 1\n", encoding="utf-8")
-    (repo / "apps").mkdir(exist_ok=True)
-    (repo / "apps" / "ok.py").write_text("ok = 1\n", encoding="utf-8")
     link = repo / "apps" / "linked"
-    os.symlink(os.path.relpath(real, start=link.parent), link)
-    _git(
-        "add",
-        "apps/ok.py",
-        "apps/linked",
-        "payload/hooks/evil.py",
-        cwd=repo,
-    )
-    _git("commit", "-q", "-m", "r10 symlink-dir ancestor fixture", cwd=repo)
-    porcelain = _git("status", "--porcelain=v1", cwd=repo)
-    assert porcelain == "", porcelain
-
-    # Path only exists through the symlinked directory under code_root.
+    link.mkdir(parents=True)
     through_link = "apps/linked/evil.py"
+    (repo / through_link).write_text("evil = 0\n", encoding="utf-8")
+    _git("add", through_link, "payload/hooks/evil.py", cwd=repo)
+    _git("commit", "-q", "-m", "r10 symlink-dir ancestor fixture", cwd=repo)
+    _git("update-index", "--assume-unchanged", through_link, cwd=repo)
+    (repo / through_link).unlink()
+    link.rmdir()
+    os.symlink(os.path.relpath(real, start=link.parent), link)
     assert (repo / through_link).is_file()
-    assert guard._path_has_symlink_ancestor(repo, repo / through_link) is True
+    assert _git("ls-files", "-v", "--", through_link, cwd=repo) == f"h {through_link}"
+    assert through_link not in _git("status", "--porcelain=v1", cwd=repo)
 
     policy = BranchIsolationPolicy(
         code_roots=("apps/",),
@@ -1424,10 +1361,6 @@ def test_find_dirty_protected_paths_symlink_dir_ancestor_filter_is_the_gate(
         first_edit_protected_surfaces=(),
     )
 
-    on_disk = guard._collect_on_disk_protected_relpaths(repo, policy)
-    assert through_link not in on_disk, on_disk
-    assert "apps/ok.py" in on_disk, on_disk
-
     result = guard.find_dirty_protected_paths(
         branch="main",
         repo_root=str(repo),
@@ -1438,20 +1371,15 @@ def test_find_dirty_protected_paths_symlink_dir_ancestor_filter_is_the_gate(
         f"symlink-dir path must not false-block; got {result!r}"
     )
 
-    # Mutation pin: neutering the helper must re-nominate the path and BLOCK.
-    monkeypatch.setattr(guard, "_path_has_symlink_ancestor", lambda *_a, **_k: False)
-    on_disk_neutered = guard._collect_on_disk_protected_relpaths(repo, policy)
-    assert through_link in on_disk_neutered, on_disk_neutered
-    neutered = guard.find_dirty_protected_paths(
+    link.unlink()
+    link.mkdir()
+    (repo / through_link).write_text("evil = 1\n", encoding="utf-8")
+    assert guard.find_dirty_protected_paths(
         branch="main",
         repo_root=str(repo),
         policy=policy,
         protected_branches=frozenset({"main", "master"}),
-    )
-    assert neutered is not None, "neutered symlink filter must not ALLOW"
-    assert not isinstance(neutered, guard.DirtyProtectedDegraded), neutered
-    _branch, paths = neutered
-    assert through_link in paths, paths
+    ) == ("main", [through_link])
 
 
 def test_find_dirty_protected_paths_raw_dirty_none_fail_closed(
@@ -1488,3 +1416,51 @@ def test_find_dirty_protected_paths_raw_dirty_none_fail_closed(
         f"raw_dirty None must hit DirtyProtectedDegraded; got {result!r}"
     )
     assert result.branch == "main"
+
+
+@pytest.mark.parametrize("gitlink", [False, True])
+def test_find_dirty_protected_paths_preserves_embedded_checkout_paths(
+    tmp_path: Path, gitlink: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path)
+    nested = repo / "apps" / "nested"
+    nested.mkdir(parents=True)
+    _git("init", "-q", cwd=nested)
+    _git("config", "user.email", "test@example.com", cwd=nested)
+    _git("config", "user.name", "Test", cwd=nested)
+    (nested / "payload.py").write_text("x = 1\n", encoding="utf-8")
+    inner = nested / "library"
+    inner.mkdir()
+    _git("init", "-q", cwd=inner)
+    _git("config", "user.email", "test@example.com", cwd=inner)
+    _git("config", "user.name", "Test", cwd=inner)
+    (inner / "component.py").write_text("x = 1\n", encoding="utf-8")
+    _git("add", "component.py", cwd=inner)
+    _git("commit", "-q", "-m", "inner fixture", cwd=inner)
+    _git("add", "payload.py", "library", cwd=nested)
+    _git("commit", "-q", "-m", "nested fixture", cwd=nested)
+    if gitlink:
+        _git("add", "apps/nested", cwd=repo)
+        _git("commit", "-q", "-m", "gitlink fixture", cwd=repo)
+
+    (inner / "component.py").write_text("x = 2\n", encoding="utf-8")
+
+    def scan():
+        return guard.find_dirty_protected_paths(
+            branch="main",
+            repo_root=str(repo),
+            policy=_protected_code_policy(),
+            protected_branches=frozenset({"main", "master"}),
+        )
+
+    assert scan() == ("main", ["apps/nested/library/component.py", "apps/nested/payload.py"])
+
+    run_git = guard._run_git_degraded
+
+    def unavailable_inner_inventory(args, **kwargs):
+        if args[:3] == ["-C", str(inner), "ls-files"]:
+            return subprocess.CompletedProcess(args, 128, stdout=b"")
+        return run_git(args, **kwargs)
+
+    monkeypatch.setattr(guard, "_run_git_degraded", unavailable_inner_inventory)
+    assert isinstance(scan(), guard.DirtyProtectedDegraded)

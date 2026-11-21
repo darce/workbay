@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.24] — 2026-11-21
+
+### Changed
+- Raise the handoff dependency floor to 0.3.33 and the orchestrator floor to 0.3.39 for WorkBay v0.1.94.
+
 ## [0.1.23] — 2026-11-20
 
 ### Fixed

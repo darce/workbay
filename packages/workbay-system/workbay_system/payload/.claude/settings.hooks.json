@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard-worktree-drift.sh\"",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard-worktree-drift.sh\" 1",
             "timeout": 5
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh\"",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard-main-branch.sh\" 1",
             "timeout": 5
           }
         ]

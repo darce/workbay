@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'cd \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" && exec scripts/hooks/_launch_python.sh scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py'",
+            "command": "sh -c 'cd \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" && exec scripts/hooks/_launch_python.sh scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py 1'",
             "timeout": 5,
             "statusMessage": "Guarding worktree drift"
           }

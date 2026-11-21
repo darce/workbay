@@ -15,4 +15,4 @@ from _worktree_drift import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(*(float(arg) for arg in sys.argv[1:])))

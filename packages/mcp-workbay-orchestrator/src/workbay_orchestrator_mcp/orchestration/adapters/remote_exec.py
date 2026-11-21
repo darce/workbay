@@ -102,7 +102,7 @@ from ..lane_test_cmd import resolve_dispatch_test_cmd as resolve_dispatch_test_c
 from ..prompt_input_budget import evaluate_prompt_input_budget
 from ..remote_agent_root import resolve_remote_agent_root
 from ..remote_exec_staging_reaper import pid_is_live
-from ..remote_job_ledger import LedgerLockTimeout, RemoteJobLedger
+from ..remote_job_ledger import LedgerLockTimeout, RemoteJobLedger, RemoteJobLedgerError, detached_pass_outcome
 from ..remote_phase_budget import (
     MODEL_CLOCK_CARRIER_ABSENT,
     MODEL_CLOCK_CARRIER_MALFORMED,
@@ -328,6 +328,20 @@ def _ledger_update_deferred_result(
     )
 
 
+def _reconcile_existing_submission(
+    backend_id: str, identity: RemoteJobIdentity, record: dict, details: str
+) -> BackendResult:
+    return _ledger_update_deferred_result(
+        backend_id,
+        identity,
+        details=details,
+        submitted=record["stage"] != "intent",
+        ambiguous=record["stage"] == "intent",
+        unit=record.get("unit"),
+        defer_reason=None,
+    )
+
+
 def _bind_detached_transport(begin):
     """Keep the authenticated native snapshot owned through actual child exit."""
 
@@ -444,6 +458,7 @@ def _detached_begin_result(
         current_remote_exec_selection,
         resolve_remote_exec_mode,
     )
+    from ..remote_job_ledger import SubmitPreparationTimeout
 
     try:
         if remote_exec_selection is None:
@@ -480,7 +495,6 @@ def _detached_begin_result(
                 state_dir = Path(get_runtime_config().state_dir)
             except RuntimeNotConfiguredError:
                 state_dir = Path(orchestrator_root) / ".task-state"
-    ledger = RemoteJobLedger(state_dir / "remote-jobs")
     if refresh_clocks is not None:
         try:
             timeout = refresh_clocks(command)
@@ -499,6 +513,26 @@ def _detached_begin_result(
                     "remote_exec_mode": "detached",
                 },
             )
+    transport_receipt = getattr(command, "receipt", None)
+    recovery_binding = (
+        {
+            "transport_digest": transport_receipt["transport_digest"],
+            "route": detached_recovery_route(
+                Path(cwd), env, timeout=max(0.0, min(5.0, lock_deadline - time.monotonic()))
+            ),
+        }
+        if transport_receipt is not None
+        else None
+    )
+    if recovery_binding is not None and recovery_binding["route"] is not None:
+        # Use the same literal host and sandbox root in the native submit and recovery.
+        env = {**env, **recovery_binding["route"]}
+    ledger = RemoteJobLedger(
+        state_dir / "remote-jobs",
+        submit_cwd=cwd,
+        submit_env=env,
+        submit_executable=getattr(command, "snapshot", None),
+    )
     spec = RemoteJobSpec(
         job_id=identity.job_id,
         task_ref=identity.task_ref,
@@ -512,20 +546,40 @@ def _detached_begin_result(
         bound_seconds=max(1, int(timeout)),
         remote_exec_mode=remote_exec_selection,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        extras={"recovery_transport": recovery_binding} if recovery_binding is not None else {},
     )
     try:
         with ledger.intent_lock_deadline(lock_deadline):
-            ledger.record_intent(spec)
-    except LedgerLockTimeout as exc:
+            try:
+                recorded = ledger.record_intent(spec)
+            except RemoteJobLedgerError as exc:
+                if exc.reason != "job_id_conflict" or recovery_binding is None:
+                    raise
+                existing = ledger.read_job(identity.job_id)
+                if "recovery_transport" in existing["spec"]:
+                    raise
+                # Existing launch digests include the legacy wire shape.
+                spec = replace(spec, extras={})
+                recorded = ledger.record_intent(spec)
+            if not recorded.get("retry_admission") and (
+                recorded["stage"] != "intent" or recorded.get("submit_state") != "before_send"
+            ):
+                # Possibly sent and legacy intents may already be on the VM.
+                if recorded["stage"] not in {"intent", "submitted"}:
+                    raise RemoteJobLedgerError("job_id_conflict")
+                return _reconcile_existing_submission(
+                    backend_id, identity, recorded, "Reconcile the original detached submission."
+                )
+    except (LedgerLockTimeout, SubmitPreparationTimeout) as exc:
         return BackendResult(
             handoff_action="needs_guidance",
-            summary=f"{backend_id} deferred detached job intent while the ledger lock was busy",
+            summary=f"{backend_id} deferred detached job intent before submission",
             details=f"{type(exc).__name__}: {exc}",
             blockers=["admission_deferred"],
             raw_payload={
                 "outcome": "admission_deferred",
                 "admission_deferred": True,
-                "defer_reason": "remote_job_ledger_lock_timeout",
+                "defer_reason": exc.reason if isinstance(exc, SubmitPreparationTimeout) else "remote_job_ledger_lock_timeout",
                 "retryable": True,
                 "job_id": identity.job_id,
                 "attempt": identity.attempt,
@@ -541,6 +595,10 @@ def _detached_begin_result(
             raw_payload={
                 "outcome": "error",
                 "remote_job_submit_error": "remote job intent could not be recorded",
+                **(
+                    {"failure_reason": exc.reason}
+                    if isinstance(exc, RemoteJobLedgerError) and exc.reason == "submit_input_unreadable" else {}
+                ),
                 "job_id": identity.job_id,
                 "attempt": identity.attempt,
                 "remote_exec_mode": "detached",
@@ -548,53 +606,50 @@ def _detached_begin_result(
         )
 
     submit_started = False
+    verified_inputs = ExitStack()
     try:
+        def delivery_timing():
+            bound = refresh_clocks(command) if refresh_clocks is not None else spec.bound_seconds
+            return bound, list(command)
+
         if refresh_clocks is not None:
-            # The intent write and its lock are setup waits. Publish timing
-            # evidence *under* the final ledger lock, then check after its write.
-            # A slow durable write repeats only within the original deadline;
-            # it never grants the remote body a new relative lifetime [RES-02].
-            while True:
-                refresh_clocks(command)
-
-                def update_timing(record):
-                    bound = refresh_clocks(command)
-                    if record["stage"] != "intent":
-                        raise ValueError("remote job intent already advanced")
-                    record["spec"]["bound_seconds"] = bound
-                    record["spec"]["argv"] = list(command)
-
+            refresh_clocks(command)
+        try:
+            with ledger.intent_lock_deadline(lock_deadline):
+                timeout = verified_inputs.enter_context(ledger.claimed_command(spec, command, delivery_timing))
+        except RemoteJobLedgerError as exc:
+            if isinstance(exc, LedgerLockTimeout):
+                reason = "remote_job_ledger_lock_timeout"
+                detail = "The timing ledger lock was busy before submission."
+            elif isinstance(exc, SubmitPreparationTimeout):
+                reason, detail = exc.reason, "Rendering the native inputs exceeded the pre-send budget."
+            elif exc.reason == "submit_claim_taken":
+                reason = exc.reason
+                detail = "Another delivery advanced the same intent before submission."
+            else:
+                raise
+            if refresh_clocks is not None:
                 try:
-                    with ledger.intent_lock_deadline(lock_deadline):
-                        timing_record = ledger._update_job(identity.job_id, update_timing)
-                except LedgerLockTimeout:
-                    # A lock wait can exhaust the phase before its callback
-                    # runs. Still no child, hence no ambiguous submission.
-                    try:
-                        refresh_clocks(command)
-                    except PhaseBudgetError:
-                        # Refresh stamped the exhausted phase receipt; this
-                        # pre-submit lock timeout remains an admission deferral.
-                        pass
-                    return BackendResult(
-                        handoff_action="needs_guidance",
-                        merge_ready=False,
-                        summary=f"{backend_id} deferred detached dispatch timing",
-                        details="The timing ledger lock was busy before submission.",
-                        blockers=["admission_deferred"],
-                        raw_payload={
-                            "outcome": "admission_deferred",
-                            "admission_deferred": True,
-                            "defer_reason": "remote_job_ledger_lock_timeout",
-                            "retryable": True,
-                            "job_id": identity.job_id,
-                            "attempt": identity.attempt,
-                            "remote_exec_mode": "detached",
-                        },
-                    )
-                timeout = refresh_clocks(command)
-                if timing_record["spec"]["bound_seconds"] == timeout and timing_record["spec"]["argv"] == list(command):
-                    break
+                    refresh_clocks(command)
+                except PhaseBudgetError:
+                    # Preserve the exhausted phase receipt on this deferral.
+                    pass
+            return BackendResult(
+                handoff_action="needs_guidance",
+                merge_ready=False,
+                summary=f"{backend_id} deferred detached dispatch timing",
+                details=detail,
+                blockers=["admission_deferred"],
+                raw_payload={
+                    "outcome": "admission_deferred",
+                    "admission_deferred": True,
+                    "defer_reason": reason,
+                    "retryable": True,
+                    "job_id": identity.job_id,
+                    "attempt": identity.attempt,
+                    "remote_exec_mode": "detached",
+                },
+            )
         remaining_timeout = max(0.0, lock_deadline - time.monotonic())
         if refresh_clocks is not None:
             remaining_timeout = min(remaining_timeout, timeout)
@@ -603,6 +658,9 @@ def _detached_begin_result(
     except Exception as exc:  # noqa: BLE001 — preserve uncertain remote acceptance
         if not submit_started:
             reason = exc.reason if isinstance(exc, PhaseBudgetError) else "remote_job_timing_failed"
+            conflict_reason = None
+            if isinstance(exc, RemoteJobLedgerError) and exc.reason == "job_id_conflict":
+                reason, conflict_reason = exc.reason, exc.detail
             return BackendResult(
                 handoff_action="needs_guidance",
                 merge_ready=False,
@@ -611,6 +669,7 @@ def _detached_begin_result(
                 blockers=[reason],
                 raw_payload={
                     "failure_reason": reason,
+                    **({"conflict_reason": conflict_reason} if conflict_reason else {}),
                     "submit_state": "not_started",
                     "job_id": identity.job_id,
                     "attempt": identity.attempt,
@@ -623,7 +682,9 @@ def _detached_begin_result(
                 if ambiguous:
                     ledger.mark_submit_ambiguous(identity.job_id)
                 else:
-                    ledger.mark_done(identity.job_id, 2)
+                    record = ledger.mark_submit_refused(identity.job_id, 2)
+                    if record.get("submit_state") != "refused":
+                        return _reconcile_existing_submission(backend_id, identity, record, str(exc))
         except LedgerLockTimeout as close_exc:
             detail = f"{type(exc).__name__}: {exc}; ledger update deferred: {type(close_exc).__name__}: {close_exc}"
             return _ledger_update_deferred_result(backend_id, identity, details=detail, ambiguous=ambiguous)
@@ -648,12 +709,11 @@ def _detached_begin_result(
                 "remote_exec_mode": "detached",
             },
         )
+    finally:
+        verified_inputs.close()
 
     if completed.returncode == 0:
-        try:
-            payload = json.loads(completed.stdout or "")
-        except (TypeError, json.JSONDecodeError):
-            payload = None
+        payload = remote_job_runner._status_payload(completed, identity)
         unit = payload.get("unit") if isinstance(payload, dict) else None
         state = payload.get("state") if isinstance(payload, dict) else None
         if (
@@ -710,15 +770,48 @@ def _detached_begin_result(
                     "remote_exec_mode": "detached",
                 },
             )
-        close_rc = 2
-        stderr = "remote_job_submit_invalid_response"
-    else:
-        close_rc = int(completed.returncode)
-        stderr = (completed.stderr or "").strip()
+    close_rc = int(completed.returncode)
+    stderr = (completed.stderr or "").strip()
+    # A native admission refusal precedes queue publication. A transport
+    # exit or unusable success reply alone says nothing about acceptance.
+    native_stderr = stderr.removeprefix(f"remote_job_submit_failed rc={close_rc} ")
+    refused = (
+        close_rc == 75
+        and re.search(
+            r"^remote_agent: (?:admission_deferred|vm_measured_saturation|vm_admission_unmeasured|"
+            r"vm_pid_saturation|vm_queue_unavailable publication=not_published|vm_queue_publication_lock_timeout|"
+            r"submit_lock_timeout|vm_admission_lock_timeout|residual timeout exhausted after pre-dispatch|"
+            r"VM MemAvailable|lane cap)\b",
+            native_stderr, re.MULTILINE,
+        )
+        or close_rc == 78 and "remote_agent: vm_linger_disabled" in native_stderr.splitlines()
+        or close_rc == 2 and stderr.startswith(("remote_job_identity_missing ", "remote_job_invalid_command "))
+    )
+    if not refused:
+        detail = stderr or f"Detached launch returned no usable receipt (exit {close_rc})."
+        defer_reason = None
+        try:
+            with ledger.intent_lock_deadline(lock_deadline):
+                ledger.mark_submit_ambiguous(identity.job_id)
+        except LedgerLockTimeout as exc:
+            defer_reason = "remote_job_ledger_lock_timeout"
+            detail += f" Ledger update deferred: {exc}"
+        except Exception as exc:  # noqa: BLE001 — the retained intent still fences a retry
+            defer_reason = "remote_job_ledger_update_failed"
+            detail += f" Ledger update failed: {type(exc).__name__}: {exc}"
+        result = _ledger_update_deferred_result(
+            backend_id, identity, details=detail, ambiguous=True, defer_reason=defer_reason
+        )
+        payload = {**result.raw_payload, "failure_reason": "remote_job_launch_no_receipt"}
+        if close_rc == 0 and (completed.stdout or "").strip():
+            payload.update(outcome="error", remote_job_submit_error="remote_job_submit_invalid_response")
+        return replace(result, raw_payload=payload)
 
     try:
         with ledger.intent_lock_deadline(lock_deadline):
-            ledger.mark_done(identity.job_id, close_rc)
+            record = ledger.mark_submit_refused(identity.job_id, close_rc)
+            if record.get("submit_state") not in {"refused", "admission_refused"}:
+                return _reconcile_existing_submission(backend_id, identity, record, stderr)
     except LedgerLockTimeout as exc:
         return _ledger_update_deferred_result(
             backend_id,
@@ -3931,8 +4024,9 @@ def resolve_transport(
     *,
     primary_repo: Path | None = None,
     recipe_argv: Sequence[str] | None = None,
+    expected_digest: str | None = None,
 ) -> TransportResolution:
-    """Search order (first existing EXECUTABLE regular file wins):
+    """Search order (first executable regular file matching any pinned digest wins):
 
     1. ``<worktree>/scripts/remote_agent.sh``
     2. ``<primary_repo>/scripts/remote_agent.sh`` (from git --git-common-dir when None)
@@ -3956,14 +4050,25 @@ def resolve_transport(
     """
     searched: list[TransportCandidate] = []
 
-    worktree_candidate = Path(worktree_path) / TRANSPORT_REL
-    usable, outcome = _inspect_transport_candidate(worktree_candidate)
-    searched.append(TransportCandidate(str(worktree_candidate), outcome))
-    if usable:
-        return _preflight_resolved_transport(
-            TransportResolution(worktree_candidate, TRANSPORT_SOURCE_WORKTREE),
-            recipe_argv,
-        )
+    def admit(path: Path, source: str) -> TransportResolution | None:
+        usable, outcome = _inspect_transport_candidate(path)
+        if usable:
+            try:
+                resolved = _preflight_resolved_transport(TransportResolution(path, source), recipe_argv)
+            except TransportMissingError:
+                if expected_digest is None:
+                    raise
+                outcome = "unreadable"
+            else:
+                if expected_digest is None or resolved.transport_digest == expected_digest:
+                    return resolved
+                outcome = "digest_mismatch"
+        searched.append(TransportCandidate(str(path), outcome))
+        return None
+
+    selected = admit(Path(worktree_path) / TRANSPORT_REL, TRANSPORT_SOURCE_WORKTREE)
+    if selected is not None:
+        return selected
 
     resolved_primary = Path(primary_repo) if primary_repo is not None else _primary_repo_from_git(Path(worktree_path))
     if resolved_primary is None:
@@ -3973,26 +4078,17 @@ def resolve_transport(
         remedy = _TRANSPORT_REMEDY_NO_PRIMARY
     else:
         remedy = _TRANSPORT_REMEDY
-        primary_candidate = resolved_primary / TRANSPORT_REL
-        usable, outcome = _inspect_transport_candidate(primary_candidate)
-        searched.append(TransportCandidate(str(primary_candidate), outcome))
-        if usable:
-            return _preflight_resolved_transport(
-                TransportResolution(primary_candidate, TRANSPORT_SOURCE_PRIMARY),
-                recipe_argv,
-            )
+        selected = admit(resolved_primary / TRANSPORT_REL, TRANSPORT_SOURCE_PRIMARY)
+        if selected is not None:
+            return selected
 
     packaged, packaged_outcome = _packaged_transport_script()
     if packaged is None:
         searched.append(TransportCandidate(_PACKAGED_TRANSPORT_DISPLAY, packaged_outcome))
     else:
-        usable, outcome = _inspect_transport_candidate(packaged)
-        searched.append(TransportCandidate(str(packaged), outcome))
-        if usable:
-            return _preflight_resolved_transport(
-                TransportResolution(packaged, TRANSPORT_SOURCE_PACKAGE),
-                recipe_argv,
-            )
+        selected = admit(packaged, TRANSPORT_SOURCE_PACKAGE)
+        if selected is not None:
+            return selected
 
     raise TransportMissingError(searched, remedy=remedy)
 
@@ -4001,6 +4097,36 @@ def resolve_transport_script(worktree_path: Path, *, primary_repo: Path | None =
     """Path-only view of :func:`resolve_transport` for callers that do not record
     the source. Prefer ``resolve_transport`` on any dispatch/preflight path."""
     return resolve_transport(worktree_path, primary_repo=primary_repo).path
+
+
+def retired_transport_digest(
+    worktree: Path,
+    primary: Path,
+    original: Path,
+    base: str,
+    *,
+    remaining: Callable[[], float],
+) -> str:
+    """Prove the legacy default executable from the pinned source's Git blob."""
+    if original != worktree / TRANSPORT_REL:
+        raise ValueError("legacy transport path is not the pinned worktree script")
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(primary), *args],
+            capture_output=True,
+            check=True,
+            timeout=min(5.0, remaining()),
+        ).stdout
+
+    entry = git("ls-tree", base, "--", TRANSPORT_REL.as_posix())
+    match = re.fullmatch(rb"100755 blob ([0-9a-f]{40})\tscripts/remote_agent\.sh\n", entry)
+    if match is None:
+        raise ValueError("pinned source has no executable transport")
+    blob = match[1].decode("ascii")
+    if int(git("cat-file", "-s", blob)) > remote_job_runner._TRANSPORT_MAX_BYTES:
+        raise ValueError("pinned transport exceeds the read limit")
+    return hashlib.sha256(git("cat-file", "blob", blob)).hexdigest()
 
 
 def _local_dirty(worktree_path: Path) -> bool:
@@ -6703,7 +6829,7 @@ def _attestation_gate_host(worktree: Path, env: Mapping[str, str]) -> str:
         return ""
 
 
-def _transport_attestation_gate_host(worktree: Path, env: Mapping[str, str]) -> str:
+def _transport_attestation_gate_host(worktree: Path, env: Mapping[str, str], *, timeout: float = 5.0) -> str:
     """Use remote_agent.sh's git-common-dir parent, independently of storage."""
     # Location overrides cannot prove membership of the supplied lane. Refuse
     # cached evidence even for apparently equivalent spellings (fail closed).
@@ -6714,7 +6840,7 @@ def _transport_attestation_gate_host(worktree: Path, env: Mapping[str, str]) -> 
             ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             check=False,
             env=dict(env),
             cwd=worktree,
@@ -6725,6 +6851,27 @@ def _transport_attestation_gate_host(worktree: Path, env: Mapping[str, str]) -> 
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
     return ""  # An unresolved transport root cannot authorize cached evidence.
+
+
+def detached_recovery_route(
+    worktree: Path,
+    env: Mapping[str, str],
+    *,
+    timeout: float = 5.0,
+) -> dict[str, str] | None:
+    """Pin the literal SSH destination and VM sandbox root used by job operations."""
+    host = _transport_attestation_gate_host(worktree, env, timeout=timeout)
+    if not re.fullmatch(r"[A-Za-z0-9_@.\[\]:][A-Za-z0-9_@.\[\]:-]*", host):
+        return None
+    if env.get("WORKBAY_REMOTE_GATE_HOST") not in (None, "", host):
+        return None
+    try:
+        sandbox_root = resolve_remote_agent_root(env)
+    except ValueError:
+        return None
+    if env.get("WORKBAY_REMOTE_AGENT_ROOT", sandbox_root) != sandbox_root:
+        return None
+    return {"WORKBAY_REMOTE_GATE_HOST": host, "WORKBAY_REMOTE_AGENT_ROOT": sandbox_root}
 
 
 def _observed_codex_identity(host: str, env: Mapping[str, str], path_prepend: Sequence[str]) -> str:
@@ -7138,7 +7285,7 @@ def _attribute_refusal(
     # A submitted detached job is still running: it is a pass fence, not a
     # refusal. Stamping it would record a live job as a non-retryable adapter
     # refusal (refusal_without_cause, retryable=False).
-    if payload.get("outcome") == "remote_job_pending" and payload.get("resumable_work") is True:
+    if detached_pass_outcome(payload) == "remote_job_pending" and payload.get("resumable_work") is True:
         return result
     cause = _inferred_refusal_cause(result, completed_rc=completed_rc)
     payload[REFUSAL_CAUSE_KEY] = cause
@@ -9011,9 +9158,24 @@ class RemoteExecAdapter(BackendAdapter):
         from ..review_cycle_dispatch import ACTIVE_DISPATCH, enforce_route, prepare, settle_actual
         cycle_receipt = ACTIVE_DISPATCH.get()
         cycle_engine_owned = cycle_receipt is not None
+        first_attempt = 0
+        if remote_exec_mode == "detached":
+            token = str(mode_env.get("WORKBAY_REMOTE_JOB_ATTEMPT", "0"))
+            if not re.fullmatch(r"[0-9]+", token):
+                return BackendResult(
+                    handoff_action="needs_guidance", summary="Invalid detached job attempt",
+                    blockers=["remote_job_identity_invalid"],
+                    raw_payload={"failure_reason": "remote_job_identity_invalid"},
+                )
+            first_attempt = int(token)
         if cycle_receipt is None:
+            dispatch_id = kwargs.get("dispatch_id")
+            if dispatch_id is None and remote_exec_mode == "detached":
+                fields = [kwargs.get(key) for key in ("task_ref", "lane_id", "pass_id")]
+                if all(isinstance(value, str) and value.strip() for value in fields):
+                    dispatch_id = RemoteJobIdentity(*(value.strip() for value in fields), first_attempt).job_id
             cycle_receipt = prepare(
-                worktree_path, dispatch_id=kwargs.get("dispatch_id") or ("j" + os.urandom(10).hex()),
+                worktree_path, dispatch_id=dispatch_id or ("j" + os.urandom(10).hex()),
                 subject_branch=branch, kind="implement", settlement_owner="adapter",
             )
         cycle_decision = cycle_receipt["decision"]
@@ -9536,7 +9698,7 @@ class RemoteExecAdapter(BackendAdapter):
             raw["provider_refusal_proof"] = provider_refusal
             if not cycle_engine_owned:
                 actual_outcome = ("dispatch_refused" if provider_refusal else
-                                  raw.get("outcome") or ("dispatch_refused" if constructor_refusal else "error"))
+                                  detached_pass_outcome(raw) or ("dispatch_refused" if constructor_refusal else "error"))
                 provenance_evidence = raw.get("source_provenance")
                 from ..review_cycle_dispatch import (
                     _model_or_unknown_evidence,
@@ -11551,10 +11713,6 @@ class RemoteExecAdapter(BackendAdapter):
                         if remote_exec_mode == "detached":
                             assert remote_job_identity_fields is not None
                             task_identity, lane_identity, pass_identity = remote_job_identity_fields
-                            try:
-                                first_attempt = max(0, int(mode_env.get("WORKBAY_REMOTE_JOB_ATTEMPT", "0")))
-                            except (TypeError, ValueError):
-                                first_attempt = 0
                             identity = RemoteJobIdentity(
                                 task_ref=task_identity,
                                 lane_id=lane_identity,
@@ -13408,6 +13566,12 @@ class RemoteExecAdapter(BackendAdapter):
                     }[scope_cause.group(1)]
                 else:
                     for marker, reason, diagnosis, remedy in (
+                        (
+                            "remote_agent: rescue_pending refusing to wipe existing sandbox",
+                            "rescue_pending",
+                            "prior sandbox work is still held",
+                            "finish the prior job's sandbox rescue before retrying",
+                        ),
                         (
                             "lane_scope_select without lane lock",
                             "lane_scope_lock_unavailable",

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.17] — 2026-11-21
+
+### Changed
+- Reissue the protocol package at a new version for the WorkBay v0.1.94 release.
+
 ## [0.3.16] — 2026-11-20
 
 ### Changed

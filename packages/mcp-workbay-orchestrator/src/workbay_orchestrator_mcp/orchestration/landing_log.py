@@ -1465,6 +1465,25 @@ def _repair_time(value: str) -> datetime:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
+def _has_receipt_repair_audit(notes: object, audit_line: str) -> bool:
+    from workbay_handoff_mcp.lane_notes import notes_envelope
+
+    if not isinstance(notes, str):
+        return False
+    envelope = notes_envelope(notes)
+    if envelope is not None:
+        entries = envelope.get("close_notes")
+        return isinstance(entries, list) and audit_line in entries
+
+    lines = notes.splitlines()
+    if not lines or lines[-1] != audit_line:
+        return False
+    # v0.1.93 appended the audit to prose and JSON alike. If the original
+    # notes looked like an object, require that the entire object is intact.
+    original, _, _ = notes.rpartition(audit_line)
+    return not original.lstrip().startswith("{") or notes_envelope(original) is not None
+
+
 def repair_receipt_backed_branch_tip(
     repo: str | Path,
     *,
@@ -1554,7 +1573,7 @@ def repair_receipt_backed_branch_tip(
                         row.get("branch_tip_sha") == receipt.tip
                         and row.get("branch_tip_source") == "backfill"
                         and row.get("branch_tip_observed_at") == stamp
-                        and evidence.audit_line() in (row.get("notes") or "").splitlines()
+                        and _has_receipt_repair_audit(row.get("notes"), evidence.audit_line())
                     )
                     if not repaired:
                         observed = row.get("branch_tip_observed_at")

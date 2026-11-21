@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote
 
 from workbay_protocol import resolve_env_alias
 
+from . import lane_close_evidence
 from .review_findings_retention import (  # noqa: F401
     DEFAULT_REVIEW_FINDINGS_ARCHIVE_RETENTION_DAYS,
     REVIEW_FINDINGS_ARCHIVE_BATCH_LIMIT,
@@ -353,7 +354,9 @@ _REVIEW_FINDINGS_FINDING_ID_INDEX = "idx_review_findings_finding_id"
 #   v51 — introducing package version 0.3.24 (coordinator-owned pyproject seam):
 #         native validation milestones and per-lane authority. Breaking reader
 #         floor: older writers do not enforce active-policy gating.
-HANDOFF_SCHEMA_VERSION = 51
+#   v52 — package version 0.3.32: additive private close evidence.
+#         Existing readers and writers keep the v51 floor.
+HANDOFF_SCHEMA_VERSION = 52
 
 # Minimum compatible reader version stamped into ``PRAGMA user_version``.
 #
@@ -413,6 +416,7 @@ SCHEMA_VERSION_PACKAGE_INTRODUCED: tuple[tuple[int, str], ...] = (
     (49, "0.3.20"),
     (50, "0.3.21"),
     (51, "0.3.24"),
+    (52, "0.3.32"),
 )
 
 # Allocated schema numbers deliberately retired by a written migration decision,
@@ -1816,7 +1820,11 @@ def _handoff_schema_bootstrapped(conn: sqlite3.Connection) -> bool:
         return False
     if not _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES):
         return False
-    return _required_columns_present(conn) and _native_validation_schema_present(conn)
+    return (
+        _required_columns_present(conn)
+        and _native_validation_schema_present(conn)
+        and lane_close_evidence.schema_present(conn)
+    )
 
 
 def _handoff_fts_bootstrapped(conn: sqlite3.Connection) -> bool:
@@ -4161,6 +4169,13 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
                 return
             raise
         try:
+            eligible_close_upgrade = (
+                handoff_schema_version(conn) == 51
+                and _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES)
+                and _required_columns_present(conn)
+                and _native_validation_schema_present(conn)
+                and not unproven_cycle_epoch_triggers(conn)
+            )
             # HANDOFF_SCHEMA_SQL now owns the delivery-claim index for fresh
             # databases, but a pre-v37 worker_reports table lacks the indexed
             # column. Reuse the idempotent v37 migration before replaying the
@@ -4175,10 +4190,12 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
             _execute_sql_script(conn, HANDOFF_SCHEMA_SQL)
             _apply_handoff_migrations(conn)
             _ensure_released_row_terminal_trigger(conn)
+            lane_close_evidence.migrate(conn, eligible_upgrade=eligible_close_upgrade)
             if (
                 not _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES)
                 or not _required_columns_present(conn)
                 or not _worker_reports_delivery_id_index_present(conn)
+                or not lane_close_evidence.schema_present(conn)
             ):
                 try:
                     conn.execute("ROLLBACK")
@@ -5189,11 +5206,17 @@ if forbidden_handoff_db_paths_from_env():
     install_forbidden_handoff_db_guard()
 
 
-def _connect_handoff_sqlite(db_path, *, deadline: float | None = None) -> sqlite3.Connection:
+def _connect_handoff_sqlite(
+    db_path, *, deadline: float | None = None, existing_only: bool = False
+) -> sqlite3.Connection:
     target = _sqlite_write_target(db_path)
     if target is not None:
         _refuse_forbidden_handoff_db_write(target, via="_connect_handoff_sqlite")
     timeout_ms = HANDOFF_SQLITE_BUSY_TIMEOUT_MS if deadline is None else _handoff_deadline_timeout_ms(deadline)
+    options = {}
+    if existing_only:
+        db_path = Path(db_path).expanduser().resolve().as_uri() + "?mode=rw"
+        options["uri"] = True
     conn = sqlite3.connect(
         db_path,
         timeout=timeout_ms / 1000.0,
@@ -5203,6 +5226,7 @@ def _connect_handoff_sqlite(db_path, *, deadline: float | None = None) -> sqlite
         # so every execution re-prepares and the callback always runs
         # (internal; ~2.35 µs/statement).
         cached_statements=0,
+        **options,
     )
     try:
         conn._handoff_deadline = deadline
@@ -5244,7 +5268,9 @@ def _close_unpublished_connection(conn: sqlite3.Connection) -> None:
         )
 
 
-def connect_handoff_db(db_path, *, read_only: bool = False, deadline: float | None = None) -> sqlite3.Connection:
+def connect_handoff_db(
+    db_path, *, read_only: bool = False, deadline: float | None = None, existing_only: bool = False
+) -> sqlite3.Connection:
     """Public handoff.db connection factory ([ARCH-13], [RES-02]).
 
     Structural busy_timeout contract for every handoff.db handle. Prefer this
@@ -5272,7 +5298,11 @@ def connect_handoff_db(db_path, *, read_only: bool = False, deadline: float | No
     Use ``bounded_handoff_read`` for an absolute end-to-end deadline on
     open/read/close, including delayed statements and non-SQLite stalls. Ordinary
     callers retain their default 30-second policy. ([NAME-03])
+    An existing-only writer opens with ``mode=rw`` and can supply a deadline.
+    This factory does not bootstrap schema.
     """
+    if existing_only and not read_only:
+        return _connect_handoff_sqlite(db_path, deadline=deadline, existing_only=True)
     if deadline is not None:
         if not read_only:
             raise ValueError("explicit-path deadline requires read_only=True")

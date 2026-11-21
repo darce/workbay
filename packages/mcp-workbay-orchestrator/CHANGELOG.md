@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.39] — 2026-11-21
+
+### Changed
+- Reconcile legacy review-cycle receipts for landed or absent issuers against current lane evidence.
+- Measure historical closes with `review_cycle_approval backfill-close`.
+- Persist terminal attempt facts in pass files so closed lanes can still be measured after sandbox cleanup.
+- Recover work from killed or vanished remote jobs, including commits, staged and unstaged changes, untracked files, and the full ordered stash stack.
+- Use the shared verifier from `workbay-system` in standalone installs and refresh custody proofs before reclaim after an upgrade or interrupted confirmation.
+
 ## [0.3.38] — 2026-11-20
 
 ### Fixed

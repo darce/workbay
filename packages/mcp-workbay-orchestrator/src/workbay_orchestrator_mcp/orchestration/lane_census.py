@@ -482,12 +482,15 @@ def _standalone_reap_custody_script(
             "_proven_key": proof.key, "_proven_tip": proof.tip,
             "_proven_artifacts": proof.artifacts, "_proven_delta": proof.delta,
         }
+        if proof.rescue:
+            values["_proven_rescue"] = proof.rescue
         assignments = "\n".join(f"export {name}={_sh_single_quote(value)}" for name, value in values.items())
         cases.append(f"{_sh_single_quote(key)})\n{assignments}\n;;")
         release_proof = json.dumps({
             "key": proof.key, "proven_tree": proof.tree, "proven_tip": proof.tip,
             "proven_generation": proof.generation, "proven_artifacts": proof.artifacts,
             "proven_delta": proof.delta,
+            **({"proven_rescue": proof.rescue} if proof.rescue else {}),
         }, separators=(",", ":"))
         release_cases.append(f"{_sh_single_quote(key)}) printf '%s\\n' {_sh_single_quote(release_proof)} ;; ")
     # The function runs in a child inheriting the sweep's lane and lease FDs.
@@ -497,6 +500,8 @@ def _standalone_reap_custody_script(
     checks = f"""# WORKBAY_STANDALONE_REAP_CUSTODY
 set -eu
 {native._remote_helpers(sandbox_root or 'workbay-sandbox', operation_timeout=max(0, expires - time.monotonic()), mapped_proof=True)}
+{native._RESCUE_PRESENCE_SH}
+{native._rescue_custody_probe()}
 _sd="$ROOT/$_sk"
 if [ -L "$ROOT/.lane-live-$_sk" ] || {{ [ -e "$ROOT/.lane-live-$_sk" ] && [ ! -f "$ROOT/.lane-live-$_sk" ]; }}; then
   echo "SKIPPED_CHANGED $_sk unknown_lease_identity"; exit 0

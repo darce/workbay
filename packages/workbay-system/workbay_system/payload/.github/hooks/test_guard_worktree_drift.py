@@ -297,7 +297,7 @@ def test_main_exits_zero_when_contract_missing(
     monkeypatch.setattr(
         _mod,
         "_load_active_task",
-        lambda _root: _mod.ActiveTaskContext(
+        lambda _root, *, edit_deadline: _mod.ActiveTaskContext(
             "internal", str(feature_repo), "feature/e17-8", str(main_repo.resolve())
         ),
     )

@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.33] — 2026-11-21
+
+### Changed
+- Migrate the handoff database to schema 52 and enroll eligible historical closes for measured backfill.
+- Preserve producer-owned lane notes when recording a close.
+- Require orchestrator 0.3.39 when installing the lifecycle extra so it uses the matching close-evidence reader.
+
+### Migration
+- Start the upgraded handoff server against the existing state to apply schema 52 before running historical close backfill.
+
 ## [0.3.31] — 2026-11-20
 
 ### Fixed

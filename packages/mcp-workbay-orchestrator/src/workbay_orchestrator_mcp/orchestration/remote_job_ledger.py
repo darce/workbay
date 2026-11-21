@@ -26,6 +26,11 @@ from typing import BinaryIO, Callable, Iterator
 
 from .lane_lifecycle_contracts import JOB_ID_RE, ContractError, RemoteJobSpec, WakeEvent
 
+UNIT_DEAD_NO_RECEIPT = "unit_dead_no_receipt"
+_LOSS_CAUSE_BY_STATE = {"lost": "vm_reported_lost", UNIT_DEAD_NO_RECEIPT: UNIT_DEAD_NO_RECEIPT}
+REMOTE_JOB_LOSS_STATES = frozenset(_LOSS_CAUSE_BY_STATE)
+REMOTE_JOB_TERMINAL_STATES = REMOTE_JOB_LOSS_STATES | {"done"}
+
 _MAX_HANDLER_ATTEMPTS = 5
 COMPLETION_DEFERRAL_MAX_AGE_SECONDS = 6 * 60 * 60
 _LOCK_RETRY_INTERVAL_SECONDS = 0.01
@@ -35,6 +40,24 @@ _INVALID_WAKE_SAMPLE_BYTES = 256
 # Consumed prefixes are rewritten out only above this size (RES-07).
 WAKE_COMPACT_THRESHOLD_BYTES = 64 * 1024
 _UNDECODABLE_WAKE_ERRORS = (ContractError, TypeError, ValueError, RecursionError, UnicodeDecodeError)
+
+
+def remote_status_state(state: str, loss_cause: object) -> str:
+    """Recover the terminal reason carried alongside a legacy lost state."""
+    if state == "lost" and loss_cause == UNIT_DEAD_NO_RECEIPT:
+        return UNIT_DEAD_NO_RECEIPT
+    return state
+
+
+def detached_pass_outcome(payload: dict) -> str | None:
+    """A submit protocol error can still leave a remote job for this pass to collect."""
+    if (
+        payload.get("submit_state") == "ambiguous"
+        and payload.get("resumable_work") is True
+        and payload.get("resumable_reason") == "remote_job_pending"
+    ):
+        return "remote_job_pending"
+    return payload.get("outcome")
 
 
 def _decode_wake_line(line: bytes) -> WakeEvent | None:
@@ -55,9 +78,10 @@ def _decode_wake_line(line: bytes) -> WakeEvent | None:
 class RemoteJobLedgerError(Exception):
     """Typed refusal for invalid ledger state or lifecycle transitions."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, detail: str | None = None) -> None:
         self.reason = reason
-        super().__init__(reason)
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}" if detail else reason)
 
 
 class LedgerLockTimeout(RemoteJobLedgerError):
@@ -65,6 +89,13 @@ class LedgerLockTimeout(RemoteJobLedgerError):
 
     def __init__(self) -> None:
         super().__init__("ledger_lock_timeout")
+
+
+class SubmitPreparationTimeout(RemoteJobLedgerError):
+    """Local rendering exhausted its pre-send budget without transferring work."""
+
+    def __init__(self) -> None:
+        super().__init__("submit_prepare_timeout")
 
 
 class RemoteCompletionDeferred(Exception):
@@ -125,6 +156,29 @@ def plan_review_failure(record: dict) -> dict | None:
     return receipt if receipt["native_rc"] != 0 else None
 
 
+@dataclass
+class _LaunchInputs:
+    """The private files used by both the digest and the native delivery."""
+
+    directory: Path
+    paths: dict[int, str]
+    delivery_argv: list[str] | None = None
+
+    def digest(self, stable_spec: dict) -> str:
+        files = {}
+        for path in sorted(self.directory.iterdir()):
+            with path.open("rb") as stream:
+                files[path.name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        payload = json.dumps([stable_spec, files], sort_keys=True).encode()
+        return "v2:" + hashlib.sha256(payload).hexdigest()
+
+    def bind(self, command: list[str]) -> None:
+        if self.delivery_argv is not None:
+            command[:] = self.delivery_argv
+        for index, path in self.paths.items():
+            command[index] = path
+
+
 class RemoteJobLedger:
     """Durable remote-job records and a write-before-advance wake queue.
 
@@ -135,7 +189,13 @@ class RemoteJobLedger:
     the shared wake cursor.
     """
 
-    def __init__(self, state_dir: str | os.PathLike[str]) -> None:
+    def __init__(
+        self, state_dir: str | os.PathLike[str], *, submit_cwd: str = ".",
+        submit_env: dict[str, str] | None = None, submit_executable: Path | None = None,
+    ) -> None:
+        self.submit_env = submit_env
+        self.submit_executable = submit_executable
+        self.submit_cwd = Path(submit_cwd)
         self.state_dir = Path(state_dir)
         self.ledger_dir = self.state_dir / "ledger"
         self.wake_path = self.state_dir / "wake.jsonl"
@@ -158,7 +218,11 @@ class RemoteJobLedger:
             self._intent_lock_deadline.reset(token)
 
     def record_intent(self, spec: RemoteJobSpec) -> dict:
-        """Durably record submit intent before a remote submit is attempted."""
+        """Return the durable record and whether this call created the intent.
+
+        intent_created is a result of this locked operation, never a stored
+        permission for a later delivery to submit the same job.
+        """
         if not isinstance(spec, RemoteJobSpec):
             raise RemoteJobLedgerError("invalid_spec")
         self._validate_job_id(spec.job_id)
@@ -167,9 +231,18 @@ class RemoteJobLedger:
         with self._locked(self.ledger_dir / ".ledger.lock", deadline=self._intent_lock_deadline.get()):
             if path.exists():
                 existing = self._read_json(path)
-                if existing.get("spec") != json.loads(spec.to_json()):
+                # Only an explicit pre-publication refusal permits a new
+                # delivery. A job may itself have finished with exit 75.
+                same_delivery = spec.remote_exec_mode is not None and self.same_submit_identity(existing, spec)
+                if same_delivery and self._can_reopen(existing):
+                    # Reopen and claim in one write after checking the retry's bytes.
+                    return {**existing, "retry_admission": True, "intent_created": False}
+                # A detached retry constructs a new spool and timestamp.
+                # Return its delivery state from the same locked read.
+                resumable = same_delivery and existing.get("stage") in {"intent", "submitted"}
+                if not resumable and existing.get("spec") != json.loads(spec.to_json()):
                     raise RemoteJobLedgerError("job_id_conflict")
-                return self._copy_record(existing)
+                return {**existing, "intent_created": False}
             now = _utc_now()
             record = {
                 "spec": json.loads(spec.to_json()),
@@ -181,14 +254,265 @@ class RemoteJobLedger:
                 "unit": None,
                 "rc": None,
             }
+            if spec.remote_exec_mode is not None:
+                record["submit_digest"] = self._submit_digest(spec)
+                record["submit_state"] = "before_send"
             self._write_json_atomic(path, record)
-            return self._copy_record(record)
+            return {**record, "intent_created": True}
+
+    @staticmethod
+    def _stable_submit_spec(wire: dict) -> dict:
+        """Normalize only delivery clocks and spool names, preserving every other wire field."""
+        stable = dict(wire)
+        for key in ("created_at", "bound_seconds"):
+            if key in stable:
+                stable[key] = None
+        argv = stable.get("argv")
+        if isinstance(argv, list) and argv[1:2] == ["build"]:
+            argv = stable["argv"] = list(argv)
+            for i in range(2, len(argv) - 1, 2):
+                if argv[i] in {
+                    "--brief", "--schema", "--agent-spec", "--out", "--uncommitted-out",
+                    "--result-out", "--debug-out", "--stream-out", "--provenance-out",
+                    "--selfverify-out", "--phases-out", "--timeout",
+                }:
+                    argv[i + 1] = None
+        return stable
+
+    @staticmethod
+    def same_submit_identity(record: dict, spec: RemoteJobSpec) -> bool:
+        reserved = RemoteJobLedger._stable_submit_spec(record["spec"])
+        retry = RemoteJobLedger._stable_submit_spec(json.loads(spec.to_json()))
+        if (
+            "remote_exec_mode" not in reserved
+            and record["stage"] in {"intent", "submitted"}
+            and record.get("submit_state") != "before_send"
+        ):
+            # A legacy unstamped delivery can only be reconciled.
+            retry.pop("remote_exec_mode", None)
+        # Extension values retain their wire types (e.g. true is distinct from 1).
+        return json.dumps(retry, sort_keys=True) == json.dumps(reserved, sort_keys=True)
+
+    @staticmethod
+    def _can_reopen(record: dict) -> bool:
+        return (
+            record.get("stage") == "done"
+            and record.get("submit_state") == "admission_refused"
+            and record.get("rc") == 75
+            and record.get("unit") is None
+        )
+
+    def _submit_digest(self, spec: RemoteJobSpec, inputs: _LaunchInputs | None = None) -> str:
+        """Hash exactly the private directory later used for native delivery."""
+        from contextlib import nullcontext
+        from subprocess import TimeoutExpired
+
+        directory = nullcontext(inputs.directory) if inputs else tempfile.TemporaryDirectory(prefix="workbay-reserve-")
+        with directory as root:
+            launch = inputs or _LaunchInputs(Path(root), {})
+            try:
+                if spec.argv[1:2] == ["build"]:
+                    self._capture_submit_files(spec.argv, launch)
+                    self._prepare_transport(spec, launch)
+                return launch.digest(self._stable_submit_spec(json.loads(spec.to_json())))
+            except TimeoutExpired as exc:
+                raise SubmitPreparationTimeout() from exc
+            except (OSError, ValueError) as exc:
+                raise RemoteJobLedgerError("submit_input_unreadable", detail=type(exc).__name__) from exc
+
+    def _capture_submit_files(self, argv: list[str], launch: _LaunchInputs) -> None:
+        from shutil import copyfileobj
+        from stat import S_ISREG
+
+        def capture(source: str, name: str, index: int | None = None) -> None:
+            target = launch.directory / name
+            path = self.submit_cwd / source
+            with open(path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK)) as stream:
+                if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OSError("expected a regular launch input")
+                with target.open("wb") as destination:
+                    copyfileobj(stream, destination)
+            if index is not None:
+                launch.paths[index] = str(target)
+
+        for i in range(2, len(argv) - 1, 2):
+            flag, source = argv[i:i + 2]
+            name = f"{i}-{flag[2:]}"
+            if flag in {"--brief", "--schema"}:
+                capture(source, name, i + 1)
+            elif flag == "--agent-spec":
+                stem = source.removesuffix(".json")
+                filename = name + ".json" if source.endswith(".json") else name
+                capture(source, filename, i + 1)
+                if filename == name:
+                    capture(stem + ".json", name + ".json")
+                capture(stem + ".argv", name + ".argv")
+
+    def _prepare_transport(self, spec: RemoteJobSpec, launch: _LaunchInputs) -> None:
+        import sys
+        from shutil import which
+
+        from .adapters import remote_job_runner
+
+        env = os.environ if self.submit_env is None else self.submit_env
+        source = self.submit_executable or spec.argv[0]
+        if "/" not in str(source):
+            search = os.pathsep.join(str(self.submit_cwd / p) for p in os.get_exec_path(env))
+            source = which(str(source), path=search)
+        if source is None:
+            # A missing command cannot become a different executable after claim.
+            launch.paths[0] = str(launch.directory / "unavailable")
+            return
+        source = (self.submit_cwd / source).absolute()
+        # A symlink selected by an ordinary CLI retains its executable semantics.
+        # The authenticated path is already a private, read-only regular inode.
+        buffered, _ = remote_job_runner._read_selected_transport(source.resolve(strict=True))
+        native = b"\n# workbay/prepare-submit@1\n" in buffered.data
+        if not native and b"\n# BEGIN BUILD_DISPATCH\n" in buffered.data:
+            raise RemoteJobLedgerError("submit_input_unreadable", detail="native_prepare_unsupported")
+        program = launch.directory / ("workbay-prepared-submit" if native else "transport")
+        if self.submit_executable is not None:
+            program.symlink_to(source)
+        else:
+            program.write_bytes(buffered.data)
+            program.chmod(0o500)
+        if native or self.submit_executable is None:
+            launch.paths[0] = str(program)
+        if not native:
+            return
+
+        (launch.directory / "transport-origin").write_text(str(source.parent))
+        command = list(spec.argv)
+        launch.bind(command)
+        budget = min(30, spec.bound_seconds)
+        deadline = self._intent_lock_deadline.get()
+        if deadline is not None:
+            budget = min(budget, max(0, deadline - time.monotonic()))
+        prepared = remote_job_runner._run_child(
+            [str(program), "prepare-submit", str(launch.directory), sys.executable,
+             "--job-id", spec.job_id, "--job-attempt", str(spec.attempt), *command[2:]],
+            cwd=str(self.submit_cwd), env=env, timeout=budget,
+        )
+        if prepared.returncode or not all(
+            (launch.directory / name).is_file() for name in ("body", "probe", "admission", "settings")
+        ):
+            raise RemoteJobLedgerError("submit_input_unreadable", detail="native_prepare_failed")
+
+    def _verify_submit_digest(self, record, spec, inputs=None) -> None:
+        original = record.get("submit_digest")
+        if not original:
+            raise RemoteJobLedgerError("job_id_conflict", detail="missing_submit_digest")
+        if not isinstance(original, str) or not original.startswith("v2:"):
+            raise RemoteJobLedgerError("job_id_conflict", detail="legacy_submit_digest")
+        try:
+            digest = self._submit_digest(spec, inputs)
+        except SubmitPreparationTimeout:
+            raise
+        except RemoteJobLedgerError as exc:
+            raise RemoteJobLedgerError("job_id_conflict", detail=exc.reason) from exc
+        if digest != original:
+            raise RemoteJobLedgerError("job_id_conflict", detail="submit_digest_mismatch")
+
+    @contextmanager
+    def claimed_command(self, spec, command, timing) -> Iterator[int]:
+        """Keep the verified native programs and uploads owned through child exit."""
+        with tempfile.TemporaryDirectory(prefix="workbay-submit-") as directory:
+            inputs = _LaunchInputs(Path(directory), {})
+            bound = self.claim_submit(spec, timing, inputs=inputs)
+            original = list(command)
+            try:
+                inputs.bind(command)
+                if self.submit_executable is not None and 0 in inputs.paths:
+                    # The runner still opens the authenticated inode through this
+                    # private alias. Keep its owner and lifetime receipt intact.
+                    command.snapshot = Path(inputs.paths[0])
+                yield bound
+            finally:
+                if self.submit_executable is not None:
+                    command.snapshot = self.submit_executable
+                command[:] = original
+
+    def claim_submit(self, spec: RemoteJobSpec, timing: Callable[[], tuple[int, list[str]]], *, inputs=None) -> int:
+        """Fence delivery and bind the sending caller's actual command to the intent."""
+        self._validate_job_id(spec.job_id)
+        path = self._job_path(spec.job_id)
+        with self._locked(self.ledger_dir / ".ledger.lock", deadline=self._intent_lock_deadline.get()):
+            record = self._read_json(path)
+            reopen = self._can_reopen(record)
+            if not reopen and (record["stage"] != "intent" or record.get("submit_state") != "before_send"):
+                raise RemoteJobLedgerError("submit_claim_taken")
+            if not self.same_submit_identity(record, spec):
+                raise RemoteJobLedgerError("job_id_conflict")
+            self._verify_submit_digest(record, spec, inputs)
+            before_send = self._copy_record(record)
+            if reopen:
+                record.update(stage="intent", rc=None, intent_at=_utc_now())
+                record.pop("done_at", None)
+            record["spec"] = {**json.loads(spec.to_json()), "created_at": record["created_at"]}
+            # An unacknowledged claim, including one left by a process crash,
+            # has the same reconcile-only semantics as an older intent.
+            del record["submit_state"]
+            identity_argv = self._stable_submit_spec({"argv": spec.argv})
+            bound, argv = timing()
+            try:
+                while True:
+                    if self._stable_submit_spec({"argv": argv}) != identity_argv:
+                        raise RemoteJobLedgerError("job_id_conflict", detail="submit_command_mismatch")
+                    record["spec"].update(bound_seconds=bound, argv=argv)
+                    record["updated_at"] = _utc_now()
+                    self._write_json_atomic(path, record)
+                    current = timing()  # Account for time spent in the durable write.
+                    if current == (bound, argv):
+                        if inputs is not None:
+                            inputs.delivery_argv = list(argv)
+                        return bound
+                    bound, argv = current
+            except Exception:
+                # No native call has started and the lock still excludes
+                # other senders. A new budget may safely retry this intent.
+                self._write_json_atomic(path, before_send)
+                raise
+
+    def mark_submit_refused(self, job_id: str, rc: int) -> dict:
+        """Close the first delivery only while its intent is still unacknowledged."""
+
+        def update(record: dict) -> None:
+            if record["stage"] == "intent" and not record.get("submit_state"):
+                from . import offload_pass
+
+                state_dir = self.state_dir.parent
+                pass_id = record["spec"]["pass_id"]
+                if hasattr(offload_pass, "PassStateUnreadable"):
+                    offload_pass.read_pass_state(state_dir, pass_id, strict=True)
+                else:
+                    # Older pass readers collapse malformed records and absence.
+                    # Use their strict record and custody primitives directly.
+                    from .invocation_disposition import _pass_path, administrative_view, read_record
+
+                    try:
+                        try:
+                            payload, raw = read_record(_pass_path(state_dir, pass_id))
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            administrative_view(state_dir, pass_id, payload, raw)
+                    except (OSError, ValueError) as exc:
+                        raise RemoteJobLedgerError("pass_state_unreadable") from exc
+                record.update(
+                    stage="done",
+                    done_at=_utc_now(),
+                    rc=rc,
+                    submit_state="admission_refused" if rc == 75 else "refused",
+                )
+
+        return self._update_job(job_id, update)
 
     def mark_submit_ambiguous(self, job_id: str) -> dict:
         """Keep an uncertain submit open for reconciliation, never mark it done."""
 
         def update(record: dict) -> None:
-            record["submit_state"] = "ambiguous"
+            if record["stage"] == "intent":
+                record["submit_state"] = "ambiguous"
 
         return self._update_job(job_id, update)
 
@@ -214,11 +538,18 @@ class RemoteJobLedger:
 
         return self._update_job(job_id, update)
 
-    def mark_done(self, job_id: str, rc: int, *, lost: bool = False, native_failure: dict | None = None) -> dict:
+    def mark_done(
+        self, job_id: str, rc: int, *, lost: bool | str = False, native_failure: dict | None = None,
+        supervisor_failure: bool = False, defer_reason: str | None = None,
+    ) -> dict:
         """Record the remote process exit code and any durable lost classification."""
         if isinstance(rc, bool) or not isinstance(rc, int):
             raise RemoteJobLedgerError("invalid_return_code")
-        if not isinstance(lost, bool):
+        if isinstance(lost, bool):
+            loss_cause = _LOSS_CAUSE_BY_STATE["lost"] if lost else None
+        elif isinstance(lost, str) and lost in REMOTE_JOB_LOSS_STATES:
+            loss_cause = _LOSS_CAUSE_BY_STATE[lost]
+        else:
             raise RemoteJobLedgerError("invalid_remote_state")
 
         def update(record: dict) -> None:
@@ -231,14 +562,32 @@ class RemoteJobLedger:
                 record["stage"] = "done"
                 record["rc"] = rc
                 record["done_at"] = _utc_now()
-                if lost:
+                if loss_cause is not None:
                     record["remote_state"] = "lost"
-                    record["loss_cause"] = "vm_reported_lost"
+                    record["loss_cause"] = loss_cause
             elif stage in {"done", "completed"}:
                 if record.get("rc") != rc:
                     raise RemoteJobLedgerError("return_code_conflict")
+                if loss_cause == UNIT_DEAD_NO_RECEIPT and record.get("loss_cause") != loss_cause:
+                    raise RemoteJobLedgerError("remote_state_conflict")
             else:
                 raise RemoteJobLedgerError("invalid_transition")
+
+            if defer_reason is not None:
+                if (
+                    rc != 75
+                    or defer_reason not in {"rescue_pending", "vm_admission_refused"}
+                    or supervisor_failure
+                    or record.get("supervisor_failure") is True
+                    or record.get("defer_reason", defer_reason) != defer_reason
+                ):
+                    raise RemoteJobLedgerError("remote_state_conflict")
+                record["defer_reason"] = defer_reason
+
+            if supervisor_failure:
+                if rc == 0 or record.get("remote_state") == "lost" or record.get("defer_reason") is not None:
+                    raise RemoteJobLedgerError("remote_state_conflict")
+                record["supervisor_failure"] = True
 
             if native_failure is not None:
                 previous = record.setdefault("native_failure", self._copy_record(native_failure))
@@ -250,6 +599,35 @@ class RemoteJobLedger:
 
         return self._update_job(job_id, update)
 
+    def record_rescue(self, job_id: str, observation: dict) -> dict:
+        """Fence the durable host observation to the dead job before publication."""
+
+        def update(record: dict) -> None:
+            if record["stage"] != "done" or (
+                record.get("loss_cause") != UNIT_DEAD_NO_RECEIPT and record.get("supervisor_failure") is not True
+            ):
+                raise RemoteJobLedgerError("rescue_without_terminal_evidence")
+            if record.setdefault("rescue", self._copy_record(observation)) != observation:
+                raise RemoteJobLedgerError("rescue_receipt_conflict")
+
+        return self._update_job(job_id, update)
+
+    def confirm_rescue(self, job_id: str, capture_sha256: str) -> dict:
+        """Remember confirmed custody across a refused pass publication."""
+
+        def update(record: dict) -> None:
+            observation = record.get("rescue")
+            if (
+                record["stage"] != "done"
+                or not isinstance(observation, dict)
+                or observation.get("partial") is not False
+                or observation.get("capture_sha256") != capture_sha256
+            ):
+                raise RemoteJobLedgerError("rescue_receipt_conflict")
+            record["rescue_confirmed"] = True
+
+        return self._update_job(job_id, update)
+
     def mark_completed(self, job_id: str) -> dict:
         """Mark a done job as fully collected and handled."""
 
@@ -257,6 +635,10 @@ class RemoteJobLedger:
             if plan_review_failure(record) is not None:
                 raise RemoteJobLedgerError("plan_review_not_collected")
             if record["stage"] == "done":
+                if record.get("loss_cause") == UNIT_DEAD_NO_RECEIPT or record.get("supervisor_failure") is True:
+                    rescue = record.get("rescue")
+                    if not isinstance(rescue, dict) or not (rescue.get("partial") is True or record.get("rescue_confirmed") is True):
+                        raise RemoteJobLedgerError("rescue_pending")
                 record["stage"] = "completed"
                 record["completed_at"] = _utc_now()
                 record.pop("completion_deferred_at", None)

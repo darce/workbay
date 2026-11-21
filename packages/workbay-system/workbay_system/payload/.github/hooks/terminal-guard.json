@@ -4,7 +4,7 @@
       {
         "matcher": "Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file",
         "type": "command",
-        "command": "scripts/hooks/_launch_python.sh scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py",
+        "command": "scripts/hooks/_launch_python.sh scripts/hooks/_run_guard.py .github/hooks/guard-worktree-drift.py 1",
         "timeout": 5
       },
       {

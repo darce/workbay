@@ -554,6 +554,7 @@ def _close_native_predecessor(
     from uuid import uuid4
 
     from workbay_handoff_mcp import validation_lane
+    from workbay_handoff_mcp.lane_notes import merge_lane_notes, notes_envelope
     from workbay_handoff_mcp.lane_resource_producer import prepare_lane_binding
 
     from workbay_orchestrator_mcp.lanes_support import _get_db_connection
@@ -581,7 +582,15 @@ def _close_native_predecessor(
     # The existing close port persists notes atomically with its status write.
     # Bind compensation to this invocation, including failures after commit;
     # another actor's merge must never be adopted as this attempt's close.
-    close_notes = (before.get("notes") or "") + f"\nContained predecessor close attempt {uuid4().hex}."
+    before_notes = before["notes"]
+    attempt_line = f"Contained predecessor close attempt {uuid4().hex}."
+    if notes_envelope(before_notes) is not None:
+        close_notes = attempt_line
+    else:
+        close_notes = f"{before_notes or ''}\n{attempt_line}"
+    # The exact writer result proves the attempt line was recorded in the
+    # close audit and verifies the original envelope's other bytes.
+    expected_notes = merge_lane_notes(before_notes, close_notes)
     close_error = None
     try:
         result = offload_pass.close_offload_lane_merged(
@@ -608,7 +617,7 @@ def _close_native_predecessor(
         any(after.get(k) != before[k] for k in _NATIVE_CLOSE_IDENTITY)
         or after.get("status") != "merged"
         or after.get("landing_commit_sha") != containing_sha
-        or after.get("notes") != close_notes
+        or after.get("notes") != expected_notes
     ):
         return False, "contained_lane_close_failed:predecessor_identity_changed", None
     claim = _NativePredecessorClose(before, policy, after, binding)

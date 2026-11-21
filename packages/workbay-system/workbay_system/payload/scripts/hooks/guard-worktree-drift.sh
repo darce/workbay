@@ -21,4 +21,4 @@ DRIFT_HANDLER="${REPO_ROOT}/scripts/hooks/_worktree_drift.py"
 # this, an empty REPO_ROOT would run a bad path and `set -e` would exit non-zero
 # (= PreToolUse block).
 [ -n "$REPO_ROOT" ] && [ -f "$DRIFT_HANDLER" ] || exit 0
-python3 "$DRIFT_HANDLER"
+exec python3 "$DRIFT_HANDLER" "$@"

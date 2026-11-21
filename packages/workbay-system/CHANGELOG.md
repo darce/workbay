@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.35] — 2026-11-21
+
+### Changed
+- Ship the remote-job rescue verifier used by both the installed transport and VM reclaim.
+- Refresh rescue proof after an upgrade or an interrupted confirmation before reclaiming a sandbox.
+- Keep edit guards within their deadline by checking dirty candidates from the index and bounding task probes.
+
 ## [0.4.34] — 2026-11-20
 
 ### Fixed

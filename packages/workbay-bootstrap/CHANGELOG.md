@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.34] — 2026-11-21
+
+### Changed
+- Require workbay-system 0.4.35 so package-source installs materialize the shared rescue verifier and matching remote transport.
+
 ## [0.4.33] — 2026-11-20
 
 ### Fixed

@@ -30,6 +30,7 @@ from workbay_handoff_mcp.config import RuntimeConfig
 from workbay_handoff_mcp.runtime import RuntimeNotConfiguredError, get_runtime_config
 from workbay_protocol import reasoning_effort as model_routing
 
+from . import remote_job_ledger
 from .adapters import remote_job_runner
 from .backend_spec import build_agent_spec, write_agent_spec
 from .execution_preflight import analysis_argv
@@ -48,6 +49,7 @@ FAILURES = {
     "review_dashboard_unknown": 27,
     "review_busy": 28,
     "review_subject_unavailable": 29,
+    remote_job_ledger.UNIT_DEAD_NO_RECEIPT: 30,
 }
 
 
@@ -572,6 +574,62 @@ def _completed_ids(task: str, run_id: str, count: int) -> list[str]:
     return ids
 
 
+def _review_operation(ledger: RemoteJobLedger, record: dict, old: dict | None, command: list[str], job_id: str):
+    """Replay a settled loss or select the native operation for this delivery."""
+    cause = remote_job_ledger.UNIT_DEAD_NO_RECEIPT
+
+    settled_loss = record.get("loss_cause") == cause or record.get("supervisor_failure") is True
+    if old and old["stage"] in {"done", "completed"} and not settled_loss and record.get("rc") == 0:
+        return remote_job_runner.collect_only
+
+    poll = remote_job_runner.resume_pending if old else remote_job_runner.run_detached
+
+    def poll_review(cmd, *, cwd, env, timeout):
+        deadline = time.monotonic() + timeout
+        if settled_loss:
+            settled = record
+        else:
+            completed = poll(cmd, cwd=cwd, env=env, timeout=timeout, observe_supervisor=True)
+            if isinstance(completed, remote_job_runner.UnitDeadNoReceipt):
+                settled = ledger.mark_done(job_id, 1, lost=cause)
+            elif isinstance(completed, remote_job_runner.SupervisorFailure):
+                settled = ledger.mark_done(job_id, completed.returncode, supervisor_failure=True)
+            else:
+                settled = None
+        if settled is not None:
+            supervisor = settled.get("supervisor_failure") is True
+            evidence = ({"native_rc": settled["rc"], "reason": "supervisor_failure"} if supervisor else
+                        {"native_rc": 69, "stderr": remote_job_runner.UnitDeadNoReceipt(cmd, job_id).stderr})
+            if settled["stage"] == "completed" and not settled.get("rescue"):
+                # Historical terminal receipts predate rescue.
+                raise ReviewFailure("review_transport_failed" if supervisor else cause, evidence)
+            binding = settled["spec"]["plan_review_binding"]
+
+            def remaining():
+                seconds = deadline - time.monotonic()
+                if seconds <= 0:
+                    raise TimeoutError("review rescue deadline")
+                return seconds
+
+            try:
+                observation = remote_job_runner.persist_dead_job_rescue(
+                    ledger, settled, cmd, cwd=cwd, env=env, base=binding["source_commit"],
+                    base_tree=binding["source_tree"], remaining=remaining,
+                )
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, RemoteJobLedgerError) as exc:
+                raise ReviewFailure("review_transport_failed", {**evidence, "reason": "rescue_pending"}) from exc
+            if settled["stage"] == "done":
+                ledger.mark_completed(job_id)
+            raise ReviewFailure("review_transport_failed" if supervisor else cause, {**evidence, **observation})
+        if isinstance(completed, remote_job_runner.ResumeHold) and completed.observation.args[1:2] == ["status"]:
+            # The receive failed in a named child. Preserve that operation and
+            # its exit for review evidence independently of the retryable hold.
+            return completed.observation
+        return completed
+
+    return poll_review
+
+
 def _record_findings(task: str, session: str, run_id: str, findings: list[dict]) -> list[str]:
     requested_ids = _finding_ids(run_id, len(findings))
     expected = [dict(f, finding_id=id_, review_mode="planning") for id_, f in zip(requested_ids, findings)]
@@ -789,7 +847,7 @@ def _execute(repo: Path, directory: Path, subject: dict, packet: dict, args: Any
                 "gate_config_sha256": _sha(config_bytes),
             },
         )
-        ledger.record_intent(native_spec)
+        record = ledger.record_intent(native_spec)
         env = {
             **os.environ,
             **identity.to_env(),
@@ -811,19 +869,13 @@ def _execute(repo: Path, directory: Path, subject: dict, packet: dict, args: Any
         # have left this exact native job queued/running before disconnecting.
         # Full-spec ledger comparison above fences recovery; only a new intent
         # may submit. An unavailable old job holds rather than spending again.
-        run = (
-            remote_job_runner.collect_only
-            if old and old["stage"] in {"done", "completed"}
-            else remote_job_runner.resume_pending
-            if old
-            else remote_job_runner.run_detached
-        )
         if brief.read_bytes() != _json(packet).encode("utf-8"):
             raise ReviewFailure("review_identity_conflict", "native brief changed")
         if old:
             read_pass_state(get_runtime_config().state_dir, identity.pass_id, strict=True)
             if (failure := plan_review_failure(old)) is not None:
                 raise ReviewFailure("review_transport_failed", failure)
+        run = _review_operation(ledger, record, old, command, identity.job_id)
         selected = {"transport_path": str(transport.path), "transport_digest": transport.digest}
         with remote_job_runner._authenticated_transport(command, selected) as authenticated:
             deadline = time.monotonic() + timeout

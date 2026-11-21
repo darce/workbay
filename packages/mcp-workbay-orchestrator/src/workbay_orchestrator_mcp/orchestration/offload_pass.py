@@ -112,6 +112,7 @@ from workbay_protocol.review_impact import is_blocking
 
 from workbay_orchestrator_mcp.lanes import BRIEF_ACK_SUCCESS_OUTCOMES
 from workbay_orchestrator_mcp.lanes_support import TERMINAL_LANE_STATUSES
+from workbay_orchestrator_mcp.orchestration import remote_job_ledger
 from workbay_orchestrator_mcp.orchestration.backend_registry import (
     BACKENDS,
     COST_REMOTE,
@@ -1220,6 +1221,113 @@ def _terminal_review_cycle_refusal(record: dict[str, Any], *, pass_id: str) -> d
     }
 
 
+def _terminal_attempt_identity(record: dict) -> tuple:
+    result = record["result"]
+    return (
+        *(
+            record.get(key)
+            for key in (
+                "lane_cycle_binding",
+                "review_cycle_dispatch_id",
+                "invocation_token",
+                "orchestrator_root",
+                "job_id",
+                "attempt",
+                "status",
+                "terminal_at",
+            )
+        ),
+        *(result.get(key) for key in ("outcome", "job_id", "attempt", "result_path")),
+        result.get("agent_stream_path") or record.get("agent_stream_path"),
+    )
+
+
+def _terminal_attempt_facts(state_dir: Path, record: dict, previous: dict | None) -> None:
+    """Publish attempt facts from the host spool, ignoring any result-supplied claim."""
+    result = record.get("result")
+    if not isinstance(result, dict):
+        return
+    result = dict(result)
+    result.pop("terminal_attempt_facts", None)
+    result.pop("terminal_attempt_evidence_changed", None)
+    record["result"] = result
+    binding = record.get("lane_cycle_binding")
+    dispatch_id = record.get("review_cycle_dispatch_id")
+    result_stream = result.get("agent_stream_path")
+    record_stream = record.get("agent_stream_path")
+    if result_stream and record_stream and result_stream != record_stream:
+        return
+    stream = record_stream or result_stream
+    if (
+        _terminal_pass_terminal_at(record) is None
+        or not isinstance(binding, dict)
+        or not isinstance(dispatch_id, str)
+        or not isinstance(stream, str)
+    ):
+        return
+    # The pass lock authenticates the previous publication. Bookkeeping may
+    # change after the spool is reaped, but observations belong to this exact
+    # invocation, attempt, and terminal result.
+    old = (previous or {}).get("result")
+    if (
+        isinstance(old, dict)
+        and isinstance(old.get("terminal_attempt_facts"), dict)
+        and _terminal_attempt_identity(previous) == _terminal_attempt_identity(record)
+    ):
+        result["terminal_attempt_facts"] = old["terminal_attempt_facts"]
+        if old.get("terminal_attempt_evidence_changed"):
+            result["terminal_attempt_evidence_changed"] = True
+        if old.get("uncommitted_remainder_present") or old.get("uncommitted_remainder_read_error"):
+            for key in (
+                "uncommitted_remainder_present",
+                "uncommitted_remainder_bytes",
+                "uncommitted_remainder_path",
+                "uncommitted_remainder_read_error",
+            ):
+                if key in old:
+                    result[key] = old[key]
+    from . import review_cycle_dispatch as cycle
+    from .lane_close_observation import CloseObservationHold, _started_attempt, protected_record
+
+    try:
+        private = cycle.authority(Path(record["orchestrator_root"]))
+        stem = hashlib.sha256(dispatch_id.encode()).hexdigest()
+        receipt, _ = protected_record(
+            private / "review_cycle_dispatch" / (stem + ".json"), private, "receipt_inventory_incomplete"
+        )
+        native, source = receipt["native_dispatch"], receipt["managed_source"]
+        if (
+            receipt.get("source_issuer") != {key: binding[key] for key in ("row_id", "task_ref", "lane_id")}
+            or source["head_sha"] != binding["source_base_sha"]
+            or source["branch"] != binding["branch"]
+        ):
+            return
+        facts = _started_attempt(
+            state_dir.resolve(),
+            binding["lane_id"],
+            binding["branch"],
+            source["head_sha"],
+            source["head_tree"],
+            Path(stream),
+            native,
+            None,
+        )
+        measured = {key: facts[key] for key in ("patch_bytes", "sandbox_base_tree")}
+        if result.setdefault("terminal_attempt_facts", measured) != measured:
+            result["terminal_attempt_evidence_changed"] = True
+        if facts["remainder_bytes"]:
+            result.update(
+                uncommitted_remainder_present=True,
+                uncommitted_remainder_bytes=facts["remainder_bytes"],
+                uncommitted_remainder_path=str(Path(stream).with_name("uncommitted-remainder.patch")),
+                work_status=WORK_STATUS_UNCOMMITTED_SALVAGED,
+            )
+        if facts.get("remainder_read_error"):
+            result["uncommitted_remainder_read_error"] = True
+    except (CloseObservationHold, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+        return
+
+
 def write_pass_state(
     state_dir: Path,
     pass_id: str,
@@ -1227,6 +1335,7 @@ def write_pass_state(
     *,
     invocation_token: str | None = None,
     expected_invocation_token: str | None = None,
+    expected_record: dict[str, Any] | None = None,
 ) -> bool:
     """Publish one pass record under lane SH + per-pass EX (CON-11).
 
@@ -1269,6 +1378,8 @@ def write_pass_state(
                     raise LanePassPublicationRefused("lane_pass_publication_destructive_owner")
             with _pass_publication_lock(path, deadline=deadline):
                 previous_record = read_pass_state(state_dir, pass_id)
+                if expected_record is not None and previous_record != expected_record:
+                    return False
                 if previous_record is not None:
                     from .nonexecution_history import authenticated_nonexecution
 
@@ -1323,6 +1434,7 @@ def write_pass_state(
                 published = _merge_pass_state(
                     pass_id, payload, previous_record, invocation_token, hint, validated_completion, not path.exists()
                 )
+                _terminal_attempt_facts(state_dir, published, previous_record)
                 try:
                     # The strict reader refuses nonfinite numbers; never publish
                     # bytes that would turn the existing record unreadable.
@@ -12465,7 +12577,7 @@ def run_offload_pass_engine(
                     exec_probe = {}
             raw_exec_result = exec_probe.get("raw_payload")
             if isinstance(raw_exec_result, dict) and detached_begin:
-                remote_outcome = raw_exec_result.get("outcome")
+                remote_outcome = remote_job_ledger.detached_pass_outcome(raw_exec_result)
                 observed_job_id = raw_exec_result.get("job_id")
                 observed_attempt = raw_exec_result.get("attempt")
                 if remote_outcome in (
@@ -14779,8 +14891,8 @@ def _fence_retained_reharvest_review(job_id: str) -> Any:
     return _RETAINED_REHARVEST_REVIEW_JOB.set(job_id)
 
 
-def _lost_remote_job_terminal(job_id: str) -> dict[str, Any]:
-    return {
+def _lost_remote_job_terminal(job_id: str, *, loss_cause: object = None) -> dict[str, Any]:
+    result = {
         "ok": False,
         "outcome": "transport_failure",
         "failed_stage": "execute",
@@ -14791,6 +14903,9 @@ def _lost_remote_job_terminal(job_id: str) -> dict[str, Any]:
         "ceremony_status": "not_attempted",
         "findings": [],
     }
+    if loss_cause == remote_job_ledger.UNIT_DEAD_NO_RECEIPT:
+        result["reason"] = remote_job_ledger.UNIT_DEAD_NO_RECEIPT
+    return result
 
 
 _COLLECT_STDERR_TAIL_BYTES = 2048
@@ -14858,6 +14973,22 @@ def _first_publication_terminal_history(
 
 
 def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Path) -> dict[str, Any]:
+    with contextlib.ExitStack() as transports:
+        return _complete_remote_pass_owned(
+            job_id,
+            state_dir=state_dir,
+            orchestrator_root=orchestrator_root,
+            transports=transports,
+        )
+
+
+def _complete_remote_pass_owned(
+    job_id: str,
+    *,
+    state_dir: Path,
+    orchestrator_root: Path,
+    transports: contextlib.ExitStack,
+) -> dict[str, Any]:
     """Idempotently collect and finish a previously submitted detached pass.
 
     A status timeout or ambiguous status remains pending. Only a confirmed
@@ -15053,10 +15184,98 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
         return terminal
 
     stage = job.get("stage")
-    if stage == "done" and job.get("remote_state") == "lost":
-        return persist_terminal(_lost_remote_job_terminal(job_id))
+
+    def mark_native_done(row: dict[str, Any], rc: int) -> dict[str, Any]:
+        # Persist the observed classification so a refused publication can be
+        # retried even after the native receipt expires.
+        supervisor = row.get("supervisor_failure") is True
+        reason = None
+        if rc == 75 and not supervisor:
+            reason = "rescue_pending" if row.get("defer_reason") == "rescue_pending" else "vm_admission_refused"
+        return ledger.mark_done(job_id, rc, supervisor_failure=supervisor, defer_reason=reason)
+
+    def settle_dead_job(record: dict[str, Any]) -> dict[str, Any]:
+        loss_cause = record.get("loss_cause")
+        result = _lost_remote_job_terminal(job_id, loss_cause=loss_cause)
+        if record.get("supervisor_failure") is True:
+            result.update(
+                reason="supervisor_failure",
+                summary="Detached remote job ended with a failed supervisor receipt.",
+                error=f"remote supervisor recorded exit {record['rc']} for job_id={job_id}",
+            )
+        elif loss_cause != remote_job_ledger.UNIT_DEAD_NO_RECEIPT:
+            return persist_terminal(result)
+        try:
+            base = pinned_base
+            if base is not None and (not isinstance(base, str) or re.fullmatch(r"[0-9a-f]{40}", base) is None):
+                raise ValueError("rescue base identity unavailable")
+            if not base:
+                # Older pass records may only pin the branch. The VM must
+                # independently match this commit to its generation binding.
+                ref = f"refs/heads/{spec['branch']}^{{commit}}" if worktree_missing else "HEAD"
+                base = _git_stdout(observation_cwd, "rev-parse", "--verify", ref)
+            base_tree = pinned_tree
+            if not base_tree and base:
+                base_tree = _git_stdout(observation_cwd, "rev-parse", "--verify", f"{base}^{{tree}}")
+            if worktree_missing and not base_tree:
+                raise ValueError("pinned source tree unavailable")
+            observation = remote_job_runner.persist_dead_job_rescue(
+                ledger,
+                record,
+                transport_command,
+                cwd=str(observation_cwd),
+                env=env,
+                base=base,
+                base_tree=base_tree,
+                remaining=_completion_remaining,
+            )
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, RemoteJobLedgerError) as exc:
+            return {
+                "ok": True,
+                "terminal": False,
+                "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+                "reason": "detached_artifact_persistence_retryable",
+                "rescue_status": "rescue_pending",
+                "job_id": job_id,
+                "attempt": attempt,
+                "pass_id": pass_id,
+                "summary": f"Detached job rescue is pending ({type(exc).__name__}).",
+            }
+        if retry_terminal_rescue:
+            # The original terminal outcome is already published. Keep its
+            # exact receipt when updating the discoverable archive reference.
+            if observation.get("rescue_artifact") != recorded_result.get("rescue_artifact"):
+                corrected = {**recorded_result, **observation}
+                if not write_pass_state(
+                    resolved_state_dir, pass_id,
+                    {**pass_state, "superseded_rescue_result": recorded_result, "result": corrected},
+                    expected_record=pass_state,
+                ):
+                    return transport_hold("detached_rescue_publication_pending")
+            else:
+                corrected = recorded_result
+            if record["stage"] == "done":
+                return persist_terminal(corrected, publish=False, retain_custody=observation["partial"])
+            return _terminal_production_view(
+                corrected, task_ref=task_ref, lane_id=lane_id, pass_id=pass_id, job_id=job_id
+            )
+        return persist_terminal(
+            {**result, **observation},
+            retain_custody=observation["partial"],
+        )
 
     recorded_result = pass_state.get("result")
+    rescue = job.get("rescue")
+    retry_terminal_rescue = (
+        stage in {"done", "completed"} and isinstance(rescue, dict)
+        and pass_state.get("status") == "done" and isinstance(recorded_result, dict)
+        and recorded_result.get("terminal") is True
+        and (job.get("loss_cause") == remote_job_ledger.UNIT_DEAD_NO_RECEIPT or job.get("supervisor_failure") is True)
+        and (
+            (rescue.get("partial") is False and ("capture_scope" not in rescue or job.get("rescue_confirmed") is not True))
+            or recorded_result.get("rescue_artifact") != rescue.get("rescue_artifact")
+        )
+    )
     hold = pass_state.get("custody_hold")
     # Automatic consumers leave a settled pass alone. A later explicit resume
     # may recover an exhausted receive, under this same lock and job identity.
@@ -15071,7 +15290,10 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
             and hold.get("exhausted") is True
         )
     )
-    if pass_state.get("status") == "done" and isinstance(recorded_result, dict) and not resume_custody:
+    if (
+        pass_state.get("status") == "done" and isinstance(recorded_result, dict)
+        and not resume_custody and not retry_terminal_rescue
+    ):
         recorded_outcome = recorded_result.get("outcome")
         if recorded_outcome != OffloadOutcome.REMOTE_JOB_PENDING.value:
             # A cached terminal read serves the approved enrichment when, and only
@@ -15089,7 +15311,7 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 return view(persist_terminal(approved, publish=False))
             return view(persist_terminal(dict(recorded_result)))
     reharvest_open = _reharvest_open(pass_state, job_id)
-    if job.get("stage") == "completed" and not reharvest_open and not resume_custody:
+    if job.get("stage") == "completed" and not reharvest_open and not resume_custody and not retry_terminal_rescue:
         return {
             "ok": False,
             "terminal": True,
@@ -15109,66 +15331,126 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
 
     worktree_text = pass_state.get("worktree_path")
     completion_config = pass_state.get("completion_config")
-    if not isinstance(worktree_text, str) or not worktree_text or not isinstance(completion_config, dict):
-        failure = {
-            "ok": False,
-            "terminal": True,
-            "outcome": "needs_guidance",
-            "failed_stage": "execute",
-            "job_id": job_id,
-            "pass_id": pass_id,
-            "task_ref": task_ref,
-            "lane_id": lane_id,
-            "summary": "Detached pass cannot be resumed because its execution identity is incomplete.",
-            "error": "persisted detached pass is missing worktree_path or completion_config",
-            "commit_landed": False,
-            "work_status": "not_landed",
-            "ceremony_status": "not_attempted",
-            "findings": [],
-        }
-        if job.get("stage") in {"intent", "submitted"}:
-            _completion_remaining()
-            ledger.mark_done(job_id, 2)
-        return persist_terminal(failure)
-    worktree_path = Path(worktree_text).expanduser().resolve()
-    if not worktree_path.is_dir():
-        failure = {
-            "ok": False,
-            "terminal": True,
-            "outcome": "worktree_unrecoverable",
-            "failed_stage": "execute",
-            "job_id": job_id,
-            "pass_id": pass_id,
-            "task_ref": task_ref,
-            "lane_id": lane_id,
-            "summary": "Detached pass worktree is unavailable for harvest.",
-            "error": f"detached pass worktree does not exist: {worktree_path}",
-            "commit_landed": False,
-            "work_status": "not_landed",
-            "ceremony_status": "not_attempted",
-            "findings": [],
-        }
-        if job.get("stage") in {"intent", "submitted"}:
-            _completion_remaining()
-            ledger.mark_done(job_id, 2)
-        return persist_terminal(failure)
-
+    worktree_path = (
+        Path(worktree_text).expanduser().resolve() if isinstance(worktree_text, str) and worktree_text else root
+    )
+    worktree_missing = not isinstance(worktree_text, str) or not worktree_text or not worktree_path.is_dir()
+    observation_cwd = root if worktree_missing else worktree_path
     env = {**os.environ, **identity.to_env(), "WORKBAY_HANDOFF_STATE_DIR": str(resolved_state_dir)}
+    pinned_base = completion_config.get("start_head_ref") if isinstance(completion_config, dict) else None
+    pinned_tree = ""
+    transport_command = argv
+    original_script = Path(argv[0])
+    rebound = worktree_missing and (
+        "recovery_transport" in spec or (original_script.is_absolute() and not original_script.exists())
+    )
+
+    def transport_hold(reason: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "terminal": False,
+            "status": "running",
+            "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+            "reason": reason,
+            "rescue_status": "rescue_pending",
+            "job_id": job_id,
+            "attempt": attempt,
+            "pass_id": pass_id,
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "summary": "Detached job recovery is waiting for its original transport identity.",
+        }
+
+    if retry_terminal_rescue:
+        fence = {"task_ref": task_ref, "lane_id": lane_id, "job_id": job_id, "attempt": attempt}
+        if recorded_result.get("pass_id") != pass_id or any(
+            source.get(key) != value for source in (pass_state, recorded_result) for key, value in fence.items()
+        ):
+            return transport_hold("detached_rescue_identity_changed")
+
+    recorded_loss = stage == "done" and job.get("remote_state") == "lost"
+    if (
+        recorded_loss
+        and job.get("loss_cause") != remote_job_ledger.UNIT_DEAD_NO_RECEIPT
+        and not job.get("supervisor_failure")
+    ):
+        return settle_dead_job(job)
+    if rebound:
+        from .adapters import remote_exec  # noqa: PLC0415
+
+        route = remote_exec.detached_recovery_route(root, env, timeout=min(5.0, _completion_remaining()))
+        binding = spec.get("recovery_transport")
+        if route is None or (
+            "recovery_transport" in spec and (not isinstance(binding, dict) or binding.get("route") != route)
+        ):
+            return transport_hold("detached_recovery_route_unverified")
+        env.update(route)
+        if (
+            not isinstance(pinned_base, str)
+            or re.fullmatch(r"[0-9a-f]{40}", pinned_base) is None
+            or _git_stdout(root, "--no-replace-objects", "rev-parse", "--verify", f"{pinned_base}^{{commit}}")
+            != pinned_base
+        ):
+            return transport_hold("detached_recovery_source_unverified")
+        pinned_tree = _git_stdout(root, "--no-replace-objects", "rev-parse", "--verify", f"{pinned_base}^{{tree}}")
+        if not pinned_tree:
+            return transport_hold("detached_recovery_source_unverified")
+        try:
+            if isinstance(binding, dict):
+                digest = binding.get("transport_digest")
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError("invalid recorded transport digest")
+            else:
+                digest = remote_exec.retired_transport_digest(
+                    worktree_path,
+                    root,
+                    original_script,
+                    pinned_base,
+                    remaining=_completion_remaining,
+                )
+            if original_script.exists():
+                script = original_script
+            else:
+                script = remote_exec.resolve_transport(
+                    worktree_path,
+                    primary_repo=root,
+                    expected_digest=digest,
+                ).path
+            transport_command = transports.enter_context(
+                remote_job_runner._authenticated_transport(
+                    [str(script), *argv[1:]],
+                    {"transport_path": str(script), "transport_digest": digest},
+                    admitted_source=remote_exec._read_transport_source(script),
+                )
+            )
+        except (
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+            remote_exec.TransportMissingError,
+            remote_job_runner._TransportBindingRefused,
+        ):
+            return transport_hold("detached_recovery_transport_unavailable")
+
+    if retry_terminal_rescue or (stage == "done" and (recorded_loss or job.get("supervisor_failure") is True)):
+        return settle_dead_job(job)
     timeout_value = spec.get("bound_seconds")
     timeout = float(timeout_value) if isinstance(timeout_value, int) and not isinstance(timeout_value, bool) else 60.0
     timeout = max(1.0, min(timeout, 300.0))
     if stage == "done" or reharvest_open or resume_custody:
         vm_rc = job.get("rc")
     else:
-        status_command = [argv[0], "status", "--job-id", job_id]
+        status_command = remote_job_runner._operation_command(transport_command, "status", identity)
         try:
             status = remote_job_runner._run_child(
                 status_command,
-                cwd=str(worktree_path),
+                cwd=str(observation_cwd),
                 env=env,
                 timeout=min(timeout, 30.0, _completion_remaining()),
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
+            if rebound:
+                return transport_hold("detached_recovery_job_unverified")
             return {
                 "ok": True,
                 "terminal": False,
@@ -15182,6 +15464,8 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 "summary": "Detached job status is unknown; ask again.",
             }
         if status.returncode != 0:
+            if rebound:
+                return transport_hold("detached_recovery_job_unverified")
             return {
                 "ok": True,
                 "terminal": False,
@@ -15195,13 +15479,15 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 "summary": "Detached job status could not be confirmed; ask again.",
                 "status_error": (status.stderr or "").strip()[-500:],
             }
-        try:
-            status_row = json.loads(status.stdout or "")
-        except (TypeError, json.JSONDecodeError):
-            status_row = None
-        if not isinstance(status_row, dict) or status_row.get("job_id") != job_id:
-            status_row = None
-        if status_row is None or status_row.get("observer_error") is not None:
+        status_row = remote_job_runner._status_payload(status, identity, strict=rebound)
+        if rebound and (
+            status_row is None
+            or status_row.get("attempt") != attempt
+            or status_row.get("observer_error") is not None
+            or status_row["state"] == "lost"
+        ):
+            return transport_hold("detached_recovery_job_unverified")
+        if status_row is None or (status_row.get("observer_error") is not None and status_row["state"] != "done"):
             return {
                 "ok": True,
                 "terminal": False,
@@ -15215,10 +15501,10 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 "summary": "Detached job status is unknown; ask again.",
             }
         remote_state = status_row.get("state")
-        if remote_state == "lost":
+        if isinstance(remote_state, str) and remote_state in remote_job_ledger.REMOTE_JOB_LOSS_STATES:
             _completion_remaining()
-            ledger.mark_done(job_id, 1, lost=True)
-            return persist_terminal(_lost_remote_job_terminal(job_id))
+            settled = ledger.mark_done(job_id, 1, lost=remote_state)
+            return settle_dead_job(settled)
         if remote_state != "done":
             return {
                 "ok": True,
@@ -15247,7 +15533,10 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                 "summary": "Detached job exit status is unknown; ask again.",
             }
         _completion_remaining()
-        ledger.mark_done(job_id, vm_rc)
+        settled = mark_native_done(status_row, vm_rc)
+        if settled.get("supervisor_failure") is True:
+            return settle_dead_job(settled)
+        job = settled
 
     if isinstance(vm_rc, bool) or not isinstance(vm_rc, int):
         return {
@@ -15262,15 +15551,89 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
             "lane_id": lane_id,
             "summary": "Detached job exit status is unknown; ask again.",
         }
+    classify_wake = stage == "done" and vm_rc != 0 and not reharvest_open and not resume_custody
+    if classify_wake and (vm_rc == 75 or not worktree_path.is_dir() or rebound) and not job.get("defer_reason"):
+        try:
+            status_command = remote_job_runner._operation_command(transport_command, "status", identity)
+            status_limit = min(8.0, timeout, _completion_remaining())
+            if rebound:
+                status = remote_job_runner._run_child(
+                    status_command,
+                    cwd=str(observation_cwd),
+                    env=env,
+                    timeout=status_limit,
+                )
+            else:
+                status = remote_job_runner.run_status(status_command, cwd=str(observation_cwd), timeout=status_limit)
+            row = remote_job_runner._status_payload(status, identity, strict=True) if status.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            row = None
+        if rebound and (not row or row.get("attempt") != attempt or row.get("observer_error") is not None):
+            return transport_hold("detached_recovery_job_unverified")
+        if not row or row.get("state") != "done" or type(row.get("rc")) is not int or row["rc"] != vm_rc:
+            return {
+                "ok": True,
+                "terminal": False,
+                "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+                "job_id": job_id,
+                "pass_id": pass_id,
+                "reason": "detached_artifact_persistence_retryable",
+                "rescue_status": "rescue_pending",
+            }
+        _completion_remaining()
+        job = mark_native_done(row, vm_rc)
+        if job.get("supervisor_failure") is True:
+            return settle_dead_job(job)
+
+    if not isinstance(worktree_text, str) or not worktree_text or not isinstance(completion_config, dict):
+        failure = {
+            "ok": False,
+            "terminal": True,
+            "outcome": "needs_guidance",
+            "failed_stage": "execute",
+            "job_id": job_id,
+            "pass_id": pass_id,
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "summary": "Detached pass cannot be resumed because its execution identity is incomplete.",
+            "error": "persisted detached pass is missing worktree_path or completion_config",
+            "commit_landed": False,
+            "work_status": "not_landed",
+            "ceremony_status": "not_attempted",
+            "findings": [],
+        }
+        return persist_terminal(failure)
+    if worktree_missing:
+        failure = {
+            "ok": False,
+            "terminal": True,
+            "outcome": "worktree_unrecoverable",
+            "failed_stage": "execute",
+            "job_id": job_id,
+            "pass_id": pass_id,
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "summary": "Detached pass worktree is unavailable for harvest.",
+            "error": f"detached pass worktree does not exist: {worktree_path}",
+            "commit_landed": False,
+            "work_status": "not_landed",
+            "ceremony_status": "not_attempted",
+            "findings": [],
+        }
+        return persist_terminal(failure)
+
     if vm_rc == 75:
+        defer_reason = job.get("defer_reason")
+        defer_reason = defer_reason or "vm_admission_refused"
+        summary = admission_defer_summary(str(spec.get("backend") or "remote"), defer_reason)
         return persist_terminal(
             {
                 "ok": False,
                 "outcome": OffloadOutcome.ADMISSION_DEFERRED.value,
                 "failed_stage": "execute",
-                "reason": "vm_admission_refused",
-                "summary": admission_defer_summary(str(spec.get("backend") or "remote"), "vm_admission_refused"),
-                "error": admission_defer_summary(str(spec.get("backend") or "remote"), "vm_admission_refused"),
+                "reason": defer_reason,
+                "summary": summary,
+                "error": summary,
                 "commit_landed": False,
                 "work_status": "not_landed",
                 "ceremony_status": "not_attempted",
@@ -15402,11 +15765,13 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                                 original = worktree_path / original
                             name = next(name for name, path in paths.items() if path == original)
                             collect_argv[index + 1] = str(receive_paths[name])
+                rescue_notice = Path(temporary) / "supervisor-failure"
+                collect_env = {**env, "WORKBAY_REMOTE_RESCUE_NOTICE": str(rescue_notice)}
                 try:
                     collected = remote_job_runner.collect_only(
                         collect_argv,
                         cwd=str(worktree_path),
-                        env=env,
+                        env=collect_env,
                         timeout=min(timeout, _completion_remaining()),
                     )
                 except subprocess.TimeoutExpired as exc:
@@ -15415,6 +15780,12 @@ def _complete_remote_pass(job_id: str, *, state_dir: Path, orchestrator_root: Pa
                     )
                 except OSError as exc:
                     return custody_hold("detached_collection_retryable", error=str(exc))
+                if vm_rc != 0 and collected.returncode == 73 and rescue_notice.is_file():
+                    if rescue_notice.read_text().strip() != job_id:
+                        raise OSError("supervisor receipt identity mismatch")
+                    settled = ledger.mark_done(job_id, vm_rc, supervisor_failure=True)
+                    receive_cleanup.callback(shutil.rmtree, temporary)
+                    return settle_dead_job(settled)
                 if "remote_agent: artifact_snapshot_failed" in (collected.stderr or "").splitlines():
                     return custody_hold(
                         "detached_collection_artifacts_unavailable",

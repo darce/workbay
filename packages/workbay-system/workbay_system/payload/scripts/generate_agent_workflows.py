@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import re
 import json
 import os
@@ -1645,6 +1646,27 @@ _wrap_guard_command = _guard_wrap_module.wrap_guard_command
 _anchor_to_repo_root = _guard_wrap_module.anchor_to_repo_root
 
 
+def render_hook_command(item: dict, command_key: str) -> str | None:
+    """Pass the contract's task-probe deadline to the edit guard entry point."""
+    command = item.get(command_key)
+    if not isinstance(command, str) or not command.strip():
+        return None
+    probe = item.get("task_probe")
+    if probe is None:
+        return command
+    deadline = probe.get("deadline_seconds") if isinstance(probe, dict) else None
+    if (
+        type(deadline) not in (int, float)
+        or not math.isfinite(deadline)
+        or not 0 < deadline < item.get("timeout", _DEFAULT_HOOK_TIMEOUT)
+        or probe.get("expired_outcome") != "handoff_probe_deadline_exceeded"
+    ):
+        raise ValueError(f"invalid task_probe contract for hook {item.get('id')!r}")
+    if item.get("id") == "main-branch" and command_key in {"vscode_command", "codex_command"}:
+        return command  # The Python main-branch adapter has no advisory probe.
+    return f"{command} {deadline:g}"
+
+
 def _render_hooks_config(
     hooks_spec: dict,
     *,
@@ -1659,7 +1681,7 @@ def _render_hooks_config(
     for stage, config_stage in _HOOK_STAGE_KEYS:
         entries: list[dict] = []
         for item in hooks_spec.get(stage) or []:
-            command = item.get(command_key)
+            command = render_hook_command(item, command_key)
             # strip-normalized so renderer and check_harness_sync classify a
             # whitespace-only command identically (omitted, not present).
             if not isinstance(command, str) or not command.strip():
@@ -1757,7 +1779,7 @@ def render_claude_hooks_config(hooks_spec: dict) -> dict:
     for stage, config_stage in _HOOK_STAGE_KEYS:
         entries: list[dict] = []
         for item in hooks_spec.get(stage) or []:
-            command = item.get("claude_command")
+            command = render_hook_command(item, "claude_command")
             if not isinstance(command, str) or not command.strip():
                 continue
             fail_mode = item.get("fail_mode")
@@ -1816,7 +1838,7 @@ def render_cursor_hooks_config(hooks_spec: dict) -> dict:
     for stage, config_stage in _CURSOR_HOOK_STAGE_KEYS:
         entries: list[dict] = []
         for item in hooks_spec.get(stage) or []:
-            command = item.get("cursor_command")
+            command = render_hook_command(item, "cursor_command")
             if not isinstance(command, str) or not command.strip():
                 continue
             entry: dict = {
@@ -2179,7 +2201,7 @@ def _render_grok_plugin_hooks_json(harness_protocol: dict) -> str:
         if not isinstance(row, dict):
             continue
         guard_id = row.get("id", "<unknown>")
-        grok_command = row.get("grok_command")
+        grok_command = render_hook_command(row, "grok_command")
         has_command = isinstance(grok_command, str) and bool(grok_command.strip())
         grok_enabled = row.get("grok_enabled")
         if grok_enabled is False and has_command:

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.90] — 2026-11-21
+
+### Changed
+- Update the runtime pins to the schema 52 handoff, measured close release, and installed remote rescue stack shipped with v0.1.94.
+
 ## [0.3.89] — 2026-11-20
 
 ### Changed

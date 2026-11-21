@@ -47,9 +47,7 @@ fi
 
 # Warning-only rollout: permitted main-branch edits still require a handoff task.
 # If none is active, print a maintenance-task reminder but do not block the edit.
-# Resolve in-process via the in-tree shared module (same pattern as
-# guard-worktree-drift) — never via a PATH-installed console script, whose
-# failure was previously swallowed and reported as "no active task".
+# Use the same deadline-bounded handoff fallback as guard-worktree-drift.
 if [ "${WORKBAY_SKIP_ACTIVE_TASK_PROBE:-0}" = "1" ]; then
   exit 0
 fi
@@ -61,7 +59,7 @@ fi
 # Failure reasons go to stderr (one line) so operators can see why [OBS-01][RES-03].
 PROBE_STATUS=0
 PROBE_OUT=$(
-  python3 - "$HOOK_DIR" "$REPO_ROOT" <<'PY'
+  python3 - "$HOOK_DIR" "$REPO_ROOT" "${1:-1.0}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -69,7 +67,7 @@ sys.path.insert(0, sys.argv[1])
 try:
     from _active_task_context import _load_active_task
 
-    ctx = _load_active_task(Path(sys.argv[2]))
+    ctx = _load_active_task(Path(sys.argv[2]), edit_deadline=float(sys.argv[3]))
 except Exception as e:
     # Bounded one-line reason; no stack trace on the hot path [OBS-01].
     sys.stderr.write("active-task probe failed: %s\n" % (e,))

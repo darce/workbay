@@ -38,12 +38,15 @@ from urllib.parse import quote
 from workbay_handoff_mcp.enums import LIVE_LANE_STATUSES, TERMINAL_LANE_STATUSES
 
 from . import review_cycle_dispatch as cycle
+from .invocation_disposition import DispositionHold
+from .invocation_disposition import _identity as _file_identity
 from .review_cycle_ledger import (
     LedgerDecision,
     ReviewCycleLedger,
     _digest,
     _encoded,
     _Hold,
+    _issued,
     correction_effects,
     correction_eligibility,
 )
@@ -65,20 +68,59 @@ def _require(condition: bool, reason: str, needed: str) -> None:
         raise EvidenceHold(reason, needed)
 
 
+@contextmanager
+def _regular(path: Path):
+    """Open an authority file without following links or listing its parents."""
+    # O_PATH on Linux pins the directory without requesting read access. XNU
+    # defines O_SEARCH as O_EXEC | O_DIRECTORY, even on Python builds made
+    # with an older SDK that does not export the flag.
+    if sys.platform == "darwin":
+        search = getattr(os, "O_SEARCH", 0x40000000 | os.O_DIRECTORY)
+    else:
+        search = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
+    directory_flags = search | os.O_DIRECTORY | os.O_NOFOLLOW
+    path = Path(os.path.abspath(path))
+    parent = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOATIME", 0)
+        fd = os.open(path.name, flags, dir_fd=parent)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise DispositionHold("unsafe_regular_file")
+            if info.st_uid != os.getuid():
+                raise DispositionHold("foreign_file_owner")
+            identity = _file_identity(info)
+
+            def check_name():
+                if _file_identity(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != identity:
+                    raise DispositionHold("file_replaced")
+
+            check_name()
+            yield fd
+            if _file_identity(os.fstat(fd)) != identity:
+                raise DispositionHold("file_changed")
+            check_name()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent)
+
+
 def _read(path: Path, root: Path) -> tuple[dict, str]:
     """Read canonical host bytes; never follow a worker-selected/export path."""
     _require(path.is_relative_to(root) and path.resolve() == path, "authority_path_invalid", str(path))
     try:
-        info = path.stat()
-        _require(
-            stat.S_ISREG(info.st_mode)
-            and info.st_uid == os.getuid()
-            and not info.st_mode & 0o022
-            and info.st_size <= 32 * 1024 * 1024,
-            "authority_custody_invalid",
-            str(path),
-        )
-        raw = path.read_bytes()
+        with _regular(path) as fd:
+            info = os.fstat(fd)
+            _require(info.st_mode & 0o444 and not info.st_mode & 0o022 and info.st_size <= 32 * 1024 * 1024,
+                     "authority_custody_invalid", str(path))
+            with open(fd, "rb", closefd=False) as stream:
+                raw = stream.read(info.st_size)
         value = json.loads(raw)
         _require(isinstance(value, dict), "authority_shape_invalid", str(path))
         return value, _digest(raw)
@@ -102,7 +144,7 @@ def _dispatch_lock(path: Path):
     # The producer creates this stable lock at preparation. Preview never
     # creates it (nor a ledger, activation, migration, pass or proof).
     try:
-        with path.with_suffix(".lock").open("r+b") as lock:
+        with _regular(path.with_suffix(".lock")) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 yield
@@ -661,6 +703,34 @@ def _bootstrap_producer_custody(repo: Path, primary: Path, runtime, receipt: dic
                 required_host_evidence=None), {str(path): digest}
 
 
+def _receipt_reservation(repo: Path, path: Path, receipt: dict, rows: dict) -> dict:
+    """Authenticate the native source and the immutable portion of its original reservation."""
+    identity = receipt.get("identity")
+    dispatch_id = identity.get("dispatch_id") if isinstance(identity, dict) else None
+    _require(isinstance(dispatch_id, str) and path.name == _digest(dispatch_id.encode()) + ".json",
+             "holder_custody_unavailable", str(path) + ": original native dispatch identity")
+    row = rows.get(dispatch_id)
+    decision = receipt.get("decision")
+    original = decision.get("row") if isinstance(decision, dict) else None
+    # ReviewCycleLedger.settle writes these fields after reservation.
+    mutable = {"completion", "outcome_class", "settled_sequence", "settlement_status",
+               "provider_refusal", "round_charged"}
+    _require(isinstance(row, dict) and row.get("decision") == "reserved"
+             and identity == {k: row.get(k) for k in ("dispatch_id", "subject_branch", "kind")}
+             and isinstance(original, dict) and decision.get("status") == "reserved"
+             and _encoded({k: v for k, v in row.items() if k not in mutable})
+             == _encoded({k: v for k, v in original.items() if k not in mutable}),
+             "holder_custody_unavailable", str(path) + ": original reservation linked to canonical ledger row")
+    head = receipt.get("source_head")
+    if head:
+        tree = receipt.get("source_tree")
+        _require(isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)
+                 and cycle._git(repo, "rev-parse", "--verify", head + "^{tree}") == tree
+                 and cycle._git(repo, "cat-file", "-t", tree) == "tree",
+                 "holder_source_mismatch", str(path) + ": immutable native source commit/tree")
+    return row
+
+
 def _bootstrap_receipts(repo: Path, data: dict) -> tuple[dict, dict]:
     """Every native dispatch receipt, custody-read and linked to its ledger row."""
     private = cycle.authority(repo)
@@ -671,21 +741,7 @@ def _bootstrap_receipts(repo: Path, data: dict) -> tuple[dict, dict]:
         if path.suffix != ".json":
             continue
         receipt, digest = _read(path, private)
-        identity = receipt.get("identity") or {}
-        dispatch_id = identity.get("dispatch_id")
-        _require(isinstance(dispatch_id, str) and path.stem == _digest(dispatch_id.encode()),
-                 "holder_custody_unavailable", str(path) + ": original native dispatch identity")
-        row = data["rows"].get(dispatch_id)
-        original = (receipt.get("decision") or {}).get("row") or {}
-        mutable = {"completion", "outcome_class", "settled_sequence", "settlement_status"}
-        _require(isinstance(row, dict) and identity == {k: row[k] for k in ("dispatch_id", "subject_branch", "kind")}
-                 and (receipt.get("decision") or {}).get("status") == "reserved"
-                 and original.get("dispatch_id") == dispatch_id
-                 and all(row.get(k) == v for k, v in original.items() if k not in mutable),
-                 "holder_custody_unavailable", str(path) + ": original reservation linked to canonical ledger row")
-        if receipt.get("source_head"):
-            _require(cycle._git(repo, "rev-parse", receipt["source_head"] + "^{tree}") == receipt.get("source_tree"),
-                     "holder_source_mismatch", str(path) + ": immutable native source commit/tree")
+        row = _receipt_reservation(repo, path, receipt, data["rows"])
         records[str(path)] = digest
         receipts[path.name] = (receipt, row)
     return records, receipts
@@ -729,6 +785,8 @@ def bootstrap_holder_report(repo: Path, primary: Path, runtime, proof: dict, dat
     An empty branch selects the ancestry walk for every nonempty source branch.
     This is an observation, never a release event or a second settlement ledger.
     """
+    from .lane_close_release import verified_close_release
+
     directory = cycle.authority(repo) / "review_cycle_dispatch"
     records, receipts = _bootstrap_receipts(repo, data)
     # Missing native source receipts cannot be replaced by a current registry
@@ -741,6 +799,7 @@ def bootstrap_holder_report(repo: Path, primary: Path, runtime, proof: dict, dat
     holding = cycle.subject_hold_report(repo, "", proof, orchestrator_root=primary)
     named = {item["receipt"] for item in holding}
     custody_by_receipt = {}
+    release_walk = HolderReleaseWalk(repo)
     # Historical discovery can release on task completion. Maintenance must
     # additionally retain an unstamped original whose native producer/harvest
     # is unknown. A finished task or pass is not native settlement evidence.
@@ -749,6 +808,12 @@ def bootstrap_holder_report(repo: Path, primary: Path, runtime, proof: dict, dat
         if name in named or receipt.get("source_task_subject") is not None or not head or not branch:
             continue
         if cycle._git(repo, "merge-base", head, "HEAD") != head:
+            continue
+        path = directory / name
+        if (receipt.get("source_issuer") is not None
+                and verified_close_release(repo, path, receipt, records[str(path)], proof) is not None):
+            continue
+        if release_walk.landed_self_source_releases(path, receipt, records[str(path)], proof):
             continue
         custody, linked = _bootstrap_producer_custody(repo, primary, runtime, receipt, row)
         records.update(linked)
@@ -991,12 +1056,13 @@ def _terminal_holder_facts(primary: Path, dispatch_id: str, receipt: dict, row: 
     ref = source if source.startswith("refs/heads/") else "refs/heads/" + source
     try:
         valid_ref = cycle._subject_probe(primary, "check-ref-format", ref)
-        exists = cycle._subject_probe(primary, "show-ref", "--verify", "--quiet", ref)
+        branch_exists = cycle._ref_exists(primary, ref)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise EvidenceHold("holder_release_branch_present_or_unknown", dispatch_id) from exc
-    branch_absent = exists.returncode == 1
+    branch_absent = not branch_exists
     _require(valid_ref.returncode == 0 and (branch_absent or (
-                 stamped_receipt is not None and not holder.owner_unproven and exists.returncode == 0
+                 stamped_receipt is not None and not holder.owner_unproven
+                 and cycle._subject_probe(primary, "rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode == 0
                  and _ref_has_later_registration(primary, ref, holder, stamped_receipt))),
              "holder_release_branch_present_or_unknown", dispatch_id)
     integrations = {}
@@ -1029,16 +1095,134 @@ def _terminal_holder_facts(primary: Path, dispatch_id: str, receipt: dict, row: 
     return result
 
 
+def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: dict, rows: dict) -> str | None:
+    """Recover the issuer's pinned integration from a protected, earlier native admission.
+
+    A ledger sequence dates the producer stamp before this unstamped dispatch.
+    Current notes, file times and a commit shared by two integrations cannot do so.
+    """
+    from . import review_ratchet as ratchet
+
+    sequence = _issued(rows[receipt["identity"]["dispatch_id"]])
+    if sequence is None:
+        return None
+    private = cycle.authority(repo)
+    names = set()
+    for row in rows.values():
+        issued = _issued(row)
+        if (row["subject_branch"] != lane["branch"] or row["decision"] != "reserved"
+                or issued is None or issued >= sequence):
+            continue
+        path = private / "review_cycle_dispatch" / (_digest(row["dispatch_id"].encode()) + ".json")
+        previous, _ = _read(path, private)
+        stamp = previous.get("source_task_subject")
+        if (not isinstance(stamp, dict) or previous.get("source_branch") != lane["branch"]
+                or stamp.get("subject_branch") != lane["branch"]):
+            continue
+        _receipt_reservation(repo, path, previous, rows)
+        issuer = cycle._receipt_holder(primary, previous, lane["branch"])
+        if (issuer.mismatch or issuer.lane is None or issuer.lane["id"] != lane["id"]
+                or previous.get("state") != "transport_started"):
+            return None
+        record = ratchet._scope_record(repo, stamp)
+        if (record is None or not ratchet._same_worktree(record["worktree_path"], lane["worktree_path"])
+                or cycle._ancestry(repo, stamp["tip_sha"], previous["source_head"]) != "ancestor"
+                or cycle._ancestry(repo, stamp["tip_sha"], receipt["source_head"]) != "ancestor"):
+            return None
+        names.add(stamp["integration_branch"])
+    return names.pop() if len(names) == 1 else None
+
+
+def _landed_self_source(repo: Path, primary: Path, receipt: dict, rows: dict, proof: dict) -> bool:
+    """The issuer's typed final tip covers this source and landed on its own integration."""
+    from . import review_ratchet as ratchet
+
+    branch, head = receipt["source_branch"], receipt["source_head"]
+    holder = cycle._receipt_holder(primary, receipt, branch)
+    lane = holder.lane
+    if (holder.mismatch or holder.owner_unproven or holder.competing or lane is None
+            or lane["branch"] != branch or lane["status"] != "merged" or lane["task_ref"] == proof["task_ref"]):
+        return False
+    managed = receipt.get("managed_identity")
+    if managed is not None and (
+            not isinstance(managed, dict) or not ratchet._same_worktree(managed.get("worktree_path"), lane["worktree_path"])
+            or receipt.get("managed_source") != dict(branch=branch, head_sha=head, head_tree=receipt["source_tree"])):
+        return False
+    task = ratchet.task_record(lane["task_ref"])
+    located = ratchet._manifest_lane(primary, lane["task_ref"], lane["lane_id"])
+    if task is None or task.get("status") not in {"done", "in_progress"} or located is None:
+        return False
+    manifest, member = located
+    integration = proof["integration_branch"]
+    target = ratchet._short_branch(task.get("target_branch"))
+    if (branch == integration or target not in {branch, integration}
+            or (target == branch and not ratchet._same_worktree(task.get("target_worktree_path"), lane["worktree_path"]))
+            or ratchet._short_branch(manifest.get("integration_branch", "main")) != integration
+            or ratchet._short_branch(member.get("branch")) != branch
+            or not ratchet._same_worktree(member.get("worktree_path"), lane["worktree_path"])):
+        return False
+
+    landed = ratchet._commit(repo, "refs/heads/" + integration)
+    if (landed is None or cycle._landed_continuation_tip(repo, head, [lane], landed) is None
+            or not cycle._terminal_refs_landed(repo, {branch}, landed)):
+        return False
+    binding = receipt.get("source_task_subject")
+    if binding is None:
+        observed = receipt["source_task_subject_unproven"]
+        cut = observed.get("integration_sha")
+        if (not isinstance(cut, str) or not re.fullmatch("[0-9a-f]{40}", cut)
+                or ratchet._commit(repo, cut) != cut or cycle._ancestry(repo, head, cut) != "not_ancestor"
+                or cycle._ancestry(repo, cut, lane["landing_commit_sha"]) != "ancestor"):
+            return False
+        if "source_integration_branch" in receipt:
+            if receipt["source_integration_branch"] != integration:
+                return False
+        elif _earlier_issuer_integration(repo, primary, lane, receipt, rows) != integration:
+            return False
+    else:
+        if (binding.get("integration_branch") != integration or binding.get("base_sha") != member.get("base_sha")
+                or not ratchet._same_worktree((ratchet._scope_record(repo, binding) or {}).get("worktree_path"),
+                                              lane["worktree_path"])
+                or cycle._ancestry(repo, binding["base_sha"], binding["tip_sha"]) != "ancestor"
+                or cycle._ancestry(repo, binding["tip_sha"], head) != "ancestor"):
+            return False
+
+    # A feature-target task which is still live also owns its other lanes.
+    if (task["status"] == "in_progress" and target == branch
+            and not cycle._feature_members_landed(repo, primary, task, lane, subject=branch, source=branch,
+                                                  head=head, integration=integration, landed=landed)):
+        return False
+    scope = ratchet._scope_record(repo, proof)
+    return (scope is not None and cycle._authorized_roots(repo, primary, proof) is not None
+            and cycle._git(repo, "symbolic-ref", "--quiet", "HEAD") == "refs/heads/" + proof["subject_branch"]
+            and ratchet._same_worktree(scope.get("worktree_path"), cycle._git(repo, "rev-parse", "--show-toplevel")))
+
+
 class HolderReleaseWalk:
     """A fresh ledger index and live observations for one subject resolution."""
 
     def __init__(self, repo: Path) -> None:
         self.repo = repo
-        path = cycle.authority(repo) / "review_cycle_ledger.json"
+        self._ledger_path = cycle.authority(repo) / "review_cycle_ledger.json"
+        self._ledger_identity = None
+        self._data = {}
         try:
-            self._data = _holder_ledger(repo)._read() if path.exists() or path.is_symlink() else {}
+            if self._ledger_path.exists() or self._ledger_path.is_symlink():
+                with _regular(self._ledger_path) as fd:
+                    info = os.fstat(fd)
+                    if not info.st_mode & 0o444:
+                        raise ValueError("unreadable ledger")
+                    with open(fd, "rb", closefd=False) as stream:
+                        data = _holder_ledger(repo)._decode(stream.read())
+                    # A legacy ledger can carry ordinary charges without supplying
+                    # an authenticated reservation or event to this release walk.
+                    if not info.st_mode & 0o022:
+                        self._data = data
+                        self._ledger_identity = (info.st_dev, info.st_ino, info.st_ctime_ns)
+                    elif data.get("holder_releases"):
+                        raise ValueError("unprotected holder release events")
         except (_Hold, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            raise ValueError("review_cycle_holder_release_ledger_unavailable") from exc
+            raise cycle.HolderLedgerUnavailable("review_cycle_holder_release_ledger_unavailable") from exc
         self.events = self._data.get("holder_releases", [])
         # The ledger validates unique membership and strictly increasing event sequences.
         self._by_dispatch = {item: event for event in self.events for item in event["dispatch_ids"]}
@@ -1047,8 +1231,41 @@ class HolderReleaseWalk:
 
     def has_reservation(self, identity: dict) -> bool:
         row = self._data.get("rows", {}).get(identity.get("dispatch_id"))
-        return (isinstance(row, dict) and row["decision"] == "reserved" and row["kind"] in {"implement", "gate"}
-                and all(row[key] == identity.get(key) for key in ("dispatch_id", "subject_branch", "kind")))
+        return (isinstance(row, dict) and row.get("decision") == "reserved" and row.get("kind") in {"implement", "gate"}
+                and all(row.get(key) == identity.get(key) for key in ("dispatch_id", "subject_branch", "kind")))
+
+    def landed_self_source_releases(self, path: Path, receipt: dict, digest: str, proof: dict) -> bool:
+        """One automatic landing proof for dispatch and reconciliation; no settlement is inferred."""
+        identity = receipt["identity"]
+        branch = receipt.get("source_branch")
+        stamp = receipt.get("source_task_subject")
+        unproven = receipt.get("source_task_subject_unproven")
+        if (branch != identity.get("subject_branch") or branch == proof.get("subject_branch")
+                or receipt.get("state") != "transport_started" or not self.has_reservation(identity)):
+            return False
+        if stamp is None:
+            if (not isinstance(unproven, dict) or unproven.get("reason") != "no_producer_proof"
+                    or unproven.get("head_on_integration") is not False):
+                return False
+        elif not isinstance(stamp, dict) or stamp.get("subject_branch") != branch or unproven is not None:
+            return False
+        try:
+            primary, private = _host(self.repo)
+            if path.parent != private / "review_cycle_dispatch":
+                return False
+            with _dispatch_lock(path):
+                protected, observed = _read(path, private)
+                if observed != digest or protected != receipt:
+                    return False
+                _receipt_reservation(self.repo, path, protected, self._data["rows"])
+                if not _landed_self_source(self.repo, primary, protected, self._data["rows"], proof):
+                    return False
+                # A ledger replacement during the walk invalidates its row and any release events.
+                info = self._ledger_path.lstat()
+                return (self._ledger_path.resolve() == self._ledger_path
+                        and (info.st_dev, info.st_ino, info.st_ctime_ns) == self._ledger_identity)
+        except (EvidenceHold, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+            return False
 
     def terminal_issuer_releases(self, path: Path, receipt: dict, digest: str,
                                  holder: cycle._ReceiptHolder, proof: dict) -> bool:

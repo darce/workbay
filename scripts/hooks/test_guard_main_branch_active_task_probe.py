@@ -36,9 +36,11 @@ time -- a latency threshold would be a flake on shared CI.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,128 @@ REPO_ROOT = HOOKS_DIR.parent.parent
 
 _WARNING_TEXT = "without an active handoff task"
 _PROBE_FAIL_PREFIX = "active-task probe failed:"
+
+
+@pytest.fixture
+def consumer_hook_repo(tmp_path: Path) -> Path:
+    """Install the hook files without any monorepo package sources."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    hooks = repo / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    for path in HOOKS_DIR.iterdir():
+        if path.suffix in {".sh", ".py"} and not path.name.startswith("test_"):
+            shutil.copy2(path, hooks / path.name)
+    contract = Path("docs/workbay/contracts/harness-protocol.yaml")
+    (repo / contract).parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / contract, repo / contract)
+    (repo / ".gitignore").write_text(".task-state/\n", encoding="utf-8")
+    _consumer_git(repo, "init", "-q", "--initial-branch=main")
+    _consumer_git(repo, "add", ".")
+    _consumer_git(repo, "commit", "-qm", "consumer fixture")
+    return repo
+
+
+def _consumer_git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+         "-c", "core.hooksPath=/dev/null", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+@pytest.fixture
+def handoff_import(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    package = tmp_path / "injected" / "workbay_handoff_mcp"
+    package.mkdir(parents=True)
+    marker = tmp_path / "handoff-imports"
+    (package / "__init__.py").write_text(
+        'import os, time\n'
+        'with open(os.environ["HOOK_TEST_IMPORT_MARKER"], "a") as marker:\n'
+        '    marker.write("started\\n")\n'
+        'time.sleep(float(os.environ["HOOK_TEST_IMPORT_DELAY"]))\n'
+        'class RuntimeConfig:\n'
+        '    @classmethod\n'
+        '    def for_repo(cls, root):\n'
+        '        raise RuntimeError("controlled handoff failure")\n'
+        'def configure_runtime(runtime): pass\n'
+        'def get_handoff_state(**kwargs): pass\n',
+        encoding="utf-8",
+    )
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("GIT_", "WORKBAY_", "ALT_"))
+    }
+    env.update(PYTHONPATH=str(package.parent), HOOK_TEST_IMPORT_MARKER=str(marker))
+    return env, marker
+
+
+def _run_consumer_hook(repo: Path, hook: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    payload = {
+        "session_id": "guard-probe-test",
+        "cwd": str(repo),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo / ".task-state/tmp/harmless.txt"), "content": "test\n"},
+    }
+    return subprocess.run(
+        ["bash", str(repo / "scripts/hooks" / hook)],
+        cwd=repo,
+        env=dict(env, CLAUDE_PROJECT_DIR=str(repo)),
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+
+
+@pytest.mark.timing
+def test_main_consumer_slow_handoff_import_stays_advisory(
+    consumer_hook_repo: Path, handoff_import: tuple[dict[str, str], Path]
+) -> None:
+    env, marker = handoff_import
+    env["HOOK_TEST_IMPORT_DELAY"] = "8"
+    start = time.monotonic()
+    result = _run_consumer_hook(consumer_hook_repo, "guard-main-branch.sh", env)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5, f"consumer main guard took {elapsed:.3f}s"
+    assert result.returncode == 0, result.stderr
+    assert "active-task probe failed: handoff_probe_deadline_exceeded" in result.stderr
+    assert marker.read_text(encoding="utf-8").splitlines() == ["started"]
+
+
+@pytest.mark.parametrize(
+    ("delay", "probe_error"),
+    [("0", "handoff_probe_failed"), ("8", "handoff_probe_deadline_exceeded")],
+    ids=["fast_failure", "expiry"],
+)
+def test_drift_consumer_probe_failure_traces_primary(
+    tmp_path: Path,
+    consumer_hook_repo: Path,
+    handoff_import: tuple[dict[str, str], Path],
+    delay: str,
+    probe_error: str,
+) -> None:
+    linked = tmp_path / "linked"
+    _consumer_git(consumer_hook_repo, "worktree", "add", "-qb", "feature/test-1", str(linked))
+    env, marker = handoff_import
+    env["HOOK_TEST_IMPORT_DELAY"] = delay
+    result = _run_consumer_hook(linked, "guard-worktree-drift.sh", env)
+    assert marker.read_text(encoding="utf-8").splitlines() == ["started"]
+    assert result.returncode == 0, result.stderr
+    decision = json.loads(result.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "block"
+    assert probe_error in decision["permissionDecisionReason"]
+    trace_path = Path(".task-state/branch_isolation_guard.jsonl")
+    (record,) = (consumer_hook_repo / trace_path).read_text(encoding="utf-8").splitlines()
+    trace = json.loads(record)
+    assert trace["outcome"] == "block"
+    assert probe_error in trace["reason"]
+    assert not (linked / trace_path).exists()
+
 
 _GIT_SHIM = """#!/bin/sh
 # Report main, and a clean tree, whatever the real checkout looks like. Anything

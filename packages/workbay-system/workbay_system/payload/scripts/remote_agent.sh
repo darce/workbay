@@ -33,6 +33,7 @@
 #                      (positive integers): STATUS_LIST_MAX rows (default 1000,
 #                      ceiling 10000), STATUS_LIST_DEADLINE_S seconds (default 90,
 #                      ceiling 600). Exit 3 = truncated by a bound, 1 = could not list.
+#   scripts/remote_agent.sh rescue --job-id ID --attempt N --lane-key KEY --base SHA STAGE
 #   scripts/remote_agent.sh collect --job-id <j+20hex>
 #   scripts/remote_agent.sh collect --job-id <j+20hex> --stage-dir <existing private dir>
 #   scripts/remote_agent.sh cancel --job-id <j+20hex>
@@ -415,7 +416,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.38
+_BOUNDARY_RUNTIME_VERSION=0.3.39
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -676,7 +677,7 @@ _review_cycle_resolve_python() {
 _review_cycle_bridge() {
     # Use this transport's package source when running from a checkout; an
     # installed transport resolves its installed runtime normally.
-    local _src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/packages"
+    local _src="$(cd "${_launch_script_dir:-$(dirname "${BASH_SOURCE[0]}")}/.." && pwd)/packages"
     PYTHONPATH="${_src}/mcp-workbay-orchestrator/src:${_src}/mcp-workbay-handoff/src:${_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
         _review_cycle_resolve_python "${_src%/packages}" || return 1
     PYTHONPATH="${_src}/mcp-workbay-orchestrator/src:${_src}/mcp-workbay-handoff/src:${_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
@@ -879,7 +880,6 @@ _remote_gate_env_load() {
         printf -v "$key" '%s' "$val"
     done < "$file"
 }
-
 # Snapshot every WORKBAY_* knob BEFORE reading the config file so process env
 # always wins (a file that exports WORKBAY_REMOTE_GATE_MEM_FLOOR_MB=0 must not
 # silently zero the floor when the operator set a valid value in the env).
@@ -904,6 +904,11 @@ writable-roots-probe|workspace-write-probe)
     _prepare_direct_probe "$@"
     ;;
 *)
+if [ -n "${_prepared_launch:-}" ]; then
+    for _field in "${_launch_fields[@]}"; do
+        IFS= read -r -d '' "$_field" || { echo 'remote_agent: incomplete prepared launch' >&2; exit 2; }
+    done < "$_prepared_launch/settings"
+else
 _env_host="${WORKBAY_REMOTE_GATE_HOST:-}"
 _env_dir="${WORKBAY_REMOTE_GATE_DIR:-}"
 _env_agent_root_set=0
@@ -1116,6 +1121,7 @@ if [ "$WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S" -lt 1 ]; then
     exit 2
 fi
 
+fi
     ;;
 esac
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 "$REMOTE_HOST")
@@ -1131,11 +1137,15 @@ _remote_submit_job() {
     : "${UV_CACHE_CAP_MB:?}" "${DISPATCH_NONCE:?}" "${BODY_B64:?}"
     case "$AGENT_ROOT" in /*) ROOT="$AGENT_ROOT" ;; *) ROOT="$HOME/$AGENT_ROOT" ;; esac
     JOB_DIR="$ROOT/.jobs/${JOB_ID}"
+    case "${JOB_ATTEMPT:-null}" in
+        null) ;;
+        *) [[ "$JOB_ATTEMPT" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "remote_agent: invalid job attempt" >&2; exit 2; } ;;
+    esac
     UNIT="workbay-lane-${LANE_KEY}-job-${JOB_ID}.service"
 
     _submit_write_state() {
         _st="$1"
-        printf '{"state":"%s","unit":"%s"}\n' "$_st" "$UNIT" > "$JOB_DIR/state.json.tmp"
+        printf '{"state":"%s","unit":"%s","attempt":%s}\n' "$_st" "$UNIT" "${JOB_ATTEMPT:-null}" > "$JOB_DIR/state.json.tmp"
         mv -f "$JOB_DIR/state.json.tmp" "$JOB_DIR/state.json"
     }
     _submit_print() {
@@ -1170,6 +1180,7 @@ _remote_submit_job() {
         {
             printf 'WORKBAY_REMOTE_AGENT_UV_CACHE_CAP_MB=%s\n' "$UV_CACHE_CAP_MB"
             printf 'WORKBAY_DISPATCH_NONCE=%s\n' "$DISPATCH_NONCE"
+            printf 'WORKBAY_SUBMIT_JOB_ATTEMPT=%s\n' "${JOB_ATTEMPT:-null}"
             printf 'WORKBAY_SUBMIT_REMOTE_GIT=%s\n' "${REMOTE_GIT:-}"
             printf 'WORKBAY_SUBMIT_REF_NAME=%s\n' "${REF_NAME:-}"
             printf 'WORKBAY_SUBMIT_BRIEF=%s\n' "${BRIEF_PATH:-}"
@@ -1323,8 +1334,12 @@ PYART
         _artifact_snapshot_failed=1
         printf '{"error":"artifact_snapshot_failed"}\n' > "${_job_dir}/artifacts.json"
     fi
-    printf '{"finished_at":"%s","job_id":"%s","rc":%s,"reason":null,"schema_version":1,"stdout_bytes":%s,"stdout_sha256":"%s"}\n' \
-        "${_finished_at}" "${_job_id}" "${_rc}" "${_stdout_bytes}" "${_stdout_sha256}" > "${_job_dir}/done.json.tmp"
+    _done_reason=null
+    if [ "$_rc" = 75 ] && command -p grep -Fxq 'remote_agent: rescue_pending refusing to wipe existing sandbox' "${_job_dir}/stderr" 2>/dev/null; then
+        _done_reason='"rescue_pending"'
+    fi
+    printf '{"finished_at":"%s","job_id":"%s","rc":%s,"reason":%s,"schema_version":1,"stdout_bytes":%s,"stdout_sha256":"%s"}\n' \
+        "${_finished_at}" "${_job_id}" "${_rc}" "$_done_reason" "${_stdout_bytes}" "${_stdout_sha256}" > "${_job_dir}/done.json.tmp"
     if ln "${_job_dir}/done.json.tmp" "${_job_dir}/done.json" 2>/dev/null; then
         rm -f "${_job_dir}/done.json.tmp"
     else
@@ -1458,7 +1473,7 @@ fi
 timeout 30 systemd-run --quiet --user --unit "$UNIT" --service-type=exec \
     -p "RuntimeMaxSec=${JOB_RUNTIME_SEC}" \
     -p "MemoryMax=${MEM_MAX}" -p "CPUQuota=${CPU_QUOTA}" \
-    -p "ExecStopPost=/bin/bash $JOB_DIR/stop.sh" \
+    -p "ExecStopPost=/bin/bash $JOB_DIR/stop.sh 2" \
     --working-directory="$JOB_DIR" /bin/bash "$JOB_DIR/wrapper.sh" 7>&- 8>&- 9>&-
 START
         } > "$JOB_DIR/start.sh.tmp"
@@ -1487,32 +1502,47 @@ case "${EXIT_CODE:-exited}" in
         _rc=$((128 + _rc)) ;;
 esac
 case "$_rc" in ''|*[!0-9]*) _rc=1 ;; esac
-[ "${SERVICE_RESULT:-success}" = success ] || [ "$_rc" != 0 ] || _rc=1
+[ "${SERVICE_RESULT:-unknown}" = success ] || [ "$_rc" != 0 ] || _rc=1
 # Publish without replacing the wrapper's terminal event.
-WORKBAY_STOP_RC="$_rc" python3 - <<'STOPPY'
+WORKBAY_RECEIPT_VERSION="${1:-1}" WORKBAY_STOP_RC="$_rc" python3 - <<'STOPPY'
 import hashlib
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 job = Path.cwd()
-stdout = (job / "stdout").read_bytes() if (job / "stdout").exists() else b""
+stdout = job / "stdout"
+digest = hashlib.sha256()
+size = 0
+# The hook runs under the same unit memory limit as the job.
+if stdout.exists():
+    with stdout.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+            size += len(chunk)
+result = os.environ.get("SERVICE_RESULT") or "unknown"
+exit_code = os.environ.get("EXIT_CODE")
+exit_status = os.environ.get("EXIT_STATUS")
 record = {"schema_version": 1, "job_id": job.name,
           "finished_at": datetime.now(timezone.utc).isoformat(),
           "rc": int(os.environ["WORKBAY_STOP_RC"]),
-          "reason": os.environ.get("SERVICE_RESULT", "unknown"),
-          "stdout_bytes": len(stdout), "stdout_sha256": hashlib.sha256(stdout).hexdigest()}
-tmp = job / "done.supervisor.tmp"
-with tmp.open("w") as stream:
-    json.dump(record, stream)
-    stream.flush()
-    os.fsync(stream.fileno())
+          "reason": result,
+          "stdout_bytes": size, "stdout_sha256": digest.hexdigest()}
+# Older launchers invoke stop.sh without a receipt version.
+if os.environ["WORKBAY_RECEIPT_VERSION"] == "2":
+    record.update(result=result, exit_code=exit_code, exit_status=exit_status, oom_killed=result == "oom-kill")
+tmp = tempfile.NamedTemporaryFile(mode="w", dir=job, prefix=".done.supervisor.", delete=False)
 try:
-    os.link(tmp, job / "done.json")
+    with tmp:
+        json.dump(record, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.link(tmp.name, job / "done.json")
 except FileExistsError:
     pass
 finally:
-    tmp.unlink(missing_ok=True)
+    Path(tmp.name).unlink(missing_ok=True)
 STOPPY
 STOP
         chmod 0700 "$JOB_DIR/stop.sh"
@@ -1555,14 +1585,23 @@ STOP
         exit 0
     fi
 
-    if [ "$_state" = queued ] && _submit_queue_fresh; then
-        _submit_print queued
-        exit 0
+    # Inspect the prior publication under both locks. A stale consumer
+    # refuses delivery even when it still owns the original queued payload.
+    if [ -e "$JOB_DIR/state.json" ] || [ -L "$JOB_DIR/state.json" ]; then
+        case "$_state" in
+            queued)
+                if _submit_queue_fresh; then
+                    _submit_print queued
+                    exit 0
+                fi
+                echo "remote_agent: vm_queue_unavailable publication=queued" >&2
+                exit 75 ;;
+            claiming|ready) ;;  # staging interrupted before queue publication
+            *) echo "remote_agent: submit_existing_state_unconfirmed" >&2; exit 75 ;;
+        esac
     fi
-    # Routine dispatch has no authority to install/promote shared runtime.
-    # Preserve existing queued payloads on failure, including their queue age.
     if ! _submit_queue_fresh; then
-        echo "remote_agent: vm_queue_unavailable; fresh installed queue required" >&2
+        echo "remote_agent: vm_queue_unavailable publication=not_published; fresh installed queue required" >&2
         exit 75
     fi
     _submit_require_linger
@@ -1575,7 +1614,7 @@ STOP
     # The heartbeat may have expired while staging. Never claim publication
     # by falling back to a direct unit start.
     if ! _submit_queue_fresh; then
-        echo "remote_agent: vm_queue_unavailable; queue expired during publication" >&2
+        echo "remote_agent: vm_queue_unavailable publication=not_published; queue expired during publication" >&2
         exit 75
     fi
     _submit_write_state ready
@@ -1602,6 +1641,39 @@ _lane_scope_cgroup_members() {
         out="${out:+$out,}$pid:$comm"
     done < "$procs" || return 2
     printf '%s' "$out"
+}
+
+_rescue_verifier_source() {
+    sed -n '/^# BEGIN SANDBOX_RESCUE_CUSTODY$/,/^# END SANDBOX_RESCUE_CUSTODY$/p' "${BASH_SOURCE[0]}"
+}
+
+# Used only for lanes with gate-owned detached-job custody state.
+_lane_warm_rescue() {
+    command -p timeout -k 1 8 python3 - "$@" <<'WARM_RESCUE_PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+# RESCUE_CUSTODY_SOURCE
+
+root, key = Path(sys.argv[1]), sys.argv[2]
+try:
+    starting_job = Path(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+    proof = rescue_custody(root, key, starting_job=starting_job)
+    if proof is not None:
+        print("complete")
+    elif os.path.lexists(root / (".workbay-rescue-binding-" + key)):
+        bound = json.loads(_rescue_regular(root / (".workbay-rescue-binding-" + key), 4096))
+        if not re.fullmatch(r"[0-9a-f]{40}", bound["base"]):
+            raise ValueError("invalid sandbox base")
+        print(bound["base"])
+except (NameError, OSError, KeyError, TypeError, ValueError):
+    sys.exit(1)
+WARM_RESCUE_PY
 }
 
 # BEGIN REMOTE_JOB_OPS
@@ -1701,82 +1773,190 @@ PY
         fi
     }
 
+    _remote_job_read_record() {
+        # One bounded read per record. Keep the receipt independently usable
+        # when state.json is damaged. Only validated fields cross into Bash.
+        command -p timeout -k 1 3 python3 - "$1" "${2:-}" <<'PY_JOB_RECORD'
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+job = Path(sys.argv[1])
+
+def read(name):
+    fd = os.open(job / name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("not a regular record")
+        record = json.load(stream)
+    if not isinstance(record, dict):
+        raise ValueError("invalid record")
+    return record
+
+attempt = "null"
+legacy = "false"
+try:
+    record = read("state.json")
+    state, unit = record["state"], record["unit"]
+    if not isinstance(state, str) or not re.fullmatch(r"[a-z_]+", state):
+        raise ValueError("invalid state")
+    if not isinstance(unit, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", unit):
+        raise ValueError("invalid unit")
+    if "attempt" in record and record["attempt"] is not None:
+        attempt = record["attempt"]
+        if type(attempt) is not int or attempt < 0:
+            raise ValueError("invalid attempt")
+    else:
+        legacy = "true"
+except (OSError, ValueError, KeyError):
+    state, unit, attempt = "unknown", "", "null"
+rc = ""
+supervisor = "false"
+defer_reason = ""
+try:
+    receipt = read("done.json")
+    rc = receipt["rc"]
+    if type(rc) is not int or not 0 <= rc <= 255 or receipt.get("job_id", job.name) != job.name:
+        raise ValueError("invalid receipt")
+    reason = receipt.get("reason")
+    if rc == 75 and reason == "rescue_pending":
+        defer_reason = reason
+    if rc and (receipt.get("result") == reason and isinstance(reason, str) or reason in (
+        "exit-code", "signal", "core-dump", "watchdog", "timeout", "resources",
+        "protocol", "start-limit-hit", "oom-kill", "unknown",
+    )):
+        supervisor = "true"
+    if sys.argv[2] != "rescue":
+        state = "done"
+except FileNotFoundError:
+    if state == "done":
+        state = "unknown"
+except (OSError, ValueError, KeyError):
+    state, rc = "receipt_invalid", ""
+print(f"{state}|{unit}|{attempt}|{rc}|{legacy}|{supervisor}|{defer_reason}")
+PY_JOB_RECORD
+    }
+
     _remote_job_compute_state() {
         JOB_DIR="$1"
-        _out_state="unknown"
-        _out_unit=""
+        local jid="${JOB_DIR##*/}" snapshot state unit props line key value
+        local load="" active="" sub="" result="" seen=" " manager_rc=0
+        _out_state=unknown
+        _out_error=job_record_unavailable
+        _out_attempt=null
+        _out_legacy=false
+        _out_supervisor=false
+        _out_defer_reason=""
+        _out_loss_cause=""
         _out_unit_active=0
-        _out_unit_obs=""
         _out_rc=""
         _out_hb=""
-        if [ ! -d "$JOB_DIR" ]; then
-            return 0
-        fi
-        _state=""
-        _unit=""
-        if [ -f "$JOB_DIR/state.json" ]; then
-            _state="$(_remote_job_json_field "$JOB_DIR/state.json" state)"
-            _unit="$(_remote_job_json_field "$JOB_DIR/state.json" unit)"
-        fi
-        _out_unit="$_unit"
-        _out_unit_obs=""
-        if [ -n "$_unit" ]; then
-            _remote_job_observe_unit "$_unit"
-            _out_unit_obs="$_unit_obs"
-        else
-            _out_unit_obs="inactive"
-        fi
-        if [ "$_out_unit_obs" = "active" ]; then
-            _out_unit_active=1
-        fi
+        [ -d "$JOB_DIR" ] && [ ! -L "$JOB_DIR" ] && [ -r "$JOB_DIR" ] && [ -x "$JOB_DIR" ] || return 0
         if [ -f "$JOB_DIR/heartbeat" ]; then
             _out_hb="$(_remote_job_file_age_s "$JOB_DIR/heartbeat" || true)"
         fi
-        if [ -f "$JOB_DIR/done.json" ]; then
-            _out_state="done"
-            _out_rc="$(_remote_job_json_field "$JOB_DIR/done.json" rc)"
+        if ! snapshot="$(_remote_job_read_record "$JOB_DIR" "${2:-}")"; then
             return 0
         fi
-        if [ "$_state" = "queued" ]; then
-            _out_state="queued"
+        IFS='|' read -r state unit _out_attempt _out_rc _out_legacy _out_supervisor _out_defer_reason <<< "$snapshot"
+        case "$state" in
+            done) _out_state=done; _out_error=""; return 0 ;;
+            receipt_invalid) _out_error=receipt_invalid; return 0 ;;
+            unknown) return 0 ;;
+        esac
+        if [ -e "$JOB_DIR/cancel.fence" ] || [ -L "$JOB_DIR/cancel.fence" ]; then
+            _out_error=cancel_pending
             return 0
         fi
-        _started=0
-        [ -f "$JOB_DIR/started" ] && _started=1
-        if [ "$_out_unit_obs" = "error" ]; then
-            case "$_state" in
-                claiming|ready) _out_state="claiming" ;;
-                submitted|running) _out_state="$_state" ;;
-                *) _out_state="${_state:-unknown}" ;;
+        case "$state" in
+            queued) _out_state=queued; _out_error=""; return 0 ;;
+            launching) _out_state=launching ;;
+            claiming|ready) _out_state=claiming; _out_error=""; return 0 ;;
+            submitted|running) ;;
+            *) _out_error=job_state_unknown; return 0 ;;
+        esac
+        case "$unit" in
+            [a-zA-Z0-9]*-job-"$jid".service) ;;
+            *) _out_error=unit_identity_mismatch; return 0 ;;
+        esac
+        _out_error=unit_probe_failed
+        props="$(command -p timeout -k 1 6 systemctl --user show --all \
+            --property=Id,LoadState,ActiveState,SubState,Result "$unit" 2>/dev/null)" || manager_rc=$?
+        case "$manager_rc" in
+            0|4) ;;
+            124|137) _out_error=unit_probe_timeout; return 0 ;;
+            *) return 0 ;;
+        esac
+        _out_error=unit_reply_invalid
+        while IFS= read -r line; do
+            case "$line" in *=*) ;; *) return 0 ;; esac
+            key="${line%%=*}"
+            value="${line#*=}"
+            case "$seen" in *" $key "*) return 0 ;; esac
+            seen="$seen$key "
+            case "$key" in
+                Id) [ "$value" = "$unit" ] || return 0 ;;
+                LoadState) load="$value" ;;
+                ActiveState) active="$value" ;;
+                SubState) sub="$value" ;;
+                Result) result="$value" ;;
+                *) return 0 ;;
             esac
-            [ -n "$_out_state" ] || _out_state="unknown"
-            return 0
-        fi
-        if [ "$_out_unit_obs" = "inactive" ]; then
-            if [ "$_state" = "submitted" ] || [ "$_state" = "running" ] || [ "$_started" -eq 1 ]; then
-                _out_state="lost"
-                return 0
-            fi
-        fi
-        if [ "$_state" = "claiming" ] || [ "$_state" = "ready" ]; then
-            _out_state="claiming"
-            return 0
-        fi
-        if [ "$_out_unit_active" -eq 1 ]; then
-            if [ "$_started" -eq 1 ] || [ "$_state" = "running" ]; then
-                _out_state="running"
-            else
-                _out_state="submitted"
-            fi
-            return 0
-        fi
-        _out_state="unknown"
+        done <<< "$props"
+        if [ "$manager_rc" = 4 ] && [ "$load" != not-found ]; then return 0; fi
+        case "$load:$active:$sub" in
+            loaded:active:?*|loaded:activating:?*|loaded:reloading:?*)
+                if [ "$state" = launching ] && { [ -e "$JOB_DIR/cancel.fence" ] || [ -L "$JOB_DIR/cancel.fence" ]; }; then
+                    _out_state=unknown
+                    _out_error=cancel_pending
+                    return 0
+                fi
+                _out_state=submitted
+                if [ "$state" = running ] || [ -f "$JOB_DIR/started" ]; then _out_state=running; fi
+                _out_unit_active=1 ;;
+            not-found:inactive:dead|loaded:inactive:dead|loaded:failed:failed)
+                if [ "$active" = failed ] && { [ -z "$result" ] || [ "$result" = success ]; }; then return 0; fi
+                # Recheck both publications after the manager read. A replaced
+                # or unreadable execution record cannot authorize loss.
+                local current
+                if ! current="$(_remote_job_read_record "$JOB_DIR" "${2:-}")"; then
+                    _out_error=job_record_unavailable
+                    return 0
+                fi
+                if [ "$current" != "$snapshot" ]; then
+                    IFS='|' read -r state unit _out_attempt _out_rc _out_legacy _out_supervisor _out_defer_reason <<< "$current"
+                    if [ "$state" = done ]; then _out_state=done; _out_error=""; else _out_error=job_record_changed; fi
+                    return 0
+                fi
+                if [ -e "$JOB_DIR/cancel.fence" ] || [ -L "$JOB_DIR/cancel.fence" ]; then
+                    _out_error=cancel_pending
+                    return 0
+                fi
+                # The queue still owns the launch before it publishes submitted.
+                if [ "$state" = launching ]; then _out_error=""; return 0; fi
+                _out_state=unit_dead_no_receipt
+                # Older jobs report a disappeared unit as lost. Carry the
+                # confirmed cause so newer collectors can settle it too.
+                if [ "$_out_legacy" = true ] && [ "$load" = not-found ]; then
+                    _out_loss_cause="$_out_state"
+                    _out_state=lost
+                fi ;;
+            *) _out_error=unit_transition_unknown; return 0 ;;
+        esac
+        _out_error=""
     }
 
     _remote_job_emit_status() {
         _jid="$1"
         JOB_DIR="$ROOT/.jobs/${_jid}"
         _remote_job_compute_state "$JOB_DIR"
+        local loss_field=""
+        [ -z "$_out_loss_cause" ] || loss_field=",\"loss_cause\":\"$_out_loss_cause\""
+        [ "$_out_supervisor" = false ] || loss_field+=',"supervisor_failure":true'
+        [ -z "$_out_defer_reason" ] || loss_field+=',"defer_reason":"rescue_pending"'
         _qs="${QUEUE_STALE:-0}"
         _ua=false
         [ "${_out_unit_active:-0}" -eq 1 ] && _ua=true
@@ -1793,13 +1973,13 @@ PY
             *) _rc_json=$_out_rc ;;
         esac
         _obs_err_json=null
-        if [ "${_out_unit_obs:-}" = "error" ]; then
-            _obs_err_json='"systemctl_is_active_failed"'
+        if [ -n "$_out_error" ]; then
+            _obs_err_json="\"$_out_error\""
             echo "remote_agent: observer_failed job_id=${_jid}" >&2
         fi
         _obs="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf '{"job_id":"%s","state":"%s","heartbeat_age_s":%s,"unit_active":%s,"rc":%s,"queue_stale":%s,"observed_at":"%s","schema_version":1,"observer_error":%s}\n' \
-            "$_jid" "$_out_state" "$_hb_json" "$_ua" "$_rc_json" "$_qjson" "$_obs" "$_obs_err_json"
+        printf '{"job_id":"%s","state":"%s"%s,"heartbeat_age_s":%s,"unit_active":%s,"rc":%s,"queue_stale":%s,"observed_at":"%s","schema_version":1,"observer_error":%s,"attempt":%s,"legacy_attempt":%s}\n' \
+            "$_jid" "$_out_state" "$loss_field" "$_hb_json" "$_ua" "$_rc_json" "$_qjson" "$_obs" "$_obs_err_json" "$_out_attempt" "$_out_legacy"
     }
 
     # Sweep is a destructive accessor: publication -> job, like native
@@ -1915,6 +2095,35 @@ PY_SWEEP
             _remote_job_sweep_defer identity_unknown
             return 0
         fi
+        if [[ "$_unit" =~ ^(workbay|grok)-lane-([A-Za-z0-9._-]+)-job-${_jid}\.service$ ]]; then
+            _key=${BASH_REMATCH[2]}
+            if [ -e "$ROOT/$_key" ] || [ -L "$ROOT/$_key" ]; then
+                if ! exec 6>>"$ROOT/.lane-lock-$_key" || ! flock -n 6; then
+                    _remote_job_sweep_defer lane_busy
+                    return 0
+                fi
+                _retired=1
+                command -p timeout 3 python3 - "$ROOT" "$_key" "$_jid" <<'RETENTION_PY' || _retired=0
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+# RETENTION_CUSTODY_SOURCE
+
+try:
+    rescue_custody(Path(sys.argv[1]), sys.argv[2], retiring_job=sys.argv[3])
+except (NameError, OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+RETENTION_PY
+                if [ "$_retired" = 0 ]; then
+                    _remote_job_sweep_defer rescue_pending
+                    return 0
+                fi
+            fi
+        fi
         if ! rm -rf -- "$_jd"; then
             echo "remote_agent: sweep_delete_failed job_id=${_jid}" >&2
             return 1
@@ -2007,8 +2216,8 @@ sys.stdout.write(json.dumps(os.environ.get("WORKBAY_JSON_VALUE", "")))' 2>/dev/n
         _le_detail_json=null
         [ -z "$_le_detail" ] || _le_detail_json="\"${_le_detail}\""
         _le_obs="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf '{"error":"%s","job_id":%s,"job_dir":%s,"file":%s,"detail":%s,"schema_version":1,"observed_at":"%s"}\n' \
-            "$_le_code" "$_le_id_json" "$_le_name_json" "$_le_file_json" "$_le_detail_json" "$_le_obs"
+        printf '{"error":"%s","job_id":%s,"job_dir":%s,"file":%s,"detail":%s,"schema_version":1,"observed_at":"%s","state":"unknown","attempt":null,"observer_error":"%s"}\n' \
+            "$_le_code" "$_le_id_json" "$_le_name_json" "$_le_file_json" "$_le_detail_json" "$_le_obs" "$_le_code"
         echo "remote_agent: job_list_error error=${_le_code} job_dir=${_le_name_json}${_le_file:+ file=${_le_file}}${_le_detail:+ detail=${_le_detail}}" >&2
     }
 
@@ -2062,7 +2271,7 @@ sys.stdout.write(json.dumps(os.environ.get("WORKBAY_JSON_VALUE", "")))' 2>/dev/n
             return 0
         fi
         _pf_rc=0
-        WORKBAY_JSON_FILE="$_pf" WORKBAY_JSON_SAFE_KEY="${2-}" WORKBAY_JSON_INT_KEY="${3-}" timeout 10 python3 -c 'import json, os, re, sys
+        WORKBAY_JSON_FILE="$_pf" WORKBAY_JSON_SAFE_KEY="${2-}" WORKBAY_JSON_INT_KEY="${3-}" command -p timeout -k 1 3 python3 -c 'import json, os, re, sys
 try:
     with open(os.environ["WORKBAY_JSON_FILE"], encoding="utf-8") as fh:
         data = json.load(fh)
@@ -2119,11 +2328,15 @@ sys.exit(0)' >/dev/null 2>&1 || _pf_rc=$?
             _remote_job_list_error job_dir_unreadable "$_lo_name"
             return 0
         fi
-        _lo_state="$(_remote_job_file_probe "$_lo_path/state.json" state)"
-        _remote_job_list_verdict "$_lo_name" state.json "$_lo_state" || return 0
         _lo_done="$(_remote_job_file_probe "$_lo_path/done.json" "" rc)"
         _remote_job_list_verdict "$_lo_name" done.json "$_lo_done" || return 0
-        if [ "$_lo_state" = missing ] && [ "$_lo_done" = missing ]; then
+        if [ "$_lo_done" = ok ]; then
+            _remote_job_emit_status "$_lo_name"
+            return 0
+        fi
+        _lo_state="$(_remote_job_file_probe "$_lo_path/state.json" state)"
+        _remote_job_list_verdict "$_lo_name" state.json "$_lo_state" || return 0
+        if [ "$_lo_state" = missing ]; then
             _remote_job_list_error status_file_missing "$_lo_name" state.json
             return 0
         fi
@@ -2264,6 +2477,715 @@ sys.exit(0)' >/dev/null 2>&1 || _pf_rc=$?
         done
     }
 
+    _remote_job_rescue() (
+        local job="$ROOT/.jobs/$JOB_ID" state unit attempt rc legacy supervisor defer_reason
+        [ ! -L "$ROOT" ] && [ ! -L "$ROOT/.jobs" ] && [ -d "$job" ] && [ ! -L "$job" ] || exit 75
+        local lock
+        for lock in "$ROOT/.lane-lock-$RESCUE_KEY" "$ROOT/.queue-publication.lock" "$job/.lock"; do
+            [ ! -L "$lock" ] && { [ ! -e "$lock" ] || [ -f "$lock" ]; } || exit 75
+        done
+        exec 6>>"$ROOT/.lane-lock-$RESCUE_KEY"
+        flock -n 6 || exit 75
+        exec 7>>"$ROOT/.queue-publication.lock"
+        flock -n 7 || exit 75
+        exec 9>>"$job/.lock"
+        flock -n 9 || exit 75
+        exec 7>&-
+        IFS='|' read -r state unit attempt rc legacy supervisor defer_reason < <(_remote_job_read_record "$job") || exit 75
+        [ "$attempt" = "$RESCUE_ATTEMPT" ] || { [ "$legacy" = true ] && [ "$attempt" = null ]; } || exit 75
+        # Read the underlying execution record even when ExecStopPost published
+        # done.json. A failed supervisor receipt also needs a dead-unit check.
+        _remote_job_compute_state "$job" rescue
+        case "$_out_state:$_out_loss_cause" in
+            unit_dead_no_receipt:|lost:unit_dead_no_receipt) ;;
+            *) exit 75 ;;
+        esac
+        [ ! -L "$job/owned-scopes" ] || exit 75
+        if [ -e "$job/owned-scopes" ]; then
+            [ -f "$job/owned-scopes" ] || exit 75
+            local scopes
+            scopes=$(command -p timeout -k 1 2 awk 'NR > 128 { exit 1 } { print $1 }' "$job/owned-scopes" | LC_ALL=C sort -u) || exit 75
+            if [ -n "$scopes" ]; then
+                while IFS= read -r scope; do
+                    [[ "$scope" =~ ^[A-Za-z0-9_.@:-]+\.scope$ ]] || exit 75
+                    _remote_job_drain_probe "$scope" rescue
+                    [ -z "$_drain_observation" ] || exit 75
+                done <<< "$scopes"
+            fi
+        fi
+        # Exit receipts produced by the normal wrapper keep their existing
+        # collection path. A supervisor record has a non-null service reason.
+        if [ "$state" = done ]; then
+            [ "$supervisor" = true ] || exit 76
+        fi
+        # Bound filesystem traversal, Git object decoding and transport.
+        ulimit -v 524288
+        command -p timeout -k 1 22 python3 - "$ROOT" "$JOB_ID" "$RESCUE_KEY" "$RESCUE_ATTEMPT" "$RESCUE_BASE" "$unit" "$RESCUE_CONFIRM" <<'RESCUE_PY'
+import contextlib
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+# RESCUE_CUSTODY_SOURCE
+
+CAP = 16 * 1024 * 1024
+OID = re.compile(rb"[0-9a-f]{40}")
+ROOT, JOB, KEY, ATTEMPT, BASE, UNIT, CONFIRM = sys.argv[1:]
+root = Path(ROOT)
+sandbox = root / KEY
+job = root / ".jobs" / JOB
+work = root / ".workbay-rescue"
+binding = root / (".workbay-rescue-binding-" + KEY)
+capture = work / (JOB + ".json")
+custody = root / (".workbay-rescue-custody-" + KEY + ".json")
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+
+def regular(name, *, dir_fd=None):
+    fd = os.open(name, FILE_FLAGS, dir_fd=dir_fd)
+    stream = os.fdopen(fd, "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        return stream
+    except BaseException:
+        stream.close()
+        raise
+
+def read(name, limit, *, dir_fd=None):
+    with regular(name, dir_fd=dir_fd) as stream:
+        data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("metadata too large")
+        return data
+
+def identity(info):
+    return [info.st_dev, info.st_ino]
+
+def atomic(path, data):
+    fd, name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        dfd = os.open(path.parent, DIR_FLAGS)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+def git_path(path):
+    if not path or any(part.lower() in (b"", b".", b"..", b".git") for part in path.split(b"/")):
+        raise ValueError("unsafe Git path")
+    return os.fsdecode(path)
+
+def capture_data(summary):
+    if not summary["work_found"]:
+        return b""
+    data = _rescue_regular(_rescue_artifact(work, summary), 24 * 1024 * 1024)
+    if summary.get("artifact_sha256") != hashlib.sha256(data).hexdigest():
+        raise ValueError("rescue archive changed")
+    return data
+
+def publish(raw, data):
+    summary = json.loads(raw)
+    summary["capture_sha256"] = hashlib.sha256(raw).hexdigest()
+    sys.stdout.buffer.write(json.dumps(summary, sort_keys=True).encode() + b"\n")
+    sys.stdout.buffer.write(data)
+
+def snapshot():
+    with contextlib.ExitStack() as stack:
+        sbfd = os.open(sandbox, DIR_FLAGS)
+        stack.callback(os.close, sbfd)
+        marker = read(".workbay-lane-sandbox", 4096, dir_fd=sbfd)
+        if marker != f"lane_key={KEY}\n".encode():
+            raise ValueError("sandbox marker mismatch")
+        sandbox_id = identity(os.fstat(sbfd))
+        marker_id = identity(os.stat(".workbay-lane-sandbox", dir_fd=sbfd, follow_symlinks=False))
+        needs_fetch_base = False
+        managed_inputs = {}
+        try:
+            bound = json.loads(read(binding, 4096))
+        except FileNotFoundError:
+            # Old deployments have no external binding. Use the exact native
+            # unit and the original outbox provenance when available. A legacy
+            # unit alias is accepted only for a single, unambiguous lane/job.
+            state = json.loads(read(job / "state.json", 8192))
+            if UNIT not in (f"workbay-lane-{KEY}-job-{JOB}.service", f"grok-lane-{KEY}-job-{JOB}.service"):
+                lanes = [p for p in root.iterdir() if not p.is_symlink() and (p / ".workbay-lane-sandbox").is_file()]
+                started = [p for p in job.parent.iterdir() if not p.is_symlink() and (p / "started").is_file()]
+                if (not UNIT.startswith("grok-lane-") or lanes != [sandbox] or started != [job]
+                        or (job / "transients").exists()):
+                    raise ValueError("unbound legacy job")
+            if not (job / "started").is_file() or state.get("unit") != UNIT:
+                raise ValueError("job did not start")
+            base = BASE
+            try:
+                transients = os.fsdecode(read(job / "transients", 8192)).splitlines()
+            except FileNotFoundError:
+                needs_fetch_base = True
+            else:
+                outbox = Path(transients[1])
+                if outbox.parent != root or not re.fullmatch(
+                    r"\.lane-out-" + re.escape(KEY) + r"-[A-Za-z0-9-]+", outbox.name
+                ):
+                    raise ValueError("invalid job outbox")
+                outfd = os.open(outbox, DIR_FLAGS)
+                try:
+                    provenance = json.loads(read(".workbay-source-provenance.json", 8192, dir_fd=outfd))
+                finally:
+                    os.close(outfd)
+                if BASE and provenance["agent_spec_head_sha"] != BASE:
+                    raise ValueError("base mismatch")
+                base = provenance["sandbox_base_commit"]
+        else:
+            if (bound["job_id"], bound["attempt"], bound["sandbox"], bound["marker"]) != (
+                JOB, int(ATTEMPT), sandbox_id, marker_id
+            ) or (BASE and bound["source_commit"] != BASE):
+                raise ValueError("sandbox generation mismatch")
+            base = bound["base"]
+            managed_inputs = bound.get("managed_inputs", {})
+        if not isinstance(base, str) or not OID.fullmatch(base.encode()):
+            raise ValueError("base unavailable")
+        work.mkdir(mode=0o700, exist_ok=True)
+        wfd = os.open(work, DIR_FLAGS)
+        stack.callback(os.close, wfd)
+        if os.fstat(wfd).st_mode & 0o077:
+            raise ValueError("rescue directory is not private")
+
+        summary = dict(schema_version=1, job_id=JOB, attempt=int(ATTEMPT), lane_key=KEY,
+                       base=base, sandbox=sandbox_id, marker=marker_id)
+        fingerprint = rescue_fingerprint(sandbox)
+        try:
+            prior_raw = read(capture, 4096)
+        except FileNotFoundError:
+            if CONFIRM:
+                raise ValueError("capture unavailable")
+        else:
+            prior = json.loads(prior_raw)
+            if any(prior.get(k) != v for k, v in summary.items()):
+                raise ValueError("rescue identity mismatch")
+            if fingerprint != prior["fingerprint"]:
+                raise ValueError("sandbox changed since rescue")
+            data = capture_data(prior)
+            if _rescue_stash_covered(sandbox, prior):
+                if not CONFIRM:
+                    if not os.path.lexists(custody):
+                        atomic(custody, prior_raw)
+                    publish(prior_raw, data)
+                    return
+                if hashlib.sha256(prior_raw).hexdigest() != CONFIRM or prior["partial"]:
+                    raise ValueError("unconfirmed or partial rescue")
+                # The acknowledgment survives reclaim and a host crash.
+                acknowledged = dict(job_id=JOB, lane_key=KEY, attempt=int(ATTEMPT), capture_sha256=CONFIRM)
+                atomic(work / (JOB + ".confirmed"), json.dumps(acknowledged, sort_keys=True).encode())
+                atomic(custody, json.dumps({**prior, "confirmed": True}, sort_keys=True).encode())
+                return
+            if CONFIRM or "capture_scope" in prior:
+                raise ValueError("stash coverage unavailable")
+            # Keep the old receipt, archive, and any host acknowledgment. The
+            # active capture switches atomically only after its new bytes exist.
+            previous = hashlib.sha256(prior_raw).hexdigest()
+            summary["supersedes_capture"] = previous
+            for path in (capture, custody, work / (JOB + ".confirmed")):
+                try:
+                    original = _rescue_regular(path, 4096)
+                except FileNotFoundError:
+                    continue
+                atomic(work / (path.name + "." + previous), original)
+
+        gitfd = os.open(".git", DIR_FLAGS, dir_fd=sbfd)
+        stack.callback(os.close, gitfd)
+        gitdir = Path(f"/proc/self/fd/{gitfd}")
+        if needs_fetch_base:
+            fetched = read("FETCH_HEAD", 8192, dir_fd=gitfd)
+            if fetched.split(b"\t", 1)[0] != base.encode():
+                raise ValueError("legacy base could not be confirmed")
+        # Git receives an isolated repository and a copied index. The only
+        # borrowed Git storage is an ordinary, local object directory.
+        for name in ("commondir", "objects/info/alternates", "objects/info/http-alternates"):
+            if os.path.lexists(gitdir / name):
+                raise ValueError("external Git metadata")
+        objfd = os.open("objects", DIR_FLAGS, dir_fd=gitfd)
+        stack.callback(os.close, objfd)
+        objects = f"/proc/self/fd/{objfd}"
+        for _, dirs, files, fd in os.fwalk(objects + "/.", follow_symlinks=False, onerror=_rescue_walk_error):
+            for name in dirs + files:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1):
+                    raise ValueError("unsafe Git object storage")
+
+        temp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".capture-", dir=work)))
+        git_env = {
+            "PATH": os.defpath, "HOME": str(temp), "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0", "GIT_ALLOW_PROTOCOL": "",
+        }
+        subprocess.run(["git", "init", "-q", "--bare", "--template=", str(temp / "git")],
+                       env=git_env, check=True, stdout=subprocess.DEVNULL)
+        git_env.update(GIT_DIR=str(temp / "git"), GIT_ALTERNATE_OBJECT_DIRECTORIES=objects,
+                       GIT_INDEX_FILE=str(temp / "index"))
+        def git(*args):
+            return subprocess.check_output(["git", *args], env=git_env, pass_fds=(objfd,))
+
+        # Reconstruct only literal, validated ref records. Never let Git
+        # discover the sandbox repository or open its config, hooks or refs.
+        refs = {}
+        try:
+            packed = read("packed-refs", CAP, dir_fd=gitfd)
+        except FileNotFoundError:
+            packed = b""
+        for line in packed.splitlines():
+            if line.startswith((b"#", b"^")):
+                continue
+            oid, ref = line.split(b" ", 1)
+            refs[ref] = oid
+        refs_fd = os.open("refs", DIR_FLAGS, dir_fd=gitfd)
+        stack.callback(os.close, refs_fd)
+        for parent, dirs, names, fd in os.fwalk(".", dir_fd=refs_fd, onerror=_rescue_walk_error):
+            for name in dirs:
+                if not stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                    raise ValueError("unsafe ref directory")
+            for name in names:
+                ref = os.fsencode(os.path.normpath(os.path.join("refs", parent, name)))
+                refs[ref] = read(name, 4096, dir_fd=fd).strip()
+        def ref_oid(value):
+            seen = set()
+            while value.startswith(b"ref: "):
+                ref = value[5:]
+                if ref in seen:
+                    raise ValueError("cyclic symbolic ref")
+                seen.add(ref)
+                value = refs[ref]
+            if not OID.fullmatch(value):
+                raise ValueError("invalid ref object")
+            return value
+
+        head = ref_oid(read("HEAD", 4096, dir_fd=gitfd).strip())
+        stash_ref = b"refs/stash"
+        tips = {ref_oid(value) for ref, value in refs.items() if ref != stash_ref} | {head}
+        for ref in refs:
+            if not ref.startswith(b"refs/"):
+                raise ValueError("invalid ref name")
+            git_path(ref)
+        try:
+            shallow = read("shallow", CAP, dir_fd=gitfd)
+        except FileNotFoundError:
+            pass
+        else:
+            if not all(OID.fullmatch(oid) for oid in shallow.splitlines()):
+                raise ValueError("invalid shallow boundary")
+            (temp / "git" / "shallow").write_bytes(shallow)
+        (temp / "index").write_bytes(read("index", CAP, dir_fd=gitfd))
+
+        def tree(commit):
+            entries = {}
+            for row in git("ls-tree", "-rz", "--full-tree", commit + "^{commit}").split(b"\0"):
+                if row:
+                    header, path = row.split(b"\t", 1)
+                    mode, _, oid = header.split()
+                    entries[git_path(path)] = (mode, oid)
+            return entries
+
+        base_tree = git("rev-parse", base + "^{tree}").strip().decode()
+        before, committed = tree(base), tree(head.decode())
+        index = {}
+        conflicts = set()
+        for row in git("ls-files", "--stage", "-z").split(b"\0"):
+            if row:
+                header, path = row.split(b"\t", 1)
+                mode, oid, stage = header.split()
+                name = git_path(path)
+                if stage == b"0":
+                    index[name] = (mode, oid)
+                else:
+                    conflicts.add(name)
+        # Read raw bytes without the sandbox's config, filters, ignore rules,
+        # or index stat cache. Files ignored by Git can still be unique work.
+        from_tree = before.keys() | committed.keys() | index.keys()
+        reserved = {".workbay-lane-sandbox", ".workbay-source-provenance"}
+        found = {}
+        changed = {}
+        skipped = set(conflicts)
+        remaining = CAP
+        changes = {"committed": {}, "index": {}, "worktree": {}}
+        files = {}
+        prefix = ".workbay-rescue-metadata"
+        while any(os.path.lexists(sandbox / prefix) or p.split("/")[0] == prefix for p in from_tree or [""]):
+            prefix += "-"
+        gitlinks = {path for entries in (before, committed, index) for path, entry in entries.items()
+                    if entry[0] == b"160000"}
+
+        # Reserve room for the receipt, manifest member, TAR end records
+        # and record padding. Charge each admitted member its actual PAX
+        # header (long/non-ASCII names included), data padding and JSON keys.
+        frame_left = 24 * 1024 * 1024 - 32768
+        blob_members = {}
+
+        def json_size(value):
+            return len(json.dumps(value, ensure_ascii=True).encode())
+
+        def member_size(name, data):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            return len(info.tobuf(format=tarfile.PAX_FORMAT)) + ((len(data) + 511) // 512) * 512
+
+        def add(layer, path, entry, data=None):
+            nonlocal remaining, frame_left
+            if entry is None:
+                charge = json_size({path: None}) + 2
+                if charge > frame_left:
+                    skipped.add(path)
+                    return
+                frame_left -= charge
+                changes[layer][path] = None
+                return
+            mode, oid = entry
+            if mode not in (b"100644", b"100755", b"120000"):
+                skipped.add(path)
+                return
+            key = (path, oid)
+            name = changed.get(key)
+            charge = 0
+            if name is None:
+                if data is None:
+                    size = int(git("cat-file", "-s", oid))
+                    if size > remaining:
+                        skipped.add(path)
+                        return
+                    data = git("cat-file", "blob", oid)
+                if len(data) > remaining:
+                    skipped.add(path)
+                    return
+                direct = layer == "worktree" and mode != b"120000"
+                name = path if direct else f"{prefix}/objects/{len(changed)}"
+                charge = member_size(name, data)
+            descriptor = [mode.decode(), name]
+            charge += json_size({path: descriptor}) + 2
+            if charge > frame_left:
+                skipped.add(path)
+                return
+            frame_left -= charge
+            if key not in changed:
+                files[name] = (data, 0o755 if mode == b"100755" else 0o600)
+                blob_members[oid] = name
+                changed[key] = name
+                remaining -= len(data)
+            changes[layer][path] = descriptor
+
+        def capture_link(path, name, fd):
+            target = os.readlink(name, dir_fd=fd)
+            if path == ".venv" and path not in from_tree and target == str(root / (".venv-lane-" + KEY)):
+                return
+            data = os.fsencode(target)
+            oid = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest().encode()
+            entry = (b"120000", oid)
+            found[path] = entry
+            if entry != before.get(path) or entry != index.get(path):
+                add("worktree", path, entry, data)
+
+        for relative, dirs, names, fd in os.fwalk(".", dir_fd=sbfd, onerror=_rescue_walk_error):
+            dirs.sort()
+            names.sort()
+            for name in dirs[:]:
+                path = os.path.normpath(os.path.join(relative, name))
+                mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+                if path == ".git":
+                    dirs.remove(name)
+                elif path in gitlinks or name.lower() == ".git":
+                    dirs.remove(name)
+                    skipped.add(path)
+                elif stat.S_ISLNK(mode):
+                    dirs.remove(name)
+                    capture_link(path, name, fd)
+                elif not stat.S_ISDIR(mode):
+                    dirs.remove(name)
+                    skipped.add(path)
+            for name in names:
+                path = os.path.normpath(os.path.join(relative, name))
+                if path in reserved and path not in from_tree:
+                    continue
+                first = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if name.lower() == ".git":
+                    skipped.add(path)
+                    continue
+                if stat.S_ISLNK(first.st_mode):
+                    capture_link(path, name, fd)
+                    continue
+                if not stat.S_ISREG(first.st_mode) or first.st_nlink != 1:
+                    skipped.add(path)
+                    found[path] = None
+                    continue
+                with regular(name, dir_fd=fd) as stream:
+                    mode = b"100755" if first.st_mode & stat.S_IXUSR else b"100644"
+                    if path not in from_tree and path not in managed_inputs and first.st_size > remaining:
+                        skipped.add(path)
+                        found[path] = None
+                        continue
+                    digest = hashlib.sha1(f"blob {first.st_size}\0".encode())
+                    data = bytearray() if first.st_size <= remaining else None
+                    length = 0
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        length += len(chunk)
+                        if length > first.st_size:
+                            raise ValueError("worktree file changed")
+                        digest.update(chunk)
+                        if data is not None:
+                            data.extend(chunk)
+                    last = os.fstat(stream.fileno())
+                    if length != first.st_size or (first.st_ino, first.st_dev, first.st_ctime_ns) != (
+                        last.st_ino, last.st_dev, last.st_ctime_ns
+                    ):
+                        raise ValueError("worktree file changed")
+                entry = (mode, digest.hexdigest().encode())
+                if path not in from_tree and mode == b"100644" and managed_inputs.get(path) == entry[1].decode():
+                    continue
+                found[path] = entry
+                if entry != before.get(path) or entry != index.get(path):
+                    if data is None:
+                        skipped.add(path)
+                    else:
+                        add("worktree", path, entry, bytes(data))
+        for path in sorted(from_tree):
+            if before.get(path) != committed.get(path):
+                add("committed", path, committed.get(path))
+            if committed.get(path) != index.get(path) and path not in conflicts:
+                add("index", path, index.get(path))
+            if path not in found and path not in skipped and (path in before or path in index):
+                add("worktree", path, None)
+        # A stash's older entries are named by its reflog, not by ref tips.
+        # Read the literal log through confined descriptors and retain its
+        # original order and messages for restoration alongside refs/stash.
+        stash_path = ".git/logs/refs/stash"
+        stash_log = None
+        stash_tips = set()
+        stash_tip = None
+        try:
+            if stash_ref in refs:
+                stash_tip = ref_oid(refs[stash_ref])
+            with contextlib.ExitStack() as log_stack:
+                fd = gitfd
+                for part in ("logs", "refs"):
+                    fd = os.open(part, DIR_FLAGS, dir_fd=fd)
+                    log_stack.callback(os.close, fd)
+                log = read("stash", CAP, dir_fd=fd)
+            entry = re.compile(rb"[0-9a-f]{40} ([0-9a-f]{40}) [^\0\t]* <[^\0\t]*> [0-9]+ [+-][0-9]{4}")
+            last = None
+            for line in io.BytesIO(log):
+                match = entry.fullmatch(line[:-1].partition(b"\t")[0])
+                if not line.endswith(b"\n") or b"\0" in line or match is None:
+                    raise ValueError("invalid stash reflog entry")
+                last = match[1]
+                stash_tips.add(last)
+            if last != stash_tip:
+                raise ValueError("stash reflog and ref disagree")
+            if log:
+                stash_log = log
+        except FileNotFoundError:
+            if stash_ref in refs:
+                skipped.add(stash_path)
+        except (OSError, KeyError, ValueError):
+            skipped.add(stash_path)
+
+        # Store the exact Git objects absent from the base, including
+        # intermediate revisions, side refs and all named stashes. A
+        # receiver can hash-object the raw members, then restore the refs and
+        # copy history.stash_reflog's archive member to .git/logs/refs/stash.
+        # The base commit itself can be a synthetic VM root over the same
+        # verified source tree, so include its bytes as well.
+        def git_input(args, data):
+            return subprocess.check_output(["git", *args], input=data, env=git_env, pass_fds=(objfd,))
+
+        def revision_input(roots):
+            return b"\n".join(sorted(roots) + [b"^" + base.encode()]) + b"\n"
+
+        if stash_tip is not None:
+            stash_tips.add(stash_tip)
+        revisions = revision_input(tips | stash_tips)
+        walk = ["rev-list", "--objects", "--no-object-names", "--stdin"]
+        try:
+            inventory = git_input(walk, revisions)
+        except subprocess.CalledProcessError:
+            if not stash_tips:
+                raise
+            # A broken stash object must not prevent custody of other work.
+            skipped.add(stash_path)
+            revisions = revision_input(tips)
+            inventory = git_input(walk, revisions)
+        history = None
+        if inventory or stash_log is not None:
+            history = {"refs": {}, "objects": {}}
+            for ref, value in sorted(refs.items()):
+                name, target = os.fsdecode(ref), os.fsdecode(value)
+                charge = json_size({name: target}) + 2
+                if charge > frame_left:
+                    skipped.add(".git/" + name)
+                else:
+                    history["refs"][name] = target
+                    frame_left -= charge
+            if stash_log is not None:
+                name = f"{prefix}/git/stash-reflog"
+                charge = json_size({"stash_reflog": name}) + 2 + member_size(name, stash_log)
+                if charge > frame_left or len(stash_log) > remaining:
+                    skipped.add(stash_path)
+                else:
+                    history["stash_reflog"] = name
+                    frame_left -= charge
+                    remaining -= len(stash_log)
+                    files[name] = (stash_log, 0o600)
+            objects = inventory + base.encode() + b"\n"
+            sizes = git_input(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"], objects)
+            missing_blobs = set()
+            for line in sizes.splitlines():
+                oid, kind, size = line.split()
+                name = blob_members.get(oid)
+                data = None
+                if name is None:
+                    if int(size) <= min(remaining, frame_left):
+                        data = git("cat-file", kind, oid)
+                    name = f"{prefix}/git/{oid.decode()}"
+                descriptor = [kind.decode(), name]
+                charge = json_size({oid.decode(): descriptor}) + 2
+                if data is not None:
+                    charge += member_size(name, data)
+                if charge > frame_left or (data is None and oid not in blob_members):
+                    if kind == b"blob":
+                        missing_blobs.add(oid)
+                    else:
+                        skipped.add(".git/objects/" + oid[:2].decode() + "/" + oid[2:].decode())
+                    continue
+                history["objects"][oid.decode()] = descriptor
+                frame_left -= charge
+                if data is not None:
+                    remaining -= len(data)
+                    files[name] = (data, 0o600)
+            if missing_blobs:
+                # rev-list --objects labels a shared blob with only one
+                # path. Count all paths whose historical bytes were omitted.
+                named_blobs = set()
+                for commit in git_input(["rev-list", "--stdin"], revisions).splitlines():
+                    for path, (_, oid) in tree(commit.decode()).items():
+                        if oid in missing_blobs:
+                            named_blobs.add(oid)
+                            skipped.add(path)
+                for oid in missing_blobs - named_blobs:
+                    skipped.add(".git/objects/" + oid[:2].decode() + "/" + oid[2:].decode())
+
+        summary.update(capture_scope=_RESCUE_SCOPE, work_found=bool(skipped or any(changes.values()) or history),
+                       skipped_files_count=len(skipped), partial=bool(skipped))
+        summary.update(head=head.decode(), tree=git("rev-parse", head + b"^{tree}").strip().decode(),
+                       base_tree=base_tree, fingerprint=fingerprint)
+        if rescue_fingerprint(sandbox) != fingerprint:
+            raise ValueError("sandbox changed during rescue")
+        archive_data = b""
+        if summary["work_found"]:
+            document = {"receipt": summary, "changes": changes, "skipped": []}
+            if history is not None:
+                document["history"] = history
+            for path in sorted(skipped):
+                charge = json_size(path) + 2
+                if charge > frame_left:
+                    document["skipped_names_truncated"] = True
+                    break
+                document["skipped"].append(path)
+                frame_left -= charge
+            manifest = json.dumps(document, sort_keys=True).encode()
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w", encoding="utf-8", errors="surrogateescape") as archive:
+                for name, (data, mode) in [(prefix + "/manifest.json", (manifest, 0o600)), *sorted(files.items())]:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    info.mode = mode
+                    archive.addfile(info, io.BytesIO(data))
+            archive_data = output.getvalue()
+            if len(archive_data) > 24 * 1024 * 1024:
+                raise ValueError("archive too large")
+            artifact = _rescue_artifact(work, summary)
+            try:
+                old_data = _rescue_regular(artifact, 24 * 1024 * 1024)
+            except FileNotFoundError:
+                atomic(artifact, archive_data)
+            else:
+                if old_data != archive_data:
+                    raise ValueError("unpublished rescue archive conflicts")
+            summary.update(artifact_sha256=hashlib.sha256(archive_data).hexdigest(), artifact_bytes=len(archive_data))
+        raw = json.dumps(summary, sort_keys=True).encode()
+        atomic(capture, raw)
+        # Until the host confirms durable receipt, the same witness is a hold.
+        atomic(custody, raw)
+        publish(raw, archive_data)
+
+try:
+    snapshot()
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as exc:
+    print(f"remote_agent: rescue_pending ({type(exc).__name__}: {exc})", file=sys.stderr)
+    sys.exit(75)
+RESCUE_PY
+    )
+
+    _remote_job_rescue_replay() {
+        [ -n "$RESCUE_CONFIRM" ] && [ ! -L "$ROOT" ] && [ ! -L "$ROOT/.workbay-rescue" ] || return 75
+        command -p timeout -k 1 2 python3 - "$ROOT" "$JOB_ID" "$RESCUE_KEY" "$RESCUE_ATTEMPT" "$RESCUE_CONFIRM" <<'RESCUE_REPLAY_PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root, job_id, key, attempt, digest = sys.argv[1:]
+try:
+    acknowledged = Path(root) / ".workbay-rescue" / (job_id + ".confirmed")
+    import fcntl
+
+    lane = Path(root) / key
+    lock_fd = os.open(Path(root) / (".lane-lock-" + key), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fd = os.open(acknowledged, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise ValueError("invalid acknowledgment")
+        record = json.loads(stream.read(4097))
+    if record != {"job_id": job_id, "lane_key": key, "attempt": int(attempt), "capture_sha256": digest}:
+        raise ValueError("acknowledgment identity mismatch")
+    fd = os.open(acknowledged.parent / (job_id + ".json"), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("invalid capture")
+        raw = stream.read(4097)
+    if len(raw) > 4096 or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("acknowledgment superseded")
+    capture = json.loads(raw)
+    try:
+        info = lane.lstat()
+        same = capture["sandbox"] == [info.st_dev, info.st_ino]
+        if same:
+            marker = (lane / ".workbay-lane-sandbox").lstat()
+            same = capture["marker"] == [marker.st_dev, marker.st_ino]
+    except FileNotFoundError:
+        same = False
+    if same:
+        # Live generations must pass the regular locked confirmation,
+        # including its fingerprint check. Only retired ones use replay.
+        raise ValueError("current generation still requires confirmation")
+except (OSError, ValueError, TypeError, KeyError):
+    sys.exit(75)
+RESCUE_REPLAY_PY
+    }
+
     _remote_job_collect() {
         : "${JOB_ID:?}"
         JOB_DIR="$ROOT/.jobs/${JOB_ID}"
@@ -2303,9 +3225,28 @@ os.replace(tmp, path)
 PY
             return 0
         fi
+        if [ "${COLLECT_RESCUE_SUPERVISOR:-0}" = 1 ]; then
+            local state unit attempt rc legacy supervisor defer_reason
+            if IFS='|' read -r state unit attempt rc legacy supervisor defer_reason < <(_remote_job_read_record "$JOB_DIR"); then
+                if [ "$state:$supervisor" = done:true ]; then
+                    exit 73
+                fi
+            fi
+        fi
         if [ ! -f "$JOB_DIR/done.json" ]; then
-            echo "remote_agent: job_not_done" >&2
-            exit 75
+            _remote_job_compute_state "$JOB_DIR"
+            # A stop hook may have published while the manager was queried.
+            if [ ! -f "$JOB_DIR/done.json" ]; then
+                if [ "${_out_loss_cause:-$_out_state}" = unit_dead_no_receipt ]; then
+                    printf '{"state":"unit_dead_no_receipt","job_id":"%s"}\n' "$JOB_ID" >&2
+                    exit 69
+                fi
+                if [ -n "$_out_error" ]; then
+                    printf '{"state":"unknown","job_id":"%s","observer_error":"%s"}\n' "$JOB_ID" "$_out_error" >&2
+                fi
+                echo "remote_agent: job_not_done" >&2
+                exit 75
+            fi
         fi
         cd "$JOB_DIR"
         _list="done.json"
@@ -2321,6 +3262,10 @@ PY
         _drain_invocation_id=""
         _drain_load=""
         props="$(timeout 5 systemctl --user show -p LoadState -p ActiveState -p ControlGroup -p InvocationID "$unit" 2>/dev/null)" || rc=$?
+        if [ "${2:-}" = rescue ] && [ "$rc" -eq 4 ] &&
+                grep -qx 'LoadState=not-found' <<< "$props" && grep -qx 'ActiveState=inactive' <<< "$props"; then
+            return 0
+        fi
         if [ "$rc" -ne 0 ]; then
             _drain_observation=probe_failed
             [ "$rc" -ne 124 ] || _drain_observation=probe_timeout
@@ -2541,6 +3486,8 @@ DRAINPY
     case "${REMOTE_JOB_OP:?}" in
         status) _remote_job_status ;;
         collect) _remote_job_collect ;;
+        rescue) _remote_job_rescue ;;
+        rescue-replay) _remote_job_rescue_replay ;;
         cancel) _remote_job_cancel ;;
         *)
             echo "remote_agent: unknown_job_op" >&2
@@ -3564,14 +4511,47 @@ REMOTE_PREFLIGHT_BODY_EOF
     ;;
 esac
 
+# workbay/prepare-submit@1
+# Local-only preparation has no review reservation, staging or VM access.
+# Managed submit consumes the private directory compared under the ledger lock.
+_prepare_launch=''
+_prepared_launch=''
+_launch_script_dir="$(dirname "${BASH_SOURCE[0]}")"
+if [ "${1:-}" = prepare-submit ]; then
+    _prepare_launch=$2
+    _launch_script_dir=$(cat "$_prepare_launch/transport-origin")
+    # The reserving orchestrator already runs this first-choice interpreter.
+    # Reuse its selection for the local binding lookup.
+    if [ "$3" = "${WORKBAY_PYTHON:-}" ]; then
+        _review_cycle_python=("$3")
+        _review_cycle_python_status=0
+    fi
+    shift 3
+    set -- submit "$@"
+elif [ "${1:-}" = submit ] && [ "${BASH_SOURCE[0]##*/}" = workbay-prepared-submit ]; then
+    # The ledger executes this private copy (an alias of the admitted inode
+    # for authenticated transports). Ordinary submit accepts only its CLI inputs.
+    _prepared_launch=$_launch_script_dir
+    _launch_script_dir=$(cat "$_prepared_launch/transport-origin")
+fi
+
+
+# Read the consumer cadence from the unit that is installed with the queue.
+# A missing or malformed timer leaves freshness unknown and therefore stale.
+# Only these scalars are needed to deliver the already-rendered programs.
+# Other admission and body settings are captured directly in the programs.
+_launch_fields=(REMOTE_HOST REMOTE_DIR AGENT_ROOT MEM_MAX CPU_QUOTA UV_CACHE_CAP_MB
+    QUEUE_TICK_INTERVAL_S WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S WORKBAY_REMOTE_SUBMIT_CRASH_AFTER
+    WORKBAY_REMOTE_AGENT_ADMISSION_PROBE_TIMEOUT_S SOURCE_COMMIT SOURCE_TREE _production_context_b64)
+
 _load_probe_trust_pruner
 repo_root="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 repo_slug="$(basename "$repo_root")"
 
 # Read the consumer cadence from the unit that is installed with the queue.
 # A missing or malformed timer leaves freshness unknown and therefore stale.
-_queue_timer_file="$(dirname "${BASH_SOURCE[0]}")/vm/workbay-lane-queue.timer"
-_host_reservation_file="$(dirname "${BASH_SOURCE[0]}")/vm/host_reservation.py"
+_queue_timer_file="$_launch_script_dir/vm/workbay-lane-queue.timer"
+_host_reservation_file="$_launch_script_dir/vm/host_reservation.py"
 
 _remote_agent_check_companions() {
     # These local files are part of the installed transport contract. A broken
@@ -3590,13 +4570,15 @@ _remote_agent_check_companions() {
 # inspect or clean up remote jobs when a local install needs repair.
 case "${1:-}" in
     build|submit)
-        _remote_agent_check_companions || exit "$?"
+        [ -n "$_prepared_launch" ] || _remote_agent_check_companions || exit "$?"
         _boundary_runtime_preamble >/dev/null || exit 2
         ;;
 esac
 
-QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
-case "$QUEUE_TICK_INTERVAL_S" in ''|*[!0-9]*|0) QUEUE_TICK_INTERVAL_S="" ;; esac
+if [ -z "$_prepared_launch" ]; then
+    QUEUE_TICK_INTERVAL_S="$(timeout 5 sed -n 's/^OnUnitInactiveSec=\([0-9][0-9]*\)s$/\1/p' "$_queue_timer_file" 2>/dev/null || true)"
+    case "$QUEUE_TICK_INTERVAL_S" in ''|*[!0-9]*|0) QUEUE_TICK_INTERVAL_S="" ;; esac
+fi
 
 _remote_agent_configure "$@"
 
@@ -4301,6 +5283,9 @@ try:
             raise ValueError("missing " + name)
     if not isinstance(proof["proven_delta"], str):
         raise ValueError("invalid proven_delta")
+    rescue = proof.get("proven_rescue", "")
+    if not re.fullmatch(r"(?:[a-f0-9]{64})?", rescue):
+        raise ValueError("invalid rescue proof")
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     if dry_run == "1":
         try:
@@ -4322,6 +5307,7 @@ try:
     record = {"schema": 1, "kind": "lane_sandbox_release", "key": key,
               "owner": "workbay-sandbox-reap", "reason": "completion_proven",
               **{name: proof[name] for name in ("proven_tip", "proven_tree", "proven_generation", "proven_artifacts", "proven_delta")},
+              **({"proven_rescue": rescue} if rescue else {}),
               "paths": [os.path.join(root, name) for name in names if os.path.lexists(os.path.join(root, name))],
               "released_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
               "host": socket.gethostname(), "sweep_run_id": run_id}
@@ -7249,6 +8235,10 @@ status)
         die "--job-id, --sweep or --list required"
     fi
     _JOB_OPS_SRC="$(declare -f _lane_scope_cgroup_members _remote_job_ops)"
+    if [ "$STATUS_SWEEP" = 1 ]; then
+        _rescue_python=$(_rescue_verifier_source) || die "missing rescue verifier"
+        _JOB_OPS_SRC=${_JOB_OPS_SRC/\# RETENTION_CUSTODY_SOURCE/$_rescue_python}
+    fi
     _status_rc=0
     # SSH joins command argv for a remote shell. Keep values out of that
     # command: quote complete export assignments for the Bash stdin script.
@@ -7270,6 +8260,48 @@ STATUS_EOF
         exit "$_status_rc"
     fi
     ;;
+rescue|rescue-confirm)
+    # An upgraded host must never ask an older installed transport to
+    # confirm a receipt whose original capture scope is unknown.
+    if [ "$cmd" = rescue-confirm ] && [ "${1:-}" = --require-stash-coverage ]; then shift; fi
+    [ "$#" = 9 ] && [ "$1" = --job-id ] && [ "$3" = --attempt ] &&
+        [ "$5" = --lane-key ] && [ "$7" = --base ] || die "invalid rescue arguments"
+    [[ "$2" =~ ^j[0-9a-f]{20}$ && "$4" =~ ^(0|[1-9][0-9]*)$ &&
+       "$6" =~ ^[A-Za-z0-9][A-Za-z0-9-]*-[0-9a-f]{8}$ &&
+       ( -z "$8" || "$8" =~ ^[0-9a-f]{40}$ ) ]] || die "invalid rescue identity"
+    _rescue_confirm=
+    _rescue_stage=$9
+    if [ "$cmd" = rescue-confirm ]; then
+        [[ "$9" =~ ^[0-9a-f]{64}$ ]] || die "invalid rescue confirmation"
+        _rescue_confirm=$9
+        _rescue_stage=/dev/null
+    fi
+    _rescue_python=$(_rescue_verifier_source) || die "missing rescue verifier"
+    [ -n "$_rescue_python" ] || die "missing rescue verifier"
+    _JOB_OPS_SRC="$(declare -f _lane_scope_cgroup_members _remote_job_ops)"
+    _JOB_OPS_SRC=${_JOB_OPS_SRC/\# RESCUE_CUSTODY_SOURCE/$_rescue_python}
+    _rescue_exports="$(printf 'export %q\n' "AGENT_ROOT=${AGENT_ROOT}" "JOB_ID=$2" \
+        "RESCUE_ATTEMPT=$4" "RESCUE_KEY=$6" "RESCUE_BASE=$8" "RESCUE_CONFIRM=$_rescue_confirm" "REMOTE_JOB_OP=rescue")"
+    (
+        ulimit -f 25600
+        "${SSH[@]}" bash -s > "$_rescue_stage" <<RESCUE_EOF
+${_rescue_exports}
+${_JOB_OPS_SRC}
+export -f _lane_scope_cgroup_members _remote_job_ops
+if command -p timeout -k 1 26 bash -c _remote_job_ops; then
+    exit 0
+else
+    _rescue_rc=\$?
+fi
+if [ -n "\$RESCUE_CONFIRM" ]; then
+    REMOTE_JOB_OP=rescue-replay bash -c _remote_job_ops
+    exit "\$?"
+fi
+exit "\$_rescue_rc"
+RESCUE_EOF
+    )
+    ;;
+
 collect)
     exec </dev/null
     JOB_ID=""
@@ -7305,18 +8337,26 @@ collect)
     fi
     _JOB_OPS_SRC="$(declare -f _lane_scope_cgroup_members _remote_job_ops)"
     _collect_tmp="$(mktemp -d "${TMPDIR:-/tmp}/wb-collect.XXXXXX")"
+    _collect_rescue_supervisor=0
+    [ -z "${WORKBAY_REMOTE_RESCUE_NOTICE:-}" ] || _collect_rescue_supervisor=1
     _stream_rc=0
     # shellcheck disable=SC2029
     "${SSH[@]}" env \
         "AGENT_ROOT=${AGENT_ROOT}" \
         "JOB_ID=${JOB_ID}" \
         "COLLECT_MODE=stream" \
+        "COLLECT_RESCUE_SUPERVISOR=$_collect_rescue_supervisor" \
         "REMOTE_JOB_OP=collect" \
         bash -s <<COLLECT_EOF >"${_collect_tmp}/bundle.tar" 2>"${_collect_tmp}/remote.err" || _stream_rc=$?
 set -euo pipefail
 ${_JOB_OPS_SRC}
 _remote_job_ops
 COLLECT_EOF
+    if [ "$_stream_rc" -eq 73 ] && [ "$_collect_rescue_supervisor" = 1 ]; then
+        rm -rf "$_collect_tmp"
+        (set -o noclobber; printf '%s\n' "$JOB_ID" > "$WORKBAY_REMOTE_RESCUE_NOTICE")
+        exit 73
+    fi
     if [ -s "${_collect_tmp}/remote.err" ]; then
         cat "${_collect_tmp}/remote.err" >&2
     fi
@@ -7624,6 +8664,7 @@ submit|build)
     AGENT_SPEC=""
     REVIEW_KIND="implement" REVIEW_SUBJECT_BRANCH="" CANON_PROPOSAL_PATH=""
     JOB_ID=""
+    JOB_ATTEMPT=null
     AGENT_SPEC_ENABLED=0
     AGENT_SPEC_BIN="" AGENT_SPEC_STDIN="/dev/null" AGENT_SPEC_STDOUT="{result_file}"
     AGENT_SPEC_STDERR="{run_log}" AGENT_SPEC_PATH_PREPEND="" AGENT_SPEC_CLOSE_FDS="9"
@@ -7650,6 +8691,9 @@ submit|build)
             --provenance-out) PROVENANCE_OUT="${2:-}"; shift 2 ;;
             --agent-spec) AGENT_SPEC="${2:-}"; shift 2 ;;
             --job-id) JOB_ID="${2:-}"; shift 2 ;;
+            --job-attempt)
+                [[ "${2:-}" =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid --job-attempt"
+                JOB_ATTEMPT="$2"; shift 2 ;;
             --model|--max-turns|--effort)
                 die "--agent-spec required; legacy $1 is removed (implementation note S4)"
                 ;;
@@ -8168,12 +9212,14 @@ PY
     # D3B: the shared build|submit boundary precedes ALL transport probes.
     REVIEW_SUBJECT_BRANCH="${REVIEW_SUBJECT_BRANCH:-$BRANCH}"
     if [ -z "$JOB_ID" ]; then JOB_ID="j$(od -An -N10 -tx1 /dev/urandom | tr -d ' \n')"; fi
+    if [ -z "$_prepare_launch" ]; then
     _review_cycle_bridge reserve "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" || exit 76
     _review_spool="$(git rev-parse --path-format=absolute --git-common-dir)/workbay/review_cycle_dispatch/spool-$(printf '%s' "$JOB_ID" | shasum -a 256 | cut -d ' ' -f 1)"
     mkdir -p "$_review_spool"
     RESULT_OUT="${RESULT_OUT:-$_review_spool/result.json}"
     PROVENANCE_OUT="${PROVENANCE_OUT:-$_review_spool/provenance.json}"
     PHASES_OUT="${PHASES_OUT:-$_review_spool/phases.json}"
+    fi
     # Off-box self-verify (item 26): base64 the caller's TEST_CMD so arbitrary shell
     # metacharacters survive interpolation into the remote heredoc intact (only
     # [A-Za-z0-9+/=] reaches the interpolation). Decoded + run on the VM below.
@@ -8214,8 +9260,10 @@ PY
     fi
     # Retain the host-generated request before any remote process. Late
     # preflight evidence must join this nonce/ref, never supply its own scope.
-    _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
-        "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" || exit 76
+    if [ -z "$_prepare_launch" ]; then
+        _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
+            "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" || exit 76
+    fi
     # Named systemd scope unit: workbay-lane-<LANE_KEY>.scope so active lanes are
     # countable + debuggable ([RES-14] concurrency ceiling; implementation note S5).
     # Suffix is part of the name: is-active/reset-failed resolve bare names to
@@ -8293,6 +9341,11 @@ PY
             return 2
         fi
 
+        if [ -n "${_prepare_launch:-}" ]; then
+            WORKBAY_REMOTE_AGENT_ADMISSION_PROBE_TIMEOUT_S=$_budget
+            cat > "$_prepare_launch/probe"
+            return
+        fi
         _start="$(date +%s)"
         _now="$_start"
         if [ "$TIMEOUT" -gt 0 ]; then
@@ -8436,8 +9489,12 @@ CLEANUP_EOF
         fi
         _cleanup_dispatch_transients
     }
-    trap '_review_cycle_exit' EXIT
+    if [ -z "$_prepare_launch" ]; then trap '_review_cycle_exit' EXIT; fi
 
+    if [ -n "$_prepared_launch" ]; then
+        _admission_remote_sh=$(cat "$_prepared_launch/admission")
+        _admission_probe_with_deadline < "$_prepared_launch/probe" >&2
+    else
     # Single-source admission for pre-dispatch and the in-run recheck.
     # Placeholders contain validated numeric options; MAX_LANES may be empty.
     read -r -d '' _admission_tpl <<'ADMISSION_EOF' || true
@@ -8952,7 +10009,8 @@ sys.stdout.buffer.write(rendered)
     # suspenders — keep both).
     # Ship the reservation authority and enforced lane caps after the original
     # render window. Refuse collisions introduced by first-pass values.
-    _host_reservation_b64="$(base64 < "$_host_reservation_file" 2>/dev/null | tr -d '\n')" || _host_reservation_b64=""
+    _host_reservation_b64="$(base64 < "$_host_reservation_file" | tr -d '\n')" || exit 78
+    [ -n "$_host_reservation_b64" ] || { echo 'remote_agent: reservation reader unavailable' >&2; exit 78; }
     _admission_remote_sh="$(python3 -c '
 import os
 import re
@@ -8993,6 +10051,8 @@ fi
 ${_admission_remote_sh}
 REMOTE_EOF
 
+    fi
+    if [ -z "$_prepared_launch" ]; then
     # BEGIN DISPATCH_SOURCE_IDENTITY
     # AgentSpec was stamped before the first attempt and is the sole dispatch
     # authority. Do not re-read even refs/heads/$BRANCH here: the branch may move
@@ -9017,11 +10077,11 @@ REMOTE_EOF
     # Resolve the admission through the public store before worker access. A
     # missing runtime/store/root is the legacy path, never an empty admission.
     _production_context_b64=''
-    _production_src="$(cd "$(dirname "$0")/.." && pwd)/packages"
+    _production_src="$(cd "${_launch_script_dir:-$(dirname "$0")}/.." && pwd)/packages"
     if PYTHONPATH="${_production_src}/mcp-workbay-orchestrator/src:${_production_src}/mcp-workbay-handoff/src:${_production_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
         _review_cycle_resolve_python "${_production_src%/packages}" 2>/dev/null; then
         _production_context_b64="$(PYTHONPATH="${_production_src}/mcp-workbay-orchestrator/src:${_production_src}/mcp-workbay-handoff/src:${_production_src}/workbay-protocol/src${PYTHONPATH:+:$PYTHONPATH}" \
-        "${_review_cycle_python[@]}" - "$BRANCH" "$SOURCE_COMMIT" <<'PRODUCTION_CONTEXT_PY'
+        "${_review_cycle_python[@]}" - "$BRANCH" "$SOURCE_COMMIT" "${_prepare_launch:-}" <<'PRODUCTION_CONTEXT_PY'
 import base64
 import json
 from pathlib import Path
@@ -9030,6 +10090,11 @@ import sys
 
 try:
     from workbay_handoff_mcp.config import RuntimeConfig
+    config = RuntimeConfig.for_repo(Path.cwd())
+    try:
+        config.db_path.stat()
+    except FileNotFoundError:
+        raise SystemExit(0)
     from workbay_handoff_mcp.runtime import configure_runtime
     from workbay_handoff_mcp.lanes_recording import list_lanes_by_branch
     from workbay_handoff_mcp.lane_completion_production import (
@@ -9038,11 +10103,11 @@ try:
 except ImportError as exc:
     print("remote_agent: production_context_runtime_missing module="
           + (exc.name or "workbay_handoff_mcp") + "; using legacy path", file=sys.stderr)
-    raise SystemExit(0)
+    raise SystemExit(78 if sys.argv[3] else 0)
+except Exception as exc:
+    print("remote_agent: production_history_unavailable: " + type(exc).__name__, file=sys.stderr)
+    raise SystemExit(78 if sys.argv[3] else 0)
 try:
-    config = RuntimeConfig.for_repo(Path.cwd())
-    if not config.db_path.is_file():
-        raise SystemExit(0)
     configure_runtime(config)
     lanes = list_lanes_by_branch(sys.argv[1])["data"]["lanes"]
     if not lanes:
@@ -9078,12 +10143,16 @@ try:
     print(base64.b64encode(json.dumps(context, sort_keys=True).encode()).decode())
 except Exception as exc:
     print("remote_agent: production_history_unavailable: " + type(exc).__name__, file=sys.stderr)
+    raise SystemExit(78 if sys.argv[3] else 0)
 PRODUCTION_CONTEXT_PY
 )"
     else
         printf '%s\n' 'remote_agent: production_context_runtime_missing module=workbay_handoff_mcp; using legacy path' >&2
     fi
+    [ -z "${_prepare_launch:-}" ] || [ "${_review_cycle_python_status:-1}" = 0 ] || exit 78
     # END REMOTE_PRODUCTION_CONTEXT
+    fi
+    if [ -z "$_prepare_launch" ]; then
     _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
         "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" "$_production_context_b64" || exit 76
 
@@ -9152,12 +10221,18 @@ PRODUCTION_CONTEXT_PY
         fi
     fi
 
+    fi
+
     # 3) materialize hardened sandbox -> uv sync -> capped grok -> emit patch on stdout
     _emit_remote_body() {
         # Render the shared member reader host-side so the unquoted heredoc
         # injects it via an allowlisted host expansion, not a bare $(...) site.
         _LANE_SCOPE_CGROUP_MEMBERS_SRC="$(declare -f _lane_scope_cgroup_members)"
-        printf '%s\n' "$_probe_trust_remote_sh"
+        local _LANE_WARM_RESCUE_SRC _lane_rescue_python
+        _LANE_WARM_RESCUE_SRC="$(declare -f _lane_warm_rescue)"
+        _lane_rescue_python=$(_rescue_verifier_source) || return 78
+        _LANE_WARM_RESCUE_SRC=${_LANE_WARM_RESCUE_SRC/\# RESCUE_CUSTODY_SOURCE/$_lane_rescue_python}
+        printf '%s\n' "$_probe_trust_remote_sh" "$_LANE_WARM_RESCUE_SRC"
         _boundary_runtime_preamble
         # Only base64 data enters this shell assignment; no raw binding text.
         printf "WORKBAY_PRODUCTION_CONTEXT_B64='%s'\n" "$_production_context_b64"
@@ -9452,6 +10527,240 @@ import stat
 import sys
 import time
 from pathlib import Path
+
+import hashlib
+
+# BEGIN SANDBOX_RESCUE_CUSTODY
+# Shipped verbatim to the host's remote proof probe and the rescue transport.
+# This check runs under the dispatch lock. Atime is excluded because observation
+# itself can change it. Ctime plus inode, size and mode exposes any later write
+# or metadata change, including an index or ref replacement.
+def rescue_fingerprint(directory, deadline=None):
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(directory, flags)
+    try:
+        def record(name, info):
+            digest.update(os.fsencode(name))
+            digest.update(b"\0")
+            digest.update(repr((info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                info.st_mtime_ns, info.st_ctime_ns)).encode() + b"\0")
+
+        for relative, dirs, files, child in os.fwalk(".", dir_fd=fd, onerror=_rescue_walk_error):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("rescue verification deadline")
+            dirs.sort()
+            for name in sorted(dirs + files):
+                record(os.path.join(relative, name), os.stat(name, dir_fd=child, follow_symlinks=False))
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def _rescue_walk_error(error):
+    raise error
+
+
+def _rescue_regular(path, limit, *, digest=False, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("invalid rescue file")
+        data = stream.read(limit + 1)
+        if len(data) != info.st_size or os.fstat(stream.fileno()).st_ctime_ns != info.st_ctime_ns:
+            raise ValueError("rescue file changed")
+    return hashlib.sha256(data).hexdigest() if digest else data
+
+
+# Minted by snapshot() after the bounded stash walk, inside the archive's
+# receipt and the fingerprinted capture confirmed by its host.
+_RESCUE_SCOPE = "named-stash-stack-v1"
+
+
+def _rescue_stash_covered(directory, receipt):
+    if "capture_scope" in receipt:
+        return receipt["capture_scope"] == _RESCUE_SCOPE
+    # Earlier captures measured ref tips only. They remain usable where
+    # there is no named stack. Inspect literal paths without running Git.
+    import contextlib
+    import io
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as stack:
+        def open_dir(path, parent=None):
+            fd = os.open(path, flags, dir_fd=parent)
+            stack.callback(os.close, fd)
+            return fd
+
+        git = open_dir(".git", open_dir(directory))
+        for parents in (("refs",), ("logs", "refs")):
+            fd = git
+            try:
+                for part in parents:
+                    fd = open_dir(part, fd)
+                os.stat("stash", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return False
+        try:
+            packed = _rescue_regular("packed-refs", 16 * 1024 * 1024, dir_fd=git)
+        except FileNotFoundError:
+            return True
+        for line in io.BytesIO(packed):
+            if line.startswith((b"#", b"^")):
+                continue
+            match = re.fullmatch(rb"[0-9a-f]{40} (refs/[^\x00\s]+)\n?", line)
+            if match is None or match[1] == b"refs/stash":
+                return False
+        return True
+
+
+def _rescue_artifact(work, receipt):
+    stem = receipt["job_id"]
+    if "supersedes_capture" in receipt:
+        previous = receipt["supersedes_capture"]
+        if receipt.get("capture_scope") != _RESCUE_SCOPE or not re.fullmatch(r"[0-9a-f]{64}", previous):
+            raise ValueError("invalid replacement capture")
+        stem += "." + previous
+    return work / (stem + ".tar")
+
+
+def _rescue_ordinary_exit(job):
+    try:
+        done = json.loads(_rescue_regular(job / "done.json", 8192))
+    except FileNotFoundError:
+        return False
+    return (isinstance(done, dict) and done.get("job_id") == job.name and type(done.get("rc")) is int
+            and "reason" in done and done["reason"] is None)
+
+
+def _rescue_unbound_job_required(root, key, job):
+    if _rescue_ordinary_exit(job):
+        return False
+    # A retired capture and a new synchronous sandbox can coexist until
+    # the native retention sweep visits the old job.
+    saved = root / ".workbay-rescue" / (job.name + ".json")
+    try:
+        capture = json.loads(_rescue_regular(saved, 4096))
+    except FileNotFoundError:
+        return True
+    if not isinstance(capture, dict) or capture.get("job_id") != job.name or capture.get("lane_key") != key:
+        raise ValueError("rescue generation unavailable")
+    return _rescue_generation_matches(root / key, capture)
+
+
+def _rescue_check_unbound(root, key, deadline, starting_job):
+    """Pre-binding jobs still own their source through their native unit identity."""
+    jobs = root / ".jobs"
+    if not os.path.lexists(jobs):
+        return
+    if jobs.is_symlink():
+        raise ValueError("invalid rescue job directory")
+    for job in jobs.iterdir():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("rescue verification deadline")
+        if not re.fullmatch(r"j[0-9a-f]{20}", job.name) or job == starting_job:
+            continue
+        if job.is_symlink():
+            raise ValueError("invalid rescue job directory")
+        if not os.path.lexists(job / "started"):
+            continue
+        state = json.loads(_rescue_regular(job / "state.json", 8192))
+        units = (f"workbay-lane-{key}-job-{job.name}.service", f"grok-lane-{key}-job-{job.name}.service")
+        if not isinstance(state, dict) or not isinstance(state.get("unit"), str):
+            raise ValueError("rescue job identity unavailable")
+        if state["unit"] in units and _rescue_unbound_job_required(root, key, job):
+            raise ValueError("rescue pending")
+
+
+def rescue_custody(root, key, deadline=None, *, retiring_job=None, starting_job=None):
+    """Return a verified rescue or None for a lane using ordinary custody."""
+    bound_path = root / (".workbay-rescue-binding-" + key)
+    proof_path = root / (".workbay-rescue-custody-" + key + ".json")
+    directory = root / key
+    if retiring_job is not None and not os.path.lexists(directory):
+        return None
+    try:
+        bound = json.loads(_rescue_regular(bound_path, 4096))
+        if not isinstance(bound, dict):
+            raise ValueError("invalid rescue binding")
+    except FileNotFoundError:
+        bound = None
+    if bound is not None:
+        job_id = bound["job_id"]
+        if not re.fullmatch(r"j[0-9a-f]{20}", job_id):
+            raise ValueError("invalid rescue job")
+        if not _rescue_generation_matches(directory, bound):
+            raise ValueError("rescue generation changed")
+    if retiring_job is not None:
+        # The generation still uses the native record for ordinary receipt
+        # verification or for capture/confirmation replay after a crash.
+        if bound is None:
+            if _rescue_unbound_job_required(root, key, root / ".jobs" / retiring_job):
+                raise ValueError("rescue pending")
+        elif bound["job_id"] == retiring_job:
+            raise ValueError("rescue pending")
+        return None
+    try:
+        raw = _rescue_regular(proof_path, 4096)
+    except FileNotFoundError:
+        if bound is None:
+            _rescue_check_unbound(root, key, deadline, starting_job)
+            return None
+        # Successful or failed normal exits use the pre-existing artifact and
+        # source checks. A missing or supervisor receipt keeps the new hold.
+        job = root / ".jobs" / job_id
+        if (root / ".jobs").is_symlink() or job.is_symlink():
+            raise ValueError("invalid rescue job directory")
+        if _rescue_ordinary_exit(job):
+            return None
+        raise ValueError("rescue pending") from None
+    receipt = json.loads(raw)
+    if (receipt["schema_version"] != 1 or receipt["lane_key"] != key
+            or receipt.get("confirmed") is not True or receipt["partial"] is not False
+            or type(receipt["skipped_files_count"]) is not int or receipt["skipped_files_count"] != 0
+            or type(receipt["work_found"]) is not bool or type(receipt["attempt"]) is not int
+            or not re.fullmatch(r"j[0-9a-f]{20}", receipt["job_id"])
+            or not re.fullmatch(r"[0-9a-f]{40}", receipt["head"])
+            or not re.fullmatch(r"[0-9a-f]{40}", receipt["tree"])
+            or not _rescue_generation_matches(directory, receipt)
+            or not _rescue_stash_covered(directory, receipt)):
+        raise ValueError("rescue pending or stale")
+    if bound is not None and any(bound[k] != receipt[k] for k in ("job_id", "attempt", "base")):
+        raise ValueError("rescue job changed")
+    artifacts = root / ".workbay-rescue"
+    if artifacts.is_symlink():
+        raise ValueError("invalid rescue directory")
+    if receipt.get("capture_scope") == _RESCUE_SCOPE:
+        # Resolve the active native capture and host acknowledgment together.
+        # An old lane witness cannot designate a replacement by itself.
+        job_id = receipt["job_id"]
+        capture = _rescue_regular(artifacts / (job_id + ".json"), 4096)
+        acknowledged = json.loads(_rescue_regular(artifacts / (job_id + ".confirmed"), 4096))
+        if receipt != {**json.loads(capture), "confirmed": True} or acknowledged != {
+            "job_id": job_id, "lane_key": key, "attempt": receipt["attempt"],
+            "capture_sha256": hashlib.sha256(capture).hexdigest(),
+        }:
+            raise ValueError("rescue capture not confirmed")
+    if receipt["work_found"]:
+        artifact = _rescue_artifact(artifacts, receipt)
+        if _rescue_regular(artifact, 24 * 1024 * 1024, digest=True) != receipt["artifact_sha256"]:
+            raise ValueError("rescue artifact changed")
+    if rescue_fingerprint(directory, deadline) != receipt["fingerprint"]:
+        raise ValueError("sandbox changed since rescue")
+    return {"digest": hashlib.sha256(raw).hexdigest(), "head": receipt["head"], "tree": receipt["tree"]}
+
+
+def _rescue_generation_matches(directory, receipt):
+    locations = (("sandbox", directory, stat.S_ISDIR),
+                 ("marker", directory / ".workbay-lane-sandbox", stat.S_ISREG))
+    for field, path, expected in locations:
+        info = path.lstat()
+        if not expected(info.st_mode) or [info.st_dev, info.st_ino] != receipt[field]:
+            return False
+    return True
+# END SANDBOX_RESCUE_CUSTODY
 
 root, key, reason, actor, global_fd, key_fd, initiating_lane, nonce, scope = sys.argv[1:]
 paired = scope == "pair"
@@ -9821,6 +11130,11 @@ try:
         else:
             probe_incoming_lock(lock)
     validate_fences()
+    if paired:
+        try:
+            rescue_custody(Path(root), key)
+        except (OSError, ValueError, KeyError, TypeError):
+            hold("rescue_pending")
     before, inodes = snapshot()
     if before[cache] is None and before[stamp] is None and not paired:
         raise SystemExit(0)
@@ -12883,6 +14197,7 @@ fi
 # Bound ladder: resolve once before occupancy re-check so arm-4 exit 7 runs
 # before _lane_write_live_lease and before rm -rf of this lane's sandbox.
 resolve_agent_bound
+_custody_source_ref='refs/heads/${LANE_KEY}-${DISPATCH_NONCE}'
 # BEGIN LANE_WIPE_GUARD
 # Occupancy re-check after lock [CON-11][RES-10]: a prior same-key dispatch may
 # have lost its shell (and the lock) while its agent still holds an unexpired
@@ -12894,14 +14209,66 @@ if _lane_occupant_live '${LANE_KEY}'; then
     echo 'remote_agent: same-branch lane still occupying sandbox (${LANE_KEY}) — deferring' >&2
     exit 75
 fi
-# Declare this dispatch's occupancy before the destructive wipe so a later
-# SIGKILL'd peer that loses the lock still advertises the sandbox as live.
+# A clean status can hide committed work. Compare against the previous base,
+# and permit a complete rescue only while its generation still matches.
+_previous_rescue=
+_previous_native=0
+# Native units from before binding publication still identify their key.
+# Most synchronous lanes have no matching unit and need only the host
+# history comparison below. An unreadable native record requires verification.
+for _started in "\$ROOT"/.jobs/j*/started; do
+    [ -e "\$_started" ] || continue
+    if command -p grep -Fq -- 'lane-${LANE_KEY}-job-' "\${_started%/*}/state.json"; then
+        _previous_native=1
+        break
+    elif [ "\$?" != 1 ]; then
+        _previous_native=1
+        break
+    fi
+done
+_previous_binding="\$ROOT/.workbay-rescue-binding-${LANE_KEY}"
+_previous_custody="\$ROOT/.workbay-rescue-custody-${LANE_KEY}.json"
+if [ -d "\$SBX" ] && { [ -e "\$_previous_binding" ] || [ -L "\$_previous_binding" ] ||
+         [ -e "\$_previous_custody" ] || [ -L "\$_previous_custody" ] || [ "\$_previous_native" = 1 ]; }; then
+    if ! _previous_rescue=\$(_lane_warm_rescue "\$ROOT" '${LANE_KEY}' "\${WORKBAY_REMOTE_JOB_DIR:-}"); then
+        echo 'remote_agent: rescue_pending refusing to wipe existing sandbox' >&2
+        exit 75
+    fi
+fi
+if [ "\$_previous_rescue" != complete ] && [ -f "\$SBX/.workbay-lane-sandbox" ] && [ -d "\$SBX/.git" ]; then
+    _previous_base="\${_previous_rescue:-}"
+    # Without a trusted binding, include the boundary itself in the host
+    # comparison. An in-sandbox sidecar or shallow file is not a receipt.
+    _previous_range=(--all HEAD)
+    if [[ "\$_previous_base" =~ ^[0-9a-f]{40}\$ ]]; then
+        _previous_range+=("^\$_previous_base")
+    fi
+    if ! _previous_trees=\$(timeout -k 1 3 git --no-replace-objects --no-optional-locks -C "\$SBX" log --format=%T "\${_previous_range[@]}" | LC_ALL=C sort -u); then
+        echo 'remote_agent: rescue_pending refusing to wipe existing sandbox' >&2
+        exit 75
+    fi
+    if [ -n "\$_previous_trees" ]; then
+        # The pushed source ref is host-owned. A locally applied format-patch
+        # may change commit IDs while preserving each intermediate tree.
+        if ! _harvested_trees=\$(timeout -k 1 3 git --no-replace-objects --no-optional-locks -C "\${SRC:-.}" log --format=%T "\${_custody_source_ref:-HEAD}" | LC_ALL=C sort -u) ||
+            [ -n "\$(LC_ALL=C comm -23 <(printf '%s\n' "\$_previous_trees") <(printf '%s\n' "\$_harvested_trees"))" ]; then
+            echo 'remote_agent: rescue_pending refusing to wipe existing sandbox' >&2
+            exit 75
+        fi
+    fi
+fi
+# Publish occupancy before the destructive wipe. A fully rescued generation
+# already has a verified copy of both committed and uncommitted work.
 _lane_write_live_lease
-if ! _snapshot_dirty_sandbox; then
+if [ "\$_previous_rescue" != complete ] && ! _snapshot_dirty_sandbox; then
     echo 'remote_agent: warm sandbox dirty snapshot failed — refusing to wipe' >&2
     exit 78
 fi
 rm -rf "\$SBX"
+if [ -e "\$_previous_binding" ] || [ -L "\$_previous_binding" ] ||
+   [ -e "\$_previous_custody" ] || [ -L "\$_previous_custody" ]; then
+    rm -f -- "\$_previous_binding" "\$_previous_custody"
+fi
 # END LANE_WIPE_GUARD
 mkdir -p "\$SBX"
 # Sandbox marker: the ONLY thing that makes a directory a reap candidate.
@@ -13027,6 +14394,58 @@ printf '{"schema_version":1,"dispatch_nonce":"%s","requested_branch":"%s","reque
     "\$REMOTE_SOURCE_COMMIT" "\$REMOTE_SOURCE_TREE" "\$SANDBOX_BASE_COMMIT" "\$SANDBOX_BASE_TREE" \
     > "\$OUT_DIR/.workbay-source-provenance.json"
 BASE="\$SANDBOX_BASE_COMMIT"
+if [ -n "\${WORKBAY_REMOTE_JOB_DIR:-}" ]; then
+    # Publish ownership and generation before giving the worker access.
+    python3 - "\$ROOT" "\$SBX" "\$WORKBAY_REMOTE_JOB_DIR" "\${WORKBAY_SUBMIT_JOB_ATTEMPT:-null}" \
+        "\$BASE" "\$SOURCE_COMMIT" '${DISPATCH_NONCE}' <<'RESCUE_BINDING_PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+root, sandbox, job = (Path(arg) for arg in sys.argv[1:4])
+attempt, base, source_commit, nonce = sys.argv[4:]
+job_id = job.name
+if job.parent != root / ".jobs":
+    sys.exit("remote_agent: rescue binding job mismatch")
+if attempt != "null":
+    def identity(path):
+        st = path.lstat()
+        return [st.st_dev, st.st_ino]
+    # The immutable dispatch inputs are already retained outside the sandbox.
+    # An input with later changes is still captured as work.
+    managed_inputs = {}
+    for name, stem, suffix in ((".brief.md", ".brief", ".md"), (".schema.json", ".schema", ".json")):
+        path = root / f"{stem}-{sandbox.name}-{nonce}{suffix}"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if stat.S_ISREG(info.st_mode) and info.st_size <= 16 * 1024 * 1024:
+                digest = hashlib.sha1(f"blob {info.st_size}".encode() + bytes(1))
+                for chunk in iter(lambda: stream.read(65536), b""):
+                    digest.update(chunk)
+                managed_inputs[name] = digest.hexdigest()
+    data = dict(job_id=job_id, attempt=int(attempt), base=base, source_commit=source_commit,
+                sandbox=identity(sandbox), marker=identity(sandbox / ".workbay-lane-sandbox"),
+                managed_inputs=managed_inputs)
+    with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".rescue-binding-", delete=False) as stream:
+        json.dump(data, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, root / (".workbay-rescue-binding-" + sandbox.name))
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+RESCUE_BINDING_PY
+fi
 # BEGIN REMOTE_SOURCE_JOURNAL
 # This journal is source evidence only. The sandbox AND outbox are writable by
 # the worker: no hook, digest, endpoint equality or complete flag grants N.
@@ -16698,6 +18117,27 @@ exit 2
 REMOTE_EOF
     }
 
+    if [ -n "$_prepare_launch" ]; then
+        # Render with private markers; encode only those substitutions as NUL
+        # slots. All literal body bytes survive, including digits and paths.
+        _marker=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+        TIMEOUT="${_marker}TIMEOUT"
+        GROK_TIMEOUT="${_marker}GROK_TIMEOUT"
+        DISPATCH_NONCE="${_marker}DISPATCH_NONCE"
+        _AGENT_SPEC_RESOLVER_SRC="$(declare -f _agent_spec_resolve_argv)"
+        _emit_remote_body | python3 -c '
+import sys
+body = sys.stdin.buffer.read()
+for key in (b"TIMEOUT", b"GROK_TIMEOUT", b"DISPATCH_NONCE"):
+    body = body.replace(sys.argv[1].encode() + key, b"\0" + key + b"\0")
+sys.stdout.buffer.write(body)
+' "$_marker" > "$_prepare_launch/body"
+        printf '%s' "$_admission_remote_sh" > "$_prepare_launch/admission"
+        WORKBAY_REMOTE_SUBMIT_CRASH_AFTER=${WORKBAY_REMOTE_SUBMIT_CRASH_AFTER:-}
+        for _field in "${_launch_fields[@]}"; do printf '%s\0' "${!_field}"; done > "$_prepare_launch/settings"
+        exit 0
+    fi
+
     run_patch() {
         # implementation note: capture resolver source once so the unquoted heredoc can
         # inject it via an allowlisted host expansion (not a bare $(...) site).
@@ -16720,7 +18160,22 @@ REMOTE_EOF
         _review_model_may_have_started=1
         _AGENT_SPEC_RESOLVER_SRC="$(declare -f _agent_spec_resolve_argv)"
         _SUBMIT_JOB_SRC="$(declare -f _remote_submit_job)"
-        _body_b64="$(_emit_remote_body | base64 | tr -d '\n')"
+        if [ -n "$_prepared_launch" ]; then
+            # Only validated clocks and the per-delivery nonce fill template slots.
+            _body_b64="$(python3 -c '
+import base64, sys
+from pathlib import Path
+
+body = Path(sys.argv[1]).read_bytes()
+for key, value in zip(("TIMEOUT", "GROK_TIMEOUT", "DISPATCH_NONCE"), sys.argv[2:]):
+    body = body.replace(b"\0" + key.encode() + b"\0", value.encode("ascii"))
+if b"\0" in body:
+    sys.exit("remote_agent: invalid prepared body slot")
+print(base64.b64encode(body).decode("ascii"))
+' "$_prepared_launch/body" "$TIMEOUT" "$GROK_TIMEOUT" "$DISPATCH_NONCE")" || return 2
+        else
+            _body_b64="$(_emit_remote_body | base64 | tr -d '\n')"
+        fi
         _admission_b64="$(printf '%s' "$_admission_remote_sh" | base64 | tr -d '\n')"
         if [ "$GROK_TIMEOUT" -gt 0 ]; then
             JOB_RUNTIME_SEC=$(( GROK_TIMEOUT + 120 ))
@@ -16737,6 +18192,7 @@ REMOTE_EOF
 set -euo pipefail
 ${_SUBMIT_JOB_SRC}
 export JOB_ID='${JOB_ID}'
+export JOB_ATTEMPT='${JOB_ATTEMPT}'
 export LANE_KEY='${LANE_KEY}'
 export AGENT_ROOT='${AGENT_ROOT}'
 export MEM_MAX='${MEM_MAX}'

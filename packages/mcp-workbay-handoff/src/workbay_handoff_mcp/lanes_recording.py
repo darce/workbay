@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import quote, unquote
 
 from .coordination_declaration import ExecutionDomain, declaration_errors
+from .lane_notes import REGISTRY_CORRECTION_KEY, ReservedLaneNotesError, merge_lane_notes, notes_envelope
 from .lane_resource_producer import LaneResourceConflict, execute_lane_change, prepare_lane_binding, replay_receipt
 from .shared_primitives import (
     CLOSEABLE_LANE_STATUSES,
@@ -235,15 +236,14 @@ def repair_lane_receipt_identity(
         if set(columns) != set(expected_row):
             return LaneReceiptCASResult(False, "incomplete_row_snapshot")
         predicate = " AND ".join(f'"{column}" IS ?' for column in columns)
-        notes = expected_row.get("notes")
-        audit = evidence.audit_line()
+        notes = merge_lane_notes(expected_row.get("notes"), evidence.audit_line(), append_to_prose=True)
         cursor = conn.execute(
             "UPDATE worktree_lanes SET branch_tip_sha = ?, branch_tip_source = 'backfill', "
             "branch_tip_observed_at = ?, notes = ?, updated_at = datetime('now') WHERE " + predicate,
             (
                 evidence.tip,
                 evidence.observed_at,
-                f"{notes}\n{audit}" if notes else audit,
+                notes,
                 *(expected_row[column] for column in columns),
             ),
         )
@@ -1048,6 +1048,9 @@ def close_lane(
     and ``branch_tip_observed_at``. Omit-preserve leaves those columns
     untouched so a derived tip stays observationally distinct from
     never-observed.
+
+    Close prose is recorded in the current notes envelope when one exists.
+    Caller-authored changes to reserved fields refuse the close.
     """
     normalized_lane_id = _normalize_optional_text(lane_id)
     if normalized_lane_id is None:
@@ -1123,6 +1126,15 @@ def close_lane(
                 data={"error": error, "error_kind": "native_validation_required"},
                 entity="lane",
             )
+        try:
+            merged_notes = merge_lane_notes(current["notes"], notes)
+        except ReservedLaneNotesError as exc:
+            return _envelope(
+                ok=False,
+                tool="close_lane",
+                data={"error": str(exc), "error_kind": "reserved_engine_field", "fields": exc.fields},
+                entity="lane",
+            )
         native_merge = status == "merged" and current["status"] == "gated"
         if native_merge:
             conn.execute("SAVEPOINT native_validation_merge")
@@ -1132,7 +1144,7 @@ def close_lane(
                 """
                 UPDATE worktree_lanes
                 SET status = ?,
-                    notes = COALESCE(?, notes),
+                    notes = ?,
                     landing_commit_sha = COALESCE(?, landing_commit_sha),
                     branch_tip_sha = COALESCE(?, branch_tip_sha),
                     branch_tip_source = CASE WHEN ? IS NOT NULL THEN ? ELSE branch_tip_source END,
@@ -1142,7 +1154,7 @@ def close_lane(
                 """,
                 (
                     status,
-                    notes,
+                    merged_notes,
                     parsed_landing,
                     parsed_tip,
                     parsed_tip,
@@ -1769,22 +1781,8 @@ def list_lanes_by_branch(branch: str, *, task_ref: str | None = None) -> dict[st
         )
 
 
-# Producer-owned key in the lane notes envelope (the orchestrator's typed
-# extension envelope; free text lives under "prose"). Only the corrected row
-# carries it: the superseded row is never rewritten, closed or deleted.
-REGISTRY_CORRECTION_KEY = "registry_correction"
 _NOTES_PROSE_KEY = "prose"
 _CORRECTION_IDENTITY_KEYS = ("row_id", "task_ref", "lane_id", "branch", "worktree_path", "identity_seq")
-
-
-def _notes_envelope(notes: object) -> dict[str, Any] | None:
-    if not isinstance(notes, str) or not notes.strip().startswith("{"):
-        return None
-    try:
-        decoded = json.loads(notes)
-    except ValueError:
-        return None
-    return decoded if isinstance(decoded, dict) else None
 
 
 def _correction_identity(row: dict[str, Any]) -> dict[str, Any]:
@@ -1816,7 +1814,7 @@ def _validated_correction(
     identity, and canonical task records in which the corrected task targets this
     branch and the superseded task does not.
     """
-    marker = (_notes_envelope(row.get("notes")) or {}).get(REGISTRY_CORRECTION_KEY)
+    marker = (notes_envelope(row.get("notes")) or {}).get(REGISTRY_CORRECTION_KEY)
     if not isinstance(marker, dict) or (marker.get("task_ref"), marker.get("lane_id")) != (
         row["task_ref"],
         row["lane_id"],
@@ -1971,7 +1969,7 @@ def rebind_lane(
             "actor": _normalize_optional_text(actor),
         }
         for row in _lanes_naming_branch(conn, short_name):
-            existing = (_notes_envelope(row.get("notes")) or {}).get(REGISTRY_CORRECTION_KEY)
+            existing = (notes_envelope(row.get("notes")) or {}).get(REGISTRY_CORRECTION_KEY)
             if not isinstance(existing, dict):
                 continue
             if row["id"] == new["id"] and all(existing.get(key) == value for key, value in marker.items()):
@@ -1986,7 +1984,7 @@ def rebind_lane(
             if row["id"] == new["id"] or (isinstance(supersedes, dict) and supersedes.get("row_id") == old["id"]):
                 return refuse("lane_rebind_conflict", "A different registry correction already exists.", lane=row)
         marker["corrected_at"] = conn.execute("SELECT datetime('now')").fetchone()[0]
-        envelope = _notes_envelope(new["notes"])
+        envelope = notes_envelope(new["notes"])
         if envelope is None:
             envelope = {} if new["notes"] is None else {_NOTES_PROSE_KEY: new["notes"]}
         envelope[REGISTRY_CORRECTION_KEY] = marker

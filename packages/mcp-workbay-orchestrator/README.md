@@ -20,6 +20,7 @@ R="git+https://github.com/darce/workbay.git@$REF"
 # deps and the codex-subagent bridge are git-sourced via --with at the same release tag.
 uv tool install --no-sources \
   --with "$R#subdirectory=packages/workbay-protocol" \
+  --with "$R#subdirectory=packages/workbay-system" \
   --with "$R#subdirectory=packages/mcp-workbay-handoff" \
   --with "$R#subdirectory=packages/workbay-codex-bridge" \
   --from "$R#subdirectory=packages/mcp-workbay-orchestrator" \
@@ -147,6 +148,7 @@ REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
 uv tool install --no-sources \
   --with "$R#subdirectory=packages/workbay-protocol" \
+  --with "$R#subdirectory=packages/workbay-system" \
   --with "$R#subdirectory=packages/mcp-workbay-handoff" \
   --with "$R#subdirectory=packages/workbay-codex-bridge" \
   --from "$R#subdirectory=packages/mcp-workbay-orchestrator" \

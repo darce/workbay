@@ -8,6 +8,7 @@ import importlib.util
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,11 +30,6 @@ GIT_PROBE_DEGRADED_BLOCK_MESSAGE = (
     "main branch because the git status probe degraded (timeout or non-zero "
     "exit). Run `git status` by hand, then re-try once git is healthy."
 )
-
-# Whole-tree ignored-file inventory (`git ls-files --others --ignored`) walks
-# every ignored path. Status-style probes keep the 5.0s default on
-# ``_run_git_degraded``; this budget is for the inventory only.
-IGNORED_INVENTORY_TIMEOUT_S = 30.0
 
 # internal: per-call budget for status-style guard scans. Operators on
 # slow volumes raise it via ``WORKBAY_GUARD_GIT_TIMEOUT`` (seconds, positive
@@ -118,18 +114,13 @@ def _load_task_ref_re() -> re.Pattern[str]:
                 if isinstance(task_ref_re, re.Pattern):
                     return task_ref_re
 
-    try:
-        from workbay_handoff_mcp import TASK_REF_RE as task_ref_re
-
-        return task_ref_re
-    except Exception:
-        return re.compile(
-            r"^feature/"
-            r"(?=[a-z])"
-            r"(?=[a-z0-9-]*\d)"
-            r"(?P<task_ref>[a-z0-9]+(?:-[a-z0-9]+)+)"
-            r"$"
-        )
+    return re.compile(
+        r"^feature/"
+        r"(?=[a-z])"
+        r"(?=[a-z0-9-]*\d)"
+        r"(?P<task_ref>[a-z0-9]+(?:-[a-z0-9]+)+)"
+        r"$"
+    )
 
 
 TASK_REF_RE = _load_task_ref_re()
@@ -554,11 +545,9 @@ def check_file_edit(
 def _path_has_symlink_ancestor(repo: Path, path: Path) -> bool:
     """Return True when any component of ``path`` under ``repo`` is a symlink.
 
-    Used to keep the on-disk protected walk from emitting paths that only
-    exist through a symlinked directory (e.g. ``.github/hooks`` → payload).
-    Git cannot classify those pathspecs (tracked/ignored both false), so they
-    would fail closed forever even though the real content is tracked under
-    the symlink target.
+    Files reached through a symlinked directory (e.g. ``.github/hooks`` →
+    payload) belong to the symlink target. They should not be emitted under
+    both that location and the link name when inspecting files on disk.
     """
     try:
         rel = path.relative_to(repo)
@@ -573,69 +562,6 @@ def _path_has_symlink_ancestor(repo: Path, path: Path) -> bool:
         except OSError:
             return True
     return False
-
-
-def _collect_on_disk_protected_relpaths(repo: Path, policy) -> list[str]:
-    """Return repo-relative paths of on-disk files that may be policy-protected.
-
-    Used by ``find_dirty_protected_paths`` so porcelain-suppressing index flags
-    (skip-worktree / assume-unchanged) cannot hide a divergent protected file:
-    the filesystem walk still nominates the path for index-tag compensation,
-    matching the pass-2 pattern in ``find_dirty_state_files``.
-
-    Does not descend into symlinked directories (and skips any path that has a
-    symlink ancestor): a symlink code-root or surface base must not re-emit
-    target files under the link name.
-    """
-    found: list[str] = []
-    extensions = tuple(getattr(policy, "protected_extensions", ()) or ())
-    for code_root in tuple(getattr(policy, "code_roots", ()) or ()):
-        rel_root = str(code_root).strip().strip("/")
-        if not rel_root:
-            continue
-        base = repo / rel_root
-        # Skip symlink roots (os.walk would still enter a symlink top) and
-        # non-directories. is_symlink before is_dir so a link-to-dir is skipped.
-        try:
-            if base.is_symlink() or not base.is_dir():
-                continue
-        except OSError:
-            continue
-        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-            # Belt-and-suspenders: never descend into symlink subdirs even if a
-            # future caller flips followlinks, and drop them before any scan.
-            dirnames[:] = [
-                d for d in dirnames if not (Path(dirpath) / d).is_symlink()
-            ]
-            for name in filenames:
-                if extensions and not name.endswith(extensions):
-                    continue
-                path = Path(dirpath) / name
-                if _path_has_symlink_ancestor(repo, path):
-                    continue
-                try:
-                    found.append(path.relative_to(repo).as_posix())
-                except ValueError:
-                    continue
-    for name in tuple(getattr(policy, "root_protected_files", ()) or ()):
-        rel = str(name).strip().lstrip("/")
-        if not rel:
-            continue
-        candidate = repo / rel
-        if candidate.is_file() and not _path_has_symlink_ancestor(repo, candidate):
-            found.append(rel)
-    for surface in tuple(getattr(policy, "first_edit_protected_surfaces", ()) or ()):
-        pattern = getattr(surface, "pattern", None)
-        if not pattern:
-            continue
-        for path in _surface_filesystem_matches(repo, str(pattern)):
-            if _path_has_symlink_ancestor(repo, path):
-                continue
-            try:
-                found.append(path.relative_to(repo).as_posix())
-            except ValueError:
-                continue
-    return found
 
 
 def find_dirty_protected_paths(
@@ -654,20 +580,13 @@ def find_dirty_protected_paths(
     * ``(branch, paths)`` — block: successful probe found dirty protected
       paths (ordinary dirty-paths message).
     * ``DirtyProtectedDegraded`` — block fail-closed: the git status probe
-      timed out or exited non-zero, path bases could not be reconciled, the
-      ignored-file inventory could not be determined, the index-tag map was
-      unavailable, or the scan root was missing on a protected branch — so
-      cleanliness is unknown. Callers must not treat this as ``None``/allow;
-      use ``.block_message`` for the distinct degraded wording (timeout /
-      non-zero exit; run ``git status``).
+      or index inventory failed, path bases could not be reconciled, or a
+      suppress-flagged protected entry could not be inspected.
 
-    Porcelain alone is not a cleanliness proof: ``git status`` suppresses
-    worktree divergence for ``--skip-worktree`` / ``--assume-unchanged``
-    index entries. This probe reuses ``_batch_ls_files_v_tags`` and
-    ``_is_tracked_clean_no_suppress`` so only a plain ``H`` tag with a
-    porcelain-clean result may be treated as clean. Porcelain paths are
-    always top-level-relative and are mapped onto ``repo_root`` before
-    policy matching (same base reconciliation as ``find_dirty_state_files``).
+    Status reports ordinary dirt. The index nominates tracked paths whose
+    flags can hide worktree changes from status. A present flagged path
+    remains dirty because its cleanliness cannot be established from either
+    Git answer. Absent skip-worktree entries can be normal in sparse checkouts.
     """
     # Non-protected branches short-circuit to allow. A falsy scan root on a
     # *protected* branch is "could not determine", not clean — degrade.
@@ -693,62 +612,110 @@ def find_dirty_protected_paths(
         # Could not determine — fail CLOSED (distinct from clean / None).
         return DirtyProtectedDegraded(branch=branch)
 
+    prefix = f"{repo_prefix}/" if repo_prefix else ""
     pass1_dirty: set[str] = set()
+    embedded_repos: set[str] = set()
     for toplevel_rel in raw_dirty:
-        mapped = _toplevel_path_to_repo_relative(toplevel_rel, repo_prefix)
-        if mapped is not None:
-            pass1_dirty.add(mapped)
+        if not toplevel_rel.startswith(prefix):
+            continue
+        candidate = toplevel_rel[len(prefix):]
+        if candidate.endswith("/"):
+            embedded_repos.add(candidate[:-1])
+        pass1_dirty.add(candidate.rstrip("/"))
 
-    # Candidates = porcelain dirt ∪ on-disk protected surfaces. The walk is
-    # required so suppress-flagged tracked files (invisible to porcelain) still
-    # enter the index-tag compensation path. Untracked gitignored paths from
-    # the walk (e.g. venv/build artifacts under code_roots) must be excluded:
-    # they carry no index tag, so compensation cannot prove them clean and
-    # would false-block a clean main. One ``ls-files --others --ignored``
-    # inventory intersected with the walk — never per-path git forks, and
-    # never ``check-ignore --stdin`` (symlink pathspecs exit 128 and discard
-    # the whole batch).
-    on_disk = _collect_on_disk_protected_relpaths(repo, policy)
-    ignored_on_disk = _batch_untracked_ignored_paths(repo, on_disk)
-    if ignored_on_disk is None:
-        # Inventory degrade is not "nothing ignored": without a complete
-        # ignore set the on-disk walk would false-block clean trees that
-        # only have gitignored artifacts under code_roots.
+    index = _run_git_degraded(
+        ["-C", str(repo), "ls-files", "-v", "--stage", "-z"],
+        text=False,
+    )
+    if index is None or index.returncode != 0:
         return DirtyProtectedDegraded(branch=branch)
-    if ignored_on_disk:
-        on_disk = [p for p in on_disk if p not in ignored_on_disk]
-    candidates = list(dict.fromkeys([*pass1_dirty, *on_disk]))
 
-    index_tags = _batch_ls_files_v_tags(repo, candidates)
-    if index_tags is None:
-        # Tag map unavailable — no cleanliness proof stronger than porcelain.
+    if index.stdout and not index.stdout.endswith(b"\0"):
         return DirtyProtectedDegraded(branch=branch)
+    suppressed: set[str] = set()
+    for record in index.stdout.split(b"\0")[:-1]:
+        metadata, separator, path = record.partition(b"\t")
+        if not separator or not path or metadata[1:2] != b" ":
+            return DirtyProtectedDegraded(branch=branch)
+        tag = metadata[:1]
+        if metadata[2:9] == b"160000 ":
+            embedded_repos.add(os.fsdecode(path))
+        if tag == b"S" or tag.islower():
+            suppressed.add(os.fsdecode(path))
+
+    # The outer Git index and status treat embedded checkouts as single paths.
+    # Ask those checkouts for their candidates so protected files under them
+    # are still visible, including files ignored by the embedded checkout.
+    while embedded_repos:
+        candidate = embedded_repos.pop()
+        checkout = repo / candidate
+        if _path_has_symlink_ancestor(repo, checkout):
+            continue
+        embedded = _embedded_checkout_paths(checkout)
+        if embedded is None:
+            return DirtyProtectedDegraded(branch=branch)
+        files, gitlinks = embedded
+        suppressed.update(f"{candidate}/{path}" for path in files)
+        embedded_repos.update(f"{candidate}/{path}" for path in gitlinks)
 
     dirty_paths: list[str] = []
-    for candidate in candidates:
+    for candidate in pass1_dirty | suppressed:
         if not is_branch_isolation_protected_path(candidate, policy):
             continue
-        # Permitted-surface carve-out: a dirty file that matches an entry in
-        # ``permitted_main_surfaces`` is explicitly allowed on main. Counting
-        # it as "dirty protected" would block unrelated permitted edits and
-        # contradicts the carve-out itself.
         if find_permitted_main_surface(candidate, policy) is not None:
             continue
-        # Fail closed on non-H tags / missing tags / porcelain dirt. Only a
-        # plain H + porcelain-clean path may be subtracted.
-        if _is_tracked_clean_no_suppress(
-            repo,
-            candidate,
-            index_tags=index_tags,
-            pass1_ok=True,
-            pass1_dirty=pass1_dirty,
-        ):
-            continue
+        if candidate not in pass1_dirty:
+            try:
+                mode = (repo / candidate).lstat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return DirtyProtectedDegraded(branch=branch)
+            if stat.S_ISDIR(mode) or _path_has_symlink_ancestor(repo, repo / candidate):
+                continue
         dirty_paths.append(candidate)
 
-    if not dirty_paths:
+    return (branch, sorted(dirty_paths)) if dirty_paths else None
+
+
+def _embedded_checkout_paths(repo: Path) -> tuple[set[str], set[str]] | None:
+    """List files and nested checkouts, including untracked and ignored entries."""
+    try:
+        (repo / ".git").lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return set(), set()
+    except OSError:
         return None
-    return branch, sorted(dict.fromkeys(dirty_paths))
+    # A broken .git directory can make Git fall back to the outer repository.
+    prefix = _run_git_degraded(["-C", str(repo), "rev-parse", "--show-prefix"], text=False)
+    if prefix is None or prefix.returncode != 0 or prefix.stdout != b"\n":
+        return None
+    result = _run_git_degraded(
+        ["-C", str(repo), "ls-files", "-t", "--stage", "--cached", "--others", "-z"],
+        text=False,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    if result.stdout and not result.stdout.endswith(b"\0"):
+        return None
+    files: set[str] = set()
+    gitlinks: set[str] = set()
+    for record in result.stdout.split(b"\0")[:-1]:
+        if record.startswith(b"? "):
+            path = record[2:]
+            is_gitlink = path.endswith(b"/")
+        else:
+            metadata, separator, path = record.partition(b"\t")
+            if not separator or metadata[1:2] != b" ":
+                return None
+            is_gitlink = metadata[2:9] == b"160000 "
+        if not path:
+            return None
+        if is_gitlink:
+            gitlinks.add(os.fsdecode(path.rstrip(b"/")))
+        else:
+            files.add(os.fsdecode(path))
+    return files, gitlinks
 
 
 def _run_git_degraded(
@@ -760,8 +727,7 @@ def _run_git_degraded(
 ) -> subprocess.CompletedProcess | None:
     """Run a guard git command; degrade loudly on timeout/OSError instead of crashing.
 
-    Timeout precedence: an explicit ``timeout=`` from the caller always wins
-    (callers such as the 30s ignored-file inventory size their own budget).
+    Timeout precedence: an explicit ``timeout=`` from the caller always wins.
     When the caller passes nothing, the budget is ``WORKBAY_GUARD_GIT_TIMEOUT``
     if it holds a positive finite float, else ``DEFAULT_GUARD_GIT_TIMEOUT_S``
     (5.0s). See ``_guard_git_timeout_s``.
@@ -797,8 +763,7 @@ def _run_git_degraded(
       path bytes (including CR) are not rewritten by universal-newlines
       before NUL-splitting / ``os.fsdecode``.
     * ``input`` feeds stdin for batched git commands without forking once per
-      path (historical callers; current ignore inventory uses argv-only
-      ``ls-files``).
+      path.
     """
     if timeout is None:
         timeout = _guard_git_timeout_s()
@@ -860,7 +825,9 @@ def _git_dirty_paths(repo_root: Path) -> list[str] | None:
         return None
     if not proc.stdout:
         return []
-    return [path for path in _parse_porcelain_z_paths(proc.stdout) if path.strip()]
+    if not proc.stdout.endswith(b"\0"):
+        return None
+    return _parse_porcelain_z_paths(proc.stdout, normalize=False)
 
 
 def _git_toplevel(repo: Path) -> Path | None:
@@ -1060,7 +1027,7 @@ def _decode_git_z_path(raw: bytes | str) -> str:
     return raw
 
 
-def _parse_porcelain_z_paths(stdout: bytes | str) -> list[str]:
+def _parse_porcelain_z_paths(stdout: bytes | str, *, normalize: bool = True) -> list[str]:
     """Parse ``git status --porcelain=v1 -z`` into normalized repo-relative paths.
 
     Prefer bytes stdout from ``_run_git_degraded(..., text=False)`` so CR and
@@ -1086,18 +1053,17 @@ def _parse_porcelain_z_paths(stdout: bytes | str) -> list[str]:
         else:
             status = entry[:2]
             raw_path = entry[3:]
-        normalized = raw_path.replace("\\", "/").lstrip("/").rstrip("/")
-        if normalized:
-            paths.append(normalized)
-        if status[0] in {"R", "C"} and index < len(entries):
-            renamed = entries[index]
+        if normalize:
+            raw_path = raw_path.replace("\\", "/").lstrip("/").rstrip("/")
+        if raw_path:
+            paths.append(raw_path)
+        if any(code in status for code in "RC") and index < len(entries):
+            renamed_text = _decode_git_z_path(entries[index])
             index += 1
-            renamed_text = _decode_git_z_path(renamed) if renamed else ""
-            renamed_normalized = (
-                renamed_text.replace("\\", "/").lstrip("/").rstrip("/") if renamed_text else ""
-            )
-            if renamed_normalized:
-                paths.append(renamed_normalized)
+            if normalize:
+                renamed_text = renamed_text.replace("\\", "/").lstrip("/").rstrip("/")
+            if renamed_text:
+                paths.append(renamed_text)
     return paths
 
 
@@ -1295,60 +1261,6 @@ def _is_untracked_ignored_path(repo: Path, rel_path: str) -> bool:
     return ignored is not None and ignored.returncode == 0
 
 
-def _batch_untracked_ignored_paths(
-    repo: Path, rel_paths: list[str]
-) -> set[str] | None:
-    """Return the subset of ``rel_paths`` that Git classifies as ignored.
-
-    Enumerates the ignored untracked set once via
-    ``git ls-files --others --ignored --exclude-standard -z`` and intersects
-    with ``rel_paths``. This never resolves caller-supplied pathspecs, so a
-    single symlink directory cannot poison the whole batch the way
-    ``git check-ignore --stdin`` does (exit 128 after writing partial
-    stdout — which must not be trusted as complete).
-
-    Return values:
-
-    * ``set[str]`` — successful inventory; may be empty when none of the
-      candidates are ignored (distinct from degrade).
-    * ``None`` — could not determine (timeout / OSError / non-zero exit /
-      ``_run_git_degraded`` returned ``None``). Callers must treat this as
-      probe degrade, not as "nothing ignored".
-
-    Uses :data:`IGNORED_INVENTORY_TIMEOUT_S` rather than the short default
-    status-probe budget: a whole-tree ignored walk is slower than a single
-    path status check.
-    """
-    if not rel_paths:
-        return set()
-    candidates = set(rel_paths)
-    proc = _run_git_degraded(
-        [
-            "-C",
-            str(repo),
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ],
-        text=False,
-        timeout=IGNORED_INVENTORY_TIMEOUT_S,
-    )
-    if proc is None or proc.returncode != 0:
-        return None
-    if not proc.stdout:
-        return set()
-    ignored: set[str] = set()
-    for part in proc.stdout.split(b"\0"):
-        if not part:
-            continue
-        path = os.fsdecode(part)
-        if path in candidates:
-            ignored.add(path)
-    return ignored
-
-
 def _surface_filesystem_matches(repo: Path, pattern: str):
     """Yield existing files under ``repo`` that match a YAML-style glob.
 
@@ -1362,7 +1274,7 @@ def _surface_filesystem_matches(repo: Path, pattern: str):
     The walker yields file paths only (directories are skipped) so the
     caller can normalise them to repo-relative POSIX strings without
     re-checking ``is_file``. Paths that only exist through a symlinked
-    directory are omitted (same rule as ``_collect_on_disk_protected_relpaths``).
+    directory are omitted.
     """
     if "**" in pattern:
         head, _, _ = pattern.partition("**")
