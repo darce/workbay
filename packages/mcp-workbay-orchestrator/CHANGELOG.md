@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.40] — 2026-11-21
+
+### Fixed
+- Preserve review-cycle admission for an existing lane with authenticated original source records after main advances.
+
 ## [0.3.39] — 2026-11-21
 
 ### Changed

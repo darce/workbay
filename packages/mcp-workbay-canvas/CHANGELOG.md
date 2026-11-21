@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.25] — 2026-11-21
+
+### Changed
+- Require mcp-workbay-handoff 0.3.34 and mcp-workbay-orchestrator 0.3.40.
+
 ## [0.1.24] — 2026-11-21
 
 ### Changed

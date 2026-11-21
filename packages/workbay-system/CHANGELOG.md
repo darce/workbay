@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.36] — 2026-11-21
+
+### Changed
+- Pin the installed remote transport to mcp-workbay-orchestrator 0.3.40.
+
 ## [0.4.35] — 2026-11-21
 
 ### Changed

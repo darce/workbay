@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.34] — 2026-11-21
+
+### Changed
+- Require workbay-protocol 0.3.18 and raise the lifecycle extra's orchestrator floor to 0.3.40.
+
 ## [0.3.33] — 2026-11-21
 
 ### Changed

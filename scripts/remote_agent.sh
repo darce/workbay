@@ -416,7 +416,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.39
+_BOUNDARY_RUNTIME_VERSION=0.3.40
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.

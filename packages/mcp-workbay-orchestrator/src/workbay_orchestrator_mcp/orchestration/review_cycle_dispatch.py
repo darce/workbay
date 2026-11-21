@@ -2261,6 +2261,8 @@ def _canonical_source(repo: Path, state_dir: Path, *, task_ref: str, branch: str
                            orchestrator_root=orchestrator_root, initial_context=False)
     configure_runtime(RuntimeConfig.for_repo(orchestrator_root))
     proof = proven_task_subject(repo, orchestrator_root, task_ref, branch=branch)
+    if proof is None:
+        proof = _historical_admission_subject(repo, orchestrator_root, task_ref, branch)
     retained = retained_subject_resolution(
         repo, branch, proof, orchestrator_root=orchestrator_root, close_releases=close_releases,
     )
@@ -2512,6 +2514,61 @@ def _receipt_holder(repo: Path, receipt: dict, branch: str) -> _ReceiptHolder:
     if lane is None:
         return _ReceiptHolder(None, None, None, tuple(rows), True)
     return _ReceiptHolder(task, lane_id, lane, tuple(r for r in rows if r["id"] != lane["id"]), False)
+
+
+def _original_admission_matches(path: Path, receipt: dict, proof: dict, ledger) -> bool:
+    """Match a lane's source-time start to the reservation for its own account."""
+    identity = receipt.get("identity")
+    dispatch_id = identity.get("dispatch_id") if isinstance(identity, dict) else None
+    return (
+        isinstance(dispatch_id, str) and bool(dispatch_id)
+        and path.name == hashlib.sha256(dispatch_id.encode()).hexdigest() + ".json"
+        and receipt.get("state") == "transport_started"
+        and receipt.get("source_branch") == proof.get("subject_branch") == identity.get("subject_branch")
+        and receipt.get("source_head") == proof.get("tip_sha")
+        and receipt.get("source_task_subject") == proof
+        and ledger.has_reservation(identity)
+    )
+
+
+def _historical_admission_subject(repo: Path, root: Path, task_ref: str, branch: str) -> dict | None:
+    """Revalidate the unchanged original lane before using its historical subject."""
+    from workbay_handoff_mcp.enums import LIVE_LANE_STATUSES
+
+    from .review_cycle_reconciliation import EvidenceHold, HolderReleaseWalk, _read
+    from .review_ratchet import _commit, _proven_task_subject, _same_worktree, _short_branch
+
+    _, lanes = _registry_rows(root, branch)
+    if len(lanes) != 1:
+        return None
+    (lane,) = lanes
+    if (lane["task_ref"] != task_ref or lane["status"] not in LIVE_LANE_STATUSES
+            or not _same_worktree(lane["worktree_path"], str(repo))):
+        return None
+    proof = _proven_task_subject(repo, root, task_ref, branch=branch, historical_baseline=True)
+    if (proof is None or proof["lane_id"] != lane["lane_id"] or proof["subject_branch"] != branch
+            or proof["base_sha"] != proof["tip_sha"]
+            or proof["tip_sha"] != _commit(repo, review_source_ref(repo))
+            or proof["tip_sha"] != _commit(repo, f"refs/heads/{branch}")):
+        return None
+    try:
+        ledger = HolderReleaseWalk(repo)
+    except HolderLedgerUnavailable:
+        return None  # The holder walk reports the ledger hold.
+    private = authority(repo)
+    for path in (private / "review_cycle_dispatch").glob("*.json"):
+        try:
+            receipt, _ = _read(path, private)
+        except EvidenceHold:
+            continue
+        if _original_admission_matches(path, receipt, proof, ledger):
+            owner = _receipt_holder(root, receipt, branch)
+            if (owner.lane is not None and owner.lane["id"] == lane["id"]
+                    and _short_branch(owner.lane["branch"]) == branch
+                    and owner.lane["status"] in LIVE_LANE_STATUSES
+                    and _same_worktree(owner.lane["worktree_path"], str(repo)) and not owner.competing):
+                return proof
+    return None
 
 
 def _confirmed_holder_rows(repo: Path, receipt: dict, subject: str, *, terminal: bool = False) -> dict[str, list[dict]] | None:
@@ -2767,7 +2824,7 @@ def _independent_baseline_source(repo: Path, proof: dict, receipt: dict, orchest
     history. Recheck the original binding and resource partition before
     distinguishing two work units.
     """
-    from .review_ratchet import _commit, _short_branch, task_record
+    from .review_ratchet import _commit
 
     original = receipt.get("source_task_subject")
     if not isinstance(original, dict) or not isinstance(original.get("task_ref"), str):
@@ -2781,10 +2838,9 @@ def _independent_baseline_source(repo: Path, proof: dict, receipt: dict, orchest
         return False
     if (source_subject is None and receipt["source_branch"] != receipt["identity"]["subject_branch"]
             and proof["base_sha"] == proof["tip_sha"]
-            and proof["tip_sha"] != _commit(repo, "refs/heads/main")
-            and _short_branch((task_record(proof["task_ref"]) or {}).get("target_branch")) == "main"):
-        # A borrowed stamp cannot authenticate the continuing source's roots.
-        # Newly proven historical starts require the complete terminal proof.
+            and proof["tip_sha"] != _commit(repo, "refs/heads/main")):
+        # The stamp covers the charged account. A historical retry also needs
+        # the distinct issuing lane's scope or evidence that its work landed.
         return False
     # Both sides' source-time and currently authorized resources participate.
     # An expansion of either the older or the incoming subject must not create
@@ -3429,11 +3485,8 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
             # An original admission survives a later integration advance. Only
             # a protected receipt joined to its reservation witnesses that start.
             identity = receipt["identity"]
-            if (not admitted_original and proof is not None and proof.get("tip_sha") == head
-                    and receipt.get("source_task_subject") == proof and receipt.get("state") == "transport_started"
-                    and source_branch == proof.get("subject_branch") == identity.get("subject_branch")
-                    and holder_release_walk.has_reservation(identity)
-                    and path.name == hashlib.sha256(identity["dispatch_id"].encode()).hexdigest() + ".json"):
+            if (not admitted_original and proof is not None
+                    and _original_admission_matches(path, receipt, proof, holder_release_walk)):
                 try:
                     admitted_original = _read(path, directory.parent)[1] == digest
                 except EvidenceHold:
@@ -3884,8 +3937,8 @@ def _validated_source_proof(repo: Path, branch: str, subject: str, dispatch_id: 
             proof = proven_task_subject(repo, config.workspace_root, lane["task_ref"], branch=subject)
         if proof is not None and proof["subject_branch"] == subject:
             return proof
-        # An already-started source retains its original identity baseline as
-        # main advances. Only protected source-time receipts can supply it.
+        # Also retain the source-time stamp when the source has since advanced.
+        # This lookup cannot authorize admission or borrow another issuer's stamp.
         from .review_cycle_reconciliation import EvidenceHold, HolderReleaseWalk, _read
 
         private = authority(repo)
@@ -3901,15 +3954,18 @@ def _validated_source_proof(repo: Path, branch: str, subject: str, dispatch_id: 
             prior_dispatch = identity.get("dispatch_id")
             if (prior.get("state") != "transport_started" or not isinstance(prior_dispatch, str)
                     or path.name != hashlib.sha256(prior_dispatch.encode()).hexdigest() + ".json"
-                    or identity.get("subject_branch") != subject or not isinstance(snapshot, dict)
-                    or snapshot.get("subject_branch") != subject or snapshot.get("task_ref") != lane["task_ref"]):
+                    or prior.get("source_branch") != branch or identity.get("subject_branch") != subject
+                    or not isinstance(snapshot, dict) or snapshot.get("subject_branch") != subject
+                    or snapshot.get("task_ref") != lane["task_ref"]):
                 continue
             if ledger is None:
                 ledger = HolderReleaseWalk(repo)
             if (ledger.has_reservation(identity) and isinstance(prior.get("source_head"), str)
                     and _ancestry(repo, prior["source_head"], review_source_ref(repo)) == "ancestor"
                     and source_task_subject_holds(repo, config.workspace_root, snapshot)):
-                return snapshot
+                owner = _receipt_holder(config.workspace_root, prior, branch)
+                if owner.lane is not None and owner.lane["id"] == lane["id"] and not owner.competing:
+                    return snapshot
     return None
 
 
