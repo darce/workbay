@@ -51,3 +51,8 @@ globs = [
 # a migration guard has to string-match — where a path glob would over-exempt the
 # whole file. The exemption stays visible at the hit site.
 inline_marker = "brand-check: allow"
+
+# Exempt one exact source line per path. This selector is required for Codex
+# migration, and an inline marker would change the released bootstrap payload.
+[allowlist.exact_lines]
+"packages/workbay-bootstrap/src/workbay_bootstrap/harnesses.py" = 'LEGACY_CODEX_PLUGIN_SELECTOR = "workstate-system@workstate-marketplace"'

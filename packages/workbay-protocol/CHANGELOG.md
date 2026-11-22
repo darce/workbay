@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.20] — 2026-11-21
+
+### Changed
+- Align the protocol package tag with the v0.1.97 mirror snapshot.
+
 ## [0.3.19] — 2026-11-21
 
 ### Changed

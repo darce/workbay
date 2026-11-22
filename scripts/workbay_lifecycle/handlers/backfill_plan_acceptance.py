@@ -2,9 +2,8 @@
 
 One-shot acceptance walk over every live ``handoff_state`` row whose
 plan baseline is missing from ``main``. For each row, the handler
-applies the same gate as :mod:`plan_accept` -- latest planning verdict
-exactly ``pass``, zero open planning findings -- and emits a per-task
-docs-only commit recipe when the gate clears. Rows that already have
+applies the same gate as :mod:`plan_accept` and emits a per-task
+acceptance command when the gate clears. Rows that already have
 their plan on ``main`` are reported as ``already_accepted`` so re-runs
 are no-ops.
 
@@ -31,7 +30,6 @@ and clean tree just like the single-task handler.
 from __future__ import annotations
 
 import argparse
-import json
 import shlex
 import sys
 from pathlib import Path
@@ -40,8 +38,7 @@ from typing import Any
 import resolver
 
 from . import _common
-from .plan_baseline import evaluate_plan_baseline
-
+from .plan_baseline import build_acceptance_next_command, evaluate_plan_baseline
 
 _LIVE_STATUSES = ("in_progress", "review", "blocked")
 
@@ -317,15 +314,34 @@ def _evaluate_row(
     )
     entry.update(baseline.to_dict())
 
+    if baseline.reason == "already_accepted" and baseline.plan_exists_on_target_branch:
+        from workbay_handoff_mcp.plan_acceptance_scope import ScopeRefusal, Selection, scoped_recovery_required
+
+        from .plan_accept import _accepted_plan_receipt
+
+        try:
+            if scoped_recovery_required(Selection(repo, task_ref, plan_path, target_branch)):
+                receipt = _accepted_plan_receipt(repo, task_ref=task_ref, branch=target_branch, plan_path=plan_path)
+                if receipt is None or "scope" not in receipt:
+                    raise ScopeRefusal("plan_scope_recovery_receipt_missing")
+                entry["accepted_receipt"] = receipt
+        except ValueError as exc:
+            reason = str(exc) if isinstance(exc, ScopeRefusal) else "accepted_receipt_unavailable"
+            entry.update(action="skip", reason=reason, detail_reason=reason, baseline_status="blocked_local")
+            return entry
+
     if not baseline.acceptance_ready:
         entry["action"] = "skip"
         entry["reason"] = baseline.reason
         return entry
 
     entry["action"] = "accept"
-    entry["next_command"] = _build_accept_command(
-        task_ref=task_ref, branch=target_branch, plan_path=plan_path,
-    )
+    if baseline.review_scope is not None:
+        entry["next_command"] = build_acceptance_next_command(
+            task_ref, source_branch=target_branch, plan_path=plan_path, local=True,
+        )
+    else:
+        entry["next_command"] = _build_accept_command(task_ref=task_ref, branch=target_branch, plan_path=plan_path)
     return entry
 
 
@@ -371,12 +387,27 @@ def run(argv: list[str]) -> int:
             for entry in entries:
                 if entry.get("action") != "accept":
                     continue
-                apply_out = _apply_local_accept(
-                    repo,
-                    task_ref=entry["task_ref"],
-                    branch=entry["target_branch"],
-                    plan_path=entry["task_plan_path"],
-                )
+                apply_args = dict(task_ref=entry["task_ref"], branch=entry["target_branch"],
+                                  plan_path=entry["task_plan_path"])
+                if entry.get("review_scope") is not None:
+                    from .plan_accept import _apply_source_bound_accept
+
+                    apply_out = _apply_source_bound_accept(
+                        repo, **apply_args, expected_subject_sha256=entry["reviewed_subject_sha256"],
+                        scope=entry["review_scope"],
+                    )
+                    if apply_out.accepted_receipt is not None:
+                        entry["accepted_receipt"] = apply_out.accepted_receipt
+                    if apply_out.accepted_receipt_unavailable or apply_out.production_history_unavailable:
+                        entry["apply_warning"] = (
+                            apply_out.accepted_receipt_unavailable or apply_out.production_history_unavailable
+                        )
+                    if apply_out.ok:
+                        entry.update(applied=True, applied_commit_sha=apply_out.commit_sha)
+                    if apply_out.ok and entry.get("apply_warning"):
+                        local_errors.append(f"{entry['task_ref']}:{entry['apply_warning']['reason']}")
+                else:
+                    apply_out = _apply_local_accept(repo, **apply_args)
                 ok, err = apply_out[0], apply_out[1]
                 residual = apply_out.residual
                 if ok:

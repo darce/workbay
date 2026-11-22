@@ -506,6 +506,7 @@ TASK_SUBJECT_FIELD = "task_subject"
 # across public upserts, and never authored by a public lane writer.
 PRODUCER_LANE_FIELDS = (TASK_SUBJECT_FIELD, "registry_correction")
 _MAX_TASK_LANES = 500
+_SCOPE_SCHEMA = "workbay/task-subject-scope@1"
 
 
 def _commit(repo: Path, ref: str) -> str | None:
@@ -681,14 +682,14 @@ def _scope_path(repo: Path, binding: dict) -> Path:
 
 def _scope_record(repo: Path, binding: dict) -> dict | None:
     """Private producer metadata, never a path/annotation accepted from notes."""
-    path = _scope_path(repo, binding)
+    from .review_cycle_dispatch import authority
+    from .review_cycle_reconciliation import EvidenceHold, _read
+
     try:
-        if path.resolve() != path or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
-            return None
-        record = json.loads(path.read_bytes())
+        record, _ = _read(_scope_path(repo, binding), authority(repo), private_mode=True)
         scopes = record["authorized_scopes"]
         if (
-            record.get("schema") != "workbay/task-subject-scope@1"
+            record.get("schema") != _SCOPE_SCHEMA
             or record["original"] != binding
             or not scopes
             or scopes[0] != binding["owned_paths"]
@@ -697,7 +698,7 @@ def _scope_record(repo: Path, binding: dict) -> dict | None:
         ):
             return None
         return record
-    except (OSError, ValueError, TypeError, KeyError):
+    except (EvidenceHold, OSError, ValueError, TypeError, KeyError):
         return None
 
 
@@ -718,7 +719,7 @@ def _publish_scope(repo: Path, binding: dict, worktree_path: str, roots: list[st
                 _scope_record(repo, binding)
                 if path.exists()
                 else {
-                    "schema": "workbay/task-subject-scope@1",
+                    "schema": _SCOPE_SCHEMA,
                     "original": binding,
                     "worktree_path": str(Path(worktree_path).resolve()),
                     "authorized_scopes": [binding["owned_paths"]],
@@ -1035,6 +1036,39 @@ def _proven_task_subject(repo: Path, orchestrator_root: Path, task_ref: str, *, 
 
 def proven_task_subject(repo: Path, orchestrator_root: Path, task_ref: str, *, branch: str | None = None) -> dict | None:
     return _proven_task_subject(repo, orchestrator_root, task_ref, branch=branch)
+
+
+def _landed_source_time_scope(repo: Path, private: Path, binding: dict, lane: dict, member: dict) -> bool:
+    """Check the scope of a custody-verified original receipt for a done task.
+
+    The protected producer record fixes the original scope and baseline. The
+    manifest and native lane can corroborate that identity, but cannot supply
+    it. The original base remains usable after integration absorbs the delta.
+    """
+    from .review_cycle_reconciliation import _read
+
+    if task_subject_binding(lane) != binding or binding.get("base_sha") != member.get("base_sha"):
+        return False
+    record, _ = _read(_scope_path(repo, binding), private, private_mode=True)
+    roots = _owned_roots(binding.get("owned_paths"))
+    if (
+        roots is None or binding["owned_paths"] != roots
+        or record.get("schema") != _SCOPE_SCHEMA or record.get("original") != binding
+        or record.get("authorized_scopes") != [roots] or _owned_roots(member.get("owned_paths")) != roots
+        or not _same_worktree(record.get("worktree_path"), lane.get("worktree_path"))
+    ):
+        return False
+    base, tip = binding.get("base_sha"), binding.get("tip_sha")
+    if not all(isinstance(sha, str) and re.fullmatch("[0-9a-f]{40}", sha) and _commit(repo, sha) == sha
+               for sha in (base, tip)) or not _subject_is_ancestor(repo, base, tip):
+        return False
+    # At source time the merge base could already have moved beyond the lane's
+    # pinned base. The protected publication records that delta as observed.
+    changed = binding.get("changed_files")
+    return (isinstance(changed, list) and bool(changed) == (tip != base)
+            and all(isinstance(path, str) and any(path == root or path.startswith(root + "/") for root in roots)
+                    for path in changed)
+            and changed == sorted(set(changed)))
 
 
 def source_task_subject_scope(repo: Path, orchestrator_root: Path, snapshot: dict) -> list[str] | None:

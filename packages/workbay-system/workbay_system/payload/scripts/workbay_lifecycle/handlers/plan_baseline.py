@@ -57,6 +57,7 @@ class PlanBaselineStatus:
     open_planning_findings_other_subjects: int | None = None
     reviewed_subject_sha256: str | None = None
     review_run_id: str | None = None
+    review_scope: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -593,7 +594,7 @@ def evaluate_plan_baseline(
             candidate_review_task_refs=candidate_review_task_refs,
             safe_next_commands=safe_next_commands,
         )
-    if verdict != "pass":
+    if verdict not in {"pass", "pass_with_findings"}:
         detail_reason = "planning_verdict_not_pass"
         return PlanBaselineStatus(
             task_ref=task_ref,
@@ -665,13 +666,33 @@ def evaluate_plan_baseline(
             review_task_ref=review_ref,
         )
 
-    findings_result = query_open_planning_finding_count(
-        repo,
-        task_ref=evidence_task_ref,
-        plan_path=plan_path,
-    )
-    # plan_path is always non-empty here, so the subject-scoped triple is returned.
-    findings_count, other_subjects_count, findings_ok = findings_result  # type: ignore[misc]
+    scope = None
+    if verdict == "pass_with_findings":
+        try:
+            from workbay_handoff_mcp.plan_acceptance_scope import ScopeRefusal, Selection, verified_scope
+
+            if not review_run.get("verdict_decision"):
+                raise ScopeRefusal("plan_scope_result_unbound")
+            with verified_scope(Selection(_workspace(repo), task_ref, plan_path, branch, review_ref)) as scope:
+                if scope["context"]["review_run_id"] != review_run["review_run_id"]:
+                    raise ScopeRefusal("plan_scope_readiness_changed")
+        except (ImportError, ValueError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else "plan_scope_evidence_unavailable"
+            return PlanBaselineStatus(
+                task_ref=task_ref, task_plan_path=plan_path, baseline_exists_on_main=baseline_exists,
+                plan_exists_on_target_branch=target_exists, plan_untracked_on_main=untracked_on_main,
+                latest_planning_verdict=verdict, open_planning_findings=None,
+                acceptance_ready=False, mcp_available=True,
+                baseline_status="stale" if baseline_stale_vs_source else "missing",
+                reason=(reason if review_run.get("verdict_decision") else "latest_planning_verdict_pass_with_findings"),
+                detail_reason=reason, next_command=None,
+                source_branch_state=source_branch_state, review_task_ref=review_ref,
+            )
+        findings_count, other_subjects_count, findings_ok = None, None, True
+    else:
+        findings_result = query_open_planning_finding_count(repo, task_ref=evidence_task_ref, plan_path=plan_path)
+        # plan_path is non-empty here, so the subject-scoped triple is returned.
+        findings_count, other_subjects_count, findings_ok = findings_result  # type: ignore[misc]
     if not findings_ok:
         detail_reason = "baseline_query_failed"
         return PlanBaselineStatus(
@@ -697,7 +718,7 @@ def evaluate_plan_baseline(
                 next_command=None,
             ),
         )
-    if findings_count > 0:
+    if findings_count is not None and findings_count > 0:
         detail_reason = "planning_findings_open"
         return PlanBaselineStatus(
             task_ref=task_ref,
@@ -724,13 +745,18 @@ def evaluate_plan_baseline(
             open_planning_findings_other_subjects=other_subjects_count,
         )
 
+    scoped_command = (
+        build_acceptance_next_command(task_ref, plan_path=plan_path, source_branch=branch, local=True,
+                                      review_task_ref=review_ref)
+        if scope is not None else None
+    )
     if baseline_stale_vs_source:
         # Main has a plan blob, but it is not the reviewed source copy.
         # Gates passed: surface stale (not already_accepted) so plan-accept
         # routes through the normal readiness/apply path rather than the
         # already_accepted no-op success.
         detail_reason = "baseline_stale_vs_source"
-        next_command = build_acceptance_next_command(task_ref, review_task_ref=review_ref)
+        next_command = scoped_command or build_acceptance_next_command(task_ref, review_task_ref=review_ref)
         return PlanBaselineStatus(
             task_ref=task_ref,
             task_plan_path=plan_path,
@@ -742,6 +768,7 @@ def evaluate_plan_baseline(
             acceptance_ready=True,
             reviewed_subject_sha256=reviewed_digest,
             review_run_id=review_run["review_run_id"],
+            review_scope=scope,
             mcp_available=True,
             baseline_status="stale",
             reason="baseline_stale_vs_source",
@@ -761,7 +788,7 @@ def evaluate_plan_baseline(
     detail_reason = (
         "untracked_draft_on_main" if untracked_on_main and not target_exists else "accepted_baseline_missing"
     )
-    next_command = (
+    next_command = scoped_command or (
         build_acceptance_next_command(
             task_ref,
             plan_path=plan_path,
@@ -783,6 +810,7 @@ def evaluate_plan_baseline(
         acceptance_ready=True,
         reviewed_subject_sha256=reviewed_digest,
         review_run_id=review_run["review_run_id"],
+        review_scope=scope,
         mcp_available=True,
         baseline_status="missing",
         reason="plan_baseline_missing",

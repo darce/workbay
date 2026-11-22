@@ -3402,6 +3402,30 @@ def _holder_scope_binds(repo: Path, proof: dict, receipt: dict, row: dict, orche
     return not _disjoint_roots(older, incoming)
 
 
+def _terminal_self_source_requirement(issuer: _ReceiptHolder, receipt: dict, proof: dict) -> str | None:
+    """A completed feature's original source requires its protected landing proof."""
+    from .review_ratchet import _short_branch, task_record
+
+    branch = receipt["source_branch"]
+    if (issuer.lane is None or issuer.task_ref == proof["task_ref"]
+            or receipt["identity"]["subject_branch"] != branch or branch == proof["subject_branch"]):
+        return None
+    original = receipt.get("source_task_subject")
+    if original is None:
+        observed = receipt.get("source_task_subject_unproven")
+        if not isinstance(observed, dict) or observed.get("head_on_integration") is not False:
+            return None
+    elif not isinstance(original, dict) or original.get("tip_sha") != receipt.get("source_head"):
+        # A later source on a continuing branch has its own resource proofs.
+        return None
+    task = task_record(issuer.task_ref)
+    if task is None:
+        return "holder_task_unknown"
+    if task["status"] == "done" and _short_branch(task.get("target_branch")) == branch:
+        return "protected source-time identity and exact landed issuer"
+    return None
+
+
 def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None, *,
                              orchestrator_root: Path | None = None, metrics: bool = False,
                              close_releases: list | None = None) -> dict:
@@ -3469,7 +3493,9 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
                     holding.append(row)
                 elif ancestry == "absent":
                     absent.append({key: row[key] for key in ("receipt", "subject", "source_branch", "source_head")})
-    ordinary = (p for p in directory.glob("*.json") if p not in release_paths)
+    receipt_paths = set(directory.glob("*.json"))
+    holding.extend(holder_release_walk.missing_receipts(directory, receipt_paths | set(verified)))
+    ordinary = (path for path in sorted(receipt_paths) if path not in release_paths)
     for path in chain(verified, ordinary):
         if path in verified:
             receipt, digest = verified[path]
@@ -3575,6 +3601,17 @@ def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None,
                     continue
                 if (original is None and source_lane is not None and not owner.mismatch
                         and holder_release_walk.terminal_issuer_releases(path, receipt, receipt_sha256, owner, proof)):
+                    continue
+                requirement = _terminal_self_source_requirement(owner, receipt, proof)
+                if requirement:
+                    # A generic disjoint-root or retry proof cannot replace
+                    # the completed issuer's protected original evidence.
+                    if (branch in {"", proof["subject_branch"]}
+                            and holder_release_walk.landed_self_source_releases(path, receipt, receipt_sha256, proof)):
+                        continue
+                    row.update(holder_task=owner.task_ref, holder_lane=owner.lane_id,
+                               predicates_tried=["landed_self_source_releases"], missing_proof=requirement)
+                    holding.append(row)
                     continue
                 # A stamp on the earlier subject says nothing about the source
                 # registration. Its resource predicates check the candidate set.

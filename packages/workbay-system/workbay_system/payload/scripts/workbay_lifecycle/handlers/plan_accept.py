@@ -11,13 +11,9 @@ fails readiness when those preconditions do not hold.
 Gates (per Plan internal §Acceptance criteria):
 
 1. The task must have a ``task_plan_path`` registered.
-2. The latest ``review_runs`` row for the plan ``subject_path`` with
-   ``review_mode="planning"`` must have ``verdict="pass"`` — exactly.
-   ``pass_with_findings``, ``conditional_pass``, ``fail``, or absent
-   review runs all block.
-3. Zero open planning findings for the plan subject (``file_path`` match).
-   Findings on other plan subjects under the same task_ref are reported
-   as ``open_planning_findings_other_subjects`` (warning, non-blocking).
+2. A clean pass retains its existing subject and open-finding checks.
+3. A pass with findings requires independently verified qualification of
+   the complete native inventory at the source-bound acceptance effect.
 
 When all gates pass the receipt's ``ready`` is True. On a successful
 inline apply the receipt adds ``applied``, ``applied_commit_sha``, and
@@ -32,9 +28,11 @@ import argparse
 import hashlib
 import json
 import os
+import select
 import shlex
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -568,7 +566,7 @@ class _PlanProduction:
             raise ValueError("production_object_probe_failed")
         return result.stdout.strip()
 
-    def settle_commit(self, row: dict[str, Any]) -> str:
+    def settle_commit(self, row: dict[str, Any], *, recovering: bool = False) -> str:
         self.commit_sha = None
         operation_id = row["operation_id"]
         facts = row["payload"]["facts"]
@@ -596,7 +594,14 @@ class _PlanProduction:
             raise ValueError("production_object_mismatch")
         self.commit_sha = oid
         # Keep the exact object reachable even if main is subsequently rewound.
-        self.git("update-ref", pin, oid, retained.stdout.strip() if retained.returncode == 0 else "")
+        def retain() -> None:
+            self.git("update-ref", pin, oid, retained.stdout.strip() if retained.returncode == 0 else "")
+
+        if recovering and "scope" in facts:
+            with _verified_recovery_scope(self.repo, facts["scope"]):
+                retain()
+        else:
+            retain()
         self.append(
             self.port.record_production_settle,
             operation_id,
@@ -708,7 +713,7 @@ class _PlanProduction:
                 if row["payload"]["facts"]["action"] == "relink_ref":
                     self.settle_relink(row)
                 else:
-                    self.settle_commit(row)
+                    self.settle_commit(row, recovering=True)
 
 
 class _ProductionHold(ValueError):
@@ -813,7 +818,8 @@ def _production_warning(reason: str, exc: Exception, operation_id: str | None = 
 
 
 def _apply_recorded_accept(
-    repo: Path, *, task_ref: str, branch: str, plan_path: str, expected_subject_sha256: str | None = None
+    repo: Path, *, task_ref: str, branch: str, plan_path: str, expected_subject_sha256: str | None = None,
+    scope: dict | None = None,
 ) -> _LocalApplyOutcome:
     try:
         production = _plan_production(repo, task_ref, branch)
@@ -826,9 +832,11 @@ def _apply_recorded_accept(
         outcome = _LocalApplyOutcome(False, warning["reason"])
         outcome.production_history_unavailable = warning
         return outcome
+    scope_args = {"scope": scope} if scope is not None else {}
     if production is None:
         return _apply_local_accept(
-            repo, task_ref=task_ref, branch=branch, plan_path=plan_path, expected_subject_sha256=expected_subject_sha256
+            repo, task_ref=task_ref, branch=branch, plan_path=plan_path,
+            expected_subject_sha256=expected_subject_sha256, **scope_args,
         )
 
     from uuid import uuid4
@@ -863,6 +871,7 @@ def _apply_recorded_accept(
                     "old_oid": production.git("rev-parse", "refs/heads/main"),
                     "old_tree_oid": production.git("rev-parse", "refs/heads/main^{tree}"),
                     "source_branch": branch,
+                    **({"scope": _scope_receipt(scope)} if scope is not None else {}),
                     "source_blob_oid": (
                         production.git("hash-object", "--", plan_path)
                         if branch == "main"
@@ -879,6 +888,7 @@ def _apply_recorded_accept(
                 plan_path=plan_path,
                 production_operation=operation_id,
                 expected_subject_sha256=expected_subject_sha256,
+                **scope_args,
             )
             outcome.production_tracked = True
             prepared = {"operation_id": operation_id, "payload": json.loads(record.payload_json)}
@@ -943,6 +953,113 @@ def _pre_mutation_refusal(repo: Path, branch: str, plan_path: str) -> str | None
     return None
 
 
+def _scope_receipt(scope: dict) -> dict:
+    context = scope["context"]
+    return {
+        key: context[key] for key in (
+            "repository", "task_ref", "review_task_ref", "path", "raw_sha256", "source_ref", "source_tip",
+            "source_tree", "review_run_id", "reviewed_source_commit", "reviewed_source_tree", "result_sha256",
+        )
+    } | {
+        "decision_sha256": scope["decision_sha256"],
+        "authority_id": scope["authority_id"],
+    }
+
+
+def _scope_selection(repo: Path, context: dict):
+    from workbay_handoff_mcp.plan_acceptance_scope import Selection
+
+    return Selection(
+        repo, context["task_ref"], context["path"], context["source_ref"].removeprefix("refs/heads/"),
+        context["review_task_ref"],
+    )
+
+
+@contextmanager
+def _verified_recovery_scope(repo: Path, stored: dict):
+    from workbay_handoff_mcp.plan_acceptance_scope import ScopeRefusal, verified_scope
+
+    with verified_scope(_scope_selection(repo, stored)) as proof:
+        if _scope_receipt(proof) != stored:
+            raise ScopeRefusal("plan_scope_recovery_changed")
+        yield proof
+
+
+def _scope_git_env() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+def _commit_scoped_ref(repo: Path, scope: dict, oid: str, old_head: str, reflog: str):
+    """Prepare Git locks before reserving the native review writer."""
+    import subprocess
+
+    from workbay_handoff_mcp.plan_acceptance_scope import verified_scope
+
+    context = scope["context"]
+    command = ["git", "-C", str(repo), "update-ref", "--stdin", "-m", reflog]
+    update = f"update refs/heads/main {oid} {old_head}\n"
+    if context["source_ref"] != "refs/heads/main":
+        update += f'verify {context["source_ref"]} {context["source_tip"]}\n'
+    elif context["source_tip"] != old_head:
+        return subprocess.CompletedProcess(command, 1, "", "plan_scope_source_changed")
+
+    env = _scope_git_env()
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, bufsize=0, env=env,
+    ) as writer:
+        assert writer.stdin is not None and writer.stdout is not None
+
+        def acknowledge(stage: bytes) -> bool:
+            readable, _, _ = select.select([writer.stdout], [], [], 10)
+            return bool(readable) and writer.stdout.readline() == stage + b": ok\n"
+
+        def stop_writer() -> None:
+            writer.stdin.close()
+            try:
+                writer.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                writer.terminate()
+                try:
+                    writer.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    writer.kill()
+                    writer.wait()
+
+        sent_commit = False
+        try:
+            writer.stdin.write(b"start\n" + update.encode() + b"prepare\n")
+            if acknowledge(b"start") and acknowledge(b"prepare"):
+                # The Git process already holds both ref locks. Its commit
+                # instruction runs under SQLite's native review writer fence.
+                with verified_scope(_scope_selection(repo, context), effect=True, expected=scope):
+                    sent_commit = True
+                    try:
+                        writer.stdin.write(b"commit\n")
+                        if acknowledge(b"commit"):
+                            return subprocess.CompletedProcess(command, 0, oid, "")
+                    finally:
+                        # Finish or stop any uncertain Git write before letting
+                        # another native writer change the signed inventory.
+                        stop_writer()
+        finally:
+            if not sent_commit:
+                stop_writer()
+
+        # A committed reference hook can delay acknowledgement after Git has
+        # updated main. The reflog binds the exact effect even if main advanced.
+        if sent_commit:
+            log = _common.run_subprocess(
+                ["git", "-C", str(repo), "reflog", "show", "--format=%H%x00%gs", "refs/heads/main"], env=env,
+            )
+            if log.returncode == 0 and oid + "\0" + reflog in log.stdout.splitlines():
+                return subprocess.CompletedProcess(command, 0, oid, "")
+        errors.seek(0)
+        detail = errors.read().decode(errors="replace").strip() or "plan_scope_ref_cas_unconfirmed"
+        return subprocess.CompletedProcess(command, 1, "", detail)
+
+
 def _commit_reviewed_index(
     repo: Path,
     *,
@@ -951,6 +1068,7 @@ def _commit_reviewed_index(
     old_head: str,
     message: str,
     production_operation: str | None,
+    scope: dict | None = None,
 ):
     """Run normal commit hooks on a detached candidate, then CAS main.
 
@@ -993,11 +1111,13 @@ def _commit_reviewed_index(
             if candidate.returncode != 0:
                 return candidate
             oid = candidate.stdout.strip()
-            parent = _common.run_subprocess(["git", "-C", str(repo), "show", "-s", "--format=%P", oid])
+            git_args = {"env": _scope_git_env()} if scope is not None else {}
+            parent = _common.run_subprocess(["git", "-C", str(repo), "show", "-s", "--format=%P", oid], **git_args)
             changed = _common.run_subprocess(
-                ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", old_head, oid]
+                ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", old_head, oid],
+                **git_args,
             )
-            entry = _common.run_subprocess(["git", "-C", str(repo), "ls-tree", "-z", oid, "--", plan_path])
+            entry = _common.run_subprocess(["git", "-C", str(repo), "ls-tree", "-z", oid, "--", plan_path], **git_args)
             header, _, entry_path = entry.stdout.partition("\t")
             if (
                 parent.returncode != 0
@@ -1010,6 +1130,13 @@ def _commit_reviewed_index(
                 or hashlib.sha256(plan_bytes(repo, plan_path, oid)).hexdigest() != expected_digest
             ):
                 return failure("review_subject_commit_bytes_changed")
+            if scope is not None:
+                raw = subprocess.run(
+                    ["git", "-C", str(repo), "show", f"{oid}:{plan_path}"],
+                    capture_output=True, timeout=10, **git_args,
+                )
+                if raw.returncode != 0 or hashlib.sha256(raw.stdout).hexdigest() != expected_digest:
+                    return failure("review_subject_commit_bytes_changed")
             if _current_branch(repo) != "main":
                 return failure("apply_target_branch_moved: not_on_main")
             reflog = (
@@ -1017,9 +1144,16 @@ def _commit_reviewed_index(
             ) + message
             # This is the only main-ref mutation. The already-checked object is
             # immutable and the expected old ref is part of the atomic effect.
-            applied = _common.run_subprocess(
-                ["git", "-C", str(repo), "update-ref", "-m", reflog, "refs/heads/main", oid, old_head]
-            )
+            if scope is None:
+                applied = _common.run_subprocess(
+                    ["git", "-C", str(repo), "update-ref", "-m", reflog, "refs/heads/main", oid, old_head]
+                )
+            else:
+                if not production_operation:
+                    from uuid import uuid4
+
+                    reflog = "workbay-plan-scope:" + uuid4().hex + ": " + message
+                applied = _commit_scoped_ref(repo, scope, oid, old_head, reflog)
             if applied.returncode != 0:
                 return applied
             # Return the object this transaction wrote, even if a committed
@@ -1038,6 +1172,7 @@ def _apply_local_accept(
     plan_path: str,
     production_operation: str | None = None,
     expected_subject_sha256: str | None = None,
+    scope: dict | None = None,
 ) -> _LocalApplyOutcome:
     """Run the docs-only checkout+commit inline.
 
@@ -1052,8 +1187,9 @@ def _apply_local_accept(
     if not expected_subject_sha256 or len(expected_subject_sha256) != 64:
         return _LocalApplyOutcome(False, "review_subject_unbound", False)
     old_head = _head_sha(repo)
+    source_ref = scope["context"]["source_tip"] if scope is not None else branch
     try:
-        source = plan_bytes(repo, plan_path, branch if branch != "main" else None)
+        source = plan_bytes(repo, plan_path, source_ref if branch != "main" else None)
     except (OSError, ValueError, RuntimeError):
         return _LocalApplyOutcome(False, "review_subject_source_unreadable", False)
     if hashlib.sha256(source).hexdigest() != expected_subject_sha256:
@@ -1073,7 +1209,7 @@ def _apply_local_accept(
     msg = f"docs({task_ref.lower()}): accept plan {plan_path}"
     if branch != "main":
         checkout = _common.run_subprocess(
-            ["git", "-C", str(repo), "checkout", branch, "--", plan_path],
+            ["git", "-C", str(repo), "checkout", source_ref, "--", plan_path],
         )
         if checkout.returncode != 0:
             _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
@@ -1109,6 +1245,7 @@ def _apply_local_accept(
         old_head=old_head,
         message=msg,
         production_operation=production_operation,
+        **({"scope": scope} if scope is not None else {}),
     )
     if commit.returncode != 0:
         _restore_path_from_head(repo, plan_path, preserve_untracked=preserve_untracked)
@@ -1327,7 +1464,7 @@ def _relink_plan_suffix(
 
 def _accepted_plan_receipt(
     repo: Path, *, task_ref: str, branch: str, plan_path: str,
-    source_tip: str | None = None, applied_commit: str | None = None,
+    source_tip: str | None = None, applied_commit: str | None = None, scope: dict | None = None,
 ) -> dict[str, Any] | None:
     """Publish/recover a source-bound event in the existing decision authority.
 
@@ -1356,6 +1493,8 @@ def _accepted_plan_receipt(
         if not source_tip or plan_bytes(repo, plan_path, applied_commit) != source:
             raise ValueError("accepted_source_commit_mismatch")
         record = dict(key, source_tip=source_tip, applied_commit=applied_commit)
+        if scope is not None:
+            record["scope"] = _scope_receipt(scope)
         event_id = prefix + source_tip + ":" + applied_commit
         result = decisions.record_decision(
             task_ref=task_ref, session="plan-accept", decision=event_id,
@@ -1363,6 +1502,8 @@ def _accepted_plan_receipt(
         )
         if result.get("ok") is not True:
             raise ValueError("accepted_event_write_failed")
+        if scope is not None:
+            record["scope"] = dict(record["scope"], residual_findings=scope["residual_findings"])
         return record
 
     candidates = [branch]
@@ -1392,13 +1533,16 @@ def _accepted_plan_receipt(
                     or plan_bytes(repo, plan_path, commit) != source
                     or plan_bytes(repo, plan_path, "main") != source):
                 raise ValueError("accepted_event_content_mismatch")
+            if "scope" in record:
+                with _verified_recovery_scope(repo, record["scope"]) as proof:
+                    record["scope"]["residual_findings"] = proof["residual_findings"]
             return record
     return None
 
 
 def _apply_source_bound_accept(
     repo: Path, *, task_ref: str, branch: str, plan_path: str,
-    expected_subject_sha256: str | None = None,
+    expected_subject_sha256: str | None = None, scope: dict | None = None,
 ) -> _LocalApplyOutcome:
     """Capture immutable source identity before apply and bind its actual result."""
 
@@ -1415,6 +1559,12 @@ def _apply_source_bound_accept(
         if tip.returncode != 0:
             return unreadable()
         source_tip = tip.stdout.strip()
+        if scope is not None:
+            from workbay_handoff_mcp.plan_acceptance_scope import verified_scope
+
+            with verified_scope(_scope_selection(repo, scope["context"]), expected=scope):
+                if source_tip != scope["context"]["source_tip"]:
+                    return _LocalApplyOutcome(False, "plan_scope_source_changed")
         # Main can hold a reviewed, untracked draft. Its source bytes become
         # immutable in the resulting main commit; a feature source is already
         # immutable at the captured tip.
@@ -1424,11 +1574,14 @@ def _apply_source_bound_accept(
             return unreadable()
         if hashlib.sha256(source).hexdigest() != expected_subject_sha256:
             return _LocalApplyOutcome(False, "review_subject_bytes_changed")
+    except ValueError as exc:
+        return _LocalApplyOutcome(False, str(exc))
     except Exception:
         return _LocalApplyOutcome(False, "accepted_receipt_unavailable")
+    scope_args = {"scope": scope} if scope is not None else {}
     outcome = _apply_recorded_accept(
         repo, task_ref=task_ref, branch=branch, plan_path=plan_path,
-        expected_subject_sha256=expected_subject_sha256,
+        expected_subject_sha256=expected_subject_sha256, **scope_args,
     )
     if outcome.ok:
         commit = outcome.commit_sha
@@ -1437,7 +1590,7 @@ def _apply_source_bound_accept(
                 raise ValueError("accepted_commit_unavailable")
             outcome.accepted_receipt = _accepted_plan_receipt(
                 repo, task_ref=task_ref, branch=branch, plan_path=plan_path,
-                source_tip=commit if branch == "main" else source_tip, applied_commit=commit,
+                source_tip=commit if branch == "main" else source_tip, applied_commit=commit, **scope_args,
             )
         except Exception as exc:
             warning = _production_warning("accepted_receipt_unavailable", exc)
@@ -1477,6 +1630,7 @@ def run(argv: list[str]) -> int:
             "root checkout on main with a clean tree)."
         ),
     )
+    parser.add_argument("--dry-run", action="store_true", help="Evaluate readiness without acceptance effects.")
     args = parser.parse_args(argv)
 
     repo = resolver.repo_root() or Path.cwd()
@@ -1596,28 +1750,49 @@ def run(argv: list[str]) -> int:
         baseline.baseline_status == "accepted" and baseline.reason == "already_accepted"
     )
     if already_accepted:
-        warning = _reconcile_recorded_accept(canonical, task_ref, str(target_branch))
-        if warning:
-            extras["production_history_unavailable"] = warning
         try:
             accepted_receipt = _accepted_plan_receipt(
                 canonical, task_ref=task_ref, branch=str(target_branch), plan_path=str(plan_path),
             ) if baseline.plan_exists_on_target_branch else None
             if accepted_receipt is not None:
                 extras["accepted_receipt"] = accepted_receipt
+            elif baseline.plan_exists_on_target_branch:
+                # A Git blob alone cannot recover qualification or mint a receipt.
+                from workbay_handoff_mcp.plan_acceptance_scope import ScopeRefusal, Selection, scoped_recovery_required
+
+                selection = Selection(canonical, task_ref, str(plan_path), str(target_branch),
+                                      effective_review_task_ref or None)
+                if scoped_recovery_required(selection):
+                    # Reconcile a proven Git effect before reporting missing
+                    # accepted custody. Reconciliation rechecks the same scope.
+                    if not args.dry_run:
+                        warning = _reconcile_recorded_accept(canonical, task_ref, str(target_branch))
+                        if warning:
+                            extras["production_history_unavailable"] = warning
+                    raise ScopeRefusal("plan_scope_recovery_receipt_missing")
+            if not args.dry_run:
+                warning = _reconcile_recorded_accept(canonical, task_ref, str(target_branch))
+                if warning:
+                    extras["production_history_unavailable"] = warning
         except Exception as exc:
-            reasons.append("accepted_receipt_unavailable")
-            extras["apply_error"] = "accepted_receipt_unavailable"
-            extras["production_history_unavailable"] = _production_warning("accepted_receipt_unavailable", exc)
+            reason = str(exc) if str(exc).startswith("plan_scope_") else "accepted_receipt_unavailable"
+            reasons.append(reason)
+            extras["apply_error"] = reason
+            extras["production_history_unavailable"] = _production_warning(reason, exc)
         # internal: an accepted baseline is a satisfied lifecycle
         # state, not a failure. Exit zero and point at the next command.
         noop_command = _build_already_accepted_next_command(
             task_ref, plan_path if isinstance(plan_path, str) else None
         )
-        extras["recovery_kind"] = "already_accepted"
-        extras["safe_next_commands"] = [
-            {"command": noop_command, "reason": "already_accepted"}
-        ]
+        if reasons and reasons[-1].startswith("plan_scope_"):
+            noop_command = None
+            extras.update(
+                baseline_status="blocked_local", reason=reasons[-1], detail_reason=reasons[-1],
+                recovery_kind="scope_recovery_blocked",
+            )
+        else:
+            extras["recovery_kind"] = "already_accepted"
+            extras["safe_next_commands"] = [{"command": noop_command, "reason": "already_accepted"}]
     elif not baseline.acceptance_ready and baseline.reason:
         reasons.append(baseline.reason)
 
@@ -1668,7 +1843,9 @@ def run(argv: list[str]) -> int:
         else None
     )
 
-    if baseline.acceptance_ready and not reasons and not already_accepted:
+    if baseline.review_scope is not None:
+        accept_command = baseline_next_command
+    if baseline.acceptance_ready and not reasons and not already_accepted and not args.dry_run:
         # implementation note S1: facade-owned inline apply when ready. ``--local`` is the
         # strict path (precondition failures become readiness reasons);
         # without ``--local`` the same preconditions soft-skip with
@@ -1764,12 +1941,14 @@ def run(argv: list[str]) -> int:
             # r0153-5: re-query open subject findings at the apply boundary so a
             # finding recorded between readiness and write cannot land silently.
             evidence_task_ref = effective_review_task_ref or task_ref
-            findings_result = query_open_planning_finding_count(
-                repo,
-                task_ref=evidence_task_ref,
-                plan_path=plan_path_str,
-            )
-            subject_count, _other_count, findings_ok = findings_result  # type: ignore[misc]
+            if baseline.review_scope is None:
+                findings_result = query_open_planning_finding_count(
+                    repo, task_ref=evidence_task_ref, plan_path=plan_path_str,
+                )
+                subject_count, _other_count, findings_ok = findings_result  # type: ignore[misc]
+            else:
+                # Scoped acceptance checks the signed inventory at the ref CAS.
+                subject_count, findings_ok = 0, True
             if not findings_ok:
                 # Fail closed: a re-query that could not answer is not evidence
                 # of zero findings. Do not hand back the destructive accept
@@ -1803,6 +1982,7 @@ def run(argv: list[str]) -> int:
                     branch=str(target_branch),
                     plan_path=plan_path_str,
                     expected_subject_sha256=baseline.reviewed_subject_sha256,
+                    **({"scope": baseline.review_scope} if baseline.review_scope is not None else {}),
                 )
                 ok, err = apply_outcome
                 residual = apply_outcome.residual
@@ -1821,6 +2001,12 @@ def run(argv: list[str]) -> int:
                 if not ok:
                     extras["applied"] = False
                     extras["apply_error"] = err or "local_accept_failed"
+                    if baseline.review_scope is not None:
+                        extras.update(
+                            acceptance_ready=False, baseline_status="blocked_local",
+                            reason=extras["apply_error"], detail_reason=extras["apply_error"],
+                            safe_next_commands=[],
+                        )
                     # Invert: default every pre-mutation refusal to the
                     # non-mutating recovery hint. Re-offering the destructive
                     # checkout when preconditions were not met is fail-open
@@ -1836,7 +2022,7 @@ def run(argv: list[str]) -> int:
                         # Typed production hold: point at its own recovery path.
                         accept_command = warning["next_command"]
                         extras["recovery_kind"] = warning["reason"]
-                    if args.local:
+                    if baseline.review_scope is not None or args.local:
                         # Strict --local: surface apply failure as a readiness block.
                         reasons.append(err or "local_accept_failed")
                     # Soft path keeps ready=True; residual post-checkout
@@ -1857,6 +2043,10 @@ def run(argv: list[str]) -> int:
     # one invocation. No-op when the suffix is already correct.
     if (
         (already_accepted or extras.get("accepted"))
+        and not args.dry_run
+        and not reasons
+        and baseline.review_scope is None
+        and not (extras.get("accepted_receipt") or {}).get("scope")
         and not extras.get("production_history_unavailable")
         and isinstance(target_branch, str)
         and target_branch

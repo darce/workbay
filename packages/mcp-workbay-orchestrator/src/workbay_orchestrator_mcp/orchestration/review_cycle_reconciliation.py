@@ -111,13 +111,14 @@ def _regular(path: Path):
         os.close(parent)
 
 
-def _read(path: Path, root: Path) -> tuple[dict, str]:
+def _read(path: Path, root: Path, *, private_mode: bool = False) -> tuple[dict, str]:
     """Read canonical host bytes; never follow a worker-selected/export path."""
     _require(path.is_relative_to(root) and path.resolve() == path, "authority_path_invalid", str(path))
     try:
         with _regular(path) as fd:
             info = os.fstat(fd)
-            _require(info.st_mode & 0o444 and not info.st_mode & 0o022 and info.st_size <= 32 * 1024 * 1024,
+            forbidden_mode = 0o077 if private_mode else 0o022
+            _require(info.st_mode & 0o444 and not info.st_mode & forbidden_mode and info.st_size <= 32 * 1024 * 1024,
                      "authority_custody_invalid", str(path))
             with open(fd, "rb", closefd=False) as stream:
                 raw = stream.read(info.st_size)
@@ -664,6 +665,13 @@ def _bootstrap_producer_custody(repo: Path, primary: Path, runtime, receipt: dic
             native_terminal_recovery=str(recovery_path), execution=observation["execution"],
             required_host_evidence=None), {**observation["producer_records"],
                                          str(recovery_path): _digest(recovery_path.read_bytes())}
+    return _managed_producer_custody(primary, runtime, receipt, row)
+
+
+def _managed_producer_custody(
+    primary: Path, runtime, receipt: dict, row: dict, *, landed_issuer: dict | None = None,
+) -> tuple[dict, dict]:
+    """Bind the protected first-publication pass to the original registration."""
     managed, source = receipt.get("managed_identity"), receipt.get("managed_source")
     unknown = dict(status="unproven", required_host_evidence="original managed_identity/managed_source and first-publication native pass lane_cycle_binding")
     if not isinstance(managed, dict) or not isinstance(source, dict):
@@ -692,9 +700,15 @@ def _bootstrap_producer_custody(repo: Path, primary: Path, runtime, receipt: dic
     if not valid:
         return {**unknown, "required_host_evidence": str(path) + ": matching original managed source, reservation, completion identity and lane-cycle join"}, {str(path): digest}
     from .review_cycle_bootstrap import _lane
-    registered = _lane(runtime, binding["row_id"])
+    registered = _lane(runtime, binding["row_id"]) if landed_issuer is None else landed_issuer
     if registered is None or any(registered.get(k) != binding.get(k)
-                                 for k in ("task_ref", "lane_id", "branch", "worktree_path", "cycle_epoch")):
+                                 for k in ("task_ref", "lane_id", "branch", "worktree_path")):
+        return unknown, {str(path): digest}
+    epoch = registered.get("cycle_epoch")
+    # Closing advances the epoch of the same row. It cannot replace the row
+    # bound by the original managed pass.
+    if (registered.get("id") != binding["row_id"] or type(epoch) is not int
+            or (epoch != binding["cycle_epoch"] if landed_issuer is None else epoch < binding["cycle_epoch"])):
         return {**unknown, "required_host_evidence": "unchanged native producer row id=" + str(binding["row_id"]) + " and original cycle_epoch"}, {str(path): digest}
     settlement = ((state.get("result") or {}).get("review_cycle") or {}).get("settlement") or {}
     return dict(status="authenticated", managed_identity=managed, managed_source=source,
@@ -1111,6 +1125,7 @@ def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: 
     for row in rows.values():
         issued = _issued(row)
         if (row["subject_branch"] != lane["branch"] or row["decision"] != "reserved"
+                or row["kind"] not in {"implement", "gate"} or row.get("legacy_source")
                 or issued is None or issued >= sequence):
             continue
         path = private / "review_cycle_dispatch" / (_digest(row["dispatch_id"].encode()) + ".json")
@@ -1122,7 +1137,9 @@ def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: 
         _receipt_reservation(repo, path, previous, rows)
         issuer = cycle._receipt_holder(primary, previous, lane["branch"])
         if (issuer.mismatch or issuer.lane is None or issuer.lane["id"] != lane["id"]
-                or previous.get("state") != "transport_started"):
+                or row["kind"] not in {"implement", "gate"} or previous.get("state") != "transport_started"
+                or previous.get("source_task_subject_unproven") is not None
+                or previous.get("source_integration_branch") not in (None, stamp.get("integration_branch"))):
             return None
         record = ratchet._scope_record(repo, stamp)
         if (record is None or not ratchet._same_worktree(record["worktree_path"], lane["worktree_path"])
@@ -1133,7 +1150,28 @@ def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: 
     return names.pop() if len(names) == 1 else None
 
 
-def _landed_self_source(repo: Path, primary: Path, receipt: dict, rows: dict, proof: dict) -> bool:
+def _landed_terminal_tip(repo: Path, lane: dict, head: str, landed: str, *, require_exact_land: bool) -> str | None:
+    """A historical Land close can explicitly project the tip as manifest provenance."""
+    from . import landing_log
+
+    source = lane.get("branch_tip_source")
+    if not require_exact_land and source in {"branch", "backfill"}:
+        return cycle._landed_continuation_tip(repo, head, [lane], landed)
+    tip, landing = lane.get("branch_tip_sha"), lane.get("landing_commit_sha")
+    if (source not in {"manifest", "branch", "backfill", None}
+            or any(not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (tip, landing))
+            or cycle._ancestry(repo, head, tip) != "ancestor"
+            or cycle._ancestry(repo, landing, landed) != "ancestor"):
+        return None
+    verdict = landing_log.verify_receipt(repo, landing, main_ref=landed)
+    if (verdict.verified and verdict.depth == 0 and verdict.receipt is not None
+            and (verdict.receipt.task_ref, verdict.receipt.lane_id, verdict.receipt.tip)
+            == (lane["task_ref"], lane["lane_id"], tip)):
+        return tip
+    return None
+
+
+def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict, rows: dict, proof: dict) -> bool:
     """The issuer's typed final tip covers this source and landed on its own integration."""
     from . import review_ratchet as ratchet
 
@@ -1162,24 +1200,53 @@ def _landed_self_source(repo: Path, primary: Path, receipt: dict, rows: dict, pr
             or not ratchet._same_worktree(member.get("worktree_path"), lane["worktree_path"])):
         return False
 
+    binding = receipt.get("source_task_subject")
+    terminal_feature = task["status"] == "done" and target == branch
     landed = ratchet._commit(repo, "refs/heads/" + integration)
-    if (landed is None or cycle._landed_continuation_tip(repo, head, [lane], landed) is None
+    if landed is None:
+        return False
+    if terminal_feature:
+        if task.get("source") != "live" or lane.get("_archived"):
+            return False
+        if binding is not None and (binding.get("integration_branch") != integration
+                or receipt.get("source_integration_branch") not in (None, integration)
+                or not ratchet._landed_source_time_scope(repo, private, binding, lane, member)
+                or cycle._ancestry(repo, binding["base_sha"], landed) != "ancestor"
+                or cycle._ancestry(repo, binding["tip_sha"], head) != "ancestor"):
+            return False
+        final_tip = _landed_terminal_tip(repo, lane, head, landed, require_exact_land=binding is None)
+        if final_tip is None:
+            return False
+    elif (cycle._landed_continuation_tip(repo, head, [lane], landed) is None
             or not cycle._terminal_refs_landed(repo, {branch}, landed)):
         return False
-    binding = receipt.get("source_task_subject")
+
     if binding is None:
+        if terminal_feature and receipt.get("source_issuer") is None:
+            from workbay_handoff_mcp.config import RuntimeConfig
+
+            runtime = RuntimeConfig.for_repo(primary)
+            custody, _ = _managed_producer_custody(
+                primary, runtime, receipt, rows[receipt["identity"]["dispatch_id"]], landed_issuer=lane,
+            )
+            if custody["status"] != "authenticated":
+                return False
         observed = receipt["source_task_subject_unproven"]
         cut = observed.get("integration_sha")
+        landing = lane["landing_commit_sha"]
+        # An authentic Land has the feature on its second parent. The old
+        # integration cut must precede the integration side of that merge.
+        integration_parent = landing + "^1" if terminal_feature else landing
         if (not isinstance(cut, str) or not re.fullmatch("[0-9a-f]{40}", cut)
                 or ratchet._commit(repo, cut) != cut or cycle._ancestry(repo, head, cut) != "not_ancestor"
-                or cycle._ancestry(repo, cut, lane["landing_commit_sha"]) != "ancestor"):
+                or cycle._ancestry(repo, cut, integration_parent) != "ancestor"):
             return False
-        if "source_integration_branch" in receipt:
-            if receipt["source_integration_branch"] != integration:
-                return False
-        elif _earlier_issuer_integration(repo, primary, lane, receipt, rows) != integration:
+        issuer_integration = receipt.get("source_integration_branch")
+        if issuer_integration is None and (terminal_feature or "source_integration_branch" not in receipt):
+            issuer_integration = _earlier_issuer_integration(repo, primary, lane, receipt, rows)
+        if issuer_integration != integration:
             return False
-    else:
+    elif not terminal_feature:
         if (binding.get("integration_branch") != integration or binding.get("base_sha") != member.get("base_sha")
                 or not ratchet._same_worktree((ratchet._scope_record(repo, binding) or {}).get("worktree_path"),
                                               lane["worktree_path"])
@@ -1193,9 +1260,18 @@ def _landed_self_source(repo: Path, primary: Path, receipt: dict, rows: dict, pr
                                                   head=head, integration=integration, landed=landed)):
         return False
     scope = ratchet._scope_record(repo, proof)
-    return (scope is not None and cycle._authorized_roots(repo, primary, proof) is not None
-            and cycle._git(repo, "symbolic-ref", "--quiet", "HEAD") == "refs/heads/" + proof["subject_branch"]
-            and ratchet._same_worktree(scope.get("worktree_path"), cycle._git(repo, "rev-parse", "--show-toplevel")))
+    if (scope is None or cycle._authorized_roots(repo, primary, proof) is None
+            or cycle._git(repo, "symbolic-ref", "--quiet", "HEAD") != "refs/heads/" + proof["subject_branch"]
+            or not ratchet._same_worktree(scope.get("worktree_path"), cycle._git(repo, "rev-parse", "--show-toplevel"))):
+        return False
+    if not terminal_feature:
+        return True
+    ref = "refs/heads/" + branch
+    tip = ratchet._commit(repo, ref)
+    return ((tip == final_tip or (tip is None and not cycle._ref_exists(repo, ref)))
+            and cycle._receipt_holder(primary, receipt, branch) == holder
+            and ratchet.task_record(lane["task_ref"]) == task
+            and ratchet._commit(repo, "refs/heads/" + integration) == landed)
 
 
 class HolderReleaseWalk:
@@ -1229,6 +1305,21 @@ class HolderReleaseWalk:
         self._observations: dict[int, dict | None] = {}
         self.unproven_owners: dict[str, list[dict]] = {}
 
+    def missing_receipts(self, directory: Path, present: set[Path]) -> list[dict]:
+        """Native source and gate reservations require their original receipt."""
+        missing = []
+        for row in self._data.get("rows", {}).values():
+            if (row.get("decision") != "reserved" or row.get("kind") not in {"implement", "gate"}
+                    or row.get("legacy_source")):
+                continue
+            dispatch_id = row["dispatch_id"]
+            path = directory / (_digest(dispatch_id.encode()) + ".json")
+            if path not in present:
+                missing.append(dict(receipt=path.name, dispatch_id=dispatch_id, subject=row["subject_branch"],
+                                    missing_proof="holder_custody_unavailable", has_source_task_subject=False,
+                                    predicates_tried=["native_receipt_membership"]))
+        return missing
+
     def has_reservation(self, identity: dict) -> bool:
         row = self._data.get("rows", {}).get(identity.get("dispatch_id"))
         return (isinstance(row, dict) and row.get("decision") == "reserved" and row.get("kind") in {"implement", "gate"}
@@ -1258,7 +1349,7 @@ class HolderReleaseWalk:
                 if observed != digest or protected != receipt:
                     return False
                 _receipt_reservation(self.repo, path, protected, self._data["rows"])
-                if not _landed_self_source(self.repo, primary, protected, self._data["rows"], proof):
+                if not _landed_self_source(self.repo, primary, private, protected, self._data["rows"], proof):
                     return False
                 # A ledger replacement during the walk invalidates its row and any release events.
                 info = self._ledger_path.lstat()

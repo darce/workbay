@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.13] — 2026-11-21
+
+### Changed
+- Align the Codex bridge package tag with the v0.1.97 mirror snapshot.
+
 ## [0.3.12] — 2026-11-21
 
 ### Changed

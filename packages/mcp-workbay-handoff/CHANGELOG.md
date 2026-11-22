@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.36] — 2026-11-21
+
+### Changed
+- Bind plan-scope decisions to the frozen review and require exact native resolution evidence for any applicable finding.
+
 ## [0.3.35] — 2026-11-21
 
 ### Changed

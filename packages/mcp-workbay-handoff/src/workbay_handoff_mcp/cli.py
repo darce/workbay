@@ -1292,6 +1292,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Port to bind to (default: 8741)",
     )
     subparsers.add_parser("doctor")
+    scope = subparsers.add_parser(
+        "plan-acceptance-scope", help="Inspect native scope evidence or record an independently signed decision."
+    )
+    scope.add_argument("operation", choices=("inspect", "record"))
+    scope.add_argument("--task-ref", required=True)
+    scope.add_argument("--review-task-ref")
+    scope.add_argument("--plan", required=True)
+    scope.add_argument("--source-branch", required=True)
+    scope.add_argument("--signed-decision", type=Path)
     # internal: direct-path agent-error write for harness
     # hooks. Special-cased (not registry-driven) because it must not
     # touch the configured runtime DB path — it resolves the primary
@@ -1536,6 +1545,19 @@ def main() -> None:
         return
     if args.subcommand == "doctor":
         _print_json(run_doctor(config))
+        return
+    if args.subcommand == "plan-acceptance-scope":
+        from .plan_acceptance_scope import ScopeRefusal, Selection, inspect_scope, record_scope
+
+        if (args.operation == "record") != (args.signed_decision is not None):
+            parser.error("--signed-decision is required for record only")
+        selection = Selection(config.workspace_root, args.task_ref, args.plan, args.source_branch, args.review_task_ref)
+        try:
+            data = inspect_scope(selection) if args.operation == "inspect" else record_scope(selection, args.signed_decision)
+        except ScopeRefusal as exc:
+            _print_json({"ok": False, "error": str(exc)})
+            return
+        _print_json({"ok": True, "data": data})
         return
     entry = getattr(args, "_cli_entry", None)
     if isinstance(entry, CliEntry):

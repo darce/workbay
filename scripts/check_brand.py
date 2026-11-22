@@ -49,6 +49,7 @@ def _load_config() -> dict:
         allowlist = cfg.get("allowlist", {})
         allow_globs = allowlist.get("globs", [])
         inline_marker = allowlist.get("inline_marker", "")
+        exact_lines = allowlist.get("exact_lines", {})
     except (KeyError, TypeError, AttributeError) as exc:
         raise BrandCheckConfigError(
             "brand-check: config schema invalid; expected [forbidden].tokens and [scan].globs lists"
@@ -65,6 +66,12 @@ def _load_config() -> dict:
         raise BrandCheckConfigError(
             "brand-check: config schema invalid; token, scan, and allowlist entries must be strings"
         )
+    if not isinstance(exact_lines, dict) or not all(
+        path and isinstance(line, str) and line for path, line in exact_lines.items()
+    ):
+        raise BrandCheckConfigError(
+            "brand-check: config schema invalid; [allowlist.exact_lines] must map paths to source lines"
+        )
     return cfg
 
 
@@ -73,8 +80,10 @@ def scan(repo_root: Path = REPO_ROOT) -> list[str]:
     cfg = _load_config()
     forbidden: list[str] = cfg["forbidden"]["tokens"]
     scan_globs: list[str] = cfg["scan"]["globs"]
-    allow_globs: list[str] = cfg.get("allowlist", {}).get("globs", [])
-    inline_marker: str = cfg.get("allowlist", {}).get("inline_marker", "")
+    allowlist = cfg.get("allowlist", {})
+    allow_globs: list[str] = allowlist.get("globs", [])
+    inline_marker: str = allowlist.get("inline_marker", "")
+    exact_lines: dict[str, str] = allowlist.get("exact_lines", {}).copy()
 
     proc = subprocess.run(
         ["git", "grep", "-nIE", "|".join(forbidden), "--", *scan_globs],
@@ -87,8 +96,10 @@ def scan(repo_root: Path = REPO_ROOT) -> list[str]:
         raise RuntimeError(f"git grep failed (rc={proc.returncode}): {proc.stderr}")
 
     hits: list[str] = []
-    for line in proc.stdout.splitlines():
-        path = line.split(":", 1)[0]
+    for line in proc.stdout.split("\n"):
+        if not line:
+            continue
+        path, _, match = line.partition(":")
         if any(fnmatch(path, glob) for glob in allow_globs):
             continue
         # Line-level escape hatch for a load-bearing literal that must stay verbatim
@@ -97,6 +108,11 @@ def scan(repo_root: Path = REPO_ROOT) -> list[str]:
         # the hit site rather than hidden in a path glob that would exempt the whole
         # file and mask future accidental drift.
         if inline_marker and inline_marker in line:
+            continue
+        _, _, source_line = match.partition(":")
+        if exact_lines.get(path) == source_line:
+            # Consume the exemption so a second declaration is still reported.
+            del exact_lines[path]
             continue
         hits.append(line)
     return hits

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.94] — 2026-11-21
+
+### Changed
+- Ship the historical-holder custody and scoped plan acceptance fixes together with refreshed runtime pins.
+
 ## [0.3.93] — 2026-11-21
 
 ### Changed

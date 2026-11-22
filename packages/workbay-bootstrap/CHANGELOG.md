@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.37] — 2026-11-21
+
+### Changed
+- Raise the WorkBay system dependency floor to the scoped acceptance and remote boundary update.
+
 ## [0.4.36] — 2026-11-21
 
 ### Changed

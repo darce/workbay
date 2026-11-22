@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.39] — 2026-11-21
+
+### Changed
+- Allow scoped acceptance for frozen plan reviews with authenticated findings evidence, and pin the updated remote boundary runtime.
+
 ## [0.4.38] — 2026-11-21
 
 ### Changed

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.27] — 2026-11-21
+
+### Changed
+- Align handoff and orchestration dependency floors with the new custody-aware WorkBay runtime.
+
 ## [0.1.26] — 2026-11-21
 
 ### Changed
