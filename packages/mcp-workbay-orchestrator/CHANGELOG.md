@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.41] — 2026-11-21
+
+### Changed
+- The planned native write provenance changes use a wrapper with lifecycle enforcement.
+
 ## [0.3.40] — 2026-11-21
 
 ### Fixed

@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.38] — 2026-11-21
+
+### Changed
+- Pin the installed remote transport to mcp-workbay-orchestrator 0.3.41.
+- Route `handoff-close-check --enforce` through the native close integrity gate and propagate its enforcement result.
+
 ## [0.4.36] — 2026-11-21
 
 ### Changed

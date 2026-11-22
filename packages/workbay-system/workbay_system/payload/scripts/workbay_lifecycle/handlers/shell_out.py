@@ -3,7 +3,8 @@
 ``review-run`` / ``handoff-review-run`` shell out to ``mcp-workbay-handoff
 review-runs --operation record --review-mode={branch,planning} ...``;
 ``handoff-close-check`` delegates to the local ``close-check --json`` gate
-(implementation note S3) and exits non-zero whenever ``ready`` is false. Review-run
+(implementation note S3) or to native ``integrity-check --kind close --enforce``
+when enforcement is requested. It exits non-zero whenever ``ready`` is false. Review-run
 wrappers shell out to ``mcp-workbay-handoff`` and pass ``--workspace-root``
 so the underlying CLI does not fall back to cwd.
 """
@@ -14,6 +15,7 @@ import argparse
 import datetime as _dt
 import json
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +46,8 @@ DELEGATED_TO_TEMPLATES: dict[str, str] = {
     "handoff-close-check": "lifecycle close-check --json",
     "handoff-set": "mcp-workbay-handoff set --status-only",
 }
+
+_ENFORCED_CLOSE_TARGET = "mcp-workbay-handoff integrity-check --kind close --enforce"
 
 REVIEW_MODE_BY_COMMAND: dict[str, str] = {
     "review-run": "branch",
@@ -280,6 +284,12 @@ def _run_local_close_check(
     if args.allow_no_active_task:
         argv.append("--allow-no-active-task")
     proc = _common.run_subprocess(argv, cwd=str(workspace_root))
+    return _close_check_result(proc, enforced=False)
+
+
+def _close_check_result(
+    proc: subprocess.CompletedProcess[str], *, enforced: bool
+) -> tuple[int, dict[str, Any]]:
     if not proc.stdout.strip():
         return proc.returncode or 2, {
             "ok": False,
@@ -289,25 +299,54 @@ def _run_local_close_check(
     try:
         close_receipt = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return 2, {
+        return (proc.returncode if enforced and proc.returncode else 2), {
             "ok": False,
             "error": "close_check_malformed_json",
             "delegated_exit_code": proc.returncode,
         }
-    ready = bool(close_receipt.get("ready"))
+    close_data = (
+        close_receipt.get("data") if enforced and isinstance(close_receipt, dict) else close_receipt
+    )
+    if not isinstance(close_data, dict):
+        return proc.returncode or 2, {
+            "ok": False,
+            "ready": False,
+            "error": "close_check_invalid_receipt",
+            "delegated_exit_code": proc.returncode,
+            "close_check": close_receipt,
+        }
+
+    if enforced:
+        ready = (
+            proc.returncode == 0
+            and close_receipt.get("ok") is True
+            and close_data.get("ready_to_close") is True
+        )
+        exit_code = proc.returncode or int(not ready)
+        delegated_exit_code = proc.returncode
+        reason = close_data.get("error") or close_data.get("reason")
+        reasons = close_data.get("failures") or ([reason] if reason else [])
+        scope = close_receipt.get("scope")
+        task_ref = scope.get("task_ref") if isinstance(scope, dict) else None
+    else:
+        ready = bool(close_data.get("ready"))
+        exit_code = delegated_exit_code = int(not ready)
+        reasons = close_data.get("reasons", [])
+        task_ref = close_data.get("task_ref")
+
     receipt: dict[str, Any] = {
         "ok": ready,
         "ready": ready,
-        "reasons": close_receipt.get("reasons", []),
-        "next_command": close_receipt.get("next_command"),
-        "findings_open": close_receipt.get("findings_open"),
-        "mergeable": close_receipt.get("mergeable"),
-        "delegated_exit_code": 0 if ready else 1,
+        "reasons": reasons,
+        "next_command": close_data.get("next_command"),
+        "findings_open": close_data.get("findings_open"),
+        "mergeable": close_data.get("mergeable"),
+        "delegated_exit_code": delegated_exit_code,
         "close_check": close_receipt,
     }
-    if close_receipt.get("task_ref"):
-        receipt["task_ref"] = close_receipt["task_ref"]
-    return (0 if ready else 1), receipt
+    if task_ref:
+        receipt["task_ref"] = task_ref
+    return exit_code, receipt
 
 
 def _build_close_check_argv(
@@ -315,8 +354,7 @@ def _build_close_check_argv(
 ) -> list[str]:
     # ``--workspace-root`` is a *parent* flag on the real adapter
     # (registered before ``add_subparsers``); positioning it after the
-    # subcommand exits 2. Guarded by
-    # ``test_handoff_close_check_workspace_root_precedes_subcommand``.
+    # subcommand exits 2.
     argv: list[str] = [
         "--workspace-root",
         str(workspace_root),
@@ -324,9 +362,8 @@ def _build_close_check_argv(
         "--kind",
         "close",
     ]
-    task_ref = args.task_ref or _read_active_task_ref(workspace_root)
-    if task_ref:
-        argv.extend(["--task-ref", task_ref])
+    if args.task_ref is not None:
+        argv.extend(["--task-ref", args.task_ref])
     if args.enforce:
         argv.append("--enforce")
     if args.allow_no_active_task:
@@ -445,32 +482,44 @@ def run(command: str, argv: list[str]) -> int:
 
     try:
         if command == "handoff-close-check":
-            preflight_err = _common.handoff_cli_required_preflight_error()
-            if preflight_err is not None:
+            args, passthrough = _parse_close_check_args(argv)
+            delegated_to = (
+                _ENFORCED_CLOSE_TARGET if args.enforce else DELEGATED_TO_TEMPLATES[command]
+            )
+            try:
+                handoff_bin = _common.resolve_handoff_cli_bin(workspace_root)
+                if passthrough:
+                    sys.stderr.write(
+                        f"{command}: ignoring unknown passthrough args: {passthrough!r}\n"
+                    )
+                if args.enforce:
+                    native_argv = _build_close_check_argv(args, workspace_root)
+                    proc = _common.run_handoff_subprocess(
+                        workspace_root, [handoff_bin, *native_argv], cwd=str(workspace_root)
+                    )
+            except ValueError as exc:
                 receipt = {
                     "ok": False,
                     "command": command,
                     "delegation_mode": "shell_out",
-                    "delegated_to": DELEGATED_TO_TEMPLATES[command],
+                    "delegated_to": delegated_to,
                     "delegated_exit_code": None,
                     "events": [],
                     "error": "handoff_cli_unavailable",
-                    "message": preflight_err,
+                    "message": str(exc),
                 }
-                sys.stderr.write(f"{command}: {preflight_err}\n")
+                sys.stderr.write(f"{command}: {exc}\n")
                 _common.emit(receipt)
                 return 127
 
-            args, passthrough = _parse_close_check_args(argv)
-            if passthrough:
-                sys.stderr.write(
-                    f"{command}: ignoring unknown passthrough args: {passthrough!r}\n"
-                )
-            exit_code, close_payload = _run_local_close_check(workspace_root, args)
+            if args.enforce:
+                exit_code, close_payload = _close_check_result(proc, enforced=True)
+            else:
+                exit_code, close_payload = _run_local_close_check(workspace_root, args)
             receipt = {
                 "command": command,
-                "delegation_mode": "local_close_check",
-                "delegated_to": DELEGATED_TO_TEMPLATES[command],
+                "delegation_mode": "shell_out" if args.enforce else "local_close_check",
+                "delegated_to": delegated_to,
                 "events": [f"{command}_delegated"],
                 **close_payload,
             }

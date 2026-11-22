@@ -13,9 +13,22 @@ import sqlite3
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
+
+from .shared_schema import (
+    EPOCH_PREFIX,
+    EPOCH_SCHEMA,
+    EPOCH_SESSION,
+    EPOCH_TASK,
+    IDENTITY_TRIGGER_SHA256,
+    _installed_triggers,
+    _migrate_add_worktree_lanes_identity_seq,
+    _record_observation_epoch,
+    _stale_identity_triggers,
+)
 
 ExecutionDomain = Literal["local_coordination"]
 CoordinationState = Literal["queued", "unknown", "held", "failure", "terminal"]
@@ -36,13 +49,21 @@ class CoordinationUnknown(CoordinationHold):
 
 HISTORY_INCOMPLETE = "coordination_dispatch_history_incomplete"
 OBSERVED_TABLES = ("lane_messages", "worker_reports", "turn_metrics", "plan_cursors")
-# DB-wide observation epochs are immutable system facts outside any task. Each
-# one records where uninterrupted trigger coverage (re)began; rows that existed
-# before it may have dispatch history that the triggers never saw.
-EPOCH_TASK = "__workbay_coordination_observation__"
-EPOCH_SESSION = "native-dispatch"
-EPOCH_PREFIX = "coordination_observation_epoch:"
-EPOCH_SCHEMA = "workbay/coordination-observation-epoch@1"
+DISPATCH_SCHEMA = "workbay/coordination-dispatch-observation@1"
+NATIVE_ACTOR_FIELDS = (
+    "lane_id",
+    "agent",
+    "harness",
+    "model",
+    "model_label",
+    "reasoning_level",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "branch",
+    "commit_sha",
+    "slice_number",
+)
 
 
 def immutable_fact_condition(ref: str = "") -> str:
@@ -191,12 +212,33 @@ def worker_fence(row: dict[str, Any]) -> Iterator[None]:
         handle.close()
 
 
-def observation_triggers() -> dict[str, str]:
+def observation_triggers(*, legacy: bool = False) -> dict[str, str]:
     """Exact native trigger set; stored SQL must match byte-for-byte to count as coverage."""
     triggers: dict[str, str] = {}
     for table in OBSERVED_TABLES:
         for event in ("INSERT", "UPDATE"):
             name = f"coordination_observe_{table}_{event.lower()}"
+            # BEFORE observes an attempted write, including sources with an
+            # auto-assigned id. Capture the NEW source and lane binding here,
+            # in the same decision that already records the observation.
+            rationale = (
+                f"'{table}'"
+                if legacy
+                else f"""json_object(
+                         'schema','{DISPATCH_SCHEMA}', 'table','{table}', 'operation','{event}',
+                         'source_created_at',NEW.created_at,
+                         'lane_row_id',l.id, 'identity_seq',l.identity_seq,
+                         'observed_at',datetime('now'),
+                         'epoch_id',(SELECT MAX(id) FROM decisions WHERE task_ref='{EPOCH_TASK}'
+                            AND session='{EPOCH_SESSION}' AND decision GLOB '{EPOCH_PREFIX}*'))"""
+            )
+            lane_join = (
+                ""
+                if legacy
+                else """
+                       FROM (SELECT 1) LEFT JOIN worktree_lanes l
+                         ON l.task_ref=NEW.task_ref AND l.lane_id=NEW.lane_id"""
+            )
             triggers[name] = f"""CREATE TRIGGER {name}
             BEFORE {event} ON {table}
             BEGIN
@@ -206,10 +248,16 @@ def observation_triggers() -> dict[str, str]:
                 THEN RAISE(ABORT,'coordination_terminal_execution_forbidden') END;
               INSERT INTO decisions(task_ref,session,decision,rationale,decision_origin)
                 SELECT NEW.task_ref,'native-dispatch','coordination_dispatch:' || NEW.lane_id,
-                       '{table}','system' WHERE NEW.lane_id IS NOT NULL AND NOT EXISTS(
+                       {rationale},'system'{lane_join} WHERE NEW.lane_id IS NOT NULL AND NOT EXISTS(
                          SELECT 1 FROM decisions WHERE task_ref=NEW.task_ref
                            AND decision='coordination_dispatch:' || NEW.lane_id);
             END"""
+    triggers.update(_decision_guards())
+    return triggers
+
+
+def _decision_guards() -> dict[str, str]:
+    triggers = {}
     condition = immutable_fact_condition("OLD.")
     triggers["coordination_fact_delete"] = f"""CREATE TRIGGER coordination_fact_delete BEFORE DELETE ON decisions
         WHEN {condition} BEGIN SELECT RAISE(ABORT,'coordination_fact_immutable'); END"""
@@ -224,13 +272,7 @@ def observation_triggers() -> dict[str, str]:
 
 
 def _stale_triggers(conn: sqlite3.Connection, expected: dict[str, str]) -> list[str]:
-    installed = {
-        name: sql
-        for name, sql in conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name IN (%s)" % ",".join("?" * len(expected)),
-            tuple(expected),
-        )
-    }
+    installed = _installed_triggers(conn, tuple(expected))
     return sorted(name for name, sql in expected.items() if installed.get(name) != sql)
 
 
@@ -277,34 +319,25 @@ def install_dispatch_observation(conn: sqlite3.Connection) -> None:
         raise CoordinationFailure("coordination_observation_transaction_required")
     expected = observation_triggers()
     stale = _stale_triggers(conn, expected)
-    if not stale and _epoch_bound(conn) is not None:
-        return
+    # A byte-for-byte predecessor set can be upgraded under the same writer
+    # lock without an observation gap. Other drift still starts a new epoch.
+    uninterrupted = (not stale or not _stale_triggers(conn, observation_triggers(legacy=True))) and (
+        _epoch_bound(conn) is not None
+    )
     for name in stale:
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         conn.execute(expected[name])
-    # One statement under the writer lock: the high-water and the epoch commit together.
-    conn.execute(
-        """INSERT INTO decisions(task_ref,session,decision,rationale,decision_origin)
-        SELECT ?, ?, ? || (SELECT COUNT(*) + 1 FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ?),
-          json_object(
-            'schema', ?,
-            'lanes_high_water', MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name='worktree_lanes'), 0),
-                                    COALESCE((SELECT MAX(id) FROM worktree_lanes), 0)),
-            'lane_messages_high_water', MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name='lane_messages'), 0),
-                                            COALESCE((SELECT MAX(id) FROM lane_messages), 0)),
-            'replaced_triggers', json(?)),
-          'system'""",
-        (
-            EPOCH_TASK,
-            EPOCH_SESSION,
-            EPOCH_PREFIX,
-            EPOCH_TASK,
-            EPOCH_SESSION,
-            EPOCH_PREFIX + "*",
-            EPOCH_SCHEMA,
-            json.dumps(stale),
-        ),
-    )
+    # If generation coverage lapsed, restart it under this same writer lock.
+    # Keep the repair on the existing epoch ledger so an unchanged integer can
+    # never requalify a receipt from before the recorded gap.
+    stale_identity = _stale_identity_triggers(conn)
+    if stale_identity:
+        _migrate_add_worktree_lanes_identity_seq(conn)
+        if _stale_identity_triggers(conn):
+            raise CoordinationFailure("coordination_identity_trigger_repair_failed")
+    if uninterrupted and not stale_identity:
+        return
+    _record_observation_epoch(conn, stale + stale_identity)
 
 
 def observation_coverage(conn: sqlite3.Connection, row: dict[str, Any], *, pending_insert: bool = False) -> None:
@@ -315,7 +348,7 @@ def observation_coverage(conn: sqlite3.Connection, row: dict[str, Any], *, pendi
     about to be inserted in this same transaction (``pending_insert``) is new
     only when coverage is already intact before its insert.
     """
-    if _stale_triggers(conn, observation_triggers()):
+    if _stale_triggers(conn, observation_triggers()) and _stale_triggers(conn, observation_triggers(legacy=True)):
         raise CoordinationUnknown(HISTORY_INCOMPLETE)
     bound = _epoch_bound(conn)
     if bound is None:
@@ -329,6 +362,292 @@ def observation_coverage(conn: sqlite3.Connection, row: dict[str, Any], *, pendi
     after = conn.execute("SELECT julianday(?) >= ?", (created, since)).fetchone()[0]
     if after != 1:
         raise CoordinationUnknown(HISTORY_INCOMPLETE)
+
+
+def _positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _sha(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def _native_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").isoformat(sep=" ") == value
+    except ValueError:
+        return False
+
+
+def _epoch_receipt(conn: sqlite3.Connection, row: sqlite3.Row, data: dict) -> bool:
+    replaced = data.get("replaced_triggers")
+    trigger_names = observation_triggers().keys() | IDENTITY_TRIGGER_SHA256.keys()
+    if not (
+        row["task_ref"] == EPOCH_TASK
+        and set(data) == {"schema", "lanes_high_water", "lane_messages_high_water", "replaced_triggers"}
+        and data["schema"] == EPOCH_SCHEMA
+        and all(type(data[k]) is int and data[k] >= 0 for k in ("lanes_high_water", "lane_messages_high_water"))
+        and isinstance(replaced, list)
+        and all(isinstance(name, str) and name in trigger_names for name in replaced)
+        and replaced == sorted(set(replaced))
+    ):
+        return False
+    ordinal = conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ? AND id<=?",
+        (EPOCH_TASK, EPOCH_SESSION, EPOCH_PREFIX + "*", row["id"]),
+    ).fetchone()[0]
+    return row["decision"] == EPOCH_PREFIX + str(ordinal)
+
+
+def _native_envelope(row: sqlite3.Row) -> bool:
+    return (
+        row["decision_origin"] == "system"
+        and all(row[k] is None for k in NATIVE_ACTOR_FIELDS)
+        and row["changed_files_json"] == "[]"
+        and _native_timestamp(row["created_at"])
+    )
+
+
+def _stored_epoch_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> dict | None:
+    if not _native_envelope(row):
+        return None
+    try:
+        data = json.loads(row["rationale"])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) and _epoch_receipt(conn, row, data) else None
+
+
+def has_stored_observation_epoch(conn: sqlite3.Connection) -> bool:
+    """Check committed predecessors in ledger order even if the wall clock stepped back."""
+    rows = conn.execute(
+        "SELECT * FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ? ORDER BY id DESC",
+        (EPOCH_TASK, EPOCH_SESSION, EPOCH_PREFIX + "*"),
+    )
+    # An older ledger may still be waiting for its attribution columns.
+    columns = {column[0] for column in rows.description}
+    if not {*NATIVE_ACTOR_FIELDS, "changed_files_json", "decision_origin", "rationale"} <= columns:
+        return False
+    return any(_stored_epoch_payload(conn, row) is not None for row in rows)
+
+
+def _protection_intact(conn: sqlite3.Connection, row: sqlite3.Row, *, uses_generation: bool) -> bool:
+    guards = _decision_guards()
+    if _stale_triggers(conn, guards) or (uses_generation and _stale_identity_triggers(conn)):
+        return False
+    required = set(guards)
+    if uses_generation:
+        required.update(IDENTITY_TRIGGER_SHA256)
+    # An observation-only restart does not invalidate the event-time binding of
+    # a typed receipt. A repair of a guard it depends on breaks continuity.
+    for epoch in conn.execute(
+        "SELECT * FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ? AND id>?",
+        (EPOCH_TASK, EPOCH_SESSION, EPOCH_PREFIX + "*", row["id"]),
+    ):
+        data = _stored_epoch_payload(conn, epoch)
+        if data is None or required.intersection(data["replaced_triggers"]):
+            return False
+    return True
+
+
+def _preceding_epoch(conn: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row | None:
+    # Decision IDs order the producer's writes even within the same second.
+    epoch = conn.execute(
+        "SELECT * FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ? AND id<? ORDER BY id DESC LIMIT 1",
+        (EPOCH_TASK, EPOCH_SESSION, EPOCH_PREFIX + "*", row["id"]),
+    ).fetchone()
+    if (
+        epoch is None
+        or native_fact_provenance_issue(conn, epoch) is not None
+        or epoch["created_at"] > row["created_at"]
+    ):
+        return None
+    return epoch
+
+
+def _dispatch_provenance(conn: sqlite3.Connection, row: sqlite3.Row, lane: sqlite3.Row, data: dict) -> str | None:
+    if (
+        set(data)
+        != {
+            "schema",
+            "table",
+            "operation",
+            "source_created_at",
+            "lane_row_id",
+            "identity_seq",
+            "observed_at",
+            "epoch_id",
+        }
+        or data["schema"] != DISPATCH_SCHEMA
+        or data["table"] not in OBSERVED_TABLES
+        or data["operation"] not in ("INSERT", "UPDATE")
+        or not _native_timestamp(data["source_created_at"])
+        or data["observed_at"] != row["created_at"]
+        or data["source_created_at"] > row["created_at"]
+    ):
+        return "coordination_dispatch_source_unverified"
+    if (
+        not _positive_int(data["lane_row_id"])
+        or not _positive_int(data["identity_seq"])
+        or (data["lane_row_id"], data["identity_seq"]) != (lane["id"], lane["identity_seq"])
+        or not _native_timestamp(lane["created_at"])
+        or lane["created_at"] > data["source_created_at"]
+    ):
+        return "coordination_dispatch_lane_identity_unverified"
+    if not _positive_int(data["epoch_id"]):
+        return "coordination_dispatch_epoch_unverified"
+    # A later coverage restart cannot retroactively supply this observation's epoch.
+    epoch = _preceding_epoch(conn, row)
+    if epoch is None or epoch["id"] != data["epoch_id"]:
+        return "coordination_dispatch_epoch_unverified"
+    return None
+
+
+def _legacy_dispatch_provenance(conn: sqlite3.Connection, row: sqlite3.Row, lane: sqlite3.Row) -> str | None:
+    # Both legacy lane-message triggers record the same first observation. The
+    # earlier native reservation binds the slug to the still-current generation.
+    # A surviving brief corroborates activity in that lifetime.
+    try:
+        observation_coverage(conn, dict(lane))
+    except CoordinationUnknown:
+        return "coordination_dispatch_coverage_unverified"
+
+    epoch = conn.execute(
+        "SELECT * FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ? ORDER BY id DESC LIMIT 1",
+        (EPOCH_TASK, EPOCH_SESSION, EPOCH_PREFIX + "*"),
+    ).fetchone()
+    if (
+        epoch is None
+        or epoch["id"] >= row["id"]
+        or native_fact_provenance_issue(conn, epoch) is not None
+        or not _native_timestamp(lane["created_at"])
+        or not epoch["created_at"] <= lane["created_at"] <= row["created_at"]
+    ):
+        return "coordination_dispatch_epoch_unverified"
+
+    reservation = conn.execute(
+        "SELECT * FROM decisions WHERE task_ref=? AND session='native-launch' AND decision=?",
+        (row["task_ref"], "native_execution_reserved:" + lane["lane_id"]),
+    ).fetchone()
+    if (
+        reservation is None
+        or not epoch["id"] < reservation["id"] < row["id"]
+        or native_fact_provenance_issue(conn, reservation) is not None
+        or not lane["created_at"] <= reservation["created_at"] <= row["created_at"]
+    ):
+        return "coordination_dispatch_reservation_unverified"
+    if conn.execute(
+        "SELECT 1 FROM decisions WHERE task_ref=? AND decision=? AND id<? LIMIT 1",
+        (row["task_ref"], row["decision"], row["id"]),
+    ).fetchone():
+        return "coordination_dispatch_observation_conflict"
+
+    message_high_water = json.loads(epoch["rationale"])["lane_messages_high_water"]
+    # Brief fields can be supplied by normal message writers or imports. Only
+    # the native marker and reservation establish authority and ledger order.
+    messages = conn.execute(
+        """SELECT agent, branch, commit_sha, dispatch_id, created_at FROM lane_messages
+           WHERE task_ref=? AND lane_id=? AND id>? AND created_at BETWEEN ? AND ?
+             AND session='dispatch_lane_work' AND direction='orchestrator_to_worker'""",
+        (row["task_ref"], lane["lane_id"], message_high_water, lane["created_at"], row["created_at"]),
+    ).fetchall()
+    if not messages or any(
+        message["branch"] != lane["branch"]
+        or not isinstance(message["agent"], str)
+        or not message["agent"].strip()
+        or not _sha(message["commit_sha"])
+        or not isinstance(message["dispatch_id"], str)
+        or not message["dispatch_id"].strip()
+        or not _native_timestamp(message["created_at"])
+        for message in messages
+    ):
+        return "coordination_dispatch_source_unverified"
+    return None
+
+
+def native_fact_provenance_issue(conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+    """Validate a candidate from immutable_fact_condition without attributing it to an actor.
+
+    The ledger and its native SQLite writers are trusted. Public decision and
+    import writes carry actor metadata. The legacy lane-message arm validates
+    observed activity for a reserved generation using existing ledger facts.
+    """
+    if not _native_envelope(row):
+        return "coordination_fact_envelope_unverified"
+    try:
+        data = json.loads(row["rationale"])
+    except (TypeError, ValueError):
+        data = None
+    kind, _, key = row["decision"].partition(":")
+    if not _protection_intact(conn, row, uses_generation=kind != "coordination_observation_epoch"):
+        return "coordination_fact_protection_unverified"
+    legacy = kind == "coordination_dispatch" and row["rationale"] == "lane_messages"
+    if not legacy and not isinstance(data, dict):
+        return "coordination_fact_payload_unverified"
+    if kind == "coordination_observation_epoch":
+        return None if _epoch_receipt(conn, row, data) else "coordination_observation_epoch_unverified"
+
+    if kind == "coordination_dispatch":
+        lane_id = key
+    else:
+        owner = data if kind == "native_execution_reserved" else data.get("identity")
+        if not isinstance(owner, dict) or not isinstance(owner.get("lane_id"), str):
+            return "coordination_fact_lane_identity_unverified"
+        lane_id = owner["lane_id"]
+    lane = conn.execute(
+        "SELECT * FROM worktree_lanes WHERE task_ref=? AND lane_id=?", (row["task_ref"], lane_id)
+    ).fetchone()
+    if lane is None or not lane_id:
+        return "coordination_fact_lane_identity_unverified"
+    if kind == "coordination_dispatch":
+        if legacy:
+            return _legacy_dispatch_provenance(conn, row, lane)
+        return _dispatch_provenance(conn, row, lane, data)
+
+    # Launch snapshots describe the event-time owner and tip. Those two fields
+    # may advance without changing the lane's database-owned identity sequence.
+    if (
+        set(owner) != set(IDENTITY)
+        or not _positive_int(owner["id"])
+        or not _positive_int(owner["identity_seq"])
+        or any(owner[k] != lane[k] for k in IDENTITY if k not in ("owner_agent", "branch_tip_sha"))
+        or (owner["owner_agent"] is not None and not isinstance(owner["owner_agent"], str))
+        or (owner["branch_tip_sha"] is not None and not _sha(owner["branch_tip_sha"]))
+        or row["rationale"] != json.dumps(data, sort_keys=True)
+    ):
+        return "coordination_fact_lane_identity_unverified"
+    if kind == "native_execution_reserved":
+        if key != lane_id:
+            return "coordination_fact_lane_identity_unverified"
+        if not _native_timestamp(lane["created_at"]) or row["created_at"] < lane["created_at"]:
+            return "coordination_reservation_predates_lane"
+        return None if _preceding_epoch(conn, row) is not None else "coordination_reservation_epoch_unverified"
+
+    if (
+        key != f"{lane['id']}:{lane['identity_seq']}"
+        or set(data) != {"identity", "intent_id", "reason", "status", "state", "ok"}
+        or data["reason"] != "declared_zero_dispatch"
+        or data["status"] != "not_required"
+        or data["state"] != "terminal"
+        or data["ok"] is not True
+        or not isinstance(data["intent_id"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", data["intent_id"]) is None
+        or not _sha(owner["branch_tip_sha"])
+        or owner != owner_identity(dict(lane))
+        or lane["status"] != "merged"
+        or not _sha(lane["landing_commit_sha"])
+        or _preceding_epoch(conn, row) is None
+    ):
+        return "coordination_terminal_unverified"
+    try:
+        if declaration(conn, dict(lane)) is not None:
+            execution_absence(conn, dict(lane))
+            return None
+    except (CoordinationHold, TypeError, ValueError, sqlite3.Error):
+        pass
+    return "coordination_terminal_unverified"
 
 
 def prepare_declaration(

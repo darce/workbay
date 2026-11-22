@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.36] — 2026-11-21
+
+### Changed
+- Require workbay-protocol 0.3.19 and workbay-system 0.4.37.
+
 ## [0.4.35] — 2026-11-21
 
 ### Changed

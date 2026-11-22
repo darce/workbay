@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.35] — 2026-11-21
+
+### Changed
+- Require workbay-protocol 0.3.19 and raise the lifecycle extra's orchestrator floor to 0.3.41.
+
+### Migration
+- Apply the supported handoff database schema migration before using the planned native write provenance changes.
+
 ## [0.3.34] — 2026-11-21
 
 ### Changed

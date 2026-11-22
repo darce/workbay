@@ -23,6 +23,7 @@ from typing import Any
 from workbay_protocol.review_impact import is_blocking
 
 from .concept_embed_hook import embed_concept_on_write
+from .coordination_declaration import immutable_fact_condition, native_fact_provenance_issue
 from .current_task_rendering import _collect_task_snapshot
 from .enums import ActionStatus, BlockerStatus, FindingStatus
 from .lanes_recording import is_reclaim_candidate_decision_id
@@ -1045,10 +1046,28 @@ def _report_blocker_impl(
 
 
 def _collect_task_provenance_integrity(conn: sqlite3.Connection, task_ref: str) -> dict:
-    table_checks: dict[str, dict[str, object]] = {}
-    total_issues = 0
+    # Resolve typed decisions and their binding within the same read snapshot.
+    missing_actor = "(agent IS NULL OR TRIM(agent) = '' OR branch IS NULL OR TRIM(branch) = '')"
+    native_fact = immutable_fact_condition()
+    decisions = conn.execute(
+        f"SELECT *, {native_fact} AS native_fact FROM decisions WHERE task_ref = ?"
+        f" AND ({missing_actor} OR {native_fact}) ORDER BY id DESC",
+        (task_ref,),
+    ).fetchall()
+    decision_issues = []
+    for row in decisions:
+        reason = native_fact_provenance_issue(conn, row) if row["native_fact"] else None
+        if row["native_fact"] and reason is None:
+            continue
+        item = {k: row[k] for k in ("agent", "branch", "commit_sha")}
+        item["row_id"] = row["id"]
+        if reason is not None:
+            item["reason"] = reason
+        decision_issues.append(item)
+
+    total_issues = len(decision_issues)
+    table_checks: dict[str, dict[str, object]] = {"decisions": {"count": total_issues, "items": decision_issues}}
     for table_name in (
-        "decisions",
         "blockers",
         "next_actions",
         "verified_tests",
@@ -1057,7 +1076,8 @@ def _collect_task_provenance_integrity(conn: sqlite3.Connection, task_ref: str) 
         "lane_messages",
     ):
         rows = conn.execute(
-            f"SELECT id AS row_id, agent, branch, commit_sha FROM {table_name} WHERE task_ref = ? AND (agent IS NULL OR TRIM(agent) = '' OR branch IS NULL OR TRIM(branch) = '') ORDER BY id DESC",
+            f"SELECT id AS row_id, agent, branch, commit_sha FROM {table_name}"
+            f" WHERE task_ref = ? AND {missing_actor} ORDER BY id DESC",
             (task_ref,),
         ).fetchall()
         items = [
@@ -1698,6 +1718,7 @@ def handoff_close_check(
         )
     require_current_commit_summary = bool(normalized_current_commit_sha)
     with _get_db_connection() as conn:
+        conn.execute("BEGIN")
         from .shared_primitives import LIVE_ACTIVE_STATUSES  # noqa: PLC0415
 
         if task_ref is None:

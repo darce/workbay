@@ -15,6 +15,7 @@ Ownership:
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -2478,6 +2479,9 @@ def _migrate_add_column_extensions(conn: sqlite3.Connection) -> None:
     )
     for column in ("model", "backend", "reasoning_effort", "speed", "tier", "test_cmd"):
         _add_column_if_missing(conn, "worktree_lanes", column, "TEXT")
+    # Surviving dispatch observers read this column during the migration
+    # probes, including when bootstrap has just recreated the lane table.
+    _add_column_if_missing(conn, "worktree_lanes", "identity_seq", "INTEGER")
     _add_column_if_missing(conn, "handoff_state", "focus", "TEXT")
     _add_column_if_missing(conn, "decisions", "changed_files_json", "TEXT")
     _add_column_if_missing(conn, "decisions", "slice_number", "INTEGER")
@@ -3119,13 +3123,13 @@ def _worker_reports_outcome_allows_no_actionable_work(conn: sqlite3.Connection) 
             ) VALUES ('__probe__', '__probe__', 's', 'probe', 'no_actionable_work')
             """
         )
-        conn.execute("DELETE FROM worker_reports WHERE task_ref = '__probe__' AND lane_id = '__probe__'")
-        conn.execute("RELEASE SAVEPOINT wr_outcome_no_actionable_probe")
         return True
     except sqlite3.IntegrityError:
+        return False
+    finally:
+        # A native observer can append an immutable dispatch decision on INSERT.
         conn.execute("ROLLBACK TO SAVEPOINT wr_outcome_no_actionable_probe")
         conn.execute("RELEASE SAVEPOINT wr_outcome_no_actionable_probe")
-        return False
 
 
 def _plan_cursors_state_allows_expired(conn: sqlite3.Connection) -> bool:
@@ -3163,13 +3167,13 @@ def _worktree_lanes_status_allows_closed_stale(conn: sqlite3.Connection) -> bool
             ) VALUES ('__probe__', '__probe_closed_stale__', '/tmp/probe', 'probe', 'closed_stale')
             """
         )
-        conn.execute("DELETE FROM worktree_lanes WHERE task_ref = '__probe__' AND lane_id = '__probe_closed_stale__'")
-        conn.execute("RELEASE SAVEPOINT worktree_lane_closed_stale_probe")
         return True
     except sqlite3.IntegrityError:
+        return False
+    finally:
+        # Keep the test insertion out of the observation epoch's lane high-water.
         conn.execute("ROLLBACK TO SAVEPOINT worktree_lane_closed_stale_probe")
         conn.execute("RELEASE SAVEPOINT worktree_lane_closed_stale_probe")
-        return False
 
 
 def _rebuild_worker_reports_outcome_check(conn: sqlite3.Connection) -> None:
@@ -3774,6 +3778,80 @@ def _migrate_add_worktree_lanes_branch_identity(conn: sqlite3.Connection) -> Non
     _add_column_if_missing(conn, "worktree_lanes", "landing_commit_sha", "TEXT")
 
 
+# DB-wide observation epochs are immutable system facts outside any task. Each
+# one records where uninterrupted trigger coverage (re)began; rows that existed
+# before it may have dispatch history that the triggers never saw.
+EPOCH_TASK = "__workbay_coordination_observation__"
+EPOCH_SESSION = "native-dispatch"
+EPOCH_PREFIX = "coordination_observation_epoch:"
+EPOCH_SCHEMA = "workbay/coordination-observation-epoch@1"
+# Digests of sqlite_master.sql installed by the v41 storage migration in
+# shared_schema._migrate_add_worktree_lanes_identity_seq. Pin both definitions:
+# the insert assigns the generation, and the update advances it on path/branch changes.
+IDENTITY_TRIGGER_SHA256 = {
+    "worktree_lanes_identity_seq_after_insert": "f14634e265e57737973129c44f19c9c8921f3dc262c7075765318fa0382cbee7",
+    "worktree_lanes_identity_seq_after_identity_update": "3e89ac4271d9ba7b729a56b9faaaac9dfa5d524e87cfad003185f4f429bf3564",
+}
+
+
+def _installed_triggers(conn: sqlite3.Connection, names: tuple[str, ...]) -> dict[str, str]:
+    return {
+        name: sql
+        for name, sql in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name IN (%s)" % ",".join("?" * len(names)),
+            names,
+        )
+    }
+
+
+def _stale_identity_triggers(conn: sqlite3.Connection) -> list[str]:
+    installed = _installed_triggers(conn, tuple(IDENTITY_TRIGGER_SHA256))
+    return [
+        name
+        for name, digest in IDENTITY_TRIGGER_SHA256.items()
+        if name not in installed or hashlib.sha256(installed[name].encode()).hexdigest() != digest
+    ]
+
+
+def _bootstrap_identity_gap(conn: sqlite3.Connection) -> list[str]:
+    """Snapshot lapses in an existing observation interval before any repair DDL."""
+    stale = _stale_identity_triggers(conn)
+    if not stale or not _sqlite_table_exists(conn, "decisions"):
+        return []
+    # The epoch survives loss of the lane table. Authenticate it before repair
+    # can recreate the triggers that would otherwise appear to attest coverage.
+    from .coordination_declaration import has_stored_observation_epoch
+
+    return stale if has_stored_observation_epoch(conn) else []
+
+
+def _record_observation_epoch(conn: sqlite3.Connection, replaced_triggers: list[str]) -> None:
+    """Append the coverage boundary inside the caller's write transaction."""
+    # One statement under the writer lock: the high-water and the epoch commit together.
+    conn.execute(
+        """INSERT INTO decisions(task_ref,session,decision,rationale,decision_origin)
+        SELECT ?, ?, ? || (SELECT COUNT(*) + 1 FROM decisions WHERE task_ref=? AND session=? AND decision GLOB ?),
+          json_object(
+            'schema', ?,
+            'lanes_high_water', MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name='worktree_lanes'), 0),
+                                    COALESCE((SELECT MAX(id) FROM worktree_lanes), 0)),
+            'lane_messages_high_water', MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name='lane_messages'), 0),
+                                            COALESCE((SELECT MAX(id) FROM lane_messages), 0)),
+            'replaced_triggers', json(?)),
+          'system'""",
+        (
+            EPOCH_TASK,
+            EPOCH_SESSION,
+            EPOCH_PREFIX,
+            EPOCH_TASK,
+            EPOCH_SESSION,
+            EPOCH_PREFIX + "*",
+            EPOCH_SCHEMA,
+            json.dumps(sorted(replaced_triggers)),
+        ),
+    )
+
+
 def _migrate_add_worktree_lanes_identity_seq(conn: sqlite3.Connection) -> None:
     """v40 -> v41: add an indexed database-owned worktree identity cursor.
 
@@ -4169,8 +4247,10 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
                 return
             raise
         try:
+            schema_version = handoff_schema_version(conn)
+            identity_gap = _bootstrap_identity_gap(conn)
             eligible_close_upgrade = (
-                handoff_schema_version(conn) == 51
+                schema_version == 51
                 and _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES)
                 and _required_columns_present(conn)
                 and _native_validation_schema_present(conn)
@@ -4206,6 +4286,8 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
                     "migrations; leaving unstamped for retry"
                 )
                 return
+            if identity_gap:
+                _record_observation_epoch(conn, identity_gap)
             # True version in schema_meta; user_version is the reader floor.
             # Do not stamp schema 34 until idx_review_findings_finding_id
             # exists: a post-COMMIT CREATE INDEX lock would otherwise leave
