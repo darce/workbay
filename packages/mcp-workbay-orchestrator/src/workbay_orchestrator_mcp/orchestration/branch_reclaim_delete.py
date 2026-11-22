@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -90,6 +91,8 @@ DeleteReason = Literal[
     "lane_identity_ambiguous",
     "reclaim_fence_held",
     "reclaim_fence_unavailable",
+    "refused_owned",
+    "refused_owner_unknown",
 ]
 
 
@@ -345,7 +348,12 @@ def lane_identity_for_branch(branch: str | None) -> tuple[str, str | None, str |
 
 
 def remove_worktree_under_close_authority(
-    repo_root: Path | str, worktree_path: str, binding: CloseAuthorityBinding
+    repo_root: Path | str,
+    worktree_path: str,
+    binding: CloseAuthorityBinding,
+    *,
+    review: dict[str, object] | None = None,
+    incarnation: Mapping[str, object] | None = None,
 ) -> tuple[bool, str]:
     """Remove a linked worktree bound to ``binding`` through the core authority-bound removal.
 
@@ -359,6 +367,33 @@ def remove_worktree_under_close_authority(
         return (False, refusal)
     from workbay_orchestrator_mcp import lane_reaping  # noqa: PLC0415
 
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
+    if review is not None:
+        if incarnation is None or binding.branch != review.get("branch"):
+            return False, "review_removal_identity_missing"
+        lock, detail = lane_reaping._acquire_lane_worker_lock(binding.lane_id)
+        if lock is None:
+            return False, detail
+        try:
+            refusal, result, release = run_under_close_authority(
+                binding,
+                lambda: lane_reaping._remove_lane_worktree(
+                    repo_root,
+                    worktree_path,
+                    lane_id=binding.lane_id,
+                    task_ref=binding.task_ref,
+                    review=review,
+                    incarnation=incarnation,
+                ),
+            )
+        finally:
+            lane_reaping._release_lane_worker_lock(lock)
+        removed, cause = result if result is not None else (False, refusal)
+        return removed, FenceReleaseDetail(cause, release)
+    deferred = review_stage_deferral(Path(repo_root), str(binding.branch or ""))
+    if deferred:
+        return False, deferred
     return lane_reaping._remove_lane_worktree(
         repo_root,
         worktree_path,
@@ -407,6 +442,8 @@ class _AuthorizedDeletePlan:
     branch_ref: str
     sha: str
     reclaim_ref: str
+    review_stage: bool = False
+    review_subject: str = ""
     recovery: dict[str, str | None] = field(default_factory=dict)
     force_delete: bool = False
     recovery_verified: bool = False
@@ -420,6 +457,9 @@ class _AuthorizedDeletePlan:
     bundle_path: str | None = None
     lock_recovery: dict[str, object] = field(default_factory=dict)
     binding: CloseAuthorityBinding | None = None
+    require_unowned_task_target: bool = False
+    effect_guard: Callable[[], str | None] | None = None
+    supersession_effect: dict[str, str] = field(default_factory=dict)
 
 
 def _decode_timeout_output(raw: object) -> str:
@@ -598,8 +638,9 @@ def _write_sha_guard_hook(directory: Path) -> None:
     reference-transaction hook runs with the ref lock held, so resolving the
     branch in the ``prepared`` phase closes the final check/delete race.  The
     hook is enabled only for the delete subprocess via ``core.hooksPath``.
-    Callers opt into main ancestry; the shared bundle reaper instead relies
-    on ``branch -d``'s merge check against its upstream or HEAD.
+    Callers opt into main ancestry. A safe delete with a preservation pin is
+    a review delete and must also prove the exact reviewed subject on main.
+    The shared bundle reaper relies on ``branch -d``'s upstream or HEAD check.
     """
 
     hook = directory / "reference-transaction"
@@ -607,6 +648,9 @@ def _write_sha_guard_hook(directory: Path) -> None:
         """#!/bin/sh
 state=$1
 [ \"$state\" = prepared ] || exit 0
+# Use the repository's actual commit graph for the prepared proof.
+export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+unset GIT_SHALLOW_FILE
 seen=0
 while read -r old new ref
 do
@@ -620,8 +664,56 @@ actual=$(git rev-parse --verify \"$WORKBAY_AUTH_REF^{commit}\") || exit 92
 if [ -n \"$WORKBAY_AUTH_PIN\" ]; then
     pinned=$(git rev-parse --verify \"$WORKBAY_AUTH_PIN^{commit}\") || exit 94
     [ \"$pinned\" = \"$actual\" ] || exit 94
-elif [ \"$WORKBAY_AUTH_REQUIRE_MAIN\" = 1 ]; then
-    git merge-base --is-ancestor \"$actual\" refs/heads/main || exit 94
+fi
+if [ \"$WORKBAY_AUTH_REQUIRE_MAIN\" = 1 ]; then
+    main=$(git show-ref --verify --hash refs/heads/main) || exit 94
+    git -c advice.graftFileDeprecated=false merge-base --is-ancestor \"$actual\" \"$main\" || exit 94
+    if [ -n \"$WORKBAY_AUTH_PIN\" ]; then
+        [ -n \"$WORKBAY_AUTH_REVIEW_SUBJECT\" ] || exit 95
+        git -c advice.graftFileDeprecated=false merge-base --is-ancestor \"$WORKBAY_AUTH_REVIEW_SUBJECT\" \"$main\" || exit 95
+    fi
+fi
+if [ -n "$WORKBAY_AUTH_SUPERSESSION_PYTHON" ]; then
+    "$WORKBAY_AUTH_SUPERSESSION_PYTHON" -I - <<'PY' || exit 96
+import hashlib, json, os, stat, subprocess
+
+def file_matches(path, digest, identity=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        observed = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(observed.st_mode)
+                or (identity is not None and [observed.st_dev, observed.st_ino, observed.st_ctime_ns] != identity)
+                or hashlib.file_digest(handle, "sha256").hexdigest() != digest):
+            return False
+        after = os.lstat(path)
+        return os.path.samestat(observed, after) and observed.st_ctime_ns == after.st_ctime_ns
+
+try:
+    env = os.environ
+    paths = json.loads(env["WORKBAY_AUTH_REMOVED_PATHS"])
+    for path in paths:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        raise ValueError("retirement path reappeared")
+    if not file_matches(env["WORKBAY_AUTH_REFLOG"], env["WORKBAY_AUTH_REFLOG_SHA"],
+                        json.loads(env["WORKBAY_AUTH_REFLOG_ID"])):
+        raise ValueError("branch incarnation changed")
+    if not file_matches(env["WORKBAY_AUTH_BUNDLE"], env["WORKBAY_AUTH_BUNDLE_SHA"]):
+        raise ValueError("recovery bundle changed")
+    if subprocess.run(["git", "symbolic-ref", "--quiet", env["WORKBAY_AUTH_PIN"]],
+                      stdout=subprocess.DEVNULL).returncode != 1:
+        raise ValueError("recovery pin is not a direct ref")
+    registry = subprocess.check_output(["git", "worktree", "list", "--porcelain", "-z"]).split(b"\\0")
+    if (not registry[0].startswith(b"worktree ")
+            or b"branch " + os.fsencode(env["WORKBAY_AUTH_REF"]) in registry
+            or any(row.startswith(b"worktree ") and os.path.realpath(os.fsdecode(row[9:])) == paths[0]
+                   for row in registry)):
+        raise ValueError("checkout registration changed")
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    raise SystemExit(str(error))
+PY
 fi
 """,
         encoding="utf-8",
@@ -683,11 +775,14 @@ def _lock_failure_detail(proc: subprocess.CompletedProcess[str]) -> str:
     return _detail(proc)[:300]
 
 
+_RetryResult = TypeVar("_RetryResult", bound=subprocess.CompletedProcess[str] | BranchDeleteResult)
+
+
 def _retry_after_ref_lock_recovery(
     root: Path,
     proc: subprocess.CompletedProcess[str],
-    retry,
-) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None, dict[str, object]]:
+    retry: Callable[[], _RetryResult],
+) -> tuple[subprocess.CompletedProcess[str] | _RetryResult, dict[str, object] | None, dict[str, object]]:
     """Recover one recognized lock failure and retry its mutation at most once."""
     from workbay_orchestrator_mcp import lane_reaping  # noqa: PLC0415
 
@@ -706,6 +801,8 @@ def _retry_after_ref_lock_recovery(
     if recovery.get("recovered") is not True:
         return proc, lock_info, recovery
     retried = retry()
+    if isinstance(retried, BranchDeleteResult):
+        return retried, None, recovery
     retry_lock_info = lane_reaping._ref_lock_busy_info(root, _detail(retried)) if retried.returncode != 0 else None
     return retried, retry_lock_info, recovery
 
@@ -830,6 +927,11 @@ def _apply_disposition_checks(
 
     if snapshot.probes.get("branch_tip") == "branch_missing":
         return _delete_result(plan, deleted=False, reason="branch_missing", detail=snapshot.probes["branch_tip"])
+    if plan.require_unowned_task_target and root is not None:
+        for path in snapshot.worktree_paths:
+            custody = _task_target_refusal(root, plan, worktree_path=path)
+            if custody is not None:
+                return custody
     if decision.rule == 0 and decision.reason == "probe_failed:landing_policy":
         return _delete_result(
             plan,
@@ -884,6 +986,43 @@ def _apply_disposition_checks(
     return None
 
 
+def review_pin_matches(root: Path, ref: str, tip: str) -> bool:
+    """A symbolic alias cannot retain the object after the source ref disappears."""
+    return _git(root, "symbolic-ref", "--quiet", ref).returncode == 1 and _resolve_ref(root, ref).sha == tip
+
+
+def review_preservation_ref(root: Path, branch: str, tip: str) -> str:
+    """Reuse an exact legacy pin or select the shared collision-free review ref."""
+    key = _short_branch_name(branch).removeprefix("feature/")
+    legacy = f"refs/reclaimed/{key}"
+    for ref in (legacy, f"{legacy}/{tip}"):
+        if review_pin_matches(root, ref, tip):
+            return ref
+    return f"refs/reclaimed/review-stage-tips/{key}/{tip}"
+
+
+def pin_review_tip(root: Path, branch: str, tip: str) -> tuple[bool, str]:
+    return _pin_preserved_tip(root, branch, tip, review_preservation_ref(root, branch, tip))
+
+
+def pin_task_finish_tip(root: Path, branch: str, tip: str) -> tuple[bool, str]:
+    return _pin_preserved_tip(root, branch, tip, f"refs/reclaimed/task-finish/{tip}")
+
+
+def _pin_preserved_tip(root: Path, branch: str, tip: str, reclaim_ref: str) -> tuple[bool, str]:
+    plan = _AuthorizedDeletePlan(
+        short_branch=branch,
+        branch_ref=f"refs/heads/{branch}",
+        sha=tip,
+        reclaim_ref=reclaim_ref,
+        review_stage=True,
+    )
+    refusal = _pin_authorized_tip(root, plan)
+    if refusal is not None:
+        return False, refusal.detail or refusal.reason
+    return True, plan.reclaim_ref
+
+
 def _pin_authorized_tip(root: Path, plan: _AuthorizedDeletePlan) -> BranchDeleteResult | None:
     pin_probe = _resolve_ref(root, plan.reclaim_ref)
     if pin_probe.probe_failed:
@@ -902,12 +1041,15 @@ def _pin_authorized_tip(root: Path, plan: _AuthorizedDeletePlan) -> BranchDelete
             detail=f"actual={existing_pin}",
         )
     expected_pin = existing_pin or _ZERO_SHA
-    pin = _git(root, "update-ref", plan.reclaim_ref, plan.sha, expected_pin)
+    update_args = ("--no-deref",) if plan.review_stage else ()
+    if plan.review_stage and _git(root, "symbolic-ref", "--quiet", plan.reclaim_ref).returncode != 1:
+        return _delete_result(plan, deleted=False, reason="pin_conflict", detail="pin_is_symbolic_or_unreadable")
+    pin = _git(root, "update-ref", *update_args, plan.reclaim_ref, plan.sha, expected_pin)
     if pin.returncode != 0:
         pin, lock_info, lock_recovery = _retry_after_ref_lock_recovery(
             root,
             pin,
-            lambda: _git(root, "update-ref", plan.reclaim_ref, plan.sha, expected_pin),
+            lambda: _git(root, "update-ref", *update_args, plan.reclaim_ref, plan.sha, expected_pin),
         )
         plan.lock_recovery = lock_recovery
         if lock_info is not None:
@@ -981,8 +1123,32 @@ def _act_refusal(plan: _AuthorizedDeletePlan) -> BranchDeleteResult | None:
     return _delete_result(plan, deleted=False, reason=refusal, detail=refusal)  # type: ignore[arg-type]
 
 
-def _run_guarded_branch_delete(root: Path, plan: _AuthorizedDeletePlan) -> subprocess.CompletedProcess[str]:
+def _task_target_refusal(
+    root: Path, plan: _AuthorizedDeletePlan, worktree_path: str | None = None
+) -> BranchDeleteResult | None:
+    if not plan.require_unowned_task_target:
+        return None
+    from workbay_orchestrator_mcp.lane_reaping import _live_task_target_refusal  # noqa: PLC0415
+
+    refusal, detail = _live_task_target_refusal(root, plan.short_branch, worktree_path)
+    if refusal is None:
+        return None
+    reason = "refused_owned" if refusal == "refused_owned" else "refused_owner_unknown"
+    return _delete_result(plan, deleted=False, reason=reason, detail=detail)
+
+
+def _run_guarded_branch_delete(
+    root: Path, plan: _AuthorizedDeletePlan
+) -> subprocess.CompletedProcess[str] | BranchDeleteResult:
     # Recheck on every actuator use, including lock-recovery retries (SECD-03).
+    if plan.effect_guard is not None and (hold := plan.effect_guard()):
+        return _delete_result(plan, deleted=False, reason="live_proof_failed", detail=hold)
+    if plan.review_stage:
+        from .review_stage_reap import review_branch_delete_guard  # noqa: PLC0415
+
+        owned, hold, subject = review_branch_delete_guard(root, plan.short_branch, plan.sha)
+        if not owned or hold or subject != plan.review_subject:
+            return subprocess.CompletedProcess([], 1, "", hold or "review_ownership_changed")
     if plan.force_delete:
         if not plan.recovery_verified or not plan.bundle_path:
             return subprocess.CompletedProcess([], 1, "", "verified_recovery_required")
@@ -1002,8 +1168,15 @@ def _run_guarded_branch_delete(root: Path, plan: _AuthorizedDeletePlan) -> subpr
         env = os.environ.copy()
         env["WORKBAY_AUTH_REF"] = plan.branch_ref
         env["WORKBAY_AUTH_SHA"] = plan.sha
-        env["WORKBAY_AUTH_PIN"] = plan.reclaim_ref if plan.force_delete else ""
+        env["WORKBAY_AUTH_PIN"] = plan.reclaim_ref if plan.force_delete or plan.review_stage else ""
         env["WORKBAY_AUTH_REQUIRE_MAIN"] = "" if plan.force_delete else "1"
+        env["WORKBAY_AUTH_REVIEW_SUBJECT"] = plan.review_subject
+        env["WORKBAY_AUTH_SUPERSESSION_PYTHON"] = sys.executable if plan.supersession_effect else ""
+        env.update(plan.supersession_effect)
+        # The landing lock still spans this read and Git, including on retry.
+        custody = _task_target_refusal(root, plan)
+        if custody is not None:
+            return custody
         return _git(
             root,
             "-c",
@@ -1016,7 +1189,9 @@ def _run_guarded_branch_delete(root: Path, plan: _AuthorizedDeletePlan) -> subpr
         )
 
 
-def _retry_guarded_branch_delete(root: Path, plan: _AuthorizedDeletePlan) -> subprocess.CompletedProcess[str]:
+def _retry_guarded_branch_delete(
+    root: Path, plan: _AuthorizedDeletePlan
+) -> subprocess.CompletedProcess[str] | BranchDeleteResult:
     """The lock-recovery retry is another act: re-prove the binding and the hook before it bypasses.
 
     A refusal returns as a failed delete, as a binding refusal does.
@@ -1166,10 +1341,16 @@ def _apply_authorized_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchD
     raced = _recheck_authorized_sha(root, plan)
     if raced is not None:
         return raced
+    return _delete_guarded_branch(root, plan)
+
+
+def _delete_guarded_branch(root: Path, plan: _AuthorizedDeletePlan) -> BranchDeleteResult:
     unbound = _act_refusal(plan)
     if unbound is not None:
         return unbound
     deleted = _run_guarded_branch_delete(root, plan)
+    if isinstance(deleted, BranchDeleteResult):
+        return deleted
     if deleted.returncode == 0:
         return _delete_result(plan, deleted=True, reason="deleted")
     deleted, lock_info, lock_recovery = _retry_after_ref_lock_recovery(
@@ -1179,6 +1360,8 @@ def _apply_authorized_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchD
     )
     if lock_recovery:
         plan.lock_recovery = lock_recovery
+    if isinstance(deleted, BranchDeleteResult):
+        return replace(deleted, lock_recovery=lock_recovery)
     if lock_info is not None:
         return _delete_result(
             plan,
@@ -1242,31 +1425,7 @@ def _apply_force_delete(root: Path, plan: _AuthorizedDeletePlan) -> BranchDelete
     raced = _recheck_authorized_sha(root, plan)
     if raced is not None:
         return raced
-    unbound = _act_refusal(plan)
-    if unbound is not None:
-        return unbound
-    deleted = _run_guarded_branch_delete(root, plan)
-    if deleted.returncode == 0:
-        return _delete_result(plan, deleted=True, reason="deleted")
-    deleted, lock_info, lock_recovery = _retry_after_ref_lock_recovery(
-        root,
-        deleted,
-        lambda: _retry_guarded_branch_delete(root, plan),
-    )
-    if lock_recovery:
-        plan.lock_recovery = lock_recovery
-    if lock_info is not None:
-        return _delete_result(
-            plan,
-            deleted=False,
-            reason="ref_lock_busy",
-            detail=_lock_failure_detail(deleted),
-            lock_info=lock_info,
-            lock_recovery=lock_recovery,
-        )
-    if deleted.returncode == 0:
-        return _delete_result(plan, deleted=True, reason="deleted", lock_recovery=lock_recovery)
-    return _reconcile_failed_delete(root, plan, deleted, lock_recovery)
+    return _delete_guarded_branch(root, plan)
 
 
 def _pre_mutation_guards(
@@ -1304,6 +1463,53 @@ def _landing_policy_preflight(plan: _AuthorizedDeletePlan, root: Path) -> Branch
     return _delete_result(plan, deleted=False, reason="landing_policy_unavailable", detail=detail)
 
 
+def _review_plan_refusal(root: Path, plan: _AuthorizedDeletePlan) -> BranchDeleteResult | None:
+    from .review_stage_reap import review_branch_delete_guard  # noqa: PLC0415
+    from .supersession_retirement import supersession_deferral  # noqa: PLC0415
+
+    if hold := supersession_deferral(root, branch=plan.short_branch, tip=plan.sha):
+        return _delete_result(plan, deleted=False, reason="live_proof_failed", detail=hold)
+
+    plan.review_stage, hold, plan.review_subject = review_branch_delete_guard(root, plan.short_branch, plan.sha)
+    if hold:
+        return _delete_result(plan, deleted=False, reason="live_proof_failed", detail=hold)
+    if plan.review_stage:
+        plan.reclaim_ref = review_preservation_ref(root, plan.short_branch, plan.sha)
+    return None
+
+
+def _delete_supersession_branch(
+    root: Path,
+    *,
+    branch: str,
+    tip: str,
+    pin: str,
+    bundle: Path,
+    lane_id: str,
+    task_ref: str,
+    revalidate: Callable[[], str | None],
+    effect: dict[str, str],
+) -> BranchDeleteResult:
+    """Delete under the registry caller's landing lock and Git's prepared ref guard."""
+    plan = _parse_authorized_target(lane_id, branch, tip)
+    if isinstance(plan, BranchDeleteResult):
+        return plan
+    plan.reclaim_ref = pin
+    plan.bundle_path = str(bundle)
+    plan.force_delete = plan.recovery_verified = True
+    plan.effect_guard = revalidate
+    plan.supersession_effect = effect
+    refusal = _pre_mutation_guards(root, plan) or _refuse_if_repo_hook(root, plan)
+    if refusal is not None:
+        return refusal
+    binding = bind_close_authority(task_ref=task_ref, lane_id=lane_id, branch=branch, tip=tip)
+    plan.binding = binding
+    refused, result, released = run_under_close_authority(binding, lambda: _delete_guarded_branch(root, plan))
+    if result is None:
+        return _delete_result(plan, deleted=False, reason="live_proof_failed", detail=refused)
+    return replace(result, fence_release=released) if released else result
+
+
 def _decide_and_act(
     root: Path,
     plan: _AuthorizedDeletePlan,
@@ -1311,6 +1517,9 @@ def _decide_and_act(
     integration_ref: str,
     expected_plan: str | None,
 ) -> BranchDeleteResult:
+    review_hold = _review_plan_refusal(root, plan)
+    if review_hold is not None:
+        return review_hold
     observed = _decide(root, plan, integration_ref)
     if isinstance(observed, BranchDeleteResult):
         return observed
@@ -1327,6 +1536,8 @@ def _decide_and_act(
         return refused
     if decision.branch_action == "delete_d":
         return _apply_authorized_delete(root, plan)
+    if plan.review_stage:
+        return _delete_result(plan, deleted=False, reason="live_proof_failed", detail="review_tip_requires_safe_delete")
     return _apply_force_delete(root, plan)
 
 
@@ -1346,6 +1557,9 @@ def _decide_and_act_bound(
     carried in ``fence_release`` and, when not ``released``, in the detail of a
     successful result too, so no success string erases it [AGT-10].
     """
+    custody = _task_target_refusal(root, plan)
+    if custody is not None:
+        return custody
     binding = bind_close_authority(task_ref=task_ref, lane_id=lane_id, branch=plan.short_branch, tip=plan.sha)
     if binding.refusal:
         return _delete_result(plan, deleted=False, reason=binding.refusal, detail=binding.refusal)  # type: ignore[arg-type]
@@ -1378,6 +1592,7 @@ def delete_authorized_branch(
     disposition: BranchDisposition | str | None = None,
     expected_plan: str | None = None,
     _lock_held: bool = False,
+    _require_unowned_task_target: bool = False,
 ) -> BranchDeleteResult:
     """Decide at the reference monitor and retire only the fresh plan."""
 
@@ -1387,6 +1602,7 @@ def delete_authorized_branch(
     if isinstance(parsed, BranchDeleteResult):
         return replace(parsed, requested_disposition=requested_disposition)
     parsed.requested_disposition = requested_disposition
+    parsed.require_unowned_task_target = _require_unowned_task_target
     refused = _pre_mutation_guards(root, parsed)
     if refused is not None:
         if apply and refused.reason == "branch_missing":
@@ -1395,6 +1611,12 @@ def delete_authorized_branch(
                 return settled
         return refused
     if not apply:
+        custody = _task_target_refusal(root, parsed)
+        if custody is not None:
+            return custody
+        review_hold = _review_plan_refusal(root, parsed)
+        if review_hold is not None:
+            return review_hold
         observed = _decide(root, parsed, integration_ref)
         if isinstance(observed, BranchDeleteResult):
             return observed

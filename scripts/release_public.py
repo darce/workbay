@@ -553,11 +553,19 @@ def run(argv: list[str]) -> int:
     confirmed = False
     # Automation never opens an implicit prompt. Exact approval is a separate
     # operator-only operation, after a concrete retained plan has been printed.
-    if args.command in ("publication-setup", "approve-publication"):
+    if args.command in ("publication-setup", "approve-publication", "verify-publication",
+                        "publication-status", "reconcile-publication"):
         import release_publication as publication
         try:
-            result = publication.operator(REPO_ROOT,
-                "setup" if args.command == "publication-setup" else "approve", args.prepared)
+            if args.command == "verify-publication":
+                result = publication.verify(REPO_ROOT, args.prepared)
+            elif args.command == "publication-status":
+                result = publication.publication_status(REPO_ROOT, args.prepared)
+            elif args.command == "reconcile-publication":
+                result = publication.reconcile(REPO_ROOT, args.prepared)
+            else:
+                result = publication.operator(REPO_ROOT,
+                    "setup" if args.command == "publication-setup" else "approve", args.prepared)
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             result = dict(status="publication_held", reason=str(exc))
             sys.stdout.write(json.dumps(result) + "\n")
@@ -1259,16 +1267,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("audit-tags", "publication-setup", "approve-publication"),
+        choices=("audit-tags", "publication-setup", "approve-publication", "verify-publication",
+                 "publication-status", "reconcile-publication"),
         default=None,
         help=(
-            "Optional read-only subcommand. 'audit-tags' lists pre-rebrand "
+            "'verify-publication' reads back the exact approved mirror refs from the Git vault. "
+            "'publication-status' inspects historical mirror completion in the vault. "
+            "'reconcile-publication' records completion locally after exact mirror readback. "
+            "'audit-tags' lists pre-rebrand "
             "stale-higher tags (version above the declared line on a pre-rebrand "
             "commit) and exits nonzero when any exist. Omit to run the release "
             "pipeline plan."
         ),
     )
-    parser.add_argument("--prepared", help="Retained content-addressed plan ID (effect/approval; no re-export).")
+    parser.add_argument("--prepared", help="Content-addressed plan ID for a publication operation.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
@@ -1301,7 +1313,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "names the offenders."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command in ("verify-publication", "publication-status", "reconcile-publication"):
+        if args.execute or not args.prepared:
+            parser.error(f"{args.command} requires --prepared and does not accept --execute")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

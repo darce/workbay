@@ -36,11 +36,12 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(repo), *args],
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -65,6 +66,42 @@ def _stage(repo: Path) -> dict:
     result = _run(repo, "stage", "--subject", "feature/fix-case-01", "--slug", "case")
     assert result.returncode == 0, result.stdout + result.stderr
     return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("checkout", ["primary", "linked"])
+def test_stage_uses_named_checkout_with_foreign_git_context(repo: Path, checkout: str) -> None:
+    named = repo
+    if checkout == "linked":
+        named = repo.with_name("linked")
+        _git(repo, "worktree", "add", "--detach", str(named), "main")
+    decoy = repo.with_name("decoy")
+    decoy.mkdir()
+    _git(decoy, "init", "-b", "main")
+    decoy_git = decoy / ".git"
+    env = {
+        **os.environ,
+        "GIT_DIR": str(decoy_git),
+        "GIT_COMMON_DIR": str(decoy_git),
+        "GIT_WORK_TREE": str(decoy),
+        "GIT_INDEX_FILE": str(decoy_git / "index"),
+        "GIT_OBJECT_DIRECTORY": str(decoy_git / "objects"),
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "user.name",
+        "GIT_CONFIG_VALUE_0": "Stage Test",
+        "GIT_CONFIG_KEY_1": "user.email",
+        "GIT_CONFIG_VALUE_1": "stage@example.invalid",
+    }
+    result = _run(named, "stage", "--subject", "feature/fix-case-01", "--slug", "case", env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    receipt = json.loads(result.stdout)
+    sidecar = Path(receipt["por_sidecar"])
+    assert sidecar.is_relative_to(repo)
+    assert sidecar.is_file()
+    assert _git(repo, "show", "-s", "--format=%ae", receipt["rev_branch"]) == "stage@example.invalid"
+    assert _git(decoy, "for-each-ref") == ""
+    assert not (decoy / ".task-state").exists()
+    assert not (decoy_git / "index").exists()
+    assert not any(path.is_file() for path in (decoy_git / "objects").rglob("*"))
 
 
 def _review_doc(
@@ -128,6 +165,22 @@ def test_stage_commits_patch_and_withholds_keys(repo: Path) -> None:
     # the patch is tracked in the review worktree, the sidecar is not
     assert str(patch.relative_to(worktree)) in _git(worktree, "ls-files")
     assert "review-por" not in _git(worktree, "ls-files")
+
+
+def test_adjudicate_uses_committed_stage_after_diff_presentation_changes(repo: Path) -> None:
+    receipt = _stage(repo)
+    sidecar = Path(receipt["por_sidecar"])
+    record = json.loads(sidecar.read_text())
+    assert sidecar.name == f"stage-{receipt['staged_commit']}.json"
+    assert record["patch_blob"] == _git(repo, "rev-parse", f"{record['staged_commit']}:{record['patch']}")
+    doc = _review_doc(repo, receipt, verdict="MERGE")
+    _git(repo, "config", "core.abbrev", "12")
+    _git(repo, "config", "diff.context", "0")
+    _git(repo, "config", "diff.noprefix", "true")
+
+    result = _run(repo, "adjudicate", "--subject", record["subject"], "--patch", receipt["patch"], "--docs", str(doc))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["verdict"] == "MERGE"
 
 
 def test_stage_without_worktree_cuts_rev_worktree_from_integration(repo: Path) -> None:
@@ -761,6 +814,40 @@ def test_explicit_root_linked_review_worktree_is_accepted(repo: Path) -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["rev_branch"] == "feature/rev1-fix-case-01"
+
+
+def test_stage_diff_uses_the_captured_subject_after_the_ref_advances(repo: Path, monkeypatch, capsys) -> None:
+    pipeline = _pipeline_module()
+    subject = "feature/fix-case-01"
+    captured = _git(repo, "rev-parse", subject)
+    _git(repo, "checkout", subject)
+    (repo / "later.txt").write_text("later\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "later subject")
+    later = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    _git(repo, "update-ref", f"refs/heads/{subject}", captured, later)
+    original_git = pipeline._git
+
+    def advance_after_capture(root, *argv):
+        result = original_git(root, *argv)
+        if argv[0] == "rev-parse" and any(arg.startswith(subject) for arg in argv[1:]):
+            _git(repo, "update-ref", f"refs/heads/{subject}", later, captured)
+        return result
+
+    monkeypatch.setattr(pipeline, "_git", advance_after_capture)
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "t")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "t@t")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "t")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "t@t")
+
+    assert pipeline.main(["--root", str(repo), "stage", "--subject", subject, "--slug", "case"]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["subject_tip"] == captured
+    assert _git(repo, "rev-parse", subject) == later
+    patch = Path(receipt["patch"]).read_bytes()
+    assert b"b.txt" in patch
+    assert b"later.txt" not in patch
 
 
 def test_auto_created_review_tree_is_removed_on_empty_diff(repo: Path) -> None:

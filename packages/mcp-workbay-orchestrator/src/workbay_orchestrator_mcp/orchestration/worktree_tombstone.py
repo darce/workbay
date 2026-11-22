@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -19,6 +20,8 @@ from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
+
+from . import landing_cleanup
 
 _INTENT_RELATIVE = Path(".task-state/worktree-tombstones")
 _GIT_TIMEOUT_S = 5.0
@@ -43,20 +46,25 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _write_intent(path: Path, intent: dict[str, Any]) -> None:
-    """Publish one intent with write, file fsync, rename, and dir fsync."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _replace_text(path: Path, contents: str) -> None:
+    """Publish a file with write, file fsync, rename, and directory fsync."""
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(intent, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
+            handle.write(contents)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_intent(path: Path, intent: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _replace_text(path, json.dumps(intent, sort_keys=True, separators=(",", ":")) + "\n")
+    if "landing_intent_id" in intent:
+        _fsync_directory(path.parent.parent)
 
 
 def _git(cwd: Path, args: list[str], *, timeout_s: float = _GIT_TIMEOUT_S) -> subprocess.CompletedProcess[str] | None:
@@ -103,17 +111,35 @@ def _git_text(cwd: Path, args: list[str], *, timeout_s: float = _GIT_TIMEOUT_S) 
     return (result.stdout or "").strip()
 
 
-def _admin_identity(worktree: Path) -> tuple[str, str] | None:
-    admin_dir = _git_text(worktree, ["rev-parse", "--path-format=absolute", "--git-dir"])
-    common_dir = _git_text(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+def _admin_identity(
+    worktree: Path, *, timeout_s: float = _GIT_TIMEOUT_S, linked_only: bool = True
+) -> tuple[str, str] | None:
+    admin_dir = _git_text(worktree, ["rev-parse", "--path-format=absolute", "--git-dir"], timeout_s=timeout_s)
+    common_dir = _git_text(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"], timeout_s=timeout_s)
     if not admin_dir or not common_dir:
         return None
     admin = Path(admin_dir).resolve()
     common = Path(common_dir).resolve()
     expected_parent = (common / "worktrees").resolve()
-    if admin.parent != expected_parent or admin == expected_parent:
+    if linked_only and admin.parent != expected_parent:
         return None
     return str(admin), str(common)
+
+
+def _directory_identity(path: Path) -> list[int] | None:
+    try:
+        entry = path.lstat()
+    except OSError:
+        return None
+    return [entry.st_dev, entry.st_ino] if stat.S_ISDIR(entry.st_mode) else None
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _new_intent(
@@ -204,6 +230,8 @@ def _read_porcelain(path: Path, *, timeout_s: float = _GIT_TIMEOUT_S) -> str | N
 
 
 def _foreign_content_reason(intent: dict[str, Any], tombstone: Path, *, timeout_s: float) -> str | None:
+    if "landing_intent_id" in intent:
+        return _landing_content_reason(intent, tombstone, timeout_s=timeout_s)
     branch = _git_text(tombstone, ["symbolic-ref", "--quiet", "--short", "HEAD"], timeout_s=timeout_s)
     head_sha = _git_text(tombstone, ["rev-parse", "--verify", "HEAD"], timeout_s=timeout_s)
     if branch is None or head_sha is None:
@@ -233,6 +261,80 @@ def _foreign_content_reason(intent: dict[str, Any], tombstone: Path, *, timeout_
     if any(line and not (line.startswith(" D ") or line.startswith("!! ")) for line in status.splitlines()):
         return "tombstone_foreign_content"
     return None
+
+
+def _landing_content_reason(intent: dict[str, Any], checkout: Path, *, timeout_s: float) -> str | None:
+    admin = Path(intent["admin_git_dir"])
+    dot_git = checkout / ".git"
+    redo = checkout == Path(intent["tombstone_path"]) and intent.get("remove_started") is True
+    checkout_identity = _directory_identity(checkout)
+    if checkout.is_symlink() or dot_git.is_symlink():
+        return "tombstone_foreign_identity"
+    if checkout_identity is None:
+        return "tombstone_guard_unavailable"
+    if checkout_identity != intent.get("worktree_identity"):
+        return "tombstone_foreign_identity"
+    if refusal := _landing_admin_reason(intent):
+        return refusal
+    if _entry_exists(dot_git):
+        observed = _admin_identity(checkout, timeout_s=timeout_s, linked_only=False)
+        if observed is None:
+            return "tombstone_guard_unavailable"
+        if observed != (str(admin), intent["git_common_dir"]):
+            return "tombstone_foreign_identity"
+    elif not redo:
+        return "tombstone_foreign_identity"
+
+    # An interrupted recursive remove may have unlinked the .git pointer.
+    # Inspect the remaining files using the exact recorded admin directory.
+    git_args = [f"--git-dir={admin}", f"--work-tree={checkout}"]
+    head = _git(checkout, [*git_args, "symbolic-ref", "--quiet", "HEAD"], timeout_s=timeout_s)
+    if head is None or head.returncode not in {0, 1}:
+        return "tombstone_guard_unavailable"
+    if head.returncode == 1 or head.stdout.strip() != f"refs/heads/{intent['branch']}":
+        return "tombstone_foreign_identity"
+    # Git status omits changes to assume-unchanged or skip-worktree entries.
+    tracked = _git_text(checkout, [*git_args, "ls-files", "-v", "-z"], timeout_s=timeout_s)
+    status = _git(
+        checkout,
+        [*git_args, "status", "--porcelain=v1", "-z", "-uall", "--ignored", "--ignore-submodules=none"],
+        timeout_s=timeout_s,
+    )
+    if tracked is None or status is None or status.returncode != 0:
+        return "tombstone_guard_unavailable"
+    if any(entry and not entry.startswith("H ") for entry in tracked.split("\0")):
+        return "tombstone_foreign_content"
+    if any(entry and not (redo and entry.startswith(" D ")) for entry in status.stdout.split("\0")):
+        return "tombstone_foreign_content"
+    return None
+
+
+def _repair_landing_links(intent: dict[str, Any]) -> tuple[bool, str]:
+    """Repair only either end of the exact Git link interrupted by this retirement."""
+    admin = Path(intent["admin_git_dir"])
+    backlink = admin / "gitdir"
+    dot_git = Path(intent["tombstone_path"]) / ".git"
+    try:
+        if backlink.is_symlink() or not backlink.is_file():
+            return False, "tombstone_foreign_identity"
+        registered = backlink.read_text(encoding="utf-8").rstrip("\n")
+        if registered == str(Path(intent["original_worktree_path"]) / ".git"):
+            # Git moved the checkout before updating its admin backlink.
+            _fsync_directory(dot_git.parent.parent)
+            _replace_text(backlink, f"{dot_git}\n")
+        elif registered != str(dot_git):
+            return False, "tombstone_foreign_identity"
+        if not os.path.lexists(dot_git):
+            if intent.get("remove_started") is not True:
+                return False, "tombstone_foreign_identity"
+            with dot_git.open("x", encoding="utf-8") as handle:
+                handle.write(f"gitdir: {admin}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_directory(dot_git.parent)
+    except (OSError, UnicodeError):
+        return False, "tombstone_link_repair_failed"
+    return True, ""
 
 
 def _live_process_reason(original: Path, tombstone: Path, *, timeout_s: float) -> str | None:
@@ -287,7 +389,7 @@ def _intent_paths(repo_root: Path) -> list[Path]:
     return sorted(path for path in directory.glob("*.json") if path.is_file())
 
 
-def _valid_intent(repo_root: Path, path: Path, intent: dict[str, Any]) -> bool:
+def _valid_intent(repo_root: Path, path: Path, intent: dict[str, Any], *, current_common: str | None = None) -> bool:
     lane_id = intent.get("lane_id")
     nonce = intent.get("nonce")
     original_text = intent.get("original_worktree_path")
@@ -302,7 +404,10 @@ def _valid_intent(repo_root: Path, path: Path, intent: dict[str, Any]) -> bool:
     if re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
         return False
     lane_key = hashlib.sha256(lane_id.encode("utf-8")).hexdigest()[:16]
-    if path.name != f"{lane_key}-{nonce}.json":
+    landing_id = intent.get("landing_intent_id")
+    if path.name != f"{lane_key}-{nonce}.json" and (
+        not isinstance(landing_id, str) or path.name != f"{landing_id}.json"
+    ):
         return False
     original = Path(original_text).resolve(strict=False)
     tombstone = Path(tombstone_text).resolve(strict=False)
@@ -312,7 +417,8 @@ def _valid_intent(repo_root: Path, path: Path, intent: dict[str, Any]) -> bool:
     admin = Path(admin_text).resolve(strict=False)
     if admin.parent != (common / "worktrees").resolve(strict=False):
         return False
-    current_common = _git_text(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if current_common is None:
+        current_common = _git_text(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
     return current_common is not None and Path(current_common).resolve(strict=False) == common
 
 
@@ -337,6 +443,7 @@ def has_intent_for_worktree(
             not isinstance(intent, dict)
             or intent.get("schema") != _SCHEMA
             or intent.get("blocked_reason")
+            or "landing_intent_id" in intent
             or not _valid_intent(root, path, intent)
         ):
             continue
@@ -357,7 +464,7 @@ def has_intent_for_worktree(
 
 
 def pending_intents(repo_root: Path | str) -> int:
-    return len(_intent_paths(Path(repo_root).resolve()))
+    return len(_wake_intent_paths(Path(repo_root).resolve()))
 
 
 def _remove_intent(path: Path) -> None:
@@ -421,13 +528,160 @@ def _drop_exact_stale_admin(intent: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def _landing_admin_reason(intent: Mapping[str, Any]) -> str | None:
+    admin = Path(intent["admin_git_dir"])
+    identity = _directory_identity(admin)
+    if admin.is_symlink():
+        return "tombstone_foreign_identity"
+    if identity is None:
+        return "tombstone_guard_unavailable"
+    if identity != intent.get("admin_identity"):
+        return "tombstone_foreign_identity"
+    backlink, common = admin / "gitdir", admin / "commondir"
+    if backlink.is_symlink() or common.is_symlink():
+        return "tombstone_foreign_identity"
+    try:
+        target = backlink.read_text(encoding="utf-8").rstrip("\n")
+        common_dir = (admin / common.read_text(encoding="utf-8").strip()).resolve()
+    except (OSError, UnicodeError):
+        return "tombstone_guard_unavailable"
+    if target not in {str(Path(intent[key]) / ".git") for key in ("original_worktree_path", "tombstone_path")}:
+        return "tombstone_foreign_identity"
+    if common_dir != Path(intent["git_common_dir"]):
+        return "tombstone_foreign_identity"
+    return None
+
+
+def _remove_bound_tree(parent_fd: int, name: str, identity: list[int]) -> tuple[bool, str]:
+    if not shutil.rmtree.avoids_symlink_attacks:
+        return False, "tombstone_guard_unavailable"
+    observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(observed.st_mode) or [observed.st_dev, observed.st_ino] != identity:
+        return False, "tombstone_foreign_identity"
+    shutil.rmtree(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    return True, ""
+
+
+def _delete_landing_checkout(path: Path, intent: dict[str, Any], tombstone: Path) -> tuple[bool, str]:
+    # Git's worktree remove couples tree deletion with unjournaled admin deletion.
+    # Retain the registration for content checks until the tree is fully gone.
+    admin = Path(intent["admin_git_dir"])
+    if any(_entry_exists(admin / marker) for marker in ("locked", "HEAD.lock", "index.lock")):
+        return False, "tombstone_locked"
+    repaired, detail = _repair_landing_links(intent)
+    if not repaired:
+        return False, detail
+    if intent.get("remove_started") is not True:
+        intent["remove_started"] = True
+        _write_intent(path, intent)
+    descriptor = os.open(tombstone.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return _remove_bound_tree(descriptor, tombstone.name, intent["worktree_identity"])
+    finally:
+        os.close(descriptor)
+
+
+def _retire_landing_admin(path: Path, intent: dict[str, Any]) -> tuple[bool, str]:
+    """Cut over the exact registration, then delete it from a private directory."""
+    from ..lane_reaping import _worktree_operation_refusal  # noqa: PLC0415
+
+    admin = Path(intent["admin_git_dir"])
+    common = Path(intent["git_common_dir"])
+    holder = common / f".workbay-retire-{intent['nonce']}"
+    destination = holder / "admin"
+    identity = intent.get("admin_identity")
+    if intent.get("remove_started") is not True:
+        return False, "tombstone_foreign_identity"
+    if any(_entry_exists(Path(intent[key])) for key in ("original_worktree_path", "tombstone_path")):
+        return False, "tombstone_remove_incomplete"
+
+    expected_move = {"source": str(admin), "destination": str(destination), "identity": identity}
+    phase = intent.get("admin_move")
+    if phase is None:
+        _fsync_directory(Path(intent["tombstone_path"]).parent)
+        if not _entry_exists(admin):
+            # Older Git removal could finish both effects before the journal was cleared.
+            return (False, "tombstone_foreign_identity") if _entry_exists(holder) else (True, "")
+        if _entry_exists(holder):
+            return False, "tombstone_foreign_identity"
+        intent["admin_move"] = phase = {**expected_move, "cutover": False}
+        _write_intent(path, intent)
+    else:
+        cutover = phase.get("cutover") if isinstance(phase, dict) else None
+        if type(cutover) is not bool or phase != {**expected_move, "cutover": cutover}:
+            return False, "tombstone_foreign_identity"
+    if phase["cutover"] and _directory_identity(admin) == identity:
+        return False, "tombstone_foreign_identity"
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as stack:
+
+        def open_directory(directory: Path | str, *, dir_fd: int | None = None) -> int:
+            descriptor = os.open(directory, flags, dir_fd=dir_fd)
+            stack.callback(os.close, descriptor)
+            return descriptor
+
+        common_fd = open_directory(common)
+        if not _entry_exists(holder):
+            if phase["cutover"]:
+                return True, ""
+            os.mkdir(holder.name, mode=0o700, dir_fd=common_fd)
+            os.fsync(common_fd)
+        holder_fd = open_directory(holder.name, dir_fd=common_fd)
+        holder_stat = os.fstat(holder_fd)
+        if holder_stat.st_uid != os.geteuid() or holder_stat.st_mode & 0o077:
+            return False, "tombstone_foreign_identity"
+        if not phase["cutover"]:
+            if not _entry_exists(destination):
+                admin_parent_fd = open_directory(admin.parent)
+                if refusal := _landing_admin_reason(intent):
+                    return False, refusal
+                if any(_entry_exists(admin / marker) for marker in ("locked", "HEAD.lock", "index.lock")):
+                    return False, "tombstone_locked"
+                refused, detail = _worktree_operation_refusal(admin)
+                if refused:
+                    return False, detail
+                head = admin / "HEAD"
+                if (
+                    head.is_symlink()
+                    or head.read_text(encoding="utf-8").strip() != f"ref: refs/heads/{intent['branch']}"
+                ):
+                    return False, "tombstone_foreign_identity"
+                bound = os.fstat(open_directory(admin.name, dir_fd=admin_parent_fd))
+                if [bound.st_dev, bound.st_ino] != identity:
+                    return False, "tombstone_foreign_identity"
+                os.rename(admin.name, destination.name, src_dir_fd=admin_parent_fd, dst_dir_fd=holder_fd)
+            if _directory_identity(destination) != identity:
+                return False, "tombstone_foreign_identity"
+            # Git may prune an empty worktrees directory after the rename.
+            try:
+                _fsync_directory(admin.parent)
+            except FileNotFoundError:
+                os.fsync(common_fd)
+            os.fsync(holder_fd)
+            intent["admin_move"] = {**expected_move, "cutover": True}
+            _write_intent(path, intent)
+
+        if _entry_exists(destination):
+            removed, detail = _remove_bound_tree(holder_fd, destination.name, identity)
+            if not removed:
+                return False, detail
+        observed = os.stat(holder.name, dir_fd=common_fd, follow_symlinks=False)
+        if (observed.st_dev, observed.st_ino) != (holder_stat.st_dev, holder_stat.st_ino):
+            return False, "tombstone_foreign_identity"
+        os.rmdir(holder.name, dir_fd=common_fd)
+        os.fsync(common_fd)
+    return True, ""
+
+
 def _delete_tombstone(
-    repo_root: Path, intent: dict[str, Any], *, timeout_s: float = _GIT_TIMEOUT_S
+    repo_root: Path, intent: dict[str, Any], *, timeout_s: float = _GIT_TIMEOUT_S, force: bool = True
 ) -> tuple[bool, str]:
     tombstone = Path(str(intent["tombstone_path"]))
     result = _git_mutation(
         repo_root,
-        ["worktree", "remove", "--force", str(tombstone)],
+        ["worktree", "remove", *(["--force"] if force else []), str(tombstone)],
         timeout_s=timeout_s,
     )
     if result is not None and result.returncode == 0:
@@ -532,17 +786,61 @@ def _drain_one_locked(
     if "close_authority" in intent and not isinstance(intent["close_authority"], dict):
         return "foreign", "tombstone_foreign_identity"
 
-    def run_actuator(actuator: Callable[[], tuple[bool, str]]) -> tuple[str, str, tuple[bool, str]]:
+    def run_actuator(
+        actuator: Callable[[], tuple[bool, str]], *, affected_path: Path | None
+    ) -> tuple[str, str, tuple[bool, str]]:
         """Run one removal step under the authority the lane's row carries now.
 
-        Returns ``(state, reason, result)``. An empty ``state`` means ``actuator`` ran and ``result``
-        is its outcome; otherwise ``(state, reason)`` is the drain outcome and the step did not run.
+        Returns ``(state, reason, result)``. An empty ``state`` means ``result`` is the step outcome,
+        including any custody refusal. Otherwise ``(state, reason)`` is the lane authority refusal.
         The authority is re-derived before every step (``_current_step_authority``), so a persisted
         intent, legacy or not, never stands in for the row. A fenced step that ran appends its fence
         release state to ``fence_releases``, beside its result and never as a refusal, also when it
         raised [AGT-10]. Only a positively rowless or legacy lane runs unfenced.
         """
         import workbay_orchestrator_mcp.lane_reaping as lane_reaping  # noqa: PLC0415
+
+        def guarded_actuator() -> tuple[bool, str]:
+            # Read current Handoff custody under the landing and worker locks, after
+            # any row fence has been claimed and its SQLite transaction has ended.
+            custody_refusal, _detail = lane_reaping._live_task_target_refusal(
+                repo_root, intent["branch"], str(affected_path) if affected_path is not None else None
+            )
+            if custody_refusal:
+                return False, custody_refusal
+            if landing_removal:
+                review_hold = lane_reaping._generic_review_deferral(repo_root, intent["branch"], intent["expected_tip"])
+                if review_hold:
+                    return False, review_hold
+                # A session or another lane can claim the checkout between
+                # attempts. Keep the original path in the liveness check after move.
+                for checkout in dict.fromkeys((original, affected_path)):
+                    if checkout is None:
+                        continue
+                    guard_identity = {
+                        "repo_root": repo_root,
+                        "worktree_path": str(checkout),
+                        "task_ref": intent["task_ref"],
+                        "lane_id": intent["lane_id"],
+                    }
+                    for probe in (
+                        lane_reaping._session_heartbeat_blocks_reclaim,
+                        lane_reaping._shared_path_blocks_reclaim,
+                    ):
+                        blocked, detail = probe(**guard_identity)
+                        if blocked:
+                            return False, detail
+                if affected_path is not None:
+                    refused, detail = lane_reaping._worktree_operation_refusal(Path(intent["admin_git_dir"]))
+                    if refused:
+                        return False, detail
+                    tip_refusal = check_expected_tip(remaining)
+                    if tip_refusal is not None:
+                        return False, tip_refusal[1]
+                    foreign = _landing_content_reason(intent, affected_path, timeout_s=remaining)
+                    if foreign:
+                        return False, foreign
+            return actuator()
 
         refused, authority = _current_step_authority(intent)
         if refused:
@@ -551,13 +849,13 @@ def _drain_one_locked(
                 return "foreign", refused, (False, refused)
             return "pending", refused, (False, refused)
         if authority is None:
-            return "", "", actuator()
+            return "", "", guarded_actuator()
         try:
             refusal, result, release = lane_reaping._run_under_reclaim_fence(
                 task_ref=str(intent["task_ref"]),
                 lane_id=str(intent["lane_id"]),
                 authority=authority,
-                actuator=actuator,
+                actuator=guarded_actuator,
             )
         except BaseException as exc:
             escaped = lane_reaping.reclaim_fence_release_of(exc)
@@ -579,11 +877,14 @@ def _drain_one_locked(
         expected_tip = intent["expected_tip"]
         if not isinstance(expected_tip, str) or re.fullmatch(r"[0-9a-f]{40}", expected_tip) is None:
             return "foreign", "tombstone_foreign_identity"
-        probe = _git(
-            repo_root, ["rev-parse", "--verify", f"refs/heads/{intent['branch']}^{{commit}}"], timeout_s=timeout_s
-        )
+        ref = f"refs/heads/{intent['branch']}"
+        probe = _git(repo_root, ["rev-parse", "--verify", f"{ref}^{{commit}}"], timeout_s=timeout_s)
         if probe is None:
             return "pending", "tombstone_guard_unavailable"
+        if landing_removal and probe.returncode != 0:
+            present = _git(repo_root, ["show-ref", "--verify", "--quiet", ref], timeout_s=timeout_s)
+            if present is None or present.returncode != 1:
+                return "pending", "tombstone_guard_unavailable"
         if probe.returncode != 0 or probe.stdout.strip() != expected_tip:
             _mark_blocked(path, intent, "tip_moved_after_intent")
             return "foreign", "tip_moved_after_intent"
@@ -591,6 +892,9 @@ def _drain_one_locked(
 
     original = Path(str(intent["original_worktree_path"]))
     tombstone = Path(str(intent["tombstone_path"]))
+    landing_removal = "landing_intent_id" in intent
+    if landing_removal and (original.is_symlink() or tombstone.is_symlink()):
+        return "foreign", "tombstone_foreign_identity"
     original_exists = original.exists()
     tombstone_exists = tombstone.exists()
     if original_exists and tombstone_exists:
@@ -614,7 +918,9 @@ def _drain_one_locked(
         tip_refusal = check_expected_tip(remaining)
         if tip_refusal is not None:
             return tip_refusal
-        state, reason, moved = run_actuator(lambda: _move_worktree(repo_root, intent, timeout_s=remaining))
+        state, reason, moved = run_actuator(
+            lambda: _move_worktree(repo_root, intent, timeout_s=remaining), affected_path=original
+        )
         if state:
             return state, reason
         _moved, detail = moved
@@ -646,28 +952,42 @@ def _drain_one_locked(
         tip_refusal = check_expected_tip(remaining)
         if tip_refusal is not None:
             return tip_refusal
-        state, reason, removed = run_actuator(lambda: _delete_tombstone(repo_root, intent, timeout_s=remaining))
+
+        # The move already retired the original path. Only the linked branch
+        # and the checkout at its verified tombstone path are affected here.
+        def delete() -> tuple[bool, str]:
+            if not landing_removal:
+                return _delete_tombstone(repo_root, intent, timeout_s=remaining)
+            return _delete_landing_checkout(path, intent, tombstone)
+
+        state, reason, removed = run_actuator(delete, affected_path=tombstone)
         if state:
             return state, reason
         deleted, detail = removed
         if not deleted and tombstone.exists():
-            return "pending", detail
+            return ("foreign" if landing_removal and _is_permanent_reason(detail) else "pending"), detail
 
     if original.exists() or tombstone.exists():
         return "pending", "tombstone_remove_incomplete"
-    admin_exists = _linked_admin_exists(intent)
-    if admin_exists is True:
-        state, reason, dropped_admin = run_actuator(lambda: _drop_exact_stale_admin(intent))
+    if landing_removal:
+        state, reason, (dropped, detail) = run_actuator(lambda: _retire_landing_admin(path, intent), affected_path=None)
         if state:
             return state, reason
-        dropped, detail = dropped_admin
         if not dropped:
-            if _is_permanent_reason(detail):
-                _mark_blocked(path, intent, detail)
-                return "foreign", detail
-            return "pending", detail
-    elif admin_exists is None:
-        return "pending", "tombstone_admin_identity_unknown"
+            return ("foreign" if _is_permanent_reason(detail) else "pending"), detail
+    else:
+        admin_exists = _linked_admin_exists(intent)
+        if admin_exists is True:
+            state, reason, (dropped, detail) = run_actuator(lambda: _drop_exact_stale_admin(intent), affected_path=None)
+            if state:
+                return state, reason
+            if not dropped:
+                if _is_permanent_reason(detail):
+                    _mark_blocked(path, intent, detail)
+                    return "foreign", detail
+                return "pending", detail
+        elif admin_exists is None:
+            return "pending", "tombstone_admin_identity_unknown"
     _remove_intent(path)
     return "drained", ""
 
@@ -698,6 +1018,16 @@ def _current_step_authority(intent: Mapping[str, Any]) -> tuple[str, dict[str, A
     if refusal:
         return refusal, None
     original = _resolved_text(intent.get("original_worktree_path"))
+    if "landing_intent_id" in intent and (
+        row is None
+        or row.get("id") != intent.get("row_id")
+        or row.get("status") != "merged"
+        or row.get("branch_tip_sha") != intent.get("expected_tip")
+        or row.get("landing_commit_sha") != intent.get("landing_commit")
+        or lane_reaping._recorded_branch_short_name(row.get("branch")) != intent.get("branch")
+        or _resolved_text(row.get("worktree_path")) != original
+    ):
+        return "row_changed_after_close", None
     if isinstance(persisted, dict):
         if authority is None or authority != persisted:
             return "row_changed_after_close", None
@@ -712,6 +1042,8 @@ def _current_step_authority(intent: Mapping[str, Any]) -> tuple[str, dict[str, A
         )
         return ("", authority) if bound else ("row_changed_after_close", None)
     if row is None:
+        return "", None
+    if "landing_intent_id" in intent:
         return "", None
     if row.get("branch") != intent.get("branch") or _resolved_text(row.get("worktree_path")) != original:
         return "row_changed_after_close", None
@@ -744,6 +1076,7 @@ def retire_worktree(
     landing_lock_held: bool = False,
     expected_tip: str | None = None,
     close_authority: Mapping[str, Any] | None = None,
+    landing_intent_id: str | None = None,
 ) -> tuple[bool, str]:
     """Write intent, atomically cut over to a tombstone, then drain it.
 
@@ -776,10 +1109,139 @@ def retire_worktree(
     path, intent = _new_intent(
         root, worktree_path, lane_id, task_ref, expected_tip=expected_tip, close_authority=close_authority
     )
+    if landing_intent_id is not None:
+        landing = landing_cleanup.load_intent(root, landing_intent_id)
+        if landing is None or landing.get("local_status") != "pending":
+            return False, "landing_cleanup_intent_unavailable"
+        identity = landing["identity"]
+        row = landing["lane_row"]
+        original = Path(intent["original_worktree_path"])
+        if (
+            not landing_lock_held
+            or landing_cleanup._intent_id(identity)[0] != landing_intent_id
+            or identity["task_ref"] != task_ref
+            or identity["lane_id"] != lane_id
+            or identity["expected_tip"] != expected_tip
+            or intent["head_sha"] != expected_tip
+            or type(row.get("id")) is not int
+            or str(row.get("branch") or "").removeprefix("refs/heads/") != intent["branch"]
+            or _resolved_text(row.get("worktree_path")) != str(original)
+        ):
+            return False, "tombstone_foreign_identity"
+        worktree_identity = _directory_identity(original)
+        admin_identity = _directory_identity(Path(intent["admin_git_dir"]))
+        if worktree_identity is None or admin_identity is None:
+            return False, "tombstone_guard_unavailable"
+        directory = _landing_intent_dir(root)
+        if directory.parents[1] != Path(intent["git_common_dir"]):
+            return False, "tombstone_foreign_identity"
+        if _landing_retirement_records(root, landing, directory):
+            return False, "landing_tombstone_pending"
+        path = directory / f"{landing_intent_id}.json"
+        intent.update(
+            landing_intent_id=landing_intent_id,
+            landing_commit=identity["landing_commit"],
+            row_id=row["id"],
+            worktree_identity=worktree_identity,
+            admin_identity=admin_identity,
+        )
     _write_intent(path, intent)
+    return _finish_retirement(root, path, intent, landing_lock_held=landing_lock_held)
+
+
+def _landing_intent_dir(root: Path) -> Path:
+    return landing_cleanup._cleanup_dir(root, create=False) / _INTENT_RELATIVE.name
+
+
+def _wake_intent_paths(root: Path) -> list[Path]:
+    paths = _intent_paths(root)
+    try:
+        paths.extend(sorted(_landing_intent_dir(root).glob("*.json")))
+    except landing_cleanup.CleanupIntentError:
+        # The legacy sweep can still report its own journals when Git is unavailable.
+        pass
+    return paths
+
+
+def _landing_retirement_records(
+    root: Path, landing: Mapping[str, Any], directory: Path
+) -> list[tuple[Path, dict[str, Any]]]:
+    landing_id = landing["intent_id"]
+    canonical = directory / f"{landing_id}.json"
+    matches = []
+    try:
+        intent = json.loads(canonical.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+    else:
+        if not isinstance(intent, dict) or intent.get("landing_intent_id") != landing_id:
+            raise ValueError("landing_retirement_identity_invalid")
+        matches.append((canonical, intent))
+
+    lane_key = hashlib.sha256(landing["identity"]["lane_id"].encode("utf-8")).hexdigest()[:16]
+    # Old landing producers wrote inside their invocation checkout. Keep those
+    # journals at their original addresses and let the receipt owner replay them.
+    directories = {root / _INTENT_RELATIVE}
+    directories.update(checkout / _INTENT_RELATIVE for checkout, _ in landing_cleanup._registered_worktrees(root))
+    for candidate in sorted(directories):
+        try:
+            paths = sorted(candidate.iterdir())
+        except FileNotFoundError:
+            continue
+        for path in paths:
+            if not path.name.startswith(f"{lane_key}-") or path.suffix != ".json":
+                continue
+            try:
+                intent = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                # Canonical replay may have just completed this record.
+                continue
+            if isinstance(intent, dict) and intent.get("landing_intent_id") == landing_id:
+                matches.append((path, intent))
+    return matches
+
+
+def has_pending_landing_retirement(root: Path, landing: Mapping[str, Any]) -> bool:
+    """Whether this landing still has a worktree retirement record to settle."""
+    return bool(_landing_retirement_records(root, landing, _landing_intent_dir(root)))
+
+
+def resume_landing_retirement(root: Path, landing: Mapping[str, Any], *, deadline: float | None) -> tuple[bool, str]:
+    """Resume only the tombstone owned by this verified, locked landing replay."""
+    identity = landing["identity"]
+    row = landing["lane_row"]
+    try:
+        directory = _landing_intent_dir(root)
+        matches = _landing_retirement_records(root, landing, directory)
+    except (landing_cleanup.CleanupIntentError, OSError, subprocess.TimeoutExpired, ValueError):
+        return False, "tombstone_guard_unavailable"
+    if not matches:
+        return True, ""
+    if len(matches) != 1:
+        return False, "tombstone_move_state_ambiguous"
+    path, intent = matches[0]
+    if (
+        intent.get("schema") != _SCHEMA
+        or not _valid_intent(root, path, intent, current_common=str(directory.parents[1]))
+        or intent.get("task_ref") != identity["task_ref"]
+        or intent.get("lane_id") != identity["lane_id"]
+        or intent.get("expected_tip") != identity["expected_tip"]
+        or intent.get("head_sha") != identity["expected_tip"]
+        or intent.get("landing_commit") != identity["landing_commit"]
+        or intent.get("row_id") != row.get("id")
+        or intent.get("branch") != str(row.get("branch") or "").removeprefix("refs/heads/")
+        or intent.get("original_worktree_path") != _resolved_text(row.get("worktree_path"))
+    ):
+        return False, "tombstone_foreign_identity"
+    return _finish_retirement(root, path, intent, landing_lock_held=True, deadline=deadline)
+
+
+def _finish_retirement(
+    root: Path, path: Path, intent: dict[str, Any], *, landing_lock_held: bool, deadline: float | None = None
+) -> tuple[bool, str]:
     releases: list[str] = []
     state, detail = _drain_one(
-        root, path, intent, deadline=None, landing_lock_held=landing_lock_held, fence_releases=releases
+        root, path, intent, deadline=deadline, landing_lock_held=landing_lock_held, fence_releases=releases
     )
     if state == "drained":
         return True, _unreleased_fence_detail(releases)
@@ -804,7 +1266,7 @@ def drain_intents(repo_root: Path | str, *, deadline: float | None = None) -> di
     budget_exhausted = False
     could_not_act: list[dict[str, str]] = []
     fence_release: list[dict[str, str]] = []
-    for path in _intent_paths(root):
+    for path in _wake_intent_paths(root):
         if deadline is not None and time.monotonic() >= deadline:
             budget_exhausted = True
             break
@@ -833,6 +1295,18 @@ def drain_intents(repo_root: Path | str, *, deadline: float | None = None) -> di
                     "task_ref": "",
                     "reason": "tombstone_intent_invalid",
                     "detail": f"{type(exc).__name__}:{exc}"[:300],
+                }
+            )
+            continue
+        if "landing_intent_id" in intent:
+            # Landing replay re-verifies receipt, projection and bundle before
+            # acting on its tombstone. Leave that authorization with its owner.
+            could_not_act.append(
+                {
+                    "lane_id": intent["lane_id"],
+                    "task_ref": intent["task_ref"],
+                    "reason": "landing_cleanup_replay_required",
+                    "detail": str(intent.get("blocked_reason") or intent.get("last_transient_reason") or ""),
                 }
             )
             continue

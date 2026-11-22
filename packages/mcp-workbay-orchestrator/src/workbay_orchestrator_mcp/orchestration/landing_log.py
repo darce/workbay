@@ -47,6 +47,7 @@ _RELEASE_KEYS = _RELEASE_ONLY_KEYS | {KEY_LANE}
 _SUPERSEDE_PLAN_VALUE = re.compile(r"^sha256:([0-9a-f]{64}) (refs/heads/[^\s]+)$")
 _GIT_TIMEOUT_S = 10.0
 _QUARANTINE_DIR = Path(".task-state", "control-path-quarantine")
+_EXACT_OBJECT_GRAPH: ContextVar[bool] = ContextVar("landing_log_exact_object_graph", default=False)
 
 
 @dataclass(frozen=True)
@@ -358,8 +359,16 @@ def parse_tombstones(message: str) -> list[Tombstone | dict[str, str]]:
 def _run_git(repo: str | Path, *args: str, timeout_s: float = _GIT_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
     from workbay_handoff_mcp.shared_write_context import run_subprocess
 
+    argv = ["git", "-C", str(repo)]
+    if _EXACT_OBJECT_GRAPH.get():
+        env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE=os.devnull)
+        env.pop("GIT_SHALLOW_FILE", None)
+        return run_subprocess(
+            [*argv, "-c", "advice.graftFileDeprecated=false", *args],
+            capture_output=True, text=True, check=False, timeout=timeout_s, env=env,
+        )
     return run_subprocess(
-        ["git", "-C", str(repo), *args],
+        [*argv, *args],
         capture_output=True,
         text=True,
         check=False,
@@ -810,7 +819,13 @@ def format_supersede_plan(*, plan_digest: str, integration_ref: str) -> str:
 
 
 def _reviewed_operator_plan(
-    repo: str | Path, tombstone: Tombstone, *, main_ref: str, deadline: float
+    repo: str | Path,
+    tombstone: Tombstone,
+    *,
+    main_ref: str,
+    deadline: float,
+    receipt: str | None = None,
+    reviewed_ref: str | None = None,
 ) -> tuple[str, str | None] | None:
     """Return ``None`` when a first-parent commit binds this tombstone to its reviewed plan.
 
@@ -855,6 +870,8 @@ def _reviewed_operator_plan(
         if len(fields) != 3:
             continue
         commit, parents, message = fields
+        if receipt is not None and commit != receipt:
+            continue
         trailers = [entry.rstrip() for entry in _final_paragraph(message) or []]
         if line not in trailers:
             continue
@@ -866,7 +883,12 @@ def _reviewed_operator_plan(
             refusal = refusal if refusal[0] != "absent" else ("operator_provenance_invalid", commit.strip())
             continue
         digest, integration_ref = parsed.groups()
-        parent = parents.split()[0] if parents.split() else ""
+        if reviewed_ref is not None and integration_ref != reviewed_ref:
+            return "operator_provenance_mismatch", commit
+        parent_shas = parents.split()
+        if receipt is not None and len(parent_shas) != 1:
+            return "operator_provenance_invalid", commit
+        parent = parent_shas[0] if parent_shas else ""
         expected = supersede_plan_digest(
             branch_ref=branch_ref,
             branch_tip=tombstone.tip,
@@ -876,6 +898,21 @@ def _reviewed_operator_plan(
             tombstone_line=line,
         )
         if expected == digest:
+            if receipt is not None:
+                try:
+                    diff = _run_git(
+                        repo,
+                        "diff-tree",
+                        "--quiet",
+                        parent,
+                        receipt,
+                        "--",
+                        timeout_s=_call_timeout(_GIT_TIMEOUT_S, deadline),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    return "probe_failed", "supersede_operator_tree_unreadable"
+                if diff.returncode != 0:
+                    return "operator_provenance_invalid", commit
             return None
         refusal = refusal if refusal[0] != "absent" else ("operator_provenance_mismatch", commit.strip())
     return refusal
@@ -965,6 +1002,60 @@ def verify_tombstone(
     if verdict.verified and tombstone.kind == "superseded_by_integration":
         return _declared_supersede_authority(repo, verdict, deadline, main_ref=main_ref)
     return verdict
+
+
+def reviewed_supersession_hold(
+    repo: Path, *, branch: str, tip: str, receipt: str, integration_ref: str, deadline: float | None = None
+) -> str | None:
+    """Qualify only the named operator-reviewed first-parent declaration."""
+    end = time.monotonic() + _GIT_TIMEOUT_S
+    token = _EXACT_OBJECT_GRAPH.set(True)
+    try:
+        return _exact_supersession_hold(
+            repo, branch, tip, receipt, integration_ref, end if deadline is None else min(end, deadline)
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "supersession_git_probe_failed"
+    finally:
+        _EXACT_OBJECT_GRAPH.reset(token)
+
+
+def _exact_supersession_hold(
+    repo: Path, branch: str, tip: str, receipt: str, integration_ref: str, deadline: float,
+) -> str | None:
+    if not _HEX40.fullmatch(receipt) or not _HEX40.fullmatch(tip):
+        return "supersession_receipt_invalid"
+    branch = branch.removeprefix("refs/heads/")
+    named_ref = "refs/heads/" + integration_ref.removeprefix("refs/heads/")
+    symbolic = _run_git(repo, "symbolic-ref", "--quiet", named_ref, timeout_s=_call_timeout(_GIT_TIMEOUT_S, deadline))
+    if symbolic.returncode != 1:
+        return "supersession_integration_unreadable"
+    integration = _run_git(
+        repo, "show-ref", "--verify", "--hash", named_ref, timeout_s=_call_timeout(_GIT_TIMEOUT_S, deadline)
+    )
+    if integration.returncode != 0 or not _HEX40.fullmatch(integration.stdout.strip()):
+        return "supersession_integration_unreadable"
+    integration_tip = integration.stdout.strip()
+    message, error = _read_commit_message(repo, receipt, _call_timeout(_GIT_TIMEOUT_S, deadline))
+    if error:
+        return "supersession_receipt_unreadable"
+    entries = parse_tombstones(message or "")
+    group = [
+        entry for entry in entries if isinstance(entry, Tombstone) and entry.branch.removeprefix("refs/heads/") == branch
+    ]
+    if len(group) != 1 or any(not isinstance(entry, Tombstone) for entry in entries):
+        return "supersession_exact_tip_receipt_missing"
+    (tombstone,) = group
+    if (tombstone.tip, tombstone.disposition, tombstone.kind) != (tip, "superseded", "superseded_by_integration"):
+        return "supersession_exact_tip_receipt_missing"
+    verdict = _verify_tombstone_evidence(repo, tombstone, main_ref=integration_tip, current_tip=tip, deadline=deadline)
+    if not verdict.verified:
+        return f"supersession_carrier_unverified: {verdict.failed_check}"
+    # The plan scan starts at the carrier and only walks the integration first parent.
+    refusal = _reviewed_operator_plan(
+        repo, tombstone, main_ref=integration_tip, deadline=deadline, receipt=receipt, reviewed_ref=named_ref
+    )
+    return f"supersession_review_unverified: {refusal[0]}" if refusal else None
 
 
 def _verify_tombstone_evidence(

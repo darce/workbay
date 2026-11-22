@@ -615,6 +615,7 @@ def _dispatch_terminal_guard_record(args: argparse.Namespace) -> dict:
         policy_source=args.policy_source,
         fallback_source=args.fallback_source,
         created_at=args.created_at,
+        event_key=args.event_key,
     )
 
 
@@ -1251,6 +1252,11 @@ def _dispatch_complete_task(args: argparse.Namespace) -> Any:
         notes=args.notes,
         actor=cast(Any, actor) if actor else None,
         clear_active_if_matches=not args.keep_live,
+        supersession_receipt=args.supersession_receipt,
+        supersession_tip=args.supersession_tip,
+        expected_handoff_db_path=args.expected_handoff_db_path,
+        expected_handoff_db_identity=args.expected_handoff_db_identity,
+        expected_task_generation=args.expected_task_generation,
     )
 
 
@@ -1386,6 +1392,7 @@ def _build_parser() -> argparse.ArgumentParser:
     terminal_guard_record_parser.add_argument("--worktree-path")
     terminal_guard_record_parser.add_argument("--fallback-source")
     terminal_guard_record_parser.add_argument("--created-at")
+    terminal_guard_record_parser.add_argument("--event-key", help="Stable producer key for invocation deduplication.")
     terminal_guard_replay_parser = subparsers.add_parser(
         "terminal-guard-replay-spool",
         help=(
@@ -1463,9 +1470,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # function; it is not an MCP tool and leaves `set`/`archive` unchanged.
     complete_parser = subparsers.add_parser(
         "complete-task",
-        help="Complete (done) or archive only the exact selected task generation",
+        help="Complete or archive a selected task, or select and resume exact supersession",
     )
-    complete_parser.add_argument("--operation", required=True, choices=("done", "archive"))
+    complete_parser.add_argument("--operation", required=True, choices=("done", "archive", "select", "resume"))
     complete_parser.add_argument("--task-ref", required=True)
     complete_parser.add_argument("--expected-revision", required=True, type=int)
     complete_parser.add_argument("--expected-status", required=True)
@@ -1476,6 +1483,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expected-target-worktree-path", required=True, help="Selected target_worktree_path; empty string for NULL"
     )
     complete_parser.add_argument("--integration-ref", default="main")
+    complete_parser.add_argument("--supersession-receipt")
+    complete_parser.add_argument("--supersession-tip")
+    complete_parser.add_argument("--expected-handoff-db-path", type=Path, help="Canonical selected Handoff DB path")
+    complete_parser.add_argument(
+        "--expected-handoff-db-identity", type=json.loads, help="Selected Handoff DB identity as JSON st_dev and st_ino"
+    )
+    complete_parser.add_argument("--expected-task-generation", help="Exact supersession generation issued by select")
     complete_parser.add_argument("--notes")
     complete_parser.add_argument(
         "--keep-live",

@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from .landing_log import (
     find_carrier,
     format_supersede_plan,
     format_tombstone,
+    reviewed_supersession_hold,
     scan_first_parent,
     supersede_plan_digest,
     verify_tombstone,
@@ -190,18 +192,31 @@ def _verified_existing(
     *,
     branch: str,
     tip: str,
+    carrier: str,
     integration_ref: str,
+    operator_review: bool,
 ) -> tuple[str | None, str | None]:
+    deadline = time.monotonic() + _GIT_TIMEOUT_S
     scan = scan_first_parent(repo, main_ref=integration_ref, timeout_s=_GIT_TIMEOUT_S)
     if not scan.complete:
         return None, scan.error or "first_parent_scan_incomplete"
     for commit, tombstone in scan.tombstones:
         if (
-            tombstone.branch != branch
+            tombstone.branch.removeprefix("refs/heads/") != branch
             or tombstone.tip != tip
+            or tombstone.ref != carrier
             or tombstone.disposition != "superseded"
             or tombstone.kind != "superseded_by_integration"
         ):
+            continue
+        if operator_review:
+            hold = reviewed_supersession_hold(
+                repo, branch=branch, tip=tip, receipt=commit, integration_ref=integration_ref, deadline=deadline
+            )
+            if hold is None:
+                return commit, None
+            if hold.endswith(("_probe_failed", "_unreadable", ": probe_failed")):
+                return None, hold
             continue
         verdict = verify_tombstone(repo, tombstone, main_ref=integration_ref, current_tip=tip)
         if verdict.failed_check == "probe_failed":
@@ -218,11 +233,13 @@ def plan_supersede(
     superseded_by: str,
     integration_ref: str,
     allow_main: bool = False,
+    operator_review: bool = True,
 ) -> PlannedSupersedeOperation | SupersedeResult:
     """Validate a supersession request and return its typed apply plan.
 
     Refusal and already-recorded outcomes remain typed results. A successful
     new plan performs only read-only Git probes.
+    Operator replay verifies the exact commit it returns as an existing receipt.
     """
 
     root = Path(repo)
@@ -395,7 +412,9 @@ def plan_supersede(
         root,
         branch=branch_name,
         tip=tip,
+        carrier=carrier_sha,
         integration_ref=integration_branch_ref,
+        operator_review=operator_review,
     )
     if existing_error:
         return _failure(
@@ -584,6 +603,7 @@ def supersede(
         superseded_by=superseded_by,
         integration_ref=integration_ref,
         allow_main=allow_main,
+        operator_review=operator_review,
     )
     if isinstance(planned, SupersedeResult):
         return planned

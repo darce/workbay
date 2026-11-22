@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import selectors
 import shutil
 import signal
 import socket
@@ -23,7 +24,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from workbay_handoff_mcp.enums import LaneStatus
+from workbay_handoff_mcp.shared_primitives import LIVE_ACTIVE_STATUSES
 from workbay_protocol.bootstrap_ledger_view import InvalidHostReceipt, InvalidLedgerShape, load_ledger_view
 
 from .lanes_support import (
@@ -903,6 +905,13 @@ def _run_reclaim_command(
             changed_detail = _primary_copy_changed_detail(command[-1])
             if changed_detail:
                 return subprocess.CompletedProcess(command, 1, stdout="", stderr=changed_detail)
+            # The older tombstone drain also enters this actuator, including
+            # on retries of intents written before native review retirement.
+            root = command[command.index("-C") + 1] if "-C" in command else Path.cwd()
+            target = Path(root) / command[-1]
+            review_hold = _generic_review_worktree_deferral(root, str(target))
+            if review_hold:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr=review_hold)
         return _run_reclaim_mutation(command, timeout=timeout, stdin_text=stdin_text, env=env)
     try:
         return subprocess.run(  # noqa: S603 — fixed argv, no shell
@@ -1101,6 +1110,19 @@ def _fenced_mutation_custody(argv: Sequence[str], env: Mapping[str, str] | None)
 #: The hold defers handlers rather than masking across spawn: a child keeps the mask it is spawned
 #: under, and git with SIGTERM blocked could not remove its lock files on a graceful termination.
 _MUTATION_OWNERSHIP_SIGNALS = frozenset({signal.SIGALRM, signal.SIGINT, signal.SIGTERM})
+
+
+@contextmanager
+def _inherit_reclaim_lock(descriptor: int) -> Iterator[None]:
+    """Give supported Git mutations the caller's held actuator lock."""
+    descriptors = _ACTIVE_RECLAIM_FENCE_LOCK_FDS.get()
+    fds_token = _ACTIVE_RECLAIM_FENCE_LOCK_FDS.set((*descriptors, descriptor))
+    thread_token = _ACTIVE_RECLAIM_FENCE_THREAD.set(threading.get_ident())
+    try:
+        yield
+    finally:
+        _ACTIVE_RECLAIM_FENCE_THREAD.reset(thread_token)
+        _ACTIVE_RECLAIM_FENCE_LOCK_FDS.reset(fds_token)
 
 
 def _run_reclaim_mutation(
@@ -1764,7 +1786,7 @@ def _lsof_cwd_worktree_owners(lsof_output: str, *, worktree_paths: Sequence[str]
             continue
         if tag != "n" or not value:
             continue
-        cwd = value.rstrip("/") or value
+        cwd = value.removesuffix(" (deleted)").rstrip("/") or value
         if any(cwd == prefix or cwd.startswith(prefix + "/") for prefix in prefixes):
             owners.append(f"{pid}:{cwd}")
     return owners
@@ -1820,7 +1842,7 @@ def _probe_worktree_process_owner(
         # unreadable process table. Exit 0, or exit 1 with sampled table
         # rows, is a read. Exit 1 with no parseable rows is an unreadable
         # instrument and must not fall through to free.
-        if proc is None or proc.returncode > 1:
+        if proc is None or proc.returncode not in {0, 1}:
             return ("unknown", "lsof_probe_failed")
         lsof_output = proc.stdout or ""
         lsof_returncode = proc.returncode
@@ -3010,8 +3032,7 @@ def _content_identity_rule(path: str, identity: _ContentIdentityContext | None) 
     # sweep never reclaims the primary, so its separate, contained regular-file
     # copy survives. A directory bound grants nothing without per-leaf identity.
     within_surface = any(
-        normalized == surface or normalized.startswith(surface + "/")
-        for surface in identity.primary_surface_paths
+        normalized == surface or normalized.startswith(surface + "/") for surface in identity.primary_surface_paths
     )
     if identity.primary_root is not None and (normalized in identity.primary_config_paths or within_surface):
         contained_candidate = _contained_worktree_path(identity.worktree_path, normalized)
@@ -4032,6 +4053,11 @@ def _registry_removal_intent_dir(repo_root: Path | str) -> Path:
     return Path(repo_root).resolve() / worktree_tombstone._INTENT_RELATIVE / _REGISTRY_REMOVAL_INTENT_SUBDIR
 
 
+def _registry_removal_intent_path(root: Path | str, lane_id: str, nonce: str) -> Path:
+    lane_key = hashlib.sha256(lane_id.encode("utf-8")).hexdigest()[:16]
+    return _registry_removal_intent_dir(root) / f"{lane_key}-{nonce}.json"
+
+
 def _registry_directory_incarnation(path: Path) -> dict[str, int]:
     observed = path.lstat()
     if not stat.S_ISDIR(observed.st_mode):
@@ -4039,13 +4065,19 @@ def _registry_directory_incarnation(path: Path) -> dict[str, int]:
     return {"st_dev": observed.st_dev, "st_ino": observed.st_ino}
 
 
-def _registry_admin_incarnation(path: Path, descriptor: int) -> dict[str, object]:
+def _registry_admin_incarnation(path: Path, descriptor: int, *, allow_missing_files: bool = False) -> dict[str, object]:
     """Read through the held directory, then verify the name still denotes it."""
     opened = os.fstat(descriptor)
     identity: dict[str, object] = {"st_dev": opened.st_dev, "st_ino": opened.st_ino}
     for name in ("gitdir", "HEAD"):
         flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-        with os.fdopen(os.open(name, flags, dir_fd=descriptor), "rb") as handle:
+        try:
+            file_fd = os.open(name, flags, dir_fd=descriptor)
+        except FileNotFoundError:
+            if allow_missing_files:
+                continue
+            raise
+        with os.fdopen(file_fd, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 raise OSError("removal identity is not a regular file")
             # Exact bytes, including whitespace; JSON stores a lossless hex encoding.
@@ -4090,10 +4122,66 @@ def _registry_removal_incarnation_matches(record: Mapping[str, object], admin: P
     return True
 
 
+def _observe_registry_removal(original: Path, *, verify_links: bool = False) -> tuple[dict[str, object] | None, str]:
+    probe = _run_reclaim_command(
+        [
+            "git",
+            "-C",
+            str(original),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+            "HEAD",
+            "--symbolic-full-name",
+            "HEAD",
+        ]
+    )
+    if probe is None or getattr(probe, "returncode", None) != 0:
+        return None, "removal_intent_identity_unavailable"
+    lines = _probe_command_stdout(probe).splitlines()
+    if len(lines) != 4 or not lines[3].startswith("refs/heads/"):
+        return None, "removal_intent_identity_unavailable"
+    admin = Path(lines[0]).resolve(strict=False)
+    common = Path(lines[1]).resolve(strict=False)
+    if admin.parent != (common / "worktrees").resolve(strict=False):
+        return None, "removal_intent_identity_unavailable"
+    branch = lines[3].removeprefix("refs/heads/")
+    try:
+        worktree_incarnation = _registry_directory_incarnation(original)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(admin, flags)
+        try:
+            admin_incarnation = _registry_admin_incarnation(admin, descriptor)
+        finally:
+            os.close(descriptor)
+        if verify_links:
+            if bytes.fromhex(str(admin_incarnation["HEAD"])) != f"ref: refs/heads/{branch}\n".encode():
+                return None, "removal_intent_branch_mismatch"
+            gitdir = os.fsdecode(bytes.fromhex(str(admin_incarnation["gitdir"]))).rstrip("\n")
+            if (admin / gitdir).resolve() != original / ".git":
+                return None, "removal_intent_gitdir_mismatch"
+    except OSError:
+        return None, "removal_intent_incarnation_unavailable"
+    return {
+        "branch": branch,
+        "head_sha": lines[2],
+        "admin_git_dir": str(admin),
+        "git_common_dir": str(common),
+        "incarnation": {"admin": admin_incarnation, "worktree": worktree_incarnation},
+    }, ""
+
+
 def _record_registry_removal_intent(
-    repo_root: Path | str, worktree_path: str, *, lane_id: str | None
+    repo_root: Path | str,
+    worktree_path: str,
+    *,
+    lane_id: str | None,
+    expected_incarnation: Mapping[str, object] | None = None,
+    review: dict[str, object] | None = None,
+    attached_supersession: dict[str, object] | None = None,
 ) -> tuple[Path | None, dict[str, object], str]:
-    """Durably record path, branch, tip and admin id before ``git worktree remove``.
+    """Durably record path, branch, tip and admin id before retirement.
 
     Returns ``(intent_path, intent, "")``, or ``(None, {}, reason)`` when the identity
     cannot be read or the record cannot be published; the removal then does not run.
@@ -4116,70 +4204,48 @@ def _record_registry_removal_intent(
                 return (None, {}, "removal_intent_recovery_pending")
         except (OSError, ValueError):
             return (None, {}, "removal_intent_recovery_pending")
-    probe = _run_reclaim_command(
-        [
-            "git",
-            "-C",
-            str(original),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-            "HEAD",
-            "--symbolic-full-name",
-            "HEAD",
-        ]
-    )
-    if probe is None or getattr(probe, "returncode", None) != 0:
-        return (None, {}, "removal_intent_identity_unavailable")
-    lines = _probe_command_stdout(probe).splitlines()
-    if len(lines) != 4 or not lines[3].startswith("refs/heads/"):
-        return (None, {}, "removal_intent_identity_unavailable")
-    admin = Path(lines[0]).resolve(strict=False)
-    common = Path(lines[1]).resolve(strict=False)
-    if admin.parent != (common / "worktrees").resolve(strict=False):
-        return (None, {}, "removal_intent_identity_unavailable")
-    branch = lines[3].removeprefix("refs/heads/")
+    observed, detail = _observe_registry_removal(original, verify_links=review is not None)
+    if observed is None:
+        return (None, {}, detail)
+    admin = Path(str(observed["admin_git_dir"]))
+    branch = str(observed["branch"])
     handoff = _REGISTRY_BRANCH_HANDOFF.get()
     if handoff is not None and handoff.branch != branch:
         return (None, {}, "removal_intent_branch_mismatch")
-    try:
-        worktree_incarnation = _registry_directory_incarnation(original)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(admin, flags)
-        try:
-            admin_incarnation = _registry_admin_incarnation(admin, descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        return (None, {}, "removal_intent_incarnation_unavailable")
+    if review is not None:
+        if observed != expected_incarnation or (branch, observed["head_sha"]) != (review["branch"], review["tip"]):
+            return (None, {}, "review_removal_incarnation_changed")
     nonce = uuid.uuid4().hex
-    lane_key = hashlib.sha256(lane_id.encode("utf-8")).hexdigest()[:16]
-    intent_path = _registry_removal_intent_dir(repo_root) / f"{lane_key}-{nonce}.json"
+    intent_path = _registry_removal_intent_path(repo_root, lane_id, nonce)
     intent: dict[str, object] = {
         "schema": 1,
         "kind": _REGISTRY_REMOVAL_INTENT_KIND,
         "nonce": nonce,
         "lane_id": lane_id,
         "original_worktree_path": str(original),
-        # Never created: the tombstone admin check accepts either path's ``.git``.
         "tombstone_path": str(original.with_name(f".{original.name}.workbay-retire-{nonce}")),
-        "branch": branch,
-        "head_sha": lines[2],
-        "admin_git_dir": str(admin),
-        "git_common_dir": str(common),
-        "incarnation": {"admin": admin_incarnation, "worktree": worktree_incarnation},
+        **observed,
         # The tip the guards just admitted is the only tip the reclaim record authorizes.
         "branch_handoff": (
             None
             if handoff is None
-            else {"task_ref": handoff.task_ref, "lane_id": handoff.lane_id, "authorized_sha": lines[2]}
+            else {"task_ref": handoff.task_ref, "lane_id": handoff.lane_id, "authorized_sha": observed["head_sha"]}
         ),
     }
+    if review is not None:
+        intent["review_preservation"] = review
+        # Keep the held registration outside Git's worktrees/ enumeration.
+        intent["admin_tombstone_path"] = str(admin.parent.parent / f".workbay-retire-{nonce}")
+    if attached_supersession is not None:
+        intent.update(attached_supersession=attached_supersession, phase="prepared", branch_handoff=None)
     try:
         if not _registry_removal_incarnation_matches(intent, admin):
             return (None, {}, "removal_intent_incarnation_changed")
         worktree_tombstone._write_intent(intent_path, intent)
+        if attached_supersession is not None:
+            # Archive may now rely on this journal across process or machine loss.
+            for directory in intent_path.parents[1:4]:
+                worktree_tombstone._fsync_directory(directory)
     except OSError as exc:
         return (None, {}, f"removal_intent_write_failed:{type(exc).__name__}")
     return (intent_path, intent, "")
@@ -4225,14 +4291,15 @@ def _hand_off_registry_removal_branch(intent: Mapping[str, object]) -> tuple[boo
 
 
 def _registry_recovery_paths_absent(record: Mapping[str, object]) -> tuple[bool, str]:
-    """Observe only: a present or unreadable path requires operator reconciliation.
-
-    External Git does not share our lock. Even matching inode and content identity
-    cannot authorize replay of an irreversible filesystem effect [FLOW-16, CON-11].
-    """
+    """Observe path absence; present paths need separate evidence to authorize replay."""
     observed: dict[str, object] = {}
     absent = True
-    for key in ("original_worktree_path", "admin_git_dir"):
+    keys = ["original_worktree_path", "admin_git_dir"]
+    if "review_preservation" in record:
+        keys.append("tombstone_path")
+        if "admin_tombstone_path" in record:
+            keys.append("admin_tombstone_path")
+    for key in keys:
         try:
             info = Path(str(record[key])).lstat()
         except OSError as exc:
@@ -4287,32 +4354,121 @@ def _settle_registry_removal_intent(intent_path: Path, intent: Mapping[str, obje
 
     # registry-removals / worktree-tombstones / .task-state / repo
     root = intent_path.parents[3]
-    with _landing_mutation_lock(root, operation="registry_removal_recovery", lane=str(intent["lane_id"])) as acquired:
+    attached = "attached_supersession" in intent
+    with _landing_mutation_lock(
+        root, operation="registry_removal_recovery", lane=str(intent["lane_id"]), inherit_for_reclaim=attached
+    ) as acquired:
         if acquired is not True:
             return ("pending", "recovery_repo_lock_unavailable")
+        if "review_preservation" in intent:
+            # Observations made before taking the lock cannot supersede a newer journal.
+            try:
+                current = json.loads(intent_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                if "attached_supersession" in intent:
+                    return ("pending", "supersession_intent_disappeared")
+                return ("completed", "already_complete")
+            except (OSError, ValueError):
+                return ("pending", "removal_intent_unreadable")
+            if current != intent:
+                return ("pending", "removal_intent_changed")
         return _settle_registry_removal_intent_locked(intent_path, intent)
 
 
-def _settle_registry_removal_intent_locked(intent_path: Path, intent: Mapping[str, object]) -> tuple[str, str]:
-    """Reconcile metadata only; never mutate an existing worktree or admin path.
+def _review_removal_is_untouched(intent: Mapping[str, object]) -> bool:
+    """Require both original identities and both unused holding paths."""
+    if "review_holder_identities" in intent:
+        return False
+    targets = _review_removal_targets(intent)
+    if targets is None:
+        return False
+    for _, holder in targets.values():
+        try:
+            holder.lstat()
+        except FileNotFoundError:
+            continue
+        return False
+    observed, _ = _observe_registry_removal(targets["worktree"][0], verify_links=True)
+    return observed is not None and all(intent.get(key) == value for key, value in observed.items())
 
-    Both paths must be absent by lstat (ENOENT) before branch hand-off. Otherwise
-    keep the intent and report the recorded and observed identities on every sweep.
-    Operators reconcile any surviving paths before retrying [SECD-05, RES-27].
+
+def _review_removal_targets(intent: Mapping[str, object]) -> dict[str, tuple[Path, Path]] | None:
+    original = Path(str(intent["original_worktree_path"]))
+    admin = Path(str(intent["admin_git_dir"]))
+    common = Path(str(intent.get("git_common_dir")))
+    nonce = intent.get("nonce")
+    if (
+        type(intent.get("schema")) is not int
+        or intent["schema"] != 1
+        or not original.name
+        or not original.is_absolute()
+        or not common.is_absolute()
+        or admin.parent != common / "worktrees"
+        or not admin.name
+        or not isinstance(nonce, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+    ):
+        return None
+    worktree_holder = original.with_name(f".{original.name}.workbay-retire-{nonce}")
+    admin_holder = common / f".workbay-retire-{nonce}"
+    if intent.get("tombstone_path") != str(worktree_holder) or intent.get("admin_tombstone_path") != str(admin_holder):
+        return None
+    return {
+        "worktree": (original, worktree_holder),
+        "admin": (admin, admin_holder),
+    }
+
+
+def _settle_registry_removal_intent_locked(intent_path: Path, intent: Mapping[str, object]) -> tuple[str, str]:
+    """Settle absent paths or replay a proved review cutover under the shared lock.
+
+    An untouched review attempt returns to the ordinary path for fresh eligibility
+    and Git custody checks [RES-19, DATA-14, GRPH-27].
     """
     try:
+        root = intent_path.parents[3]
+        if "attached_supersession" in intent:
+            from .orchestration.supersession_retirement import settle_supersession  # noqa: PLC0415
+
+            return settle_supersession(root, intent_path, dict(intent))
+        review = "review_preservation" in intent
+        if review and (
+            _review_removal_targets(intent) is None
+            or ("review_holder_identities" in intent and _review_holder_identities(intent) is None)
+        ):
+            return ("pending", "review_removal_identity_invalid")
         absent, detail = _registry_recovery_paths_absent(intent)
         if not absent:
-            return ("pending", detail)
+            if not review:
+                return ("pending", detail)
+            if _review_removal_is_untouched(intent) and _review_removal_archive_matches(root, intent):
+                from .orchestration.worktree_tombstone import _remove_intent  # noqa: PLC0415
+
+                _registry_reap_remaining()
+                _remove_intent(intent_path)
+                return ("aborted", "review_removal_untouched")
+            if not _replay_detached_review_removal(intent_path, intent):
+                return ("pending", detail)
+        elif review:
+            if not _review_removal_archive_matches(root, intent):
+                return ("pending", "review_removal_preservation_unverified")
+        elif intent.get("branch_handoff") is not None:
+            hold = _generic_review_deferral(root, intent["branch"])
+            if hold:
+                return ("pending", hold)
         handed_off, handoff_detail = _hand_off_registry_removal_branch(intent)
         if not handed_off:
             return ("pending", handoff_detail)
         return _commit_registry_removal_intent(intent_path, intent)
+    except TimeoutError:
+        return ("pending", "deadline_exceeded")
     except OSError as exc:
         return ("pending", f"removal_intent_settle_failed:{type(exc).__name__}")
 
 
-def _recover_registry_removal_intents(root: Path, *, apply: bool) -> list[dict[str, object]]:
+def _recover_registry_removal_intents(
+    root: Path, *, apply: bool, review_only: bool = False, review_slug: str | None = None
+) -> list[dict[str, object]]:
     """Report, and when applying finish, removals an earlier sweep left interrupted.
 
     Each record is settled under its lane's worker lock, so an in-flight removal is
@@ -4352,7 +4508,23 @@ def _recover_registry_removal_intents(root: Path, *, apply: bool) -> list[dict[s
         ):
             records.append({**record, "state": "pending", "detail": "removal_intent_foreign"})
             continue
+        if review_only:
+            if "review_preservation" not in intent or "attached_supersession" in intent:
+                continue
+            if review_slug is not None:
+                from .orchestration.review_stage_reap import _review_branch_parts  # noqa: PLC0415
+
+                parts = _review_branch_parts(intent["branch"])
+                if parts is None or parts[1] != review_slug:
+                    continue
         record = {**record, "worktree_path": intent["original_worktree_path"], "branch": intent["branch"]}
+        if "attached_supersession" in intent:
+            if intent.get("phase") == "completed":
+                # Keep the terminal receipt for explicit replay and replacement protection.
+                continue
+            if not apply:
+                records.append({**record, "state": "pending", "detail": "dry_run"})
+                continue
         if not apply:
             absent, detail = _registry_recovery_paths_absent(intent)
             if not absent:
@@ -4373,6 +4545,654 @@ def _recover_registry_removal_intents(root: Path, *, apply: bool) -> list[dict[s
     return records
 
 
+def _bounded_registry_removal_recovery(
+    root: Path, *, apply: bool, review_only: bool = False, review_slug: str | None = None
+) -> list[dict[str, object]]:
+    """Reserve scan time even if an older intent's recovery cannot finish."""
+    remaining = _registry_reap_remaining()
+    if remaining is None:
+        return _recover_registry_removal_intents(root, apply=apply, review_only=review_only, review_slug=review_slug)
+    token = _REGISTRY_REAP_DEADLINE.set(time.monotonic() + min(2.0, remaining / 4))
+    try:
+        return _recover_registry_removal_intents(root, apply=apply, review_only=review_only, review_slug=review_slug)
+    except TimeoutError:
+        return [{"intent": "recovery_scan", "state": "pending", "detail": "recovery_budget_exhausted"}]
+    finally:
+        _REGISTRY_REAP_DEADLINE.reset(token)
+
+
+def _generic_review_deferral(root: Path | str, branch: object, tip: str | None = None) -> str:
+    from .orchestration.review_stage_reap import review_stage_deferral  # noqa: PLC0415
+    from .orchestration.supersession_retirement import supersession_deferral  # noqa: PLC0415
+
+    return supersession_deferral(Path(root), branch=str(branch or ""), tip=tip) or review_stage_deferral(
+        Path(root), str(branch or ""), tip
+    )
+
+
+def _generic_review_worktree_deferral(root: Path | str, worktree_path: str) -> str:
+    from .orchestration.supersession_retirement import supersession_deferral  # noqa: PLC0415
+
+    if hold := supersession_deferral(Path(root), worktree_path=worktree_path):
+        return hold
+    if not (Path(worktree_path) / ".git").is_file():
+        return ""
+    actual = _run_reclaim_command(["git", "-C", str(worktree_path), "symbolic-ref", "--quiet", "HEAD"])
+    if actual is None or actual.returncode not in {0, 1}:
+        return "worktree_branch_unknown"
+    if actual.returncode == 0:
+        return _generic_review_deferral(root, _probe_command_stdout(actual).strip())
+    return ""
+
+
+def _review_removal_pending(root: Path, branch: str, *, include_legacy: bool = False) -> bool:
+    for path in _registry_removal_intent_dir(root).glob("*.json"):
+        try:
+            intent = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        if not isinstance(intent, dict):
+            return True
+        if intent.get("branch") == branch and (include_legacy or "review_preservation" in intent):
+            return True
+    return False
+
+
+def _review_removal_archive_matches(root: Path, intent: Mapping[str, object]) -> bool:
+    from .orchestration.review_stage_reap import _review_archive_binding  # noqa: PLC0415
+
+    review = intent.get("review_preservation")
+    if not isinstance(review, dict) or not all(
+        isinstance(review.get(key), str) for key in ("branch", "tip", "bundle_path", "pin_ref")
+    ):
+        return False
+    if (review["branch"], review["tip"]) != (intent.get("branch"), intent.get("head_sha")) or not review[
+        "pin_ref"
+    ].startswith("refs/reclaimed/"):
+        return False
+    verified = _review_archive_binding(
+        root, review["branch"], review["tip"], Path(review["bundle_path"]), review["pin_ref"]
+    )
+    return verified is not None and verified["bundle_identity"] == review.get("bundle_identity")
+
+
+def _review_removal_directory_matches(observed: os.stat_result, expected: Mapping[str, object]) -> bool:
+    return (
+        stat.S_ISDIR(observed.st_mode)
+        and observed.st_dev == expected["st_dev"]
+        and observed.st_ino == expected["st_ino"]
+    )
+
+
+def _review_inode_identity(observed: os.stat_result) -> dict[str, int]:
+    return {"st_dev": observed.st_dev, "st_ino": observed.st_ino}
+
+
+def _review_removal_identities(value: object) -> dict[str, dict[str, int]] | None:
+    if (
+        not isinstance(value, dict)
+        or value.keys() != {"worktree", "admin"}
+        or any(
+            not isinstance(identity, dict)
+            or any(type(identity.get(key)) is not int or identity[key] < 0 for key in ("st_dev", "st_ino"))
+            for identity in value.values()
+        )
+    ):
+        return None
+    return {kind: {key: identity[key] for key in ("st_dev", "st_ino")} for kind, identity in value.items()}
+
+
+def _review_holder_identities(intent: Mapping[str, object]) -> dict[str, dict[str, int]] | None:
+    recorded = intent.get("review_holder_identities")
+    identities = _review_removal_identities(recorded)
+    return identities if identities == recorded else None
+
+
+def _review_removal_stat_at(name: str, parent_fd: int) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _open_review_removal_directory(stack: ExitStack, path: Path | str, parent_fd: int | None = None) -> int:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    stack.callback(os.close, descriptor)
+    return descriptor
+
+
+@dataclass(frozen=True)
+class _ReviewRemovalTarget:
+    original: Path
+    holder: Path
+    original_parent_fd: int
+    holder_parent_fd: int
+    holder_fd: int | None
+
+    def _original_entry(self) -> os.stat_result | None:
+        parent = self.original.parent
+        if parent.resolve(strict=True) != parent or not os.path.samestat(
+            parent.lstat(), os.fstat(self.original_parent_fd)
+        ):
+            raise OSError("original removal parent changed")
+        return _review_removal_stat_at(self.original.name, self.original_parent_fd)
+
+    def original_absent(self) -> bool:
+        return self._original_entry() is None
+
+    def original_matches(self, expected: Mapping[str, object]) -> bool:
+        observed = self._original_entry()
+        return observed is not None and _review_removal_directory_matches(observed, expected)
+
+    def move_candidate(self) -> None:
+        assert self.holder_fd is not None
+        os.rename(self.original.name, "candidate", src_dir_fd=self.original_parent_fd, dst_dir_fd=self.holder_fd)
+        os.fsync(self.original_parent_fd)
+        os.fsync(self.holder_fd)
+
+    def observe_holder(self, expected_candidate: Mapping[str, object]) -> tuple[dict[str, int] | None, bool]:
+        parent = self.holder.parent
+        if parent.resolve(strict=True) != parent or _review_inode_identity(parent.lstat()) != _review_inode_identity(
+            os.fstat(self.holder_parent_fd)
+        ):
+            raise OSError("review holder parent changed")
+        observed = _review_removal_stat_at(self.holder.name, self.holder_parent_fd)
+        if self.holder_fd is None and observed is None:
+            return None, False
+        if self.holder_fd is None or observed is None:
+            raise OSError("review holder path changed")
+        identity = _review_inode_identity(os.fstat(self.holder_fd))
+        if (
+            not _review_removal_directory_matches(observed, identity)
+            or observed.st_uid != os.geteuid()
+            or observed.st_mode & 0o077
+        ):
+            raise OSError("review holder identity changed")
+        entries = os.listdir(self.holder_fd)
+        if not entries:
+            return identity, False
+        if entries == ["candidate"]:
+            candidate = _review_removal_stat_at("candidate", self.holder_fd)
+            if candidate is not None and _review_removal_directory_matches(candidate, expected_candidate):
+                return identity, True
+        raise OSError("review holder contents changed")
+
+    def remove_holder(self, expected: Mapping[str, object], candidate: Mapping[str, object]) -> None:
+        if self.observe_holder(candidate) != (expected, False) or self.holder_fd is None:
+            raise OSError("review holder changed before rmdir")
+        os.rmdir(self.holder.name, dir_fd=self.holder_parent_fd)
+        os.fsync(self.holder_parent_fd)
+
+
+def _open_registry_removal_targets(
+    stack: ExitStack,
+    paths: Mapping[str, tuple[Path, Path]],
+    *,
+    create_holders: bool = False,
+    resume_empty_holders: bool = False,
+) -> dict[str, _ReviewRemovalTarget]:
+    targets = {}
+    for kind, (original, holder) in paths.items():
+        original_parent = _open_review_removal_directory(stack, original.parent)
+        holder_parent = _open_review_removal_directory(stack, holder.parent)
+        if create_holders:
+            try:
+                os.mkdir(holder.name, mode=0o700, dir_fd=holder_parent)
+            except FileExistsError:
+                if not resume_empty_holders:
+                    raise
+        holder_fd = (
+            _open_review_removal_directory(stack, holder.name, holder_parent)
+            if _review_removal_stat_at(holder.name, holder_parent) is not None
+            else None
+        )
+        targets[kind] = _ReviewRemovalTarget(original, holder, original_parent, holder_parent, holder_fd)
+    return targets
+
+
+def _record_review_holders(
+    intent_path: Path,
+    intent: Mapping[str, object],
+    targets: Mapping[str, _ReviewRemovalTarget],
+    identities: dict[str, dict[str, int]],
+) -> None:
+    from .orchestration.worktree_tombstone import _write_intent  # noqa: PLC0415
+
+    # Make the moved names durable before publishing the proof that permits deletion.
+    for target in targets.values():
+        assert target.holder_fd is not None
+        os.fsync(target.holder_fd)
+        os.fsync(target.original_parent_fd)
+        os.fsync(target.holder_parent_fd)
+    try:
+        current = json.loads(intent_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise OSError("review removal journal unreadable") from exc
+    if current != intent:
+        raise OSError("review removal journal changed")
+    record = {**intent, "review_holder_identities": identities}
+    if "attached_supersession" in intent:
+        record["phase"] = "detached"
+    _write_intent(intent_path, record)
+
+
+def _retire_review_removal_directories(intent: Mapping[str, object]) -> tuple[bool, str]:
+    """Move both directories into private holders before deleting either."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        return False, "review_removal_safe_rmtree_unavailable"
+    paths = _review_removal_targets(intent)
+    candidates = _review_removal_identities(intent.get("incarnation"))
+    if paths is None or candidates is None:
+        return False, "review_removal_identity_invalid"
+    # The native review archive and removal journal live under the same .task-state.
+    review = cast(dict[str, object], intent["review_preservation"])
+    root = Path(str(review["bundle_path"])).parents[2]
+    intent_path = _registry_removal_intent_path(root, str(intent["lane_id"]), str(intent["nonce"]))
+    with ExitStack() as stack:
+        try:
+            targets = _open_registry_removal_targets(stack, paths, create_holders=True)
+            for kind, target in targets.items():
+                opened = os.fstat(_open_review_removal_directory(stack, target.original.name, target.original_parent_fd))
+                if not _review_removal_directory_matches(opened, candidates[kind]):
+                    return False, "review_removal_incarnation_changed_before_move"
+                if os.fstat(target.holder_parent_fd).st_dev != opened.st_dev:
+                    return False, "review_removal_holding_volume_mismatch"
+
+            _registry_reap_remaining()
+            for target in targets.values():
+                target.move_candidate()
+            if not _finish_detached_review_removal(intent_path, intent, targets, candidates):
+                return False, "review_removal_incarnation_changed_after_move"
+        except TimeoutError:
+            return False, "deadline_exceeded"
+        except OSError as exc:
+            return False, f"review_removal_filesystem_failed:{type(exc).__name__}"
+    return True, ""
+
+
+def _detached_review_authority_matches(intent_path: Path, intent: Mapping[str, object]) -> bool:
+    from .orchestration.review_stage_reap import _review_branch_parts  # noqa: PLC0415
+
+    handoff = intent.get("branch_handoff")
+    if (
+        _review_branch_parts(str(intent["branch"])) is None
+        or "branch_handoff" not in intent
+        or (
+            handoff is not None
+            and (
+                not isinstance(handoff, dict)
+                or not all(isinstance(handoff.get(key), str) and handoff[key] for key in ("lane_id", "task_ref"))
+                or handoff.get("authorized_sha") != intent.get("head_sha")
+            )
+        )
+    ):
+        return False
+    root = intent_path.parents[3]
+    common = _run_reclaim_command(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    return (
+        common is not None
+        and common.returncode == 0
+        and str(Path(_probe_command_stdout(common).strip()).resolve()) == intent["git_common_dir"]
+        and _review_removal_archive_matches(root, intent)
+    )
+
+
+def _replay_detached_review_removal(intent_path: Path, intent: Mapping[str, object]) -> bool:
+    """Finish a review cutover from descriptor-bound evidence in the original journal."""
+    paths = _review_removal_targets(intent)
+    candidates = _review_removal_identities(intent.get("incarnation"))
+    if paths is None or candidates is None or not shutil.rmtree.avoids_symlink_attacks:
+        return False
+    with ExitStack() as stack:
+        try:
+            targets = _open_registry_removal_targets(stack, paths)
+        except OSError:
+            return False
+        return _finish_detached_review_removal(intent_path, intent, targets, candidates, replay_stack=stack)
+
+
+def _finish_detached_review_removal(
+    intent_path: Path,
+    intent: Mapping[str, object],
+    targets: dict[str, _ReviewRemovalTarget],
+    candidates: Mapping[str, dict[str, int]],
+    *,
+    replay_stack: ExitStack | None = None,
+    attached_guard: Callable[[set[str]], str | None] | None = None,
+) -> bool:
+    def observe() -> dict[str, tuple[dict[str, int] | None, bool]]:
+        if not all(target.original_absent() for target in targets.values()):
+            raise OSError("review original path present or changed")
+        return {kind: target.observe_holder(candidates[kind]) for kind, target in targets.items()}
+
+    try:
+        moved = observe()
+    except OSError:
+        return False
+    present = {kind: identity for kind, (identity, _) in moved.items() if identity is not None}
+    populated = {kind for kind, (_, has_candidate) in moved.items() if has_candidate}
+    recorded = _review_holder_identities(intent)
+    if recorded is None:
+        if populated != targets.keys():
+            return False
+    elif any(recorded[kind] != identity for kind, identity in present.items()) or (
+        populated and present.keys() != targets.keys()
+    ):
+        return False
+    admin_fd = None
+    if replay_stack is not None:
+        if attached_guard is None and not _detached_review_authority_matches(intent_path, intent):
+            return False
+        if "admin" in populated:
+            admin = targets["admin"]
+            assert admin.holder_fd is not None
+            admin_fd = _open_review_removal_directory(replay_stack, "candidate", admin.holder_fd)
+
+    def admin_matches() -> bool:
+        if admin_fd is None:
+            return True
+        expected = cast(dict[str, dict[str, object]], intent["incarnation"])["admin"]
+        # The admin rmtree can only have started after the worktree candidate was removed.
+        allow_missing_files = recorded is not None and "worktree" not in populated
+        observed = _registry_admin_incarnation(
+            targets["admin"].holder / "candidate", admin_fd, allow_missing_files=allow_missing_files
+        )
+        return all(expected.get(key) == value for key, value in observed.items())
+
+    _registry_reap_remaining()
+    if observe() != moved:
+        return False
+    if attached_guard is not None and (refusal := attached_guard(populated)):
+        raise OSError(refusal)
+    if recorded is None:
+        if not admin_matches():
+            return False
+        _record_review_holders(intent_path, intent, targets, present)
+    else:
+        from .orchestration.worktree_tombstone import _fsync_directory  # noqa: PLC0415
+
+        # A previous publisher may have stopped just after replacing the journal.
+        _fsync_directory(intent_path.parent)
+
+    if not admin_matches():
+        return False
+    # Keep both holder names until both candidates are gone so every
+    # interruption leaves a state the same journal can prove on replay.
+    for kind, target in targets.items():
+        _registry_reap_remaining()
+        if observe() != moved:
+            return False
+        identity, has_candidate = moved[kind]
+        if has_candidate:
+            assert target.holder_fd is not None and identity is not None
+            shutil.rmtree("candidate", dir_fd=target.holder_fd)
+            moved[kind] = identity, False
+
+    # Make both candidate deletions durable before either holder can disappear.
+    for target in targets.values():
+        if target.holder_fd is not None:
+            os.fsync(target.holder_fd)
+    for kind, identity in present.items():
+        _registry_reap_remaining()
+        if observe() != moved:
+            return False
+        target = targets[kind]
+        target.remove_holder(identity, candidates[kind])
+        targets[kind] = replace(target, holder_fd=None)
+        moved[kind] = None, False
+    return True
+
+
+@contextmanager
+def _review_checkout_write_exclusion(
+    root: Path,
+    intent: Mapping[str, object],
+    preservation: Mapping[str, object],
+    *,
+    integration_ref: str = "refs/heads/main",
+    additional_refs: Mapping[str, str] | None = None,
+    admin_path: Path | None = None,
+    recorded_locks: Mapping[str, object] | None = None,
+    record_locks: Callable[[dict[str, dict[str, int]]], None] | None = None,
+) -> Iterator[bool]:
+    """Hold Git's checkout and exact-ref write locks through retirement."""
+    admin = admin_path if admin_path is not None else Path(str(intent["admin_git_dir"]))
+    integration = _reclaim_rev_parse(root, integration_ref)
+    if integration is None:
+        yield False
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with ExitStack() as cleanup:
+        try:
+            directory = os.open(admin, flags)
+            cleanup.callback(os.close, directory)
+            if record_locks is not None:
+                candidates = _review_removal_identities(intent.get("incarnation"))
+                if candidates is None or not _review_removal_directory_matches(
+                    os.fstat(directory), candidates["admin"]
+                ):
+                    raise OSError("checkout registration changed")
+            identities = {}
+            # Git's registration lock also excludes an ordinary worktree move or prune.
+            names = ("locked", "index.lock", "HEAD.lock") if record_locks is not None else ("index.lock", "HEAD.lock")
+            for name in names:
+                marker = _review_checkout_lock_marker(intent, name) if record_locks is not None else None
+                try:
+                    if marker is None:
+                        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+                    else:
+                        descriptor = _publish_review_checkout_lock(directory, name, marker)
+                except FileExistsError:
+                    if marker is None:
+                        raise
+                    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                cleanup.callback(os.close, descriptor)
+                if marker is None:
+                    identity = _review_inode_identity(os.fstat(descriptor))
+                else:
+                    identity = _review_checkout_lock_evidence(descriptor, marker, (recorded_locks or {}).get(name))
+                    current = _review_removal_stat_at(name, directory)
+                    if identity is None or current is None or not os.path.samestat(current, os.fstat(descriptor)):
+                        raise OSError("foreign checkout lock")
+                identities[name] = identity
+                cleanup.callback(_release_review_checkout_lock, directory, name, descriptor)
+            if record_locks is not None:
+                os.fsync(directory)
+                record_locks(identities)
+        except OSError:
+            yield False
+            return
+        refs = {
+            f"refs/heads/{intent['branch']}": str(intent["head_sha"]),
+            str(preservation["pin_ref"]): str(intent["head_sha"]),
+            integration_ref: integration,
+            **(additional_refs or {}),
+        }
+        with _hold_reclaim_refs(root, refs) as locked:
+            yield locked
+
+
+def _review_checkout_lock_marker(intent: Mapping[str, object], name: str) -> bytes:
+    return f"workbay supersession {intent['nonce']} {name}\n".encode("ascii")
+
+
+def _publish_review_checkout_lock(directory: int, name: str, marker: bytes) -> int:
+    """Publish a complete marker atomically at Git's exclusive lock name."""
+    temporary = f".workbay-checkout-lock-{uuid.uuid4().hex}"
+    descriptor = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+    try:
+        try:
+            if os.write(descriptor, marker) != len(marker):
+                raise OSError("short checkout lock write")
+            os.fsync(descriptor)
+            os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        finally:
+            os.unlink(temporary, dir_fd=directory)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _review_checkout_lock_evidence(descriptor: int, marker: bytes, recorded: object) -> dict[str, int] | None:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    identity = _review_inode_identity(info)
+    # The intent nonce is durable before the first lock may be published.
+    # This proves an exact lock even if the inode list was never journaled.
+    if info.st_size == len(marker) and os.pread(descriptor, len(marker) + 1, 0) == marker:
+        return {**identity, "marker_size": len(marker)}
+    # Older journals can still prove a completely recorded set of empty locks.
+    if info.st_size == 0 and identity == recorded:
+        return identity
+    return None
+
+
+@contextmanager
+def _hold_reclaim_refs(root: Path, refs: Mapping[str, str]) -> Iterator[bool]:
+    """Keep a verify-only Git transaction prepared until the caller finishes."""
+    from .orchestration.adapters.control_path_release import (  # noqa: PLC0415
+        _GitTransactionError,
+        _transaction_response,
+    )
+
+    with ExitStack() as cleanup:
+        try:
+            command = ["git", "-C", str(root), "update-ref", "--stdin"]
+            process = subprocess.Popen(  # noqa: S603 - fixed Git argv for a verify-only transaction
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            yield False
+            return
+        cleanup.callback(_abort_review_ref_verification, process)
+        assert process.stdin is not None and process.stdout is not None
+        timeout = _registry_reap_remaining()
+        deadline = time.monotonic() + (5.0 if timeout is None else min(timeout, 5.0))
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                process.stdin.write(b"start\n")
+                process.stdin.flush()
+                _transaction_response(process, selector, b"start: ok\n", deadline)
+                verifies = "".join(f"option no-deref\nverify {ref} {tip}\n" for ref, tip in refs.items())
+                process.stdin.write(f"{verifies}prepare\n".encode())
+                process.stdin.flush()
+                _transaction_response(process, selector, b"prepare: ok\n", deadline)
+        except (OSError, ValueError, _GitTransactionError, subprocess.TimeoutExpired):
+            yield False
+            return
+        yield True
+
+
+def _release_review_checkout_lock(directory: int, name: str, descriptor: int) -> None:
+    try:
+        observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        owned = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == (owned.st_dev, owned.st_ino):
+            os.unlink(name, dir_fd=directory)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            _logger.warning("review removal lock release failed for %s: %s", name, exc)
+
+
+def _abort_review_ref_verification(process: subprocess.Popen[bytes]) -> None:
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        with suppress(OSError):
+            process.stdin.close()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    finally:
+        process.stdout.close()
+
+
+def _remove_preserved_review_worktree(
+    root: Path,
+    worktree_path: str,
+    lane_id: str,
+    incarnation: Mapping[str, object],
+    preservation: dict[str, object],
+    task_ref: str | None,
+) -> tuple[bool, str]:
+    from .orchestration.orchestrator_lanes import _landing_mutation_lock  # noqa: PLC0415
+    from .orchestration.review_stage_reap import _live_review_removal_proof  # noqa: PLC0415
+
+    with _landing_mutation_lock(root, operation="review_stage_worktree_remove", lane=lane_id) as locked:
+        if locked is not True:
+            return False, "review_removal_repo_lock_unavailable"
+        common = _run_reclaim_command(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )
+        if common is None or common.returncode != 0:
+            return False, "review_removal_repo_identity_unknown"
+        if Path(_probe_command_stdout(common).strip()).resolve() != Path(str(incarnation["git_common_dir"])):
+            return False, "review_removal_foreign_repo"
+        branch = str(preservation["branch"])
+        queue_task, queue_lane = _registry_reclaim_queue_identity(task_ref, lane_id, branch)
+        handoff = _REGISTRY_BRANCH_HANDOFF.set(_RegistryBranchHandoff(queue_task, queue_lane, branch))
+        try:
+            path, intent, refusal = _record_registry_removal_intent(
+                root, worktree_path, lane_id=lane_id, expected_incarnation=incarnation, review=preservation
+            )
+        finally:
+            _REGISTRY_BRANCH_HANDOFF.reset(handoff)
+        if path is None:
+            return False, refusal
+        original = Path(str(intent["original_worktree_path"]))
+        admin = Path(str(intent["admin_git_dir"]))
+        if not _review_removal_archive_matches(root, intent) or not _registry_removal_incarnation_matches(
+            intent, admin
+        ):
+            return False, "review_removal_binding_changed"
+
+        with _review_checkout_write_exclusion(root, intent, preservation) as custody:
+            if not custody:
+                return False, "review_removal_git_custody_unavailable"
+            if not _review_removal_archive_matches(root, intent):
+                return False, "review_removal_preservation_unverified"
+            if not _live_review_removal_proof(root, preservation):
+                return False, "review_removal_stage_proof_changed"
+            submodules = _run_reclaim_command(["git", "-C", str(original), "submodule", "status"])
+            if (
+                submodules is None
+                or submodules.returncode != 0
+                or any(not line.startswith("-") for line in _probe_command_stdout(submodules).splitlines())
+            ):
+                return False, "review_removal_submodule_custody_unavailable"
+            ignored_ok, ignored_detail = _probe_worktree_ignored(str(original))
+            if ignored_ok is not True:
+                return False, ignored_detail or "review_removal_ignored_content"
+            if changed_detail := _primary_copy_changed_detail(str(original)):
+                return False, changed_detail
+            status = _run_reclaim_command(
+                [
+                    "git",
+                    "-C",
+                    str(original),
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                ]
+            )
+            if status is None or status.returncode != 0 or _probe_command_stdout(status).strip():
+                return False, "review_removal_worktree_dirty_or_unknown"
+            observed, _ = _observe_registry_removal(original, verify_links=True)
+            if observed != incarnation or os.path.lexists(admin / "locked"):
+                return False, "review_removal_topology_changed_before_remove"
+            retired, detail = _retire_review_removal_directories(intent)
+            if not retired:
+                return False, detail
+        state, detail = _settle_registry_removal_intent_locked(path, intent)
+        return (True, "") if state == "completed" else (False, detail)
+
+
 def _remove_lane_worktree(
     repo_root: Path | str,
     worktree_path: str,
@@ -4382,6 +5202,9 @@ def _remove_lane_worktree(
     lane_id: str | None = None,
     task_ref: str | None = None,
     landing_lock_held: bool = False,
+    review: dict[str, object] | None = None,
+    incarnation: Mapping[str, object] | None = None,
+    landing_intent_id: str | None = None,
 ) -> tuple[bool, str]:
     """Remove a linked worktree with Git's SAFE dirty-tree check.
 
@@ -4396,6 +5219,12 @@ def _remove_lane_worktree(
     with or without an expected tip, so no entry path removes a moved closed
     worktree. A caller's expected tip that disagrees with the authority is refused.
     """
+    if review is not None:
+        if incarnation is None or lane_id is None:
+            return (False, "review_removal_identity_missing")
+        return _remove_preserved_review_worktree(Path(repo_root), worktree_path, lane_id, incarnation, review, task_ref)
+    if review_hold := _generic_review_worktree_deferral(repo_root, worktree_path):
+        return (False, review_hold)
     if lane_id:
         row, authority, refusal = _durable_close_authority(task_ref=task_ref, lane_id=lane_id)
         if refusal:
@@ -4426,6 +5255,7 @@ def _remove_lane_worktree(
             expected_tip=expected_tip,
             landing_lock_held=landing_lock_held,
             close_authority=authority,
+            **({"landing_intent_id": landing_intent_id} if landing_intent_id is not None else {}),
         )
     argv = ["git", "-C", str(repo_root), "worktree", "remove", str(worktree_path)]
     run = runner if runner is not None else _run_reclaim_command
@@ -4487,6 +5317,9 @@ def _remove_interrupted_lane_worktree(
     def _failure_detail(code: str, proc: object | None = None) -> str:
         detail = str(getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
         return f"{code}:{detail}"[:_RECLAIM_DETAIL_CAP] if detail else code
+
+    if review_hold := _generic_review_worktree_deferral(repo_root, worktree_path):
+        return (False, review_hold)
 
     deleted = _run_reclaim_command(["git", "-C", str(worktree_path), "ls-files", "--deleted", "-z"])
     deleted_rc = getattr(deleted, "returncode", 1)
@@ -4916,6 +5749,27 @@ def _branch_ledger_owner_blocks_reclaim(
     return (True, "branch_owner_scan_truncated")
 
 
+def _worktree_operation_refusal(gitdir: Path) -> tuple[str | None, str]:
+    # Porcelain can be clean while MERGE_AUTOSTASH owns uncommitted edits.
+    try:
+        for marker in (
+            "MERGE_HEAD",
+            "MERGE_AUTOSTASH",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "rebase-merge",
+            "rebase-apply",
+        ):
+            try:
+                (gitdir / marker).lstat()
+            except FileNotFoundError:
+                continue
+            return ("refused_operation_in_progress", f"pending_git_operation:{marker}")
+    except OSError:
+        return ("refused_operation_unknown", "worktree_operation_metadata_unreadable")
+    return (None, "")
+
+
 def _under_claim_worktree_reclaim_guards(
     *,
     worktree_path: object,
@@ -4924,6 +5778,7 @@ def _under_claim_worktree_reclaim_guards(
     task_ref: str | None = None,
     lane_id: str | None = None,
     owner_probe: Callable[[object], tuple[str, str]] | None = None,
+    require_clean: bool = False,
 ) -> tuple[str | None, str]:
     """Under-claim guards shared by every worktree reclaim actuator (REF-26).
 
@@ -4956,32 +5811,15 @@ def _under_claim_worktree_reclaim_guards(
         if head_ok is not True:
             return ("refused_head_mismatch", "worktree_head_not_recorded_branch")
 
-        # Porcelain can be clean while MERGE_AUTOSTASH owns uncommitted edits.
-        # Check operation custody here, under the removal claim [SECD-03/05].
         gitdir_probe = _run_reclaim_command(["git", "-C", path, "rev-parse", "--absolute-git-dir"])
         if gitdir_probe is None or gitdir_probe.returncode != 0:
             return ("refused_operation_unknown", "worktree_gitdir_unreadable")
         gitdir_text = _probe_command_stdout(gitdir_probe).strip()
         if not gitdir_text:
             return ("refused_operation_unknown", "worktree_gitdir_unreadable")
-        gitdir = Path(gitdir_text)
-        try:
-            for marker in (
-                "MERGE_HEAD",
-                "MERGE_AUTOSTASH",
-                "CHERRY_PICK_HEAD",
-                "REVERT_HEAD",
-                "rebase-merge",
-                "rebase-apply",
-            ):
-                # lstat also retains dangling links and reports permission errors.
-                try:
-                    (gitdir / marker).lstat()
-                except FileNotFoundError:
-                    continue
-                return ("refused_operation_in_progress", f"pending_git_operation:{marker}")
-        except OSError:
-            return ("refused_operation_unknown", "worktree_operation_metadata_unreadable")
+        operation_refusal, operation_detail = _worktree_operation_refusal(Path(gitdir_text))
+        if operation_refusal:
+            return operation_refusal, operation_detail
 
         probe = owner_probe if owner_probe is not None else _probe_worktree_process_owner
         state, owner_detail = probe(path)
@@ -5004,7 +5842,7 @@ def _under_claim_worktree_reclaim_guards(
             return ("refused_status_unknown", clean_detail)
         interrupted_removal = False
         if clean is False:
-            if not _is_interrupted_worktree_removal(root, path, branch):
+            if require_clean or not _is_interrupted_worktree_removal(root, path, branch):
                 return _dirty_refusal_outcome(root, path, clean_detail)
             interrupted_removal = True
 
@@ -6759,6 +7597,7 @@ def _reclaim_lane_worktree(
     trusted_landing: Mapping[str, object] | None = None,
     landing_lock_held: bool = False,
     preserving_ref: str | None = None,
+    protect_live_task_targets: bool = False,
 ) -> tuple[str, str]:
     """Remove one lane worktree if — and only if — every guard proves it safe.
 
@@ -6828,6 +7667,9 @@ def _reclaim_lane_worktree(
     root_resolved = _resolved_path_text(root).rstrip("/")
     if target == root_resolved:
         return ("refused_repo_root", "target equals repo_root")
+
+    if review_hold := _generic_review_deferral(root, branch):
+        return ("refused_review_stage", review_hold)
 
     if allow_rowless_work_complete:
         no_row, row_detail = _removal_time_rowless_lane_row_verdict(path, branch)
@@ -6901,13 +7743,16 @@ def _reclaim_lane_worktree(
     if merged is False and not unmerged_candidate:
         return ("refused_unmerged", merged_detail)
     authorizing = (merged, merged_detail)
+    # A normal landing uses its own tombstone epoch. A dirty original checkout,
+    # even one missing every tracked file, is not evidence of that epoch.
+    normal_landing = trusted_landing is not None and merged_detail == "verified_task_landing_receipt"
 
     clean, clean_detail = _probe_worktree_clean(path)
     if clean is None:
         return ("refused_status_unknown", clean_detail)
     interrupted_removal_resumed = False
     if clean is False:
-        if not _is_interrupted_worktree_removal(root, path, branch):
+        if normal_landing or not _is_interrupted_worktree_removal(root, path, branch):
             return _dirty_refusal_outcome(root, path, clean_detail)
         interrupted_removal_resumed = True
 
@@ -6991,6 +7836,10 @@ def _reclaim_lane_worktree(
             if tip_refusal:
                 return (tip_refusal, "authorized branch tip unavailable")
         if not apply:
+            if protect_live_task_targets:
+                custody_refusal, custody_detail = _live_task_target_refusal(root, branch, path)
+                if custody_refusal:
+                    return (custody_refusal, custody_detail)
             if never_started_candidate or terminal_unmerged_candidate:
                 row_terminal, _terminal_detail = _terminal_never_started_lane_row(
                     task_ref=task_ref,
@@ -7014,6 +7863,7 @@ def _reclaim_lane_worktree(
             task_ref=task_ref,
             lane_id=lane_id,
             owner_probe=probe,
+            **({"require_clean": True} if normal_landing else {}),
         )
         if guard_outcome is not None:
             return (guard_outcome, guard_detail)
@@ -7104,6 +7954,22 @@ def _reclaim_lane_worktree(
             if not no_row:
                 return ("refused_rowless_row_present", row_detail)
 
+        if review_hold := _generic_review_deferral(root, branch):
+            return ("refused_review_stage", review_hold)
+
+        if protect_live_task_targets:
+            custody_refusal, custody_detail = _live_task_target_refusal(root, branch, path)
+            if custody_refusal:
+                return (custody_refusal, custody_detail)
+
+        landing_removal: dict[str, str] = {}
+        if normal_landing and trusted_landing is not None:
+            from .orchestration import landing_cleanup  # noqa: PLC0415
+
+            intent_id, landing_identity = landing_cleanup._intent_id(trusted_landing)
+            expected_tip = landing_identity["expected_tip"]
+            landing_removal["landing_intent_id"] = intent_id
+
         # The tip was checked under the lock above; the tombstone's drain re-checks
         # it against the intent, so a move after this point is still refused.
         if interrupted_removal_resumed and expected_tip is None:
@@ -7138,6 +8004,7 @@ def _reclaim_lane_worktree(
                 lane_id=lane_id,
                 task_ref=task_ref,
                 **({"landing_lock_held": True} if landing_lock_held else {}),
+                **landing_removal,
             )
             if not removed and remove_detail == "tip_moved_after_intent":
                 # The tombstone's drain-time tip guard saw the move after the intent
@@ -7906,6 +8773,7 @@ def _drain_one_branch_reclaim_item(
         authorized_sha=item.authorized_sha,
         task_ref=item.task_ref,
         integration_ref=integration_ref,
+        _require_unowned_task_target=True,
     )
     disposition = _terminal_disposition_for_item(
         item,
@@ -10041,20 +10909,58 @@ def _preserving_integration_ref(
     return (None, "unmerged", "")
 
 
-_LIVE_TASK_TARGET_STATUSES = ("in_progress", "review")
+_TASK_INTEGRATION_TARGET_STATUSES = ("in_progress", "review")
 _PRESERVED_BRANCH_KEPT = "preserved_by_non_main_ref"
 
 
-def _read_live_task_target_branches() -> list[str]:
-    """``target_branch`` of every non-archived handoff task in progress or in review."""
+def _read_live_task_targets(*, include_done: bool = False) -> list[sqlite3.Row]:
+    """Current live targets and archive presence for integration-ref eligibility."""
+    statuses = (*LIVE_ACTIVE_STATUSES, "done") if include_done else LIVE_ACTIVE_STATUSES
+    placeholders = ",".join("?" for _ in statuses)
     with _get_db_connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT hs.target_branch AS target_branch FROM handoff_state hs "
-            "WHERE LOWER(COALESCE(hs.status, '')) IN (?, ?) "
-            "AND NOT EXISTS (SELECT 1 FROM task_archives ta WHERE ta.task_ref = hs.task_ref)",
-            _LIVE_TASK_TARGET_STATUSES,
+        return conn.execute(
+            "SELECT hs.task_ref, hs.target_branch, hs.target_worktree_path, hs.status, "
+            "EXISTS (SELECT 1 FROM task_archives ta WHERE ta.task_ref = hs.task_ref) AS has_archive "
+            f"FROM handoff_state hs WHERE hs.status IN ({placeholders})",
+            statuses,
         ).fetchall()
-    return [str(row["target_branch"]) for row in rows if row["target_branch"]]
+
+
+def _read_live_task_target_branches() -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(row["target_branch"])
+            for row in _read_live_task_targets()
+            if row["status"] in _TASK_INTEGRATION_TARGET_STATUSES and not row["has_archive"] and row["target_branch"]
+        )
+    )
+
+
+def _live_task_target_refusal(
+    root: Path,
+    branch: object,
+    worktree_path: str | None = None,
+    *,
+    exclude_task_ref: str | None = None,
+    include_done: bool = False,
+) -> tuple[str | None, str]:
+    """A live task retains custody of its exact checkout and local branch."""
+    try:
+        wanted_branch = _recorded_branch_short_name(branch)
+        wanted_path = _shared_path_identity(worktree_path, root)
+        # switch_task can restore a live row while keeping its historical snapshot.
+        targets = _read_live_task_targets(include_done=True) if include_done else _read_live_task_targets()
+        for row in targets:
+            if row["task_ref"] == exclude_task_ref:
+                continue
+            if wanted_branch and wanted_branch == _recorded_branch_short_name(row["target_branch"]):
+                return ("refused_owned", f"live_task_target_branch:{row['task_ref']}"[:_RECLAIM_DETAIL_CAP])
+            if wanted_path and wanted_path == _shared_path_identity(row["target_worktree_path"], root):
+                return ("refused_owned", f"live_task_target_worktree:{row['task_ref']}"[:_RECLAIM_DETAIL_CAP])
+    except Exception as exc:  # noqa: BLE001 — an unreadable authority never authorizes retirement
+        _registry_reap_remaining()
+        return ("refused_owner_unknown", f"live_task_target_probe_failed:{type(exc).__name__}")
+    return (None, "")
 
 
 def _live_task_integration_refs(root: Path, integration_ref: str) -> tuple[tuple[str, ...], str | None]:
@@ -10689,6 +11595,7 @@ def _bundle_before_reap(
     *,
     retention_count: int = _DEFAULT_BUNDLE_RETENTION_COUNT,
     bundle_dir: Path | str | None = None,
+    prune_to_cap: bool = True,
 ) -> dict[str, object]:
     """Write and verify the rollback bundle that must exist before a ref is deleted.
 
@@ -10849,7 +11756,8 @@ def _bundle_before_reap(
         keep=bundle_path,
         bundle_dir=bundle_dir,
     )
-    pruned += _prune_bundle_dir_to_cap(root, keep=bundle_path, bundle_dir=bundle_dir)
+    if prune_to_cap:
+        pruned += _prune_bundle_dir_to_cap(root, keep=bundle_path, bundle_dir=bundle_dir)
     try:
         bundle_bytes = bundle_path.stat().st_size
     except OSError as exc:
@@ -11010,6 +11918,7 @@ def _delete_merged_branch(
     close_authority: Mapping[str, Any] | None = None,
     task_ref: str | None = None,
     lane_id: str | None = None,
+    protect_live_task_targets: bool = False,
 ) -> tuple[bool, str]:
     """Bundle, then safe-delete. ``-d`` refuses unmerged work as the final fail-safe.
 
@@ -11019,6 +11928,8 @@ def _delete_merged_branch(
     tip: a branch that has moved off it is refused before anything is bundled,
     and a bundle of any other commit is refused before the delete.
     """
+    if review_hold := _generic_review_deferral(root, branch):
+        return (False, review_hold)
     if expected_tip is not None:
         current = _run_reclaim_command(
             ["git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"]
@@ -11061,6 +11972,12 @@ def _delete_merged_branch(
             bundle_record["reap_refusal"] = "tip_moved_after_bundle"
             bundle_record["reap_detail"] = f"bundled {bundled_sha} but ref now {current_sha}"
         return (False, "tip_moved_after_bundle")
+    if review_hold := _generic_review_deferral(root, branch, current_sha or None):
+        return (False, review_hold)
+    if protect_live_task_targets:
+        custody_refusal, custody_detail = _live_task_target_refusal(root, branch)
+        if custody_refusal:
+            return (False, f"{custody_refusal}:{custody_detail}")
     # Both actuators take their ``-d`` argv from branch_reclaim_delete, the designated delete module.
     from .orchestration.branch_reclaim_delete import (  # noqa: PLC0415
         _write_sha_guard_hook,
@@ -11151,6 +12068,7 @@ def reap_merged_registry_worktrees(
     rowless_only: bool = False,
     current_worktree: Path | None = None,
     deadline: float | None = None,
+    schedule_candidates: Callable[[Iterable[str]], Iterable[str]] | None = None,
 ) -> dict:
     """Reclaim merged worktrees and branches found in git itself, not rows.
 
@@ -11165,8 +12083,9 @@ def reap_merged_registry_worktrees(
     :func:`_reclaim_lane_worktree` chain (clean, ignored, owner, heartbeat,
     shared-path, flock, removal-time re-probe). Branch deletion runs after —
     and only after — the worktree is gone, always from the integration root,
-    always ``-d``. A branch named by any non-terminal lane row is refused
-    outright. Dry-run by default; ordinary failures return structured errors.
+    always ``-d``. Live handoff tasks retain their exact worktree and branch;
+    branches named by non-terminal lane rows are also held. Dry-run by default;
+    ordinary failures return structured errors.
     The hook watchdog may unwind the sweep immediately. In the rowless arm,
     ``current_worktree`` names the protected registered worktree. If omitted,
     the cwd's git toplevel is used only when it belongs to this registry;
@@ -11222,7 +12141,10 @@ def reap_merged_registry_worktrees(
             repo_root = _workspace_root()
         root = Path(repo_root)
         # Finish interrupted removals before listing, so their stale entries never reach the guards.
-        removal_intents = _recover_registry_removal_intents(root, apply=apply)
+        if schedule_candidates is None:
+            removal_intents = _recover_registry_removal_intents(root, apply=apply)
+        else:
+            removal_intents = _bounded_registry_removal_recovery(root, apply=apply)
         # The hook forwards failed entries, not removal_intents. Report every pending
         # recovery on every sweep while leaving its durable intent and branch intact.
         pending_removal_failures = [
@@ -11244,8 +12166,7 @@ def reap_merged_registry_worktrees(
         registry = _parse_worktree_registry(_probe_command_stdout(listing))
         root_resolved = _resolved_path_text(root).rstrip("/")
         resolved_registry_paths = {
-            str(entry.get("path")): _resolved_path_text(str(entry.get("path"))).rstrip("/")
-            for entry in registry
+            str(entry.get("path")): _resolved_path_text(str(entry.get("path"))).rstrip("/") for entry in registry
         }
         current_resolved: str | None = None
         cwd_resolved: str | None = None
@@ -11286,7 +12207,12 @@ def reap_merged_registry_worktrees(
             if resolved_entry_path == root_resolved:
                 root_branch = entry.get("branch")  # type: ignore[assignment]
 
-        for entry in registry:
+        if schedule_candidates is not None:
+            by_path = {str(entry.get("path") or ""): entry for entry in registry}
+            candidates = (by_path[path] for path in schedule_candidates(by_path))
+        else:
+            candidates = iter(registry)
+        for entry in candidates:
             _registry_reap_remaining()
             path = str(entry.get("path") or "")
             branch = entry.get("branch")
@@ -11316,6 +12242,9 @@ def reap_merged_registry_worktrees(
                 if branch == integration_ref or branch == root_branch:
                     reason = "keep:rowless_integration_branch" if rowless_only else "integration_branch"
                     skipped.append({**record, "reason": reason})
+                    continue
+                if review_hold := _generic_review_deferral(root, branch):
+                    skipped.append({**record, "reason": "keep:review_stage", "detail": review_hold})
                     continue
                 if rowless_only:
                     no_row, row_detail = _rowless_lane_row_verdict(path, branch)
@@ -11372,6 +12301,9 @@ def reap_merged_registry_worktrees(
                         skipped.append({**record, "reason": "keep:rowless_grace", "detail": age_detail})
                         continue
                 else:
+                    if review_hold := _generic_review_deferral(root, branch):
+                        skipped.append({**record, "reason": "keep:review_stage", "detail": review_hold})
+                        continue
                     merged = _branch_merged_into_integration(root, branch, integration_ref)
                     if merged is False:
                         # Not contained in main: a live task integration branch may still preserve it.
@@ -11435,6 +12367,11 @@ def reap_merged_registry_worktrees(
                             }
                         )
                         continue
+                custody_refusal, custody_detail = _live_task_target_refusal(root, branch, path)
+                if custody_refusal:
+                    reason = "keep:rowless_live_owner" if rowless_only else custody_refusal
+                    skipped.append({**record, "reason": reason, "detail": custody_detail})
+                    continue
                 try:
                     task_ref, lane_id = _row_identity_for_worktree_path(path)
                 except Exception:  # noqa: BLE001 — an unreadable row never authorizes removal
@@ -11465,6 +12402,7 @@ def reap_merged_registry_worktrees(
                         lane_id=lane_id,
                         allow_rowless_work_complete=rowless_only,
                         preserving_ref=preserved_by,
+                        protect_live_task_targets=True,
                     )
                 finally:
                     _REGISTRY_BRANCH_HANDOFF.reset(handoff_token)
@@ -11528,6 +12466,7 @@ def reap_merged_registry_worktrees(
                         close_authority=authority,
                         task_ref=task_ref,
                         lane_id=lane_id,
+                        protect_live_task_targets=True,
                     )
                     rollback = {key: bundle_record[key] for key in _BUNDLE_RECORD_FIELDS if key in bundle_record}
                     if rollback:
@@ -11627,6 +12566,10 @@ def reap_merged_registry_worktrees(
                     if authority_refusal:
                         failed.append({**record, "stage": "close_authority", "detail": authority_refusal})
                         continue
+                    custody_refusal, custody_detail = _live_task_target_refusal(root, branch)
+                    if custody_refusal:
+                        skipped.append({**record, "reason": custody_refusal, "detail": custody_detail})
+                        continue
                     if not apply:
                         would_delete_branch.append(record)
                         continue
@@ -11649,6 +12592,7 @@ def reap_merged_registry_worktrees(
                         close_authority=authority,
                         task_ref=task_ref,
                         lane_id=lane_id,
+                        protect_live_task_targets=True,
                     )
                     rollback = {key: bundle_record[key] for key in _BUNDLE_RECORD_FIELDS if key in bundle_record}
                     if deleted:

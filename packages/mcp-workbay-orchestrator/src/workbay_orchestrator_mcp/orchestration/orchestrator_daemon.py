@@ -6010,6 +6010,12 @@ def remote_jobs_loop(
 # ---------------------------------------------------------------------------
 
 
+def _default_maintenance_state_dir(orchestrator_root: Path) -> Path:
+    from workbay_handoff_mcp import RuntimeConfig  # noqa: PLC0415
+
+    return RuntimeConfig.for_repo(orchestrator_root).state_dir
+
+
 def _build_maintenance_context(
     orchestrator_root: Path,
     poll_interval: int,
@@ -6019,7 +6025,8 @@ def _build_maintenance_context(
     """Configure reaper authority without loading ordering or worker policy."""
     from workbay_handoff_mcp import RuntimeConfig, configure_runtime  # noqa: PLC0415
 
-    state_dir = state_dir or orchestrator_root / ".task-state"
+    if state_dir is None:
+        state_dir = _default_maintenance_state_dir(orchestrator_root)
     log_dir = orchestrator_root / "logs" / "daemon"
     run_id = str(uuid.uuid4())
 
@@ -6035,12 +6042,11 @@ def _build_maintenance_context(
             exports_dir=state_dir / "exports",
         )
     )
-    # Cross-session reaping uses _in_progress_task_refs(ctx), which requires
-    # a concrete task. The other two arms support all-task reaping. Reuse run's
-    # active-task / sole-manifest resolution, but report absence each cycle.
+    # Cross-session reaping requires a concrete task. Keep the other arms
+    # available when active-task or sole-manifest resolution is unavailable.
     try:
         task_ref = _resolve_task_ref(orchestrator_root, None)
-    except RuntimeError as exc:
+    except (ImportError, RuntimeError) as exc:
         task_ref = ""
         log("WARN", "maintenance_task_ref_unavailable", error=_reap_cap_error_text(exc))
 
@@ -6062,8 +6068,61 @@ def _build_maintenance_context(
     )
 
 
+_PENDING_REVIEW_BUDGET_S = 20.0
+
+
+class _PendingReviewTimeout(BaseException):
+    """Unwind even a native probe that handles ordinary exceptions."""
+
+
+def _resume_post_merge_review(ctx: OrchestratorContext) -> None:
+    from workbay_handoff_mcp.runtime import get_runtime_config  # noqa: PLC0415
+
+    from .post_merge_reap import consume_review_sweep, review_sweep_complete  # noqa: PLC0415
+
+    root = get_runtime_config().workspace_root
+    deadline = time.monotonic() + _PENDING_REVIEW_BUDGET_S
+
+    def expire(_signum: int, _frame: object) -> None:
+        raise _PendingReviewTimeout
+
+    def run(
+        schedule: collections.abc.Callable[[collections.abc.Iterable[str]], collections.abc.Iterable[str]],
+    ) -> dict[str, Any]:
+        from .review_stage_reap import reap_review_stage_worktrees  # noqa: PLC0415
+
+        # Maintenance owns SIGALRM only while running the native scan. Leave
+        # the request pending if an embedding caller already owns the timer.
+        if (
+            threading.current_thread() is not threading.main_thread()
+            or signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0)
+            or signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            or signal.SIGALRM in signal.sigpending()
+        ):
+            return {"ok": False, "error": "watchdog_unavailable"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _PendingReviewTimeout
+        previous = signal.signal(signal.SIGALRM, expire)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            return reap_review_stage_worktrees(root, apply=True, deadline=deadline, schedule_candidates=schedule)
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            finally:
+                signal.signal(signal.SIGALRM, previous)
+
+    try:
+        result = consume_review_sweep(root, deadline=deadline, run=run)
+    except _PendingReviewTimeout:
+        result = {"ok": False, "error": "deadline_exceeded"}
+    if result is not None and not review_sweep_complete(result):
+        ctx.log("WARN", "post_merge_review_pending", error=result.get("error") or "review_scan_incomplete")
+
+
 def _run_maintenance_cycle(ctx: OrchestratorContext) -> int:
-    """Run the three existing capped reapers, with no worker execution path."""
+    """Run bounded reapers and resume pending review sweeps."""
     if _shutdown_requested:
         ctx.log("INFO", "daemon_stop", reason="sigterm")
         return 0
@@ -6095,6 +6154,7 @@ def _run_maintenance_cycle(ctx: OrchestratorContext) -> int:
                 log("WARN", "reaper_heartbeat_write_failed", error=_reap_cap_error_text(exc))
 
             for arm, failure_event, needs_task in (
+                (_resume_post_merge_review, "post_merge_review_resume_failed", False),
                 (_reap_blocked_lanes_maintenance, "blocked_lane_reap_failed", False),
                 (_remote_sandbox_reap_maintenance, "remote_sandbox_reap_failed", False),
                 (_cross_session_lane_reap_maintenance, "cross_session_lane_reap_failed", True),
@@ -6110,7 +6170,7 @@ def _run_maintenance_cycle(ctx: OrchestratorContext) -> int:
                     continue
                 try:
                     arm(ctx)
-                except Exception as exc:  # noqa: BLE001 - one reaper cannot strand the other two
+                except Exception as exc:  # noqa: BLE001 - a failing reaper cannot strand the other arms
                     log("WARN", failure_event, error=_reap_cap_error_text(exc))
             if degraded:
                 try:
@@ -6189,10 +6249,10 @@ def _parse_args() -> argparse.Namespace:
     )
     remote_jobs_parser.add_argument("--single-pass", action="store_true", help="Run one poll cycle and exit.")
 
-    maintenance_parser = sub.add_parser("maintenance", help="Run only the three reclaim maintenance arms.")
+    maintenance_parser = sub.add_parser("maintenance", help="Run reclaim maintenance and pending review sweeps.")
     maintenance_parser.add_argument("--orchestrator-root", required=True, help="Absolute path to the monorepo root.")
     maintenance_parser.add_argument(
-        "--state-dir", default=None, help="State directory. Defaults to <orchestrator-root>/.task-state."
+        "--state-dir", default=None, help="State directory. Defaults to the primary Git worktree's .task-state."
     )
     maintenance_parser.add_argument(
         "--poll-interval", type=_positive_poll_interval, default=300, help="Seconds between polls (default: 300)."
@@ -6319,7 +6379,12 @@ def main() -> int:
 
     if args.command in {"remote-jobs", "maintenance"}:
         orchestrator_root = Path(args.orchestrator_root).expanduser().resolve()
-        state_dir = Path(args.state_dir).expanduser().resolve() if args.state_dir else orchestrator_root / ".task-state"
+        if args.state_dir:
+            state_dir = Path(args.state_dir).expanduser().resolve()
+        elif args.command == "maintenance":
+            state_dir = _default_maintenance_state_dir(orchestrator_root)
+        else:
+            state_dir = orchestrator_root / ".task-state"
 
         lock = OrchestratorLock(state_dir)
         if not lock.acquire():

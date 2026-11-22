@@ -129,6 +129,7 @@ __all__ = (
     "KIND_PROBE_FAILED",
     "KIND_REOPEN_MISSED",
     "KIND_RETRY_REAPED",
+    "KIND_REVIEW_STAGE_DEFERRED",
     "KIND_ROW_ALREADY_TERMINAL",
     "KIND_SHARED_PATH_IN_USE",
     "KIND_SHARED_PATH_UNVERIFIED",
@@ -155,6 +156,7 @@ KIND_PROBE_FAILED = "probe_failed"
 KIND_MANIFEST_RETIRE_FAILED = "manifest_retire_failed"
 KIND_REOPEN_MISSED = "reopen_missed"
 KIND_RETRY_REAPED = "retry_reaped"
+KIND_REVIEW_STAGE_DEFERRED = "review_stage_deferred"
 KIND_SHARED_PATH_UNVERIFIED = "shared_path_unverified"
 KIND_SHARED_PATH_IN_USE = "shared_path_in_use"
 CANDIDATE_REAP = "reap"
@@ -176,6 +178,7 @@ VERDICT_KINDS = frozenset(
         KIND_MANIFEST_RETIRE_FAILED,
         KIND_REOPEN_MISSED,
         KIND_RETRY_REAPED,
+        KIND_REVIEW_STAGE_DEFERRED,
         KIND_SHARED_PATH_UNVERIFIED,
         KIND_SHARED_PATH_IN_USE,
     }
@@ -513,6 +516,10 @@ def _reap_merged(
     retire_ownership: Callable[[str], tuple[bool, str]],
     state_dir: Path | str | None = None,
 ) -> LaneVerdict:
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
+    if hold := review_stage_deferral(repo, branch, tip_sha):
+        return _verdict(lane_id, branch, tip_sha, KIND_REVIEW_STAGE_DEFERRED, hold, applied=False)
     absent, refusal = _live_worktree_refusal(
         lane_id=lane_id,
         branch=branch,
@@ -556,7 +563,7 @@ def _reap_merged(
 
     try:
         if not absent:
-            removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path)
+            removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path, repo=repo)
             if remove_kind == KIND_MERGED_WORKTREE_DIRTY:
                 return _compensate_git_failure(
                     reopen_row,
@@ -567,14 +574,14 @@ def _reap_merged(
                     kind=KIND_MERGED_WORKTREE_DIRTY,
                     detail=remove_detail,
                 )
-            if remove_kind == KIND_PROBE_FAILED:
+            if remove_kind in {KIND_PROBE_FAILED, KIND_REVIEW_STAGE_DEFERRED}:
                 return _compensate_git_failure(
                     reopen_row,
                     lane_id=lane_id,
                     branch=branch,
                     tip_sha=tip_sha,
                     restore_status=status,
-                    kind=KIND_PROBE_FAILED,
+                    kind=remove_kind,
                     detail=f"worktree: {remove_detail}",
                 )
             if remove_kind == KIND_MERGED_WORKTREE_ABSENT:
@@ -590,7 +597,7 @@ def _reap_merged(
                     detail=f"worktree: {remove_detail}",
                 )
 
-        deleted, branch_detail = _delete_branch(git, branch, tip_sha, integration_branch)
+        deleted, branch_detail = _delete_branch(git, branch, tip_sha, integration_branch, repo=repo)
         if not deleted:
             return _compensate_git_failure(
                 reopen_row,
@@ -640,9 +647,13 @@ def _live_worktree_refusal(
     git: Callable[..., Any],
 ) -> tuple[bool, LaneVerdict | None]:
     """Probe absent / dirty / shared. Return ``(absent, refusal_or_none)``."""
+    from workbay_orchestrator_mcp.lane_reaping import _generic_review_worktree_deferral  # noqa: PLC0415
+
     absent = _worktree_is_absent(worktree_path, repo)
     if absent:
         return True, None
+    if worktree_path and (hold := _generic_review_worktree_deferral(repo, str(_resolve_worktree(worktree_path, repo)))):
+        return False, _verdict(lane_id, branch, tip_sha, KIND_REVIEW_STAGE_DEFERRED, hold, applied=False)
     try:
         dirty, dirty_detail, dirty_failed = _worktree_is_dirty(git, worktree_path)
     except _GitError as exc:
@@ -688,6 +699,10 @@ def _close_missing_branch(
     task_ref: str,
     detail: str,
 ) -> LaneVerdict:
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
+    if hold := review_stage_deferral(repo, branch):
+        return _verdict(lane_id, branch, None, KIND_REVIEW_STAGE_DEFERRED, hold, applied=False)
     absent, refusal = _live_worktree_refusal(
         lane_id=lane_id,
         branch=branch,
@@ -706,7 +721,7 @@ def _close_missing_branch(
 
     if not absent:
         try:
-            removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path)
+            removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path, repo=repo)
         except _GitError as exc:
             return _verdict(lane_id, branch, None, KIND_PROBE_FAILED, exc.detail, applied=False)
         if remove_kind == KIND_MERGED_WORKTREE_DIRTY:
@@ -723,7 +738,7 @@ def _close_missing_branch(
                 lane_id,
                 branch,
                 None,
-                KIND_PROBE_FAILED,
+                remove_kind or KIND_PROBE_FAILED,
                 f"worktree: {remove_detail}",
                 applied=False,
             )
@@ -1024,9 +1039,14 @@ def _call_list_by_path(list_by_path: Callable[..., Any], worktree_path: str) -> 
             return list_by_path(worktree_path)
 
 
-def _remove_worktree(git: Callable[..., Any], worktree_path: str | None) -> tuple[bool, str, str | None]:
+def _remove_worktree(git: Callable[..., Any], worktree_path: str | None, *, repo: Path) -> tuple[bool, str, str | None]:
+    from workbay_orchestrator_mcp.lane_reaping import _generic_review_worktree_deferral  # noqa: PLC0415
+
     if not worktree_path:
         return True, "worktree absent", KIND_MERGED_WORKTREE_ABSENT
+    # A missing or stale row branch can still point at an attached native stage.
+    if hold := _generic_review_worktree_deferral(repo, str(_resolve_worktree(worktree_path, repo))):
+        return False, hold, KIND_REVIEW_STAGE_DEFERRED
     try:
         proc = _git(git, ["worktree", "remove", worktree_path])
     except _GitError as exc:
@@ -1046,7 +1066,11 @@ def _delete_branch(
     branch: str,
     tip_sha: str,
     integration_branch: str,
+    *,
+    repo: Path,
 ) -> tuple[bool, str]:
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
     try:
         current = _probe_tip_sha(git, branch)
     except _GitError as exc:
@@ -1055,6 +1079,8 @@ def _delete_branch(
         return True, "branch missing"
     if current != tip_sha:
         return False, "ref_moved"
+    if hold := review_stage_deferral(repo, branch, current):
+        return False, hold
     try:
         if not _is_ancestor(git, tip_sha, integration_branch):
             return False, "not fully merged"
@@ -2028,6 +2054,8 @@ def _retry_finish_branch(
     branch: str,
     tip_sha: str,
     integration_branch: str,
+    *,
+    repo: Path,
 ) -> bool:
     """Delete the reaped branch if it still names ``tip_sha``.
 
@@ -2042,7 +2070,7 @@ def _retry_finish_branch(
     current = _probe_tip_sha(git, branch)
     if current is None:
         return True
-    deleted, _detail = _delete_branch(git, branch, tip_sha, integration_branch)
+    deleted, _detail = _delete_branch(git, branch, tip_sha, integration_branch, repo=repo)
     if not deleted:
         return False
     try:
@@ -2074,7 +2102,7 @@ def _retry_finish_and_record(
     ``branch_remains`` is only a still-present ref after a real ``-d`` miss.
     """
     try:
-        finished = _retry_finish_branch(git, branch, tip_sha, integration_branch)
+        finished = _retry_finish_branch(git, branch, tip_sha, integration_branch, repo=repo)
     except _GitError as exc:
         return _verdict(
             lane_id,
@@ -2145,11 +2173,15 @@ def _retry_missing_reap_decision(
     ours, retry still deletes the leftover consumed ref and never
     removes the occupier.
     """
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
     tip_sha = _tip_from_close_notes(_text(_row_get(row, "notes")))
     if not tip_sha:
         return None
     if not _terminal_needs_retry(row, repo, git):
         return None
+    if hold := review_stage_deferral(repo, branch, tip_sha):
+        return _verdict(lane_id, branch, tip_sha, KIND_REVIEW_STAGE_DEFERRED, hold, applied=False)
     decision_id = f"postmerge_reap:{task_ref}:{lane_id}:{tip_sha}"
     rationale = _decision_rationale(lane_id, branch, tip_sha)
 
@@ -2202,7 +2234,7 @@ def _retry_missing_reap_decision(
     )
     if refusal is not None:
         return refusal
-    removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path)
+    removed, remove_detail, remove_kind = _remove_worktree(git, worktree_path, repo=repo)
     if remove_kind == KIND_MERGED_WORKTREE_DIRTY:
         return _verdict(
             lane_id,
@@ -2212,12 +2244,12 @@ def _retry_missing_reap_decision(
             remove_detail,
             applied=False,
         )
-    if remove_kind == KIND_PROBE_FAILED:
+    if remove_kind in {KIND_PROBE_FAILED, KIND_REVIEW_STAGE_DEFERRED}:
         return _verdict(
             lane_id,
             branch,
             tip_sha,
-            KIND_PROBE_FAILED,
+            remove_kind,
             f"worktree: {remove_detail}",
             applied=False,
         )
@@ -2462,6 +2494,8 @@ def reap_preserved_lanes_cross_session(
         lane_status_is_reclaim_eligible,
     )
 
+    from .review_stage_reap import review_stage_deferral  # noqa: PLC0415
+
     would_reclaim: list[dict[str, Any]] = []
     reclaimed: list[dict[str, Any]] = []
     backlog: list[dict[str, Any]] = []
@@ -2492,6 +2526,11 @@ def reap_preserved_lanes_cross_session(
             task_ref=task_ref,
             orchestrator_root=orchestrator_root,
         )
+        # The native sweep owns stage proof, preservation, and retirement.
+        if item["verdict"] == "reclaim":
+            hold = review_stage_deferral(repo, item["branch"], _text(item.get("tip_sha")))
+            if hold:
+                item = _cross_session_keep(item, "keep:review_stage_deferred", hold)
         verdicts.append(item)
         if item["verdict"] == "keep:probe_failed":
             probe_failures += 1

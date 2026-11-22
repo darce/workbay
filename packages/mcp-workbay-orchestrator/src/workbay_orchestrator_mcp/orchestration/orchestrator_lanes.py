@@ -1392,8 +1392,12 @@ def _landing_mutation_lock(
     operation: str = "land",
     lane: str | None = None,
     lock_details: dict[str, Any] | None = None,
+    inherit_for_reclaim: bool = False,
 ):
-    """Coordinate actuators; omitted wait_seconds preserves the nonblocking fence."""
+    """Coordinate actuators with a nonblocking lock by default.
+
+    Attached retirement can extend the shared Handoff reservation to Git children.
+    """
     wait_bound = 0.0 if wait_seconds is None else _landing_lock_wait_bound(wait_seconds)
     try:
         git_dir = repo / ".git"
@@ -1484,10 +1488,18 @@ def _landing_mutation_lock(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             yield None
             return
-        try:
-            yield True
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if inherit_for_reclaim:
+            from workbay_orchestrator_mcp.lane_reaping import _inherit_reclaim_lock  # noqa: PLC0415
+
+            # Close our descriptor on exit. LOCK_UN would also unlock the
+            # inherited description while a Git child could still use it.
+            with _inherit_reclaim_lock(handle.fileno()):
+                yield True
+        else:
+            try:
+                yield True
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _no_ff_merge_heads(repo: Path) -> list[str]:

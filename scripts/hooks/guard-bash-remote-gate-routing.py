@@ -94,13 +94,17 @@ if __name__ == "__main__":
 
 import datetime
 import fnmatch
+import hashlib
 import importlib.util
 import ipaddress
 import json
 import re
 import shlex
+import shutil
 import socket
+import subprocess
 import sys
+import uuid
 import zlib
 from pathlib import Path
 from types import MappingProxyType
@@ -3002,17 +3006,20 @@ def _blocked_message(targets: set[str]) -> str:
     )
 
 
+_REFUSAL_REASONS = (
+    ("unverified_size", "executable shell syntax exceeds the structural scan limit"),
+    ("make_argv_unparsed", "the hook could not parse the whole make argv"),
+    ("make_makefile_unprovable", "makefile source or parse-time text is unprovable"),
+    ("make_goal_missing", "make requires an explicit inert goal; the default goal may run tests"),
+    ("make_goal_not_allowlisted", "make goal is not in the hook's fixed inert-goal allowlist"),
+    ("unparseable", "command could not be parsed"),
+    (_UNPARSED_SHAPE, "the hook could not prove this command shape is not a host test run"),
+)
+
+
 def _refusal_message(findings: list[_Finding]) -> str:
     targets = {target for _reason, target, _via, _word in findings}
-    for reason, prefix in (
-        ("unverified_size", "executable shell syntax exceeds the structural scan limit"),
-        ("make_argv_unparsed", "the hook could not parse the whole make argv"),
-        ("make_makefile_unprovable", "makefile source or parse-time text is unprovable"),
-        ("make_goal_missing", "make requires an explicit inert goal; the default goal may run tests"),
-        ("make_goal_not_allowlisted", "make goal is not in the hook's fixed inert-goal allowlist"),
-        ("unparseable", "command could not be parsed"),
-        (_UNPARSED_SHAPE, "the hook could not prove this command shape is not a host test run"),
-    ):
+    for reason, prefix in _REFUSAL_REASONS:
         word = next((word for kind, _target, _via, word in findings if kind == reason), None)
         if word is not None:
             if reason == "unverified_size":
@@ -3079,7 +3086,77 @@ def _policy_refusal(findings: list[_Finding], ledger_error: str | None) -> str:
     return message
 
 
-def _apply_findings(command: str, findings: list[_Finding], ledger_error: str | None, root: Path) -> int:
+def _record_policy_refusal(
+    findings: list[_Finding], ledger_error: str | None, root: Path, payload: dict
+) -> None:
+    """Launch the terminal recorder after the block, using only safe metadata."""
+    try:
+        if __name__ == "__main__" and time.monotonic() - _HOOK_STARTED >= _HOOK_DEADLINE_SECONDS - 0.25:
+            return
+        source = "guard-bash-remote-gate-routing"
+        kinds = {kind for kind, _target, _via, _word in findings}
+        reason = (
+            "ledger_unreadable"
+            if ledger_error is not None
+            else next((kind for kind, _prefix in _REFUSAL_REASONS if kind in kinds), "test")
+        )
+        harness = os.environ.get("WORKBAY_HANDOFF_HARNESS", "").strip()
+        if not harness:
+            harness = "grok" if os.environ.get("GROK_WORKSPACE_ROOT", "").strip() else "claude-code"
+        if harness not in {"claude-code", "codex", "grok", "cursor", "manual"}:
+            harness = "manual"
+
+        invocation = payload.get("tool_use_id") or payload.get("toolUseId")
+        session = payload.get("session_id") or payload.get("sessionId")
+        if not isinstance(invocation, str) or not 0 < len(invocation) <= 256:
+            invocation = uuid.uuid4().hex
+        if not isinstance(session, str) or len(session) > 256:
+            session = None
+        # Namespace the invocation to the policy, worktree and harness. The
+        # spool and ledger can dedupe without persisting any raw payload IDs.
+        identity = json.dumps([source, str(root), harness, session, invocation])
+        event_key = hashlib.sha256(identity.encode("ascii")).hexdigest()
+
+        override = os.environ.get("WORKBAY_TERMINAL_GUARD_RECORD")
+        if override:
+            argv = shlex.split(override)
+            if not argv:
+                return
+        else:
+            recorder = shutil.which("mcp-workbay-handoff")
+            argv = [os.path.abspath(recorder)] if recorder else [sys.executable, "-m", "workbay_handoff_mcp"]
+            argv.append("terminal-guard-record")
+        argv.extend([
+            "--decision", "block",
+            "--tool-name", "Bash",
+            "--harness", harness,
+            "--worktree-path", str(root),
+            "--command-preview", "[REDACTED]",
+            "--policy-version", "remote-gate-routing-v1",
+            "--policy-source", source,
+            "--trigger", reason,
+            "--event-key", event_key,
+        ])
+        subprocess.Popen(
+            argv,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 - recorder failures must preserve the guard outcome.
+        pass
+
+
+def _apply_findings(
+    command: str,
+    findings: list[_Finding],
+    ledger_error: str | None,
+    root: Path,
+    *,
+    payload: dict | None = None,
+) -> int:
     """Both normal and exception paths require a receipt before any bypass."""
     if _is_remote_gate_context(root):
         # A real remote lane suppresses a finding only after scanning it.
@@ -3093,6 +3170,8 @@ def _apply_findings(command: str, findings: list[_Finding], ledger_error: str | 
     message = _policy_refusal(findings, ledger_error)
     if unbypassed and not ambient_bypass:
         _emit_diagnostic(message)
+        if payload is not None:
+            _record_policy_refusal(findings, ledger_error, root, payload)
         return 2
     via = "env" if ambient_bypass else (findings[0][2] or "")
     if not via:
@@ -3188,7 +3267,7 @@ def main(raw_input: str | None = None) -> int:
             return _diagnostic(f"ALLOW: unparseable command, no test-run word found: {scan.parse_errors[0]}")
         return 0
 
-    return _apply_findings(command, scan.findings, ledger_error, root)
+    return _apply_findings(command, scan.findings, ledger_error, root, payload=payload)
 
 
 def _exception_bypass(command: str) -> str | None:

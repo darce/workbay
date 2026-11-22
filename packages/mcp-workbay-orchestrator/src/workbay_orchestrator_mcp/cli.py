@@ -66,6 +66,7 @@ from typing import Any
 from workbay_handoff_mcp import record_decision
 from workbay_handoff_mcp.config import RuntimeConfig
 from workbay_protocol import BRAND_NAME
+from workbay_system.payload.scripts.review_pipeline import checkout_git_env
 
 from .api import (
     build_orchestrator_mcp,
@@ -1656,6 +1657,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    if args.command == "review-stage-reap":
+        env = checkout_git_env()
+        if env != os.environ:
+            # The shared Git probes inherit their environment. Isolate the CLI
+            # before resolving runtime state or inspecting any checkout.
+            result = subprocess.run(
+                [sys.executable, "-m", "workbay_orchestrator_mcp.cli", *sys.argv[1:]],
+                env=env,
+                check=False,
+            )
+            raise SystemExit(result.returncode)
+
     if args.command == "resource-retention":
         from workbay_orchestrator_mcp.orchestration.resource_runtime import run_public
 

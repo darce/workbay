@@ -6,7 +6,8 @@ single Make-callable target so the order is mechanical and a stalled
 operator never leaves an inconsistent dashboard / unarchived task row /
 orphaned linked worktree behind.
 
-The sequence:
+Attached supersession requires Handoff's atomic archive and the native reaper's
+incarnation-bound journal. The sequence below applies to ordinary landed tasks.
 
 1. ``mcp-workbay-handoff complete-task --operation done`` — flip the live
    row to ``done`` through the core conditional-completion port, fenced on
@@ -271,9 +272,8 @@ def _read_handoff_identity(repo: Path, task_ref: str) -> dict[str, Any]:
     eliminates the fallback surface entirely and mirrors the pattern
     already used by ``_open_lanes_for_task`` below.
 
-    Returns ``{}`` on any missing/stale state — callers collapse to
-    ``skipped_unset`` for the optional teardown steps that need
-    ``target_worktree_path`` / ``target_branch``.
+    The selected row carries the database file identity observed during its
+    read. A missing database or an unverified read carries no selection.
 
     When no live row exists the lookup falls back to the
     ``task_archives`` snapshot (see ``_read_archived_identity``): a prior
@@ -283,37 +283,44 @@ def _read_handoff_identity(repo: Path, task_ref: str) -> dict[str, Any]:
     a manual merge still reap that orphan worktree.
     """
     canonical = resolver.canonical_workspace_root(repo) or repo
-    db_path = canonical / ".task-state" / "handoff.db"
-    if not db_path.is_file():
-        return {"source": "absent"}
+    lookup_path = canonical / ".task-state" / "handoff.db"
     try:
+        db_path = lookup_path.resolve(strict=True)
+        before = db_path.stat()
         with _connect(db_path, read_only=True) as conn:
+            # The live row and the archive marker are one SQLite snapshot.
+            conn.execute("BEGIN")
             cursor = conn.execute("SELECT * FROM handoff_state WHERE task_ref = ?", (task_ref,))
             row = cursor.fetchone()
+            archived = _read_archived_identity(conn, task_ref)
             if row is not None:
                 columns = dict(zip((col[0] for col in cursor.description), tuple(row), strict=True))
                 revision = columns.get("revision")
-                return {
+                result = {
                     "target_branch": columns.get("target_branch") or "",
                     "target_worktree_path": columns.get("target_worktree_path") or "",
                     "status": columns.get("status") or "",
-                    # Selected generation; the completion port fences on it.
                     "revision": revision if isinstance(revision, int) else None,
                     "source": "live",
                 }
-            # Live row gone — recover identity from the archive snapshot so
-            # an already-archived task can still have its orphan worktree
-            # reaped on a re-run. Shares the open connection. A present
-            # snapshot marks the task already-terminal (source='archived') so
-            # the close sequence skips the redundant (and crash-prone) set-done
-            # + archive writes; an empty result is a never-existed/stale ref.
-            archived = _read_archived_identity(conn, task_ref)
-            if archived:
-                return {**archived, "source": "archived"}
-            return {"source": "absent"}
+                # A restored live generation cannot hide prior supersession.
+                if "task_supersession" in archived:
+                    result["task_supersession"] = archived["task_supersession"]
+            elif archived:
+                result = {**archived, "source": "archived"}
+            else:
+                result = {"source": "absent"}
+            after = db_path.stat()
+            if lookup_path.resolve(strict=True) != db_path or not os.path.samestat(before, after):
+                return {"source": "unverified"}
+            return {**result, "db_identity": (str(db_path), before.st_dev, before.st_ino)}
+    except FileNotFoundError:
+        return {"source": "absent"}
     except sqlite3.Error as exc:
         _log_sqlite_error(exc, site="_read_handoff_identity")
-        return {"source": "absent"}
+    except (OSError, RuntimeError):
+        pass
+    return {"source": "unverified"}
 
 
 def _integration_target_branches(repo: Path, task_ref: str) -> set[str]:
@@ -539,6 +546,7 @@ def _read_archived_identity(conn: sqlite3.Connection, task_ref: str) -> dict[str
         return {}
     archived_branch, snapshot_json = arow[0], arow[1]
     active: dict[str, Any] = {}
+    snapshot = None
     snapshot_corrupt = False
     if not snapshot_json:
         # Row present but snapshot body missing — cannot recover worktree.
@@ -569,6 +577,10 @@ def _read_archived_identity(conn: sqlite3.Connection, task_ref: str) -> dict[str
     }
     if snapshot_corrupt:
         result["snapshot_corrupt"] = True
+    if isinstance(snapshot, dict) and "task_supersession" in snapshot:
+        result["task_supersession"] = snapshot["task_supersession"]
+        if active.get("task_ref") != task_ref or active.get("status") != "done":
+            result["snapshot_corrupt"] = True
     return result
 
 
@@ -899,7 +911,10 @@ def _complete_task(
         *context_argv,
         *(["--keep-live"] if operation == "archive" else []),
     )
-    proc = _common.run_handoff_subprocess(repo, argv)
+    return _completion_response(_common.run_handoff_subprocess(repo, argv))
+
+
+def _completion_response(proc: subprocess.CompletedProcess[str]) -> tuple[bool, str | None, dict[str, Any]]:
     try:
         envelope = json.loads(proc.stdout or "")
     except ValueError:
@@ -1166,7 +1181,7 @@ def _run_lsof_cwd_probe(worktree: Path) -> subprocess.CompletedProcess[str]:
         probe_root = str(worktree.resolve())
     except OSError:
         probe_root = str(worktree)
-    return _common.run_subprocess([*_LSOF_CWD_PROBE, probe_root])
+    return _common.run_subprocess([*_LSOF_CWD_PROBE, probe_root], timeout=TASK_FINISH_GIT_TIMEOUT_S)
 
 
 def _has_live_process_in(
@@ -1758,13 +1773,13 @@ def _remove_worktree(
         )
         if shared_reason is not None:
             return "skipped_active", shared_reason
+    custody = _PLANNING_CUSTODY.get()
     proc = _common.run_subprocess(
         ["git", "-C", str(primary), "worktree", "remove", str(target)],
         timeout=TASK_FINISH_GIT_TIMEOUT_S,
     )
     if proc.returncode == 0:
         return "removed", None
-    custody = _PLANNING_CUSTODY.get()
     if custody and custody["root"] == str(primary) and custody["branch"] == target_branch:
         # Accepted committed bytes never authorize force-removing new user work.
         return "failed", "planning_worktree_changed: preserve dirty or locked source and retry safe removal"
@@ -1997,10 +2012,9 @@ def _delete_merged_branch_status(
             reason = f"planning_thin_custody_required: restore proof unavailable ({type(exc).__name__})"
         if reason:
             return "failed", reason
-        # Existing owner/liveness/checkout and durable-record gates ran above.
         # CAS is mandatory: accepted bytes do not make the original tip merged.
         deleted = _common.run_subprocess(
-            ["git", "-C", str(primary), "update-ref", "-d", "refs/heads/" + target_branch, custody["tip"]],
+            ["git", "-C", str(primary), "update-ref", "-d", f"refs/heads/{target_branch}", custody["tip"]],
             timeout=TASK_FINISH_GIT_TIMEOUT_S,
         )
         return (
@@ -2076,20 +2090,25 @@ def _source_has_git_completion(primary: Path, branch: str, integration_ref: str)
     return cherry.returncode == 0 and bool(patches) and all(re.fullmatch(r"- [0-9a-f]{40}", p) for p in patches)
 
 
-def _planning_custody_hold_reason(primary: Path, custody: dict[str, Any]) -> str | None:
-    """Recheck source, declared canonical prerequisites, and the restore proof."""
+def _custody_source_hold(primary: Path, custody: dict[str, Any]) -> str | None:
     from workbay_handoff_mcp.import_export import planning_completion_hold_reason
-    from workbay_orchestrator_mcp.lane_reaping import _bundle_prerequisite_shas, _verified_bundle_contains
 
-    if custody["root"] != str(primary) or _branch_sha(primary, custody["branch"]) != custody["tip"]:
-        return "planning_source_changed: requalify the exact source tip"
-    reason = planning_completion_hold_reason(
+    return planning_completion_hold_reason(
         workspace_root=primary,
         task_ref=custody["task_ref"],
         branch=custody["branch"],
         source_tip=custody["tip"],
         integration_ref=custody["integration_ref"],
     )
+
+
+def _planning_custody_hold_reason(primary: Path, custody: dict[str, Any]) -> str | None:
+    """Recheck source, declared canonical prerequisites, and the restore proof."""
+    from workbay_orchestrator_mcp.lane_reaping import _bundle_prerequisite_shas, _verified_bundle_contains
+
+    if custody["root"] != str(primary) or _branch_sha(primary, custody["branch"]) != custody["tip"]:
+        return "planning_source_changed: requalify the exact source tip"
+    reason = _custody_source_hold(primary, custody)
     if reason:
         return reason
     path = Path(custody["bundle_path"])
@@ -2111,21 +2130,21 @@ def _planning_custody_hold_reason(primary: Path, custody: dict[str, Any]) -> str
 
 
 def _prepare_planning_custody(
-    primary: Path, *, task_ref: str, branch: str, integration_ref: str
+    primary: Path,
+    *,
+    task_ref: str,
+    branch: str,
+    integration_ref: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Use the existing bundle owner; do not introduce another history reaper."""
     try:
-        from workbay_handoff_mcp.import_export import planning_completion_hold_reason
         from workbay_orchestrator_mcp.lane_reaping import _bundle_before_reap
 
         tip = _resolve_branch_tip_sha(primary, branch)
-        reason = planning_completion_hold_reason(
-            workspace_root=primary,
-            task_ref=task_ref,
-            branch=branch,
-            source_tip=tip or "",
-            integration_ref=integration_ref,
+        custody = dict(
+            root=str(primary), task_ref=task_ref, branch=branch, tip=tip or "", integration_ref=integration_ref
         )
+        reason = _custody_source_hold(primary, custody)
         if reason:
             return None, reason
         # The existing bundler uses canonical main as its exclusion. Refuse an
@@ -2139,15 +2158,7 @@ def _prepare_planning_custody(
         bundle = _bundle_before_reap(primary, branch)
         if bundle.get("ok") is not True or bundle.get("bundle_mode") != "delta" or bundle.get("tip_sha") != tip:
             return None, "planning_thin_custody_required: " + str(bundle.get("error") or "exact delta bundle required")
-        custody = dict(
-            root=str(primary),
-            task_ref=task_ref,
-            branch=branch,
-            tip=tip,
-            integration_ref=integration_ref,
-            bundle_path=str(bundle["bundle_path"]),
-            bundle_mode="delta",
-        )
+        custody.update(bundle_path=str(bundle["bundle_path"]), bundle_mode="delta")
         reason = _planning_custody_hold_reason(primary, custody)
         return (None, reason) if reason else (custody, None)
     except (
@@ -2702,11 +2713,214 @@ def _note_codemap_reindex_on_receipt(
             warnings.append(note)
 
 
+def _emit_supersession_hold(
+    task_ref: str,
+    identity: dict[str, Any],
+    detail: str,
+    warnings: list[str],
+) -> int:
+    archived = identity.get("source") == "archived" or "task_supersession" in identity
+    _common.emit(
+        {
+            "ok": False,
+            "command": "task-finish",
+            "task_ref": task_ref,
+            "error": "cleanup_incomplete" if archived else "task_completion_held",
+            "detail_code": detail.split(":", 1)[0],
+            "detail_reason": detail,
+            "target_branch": identity.get("target_branch"),
+            "target_worktree_path": identity.get("target_worktree_path"),
+            "events": [],
+            "warnings": warnings,
+            **({"finish_status": "cleanup_pending", "cleanup_pending": True, "retryable": True} if archived else {}),
+        }
+    )
+    return 2
+
+
+def _supersession_handoff(
+    repo: Path,
+    selection: dict[str, Any],
+    db_identity: tuple[str, int, int],
+    operation: str,
+    *,
+    generation: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    db_path, device, inode = db_identity
+    if Path(db_path).name != "handoff.db":
+        return None, "supersession_handoff_db_mismatch"
+    try:
+        argv = _common.handoff_command_argv(
+            repo,
+            "--state-dir",
+            str(Path(db_path).parent),
+            "complete-task",
+            "--operation",
+            operation,
+            "--task-ref",
+            selection["task_ref"],
+            "--expected-revision",
+            str(selection["revision"]),
+            "--expected-status",
+            selection["status"],
+            "--expected-target-branch",
+            selection["target_branch"],
+            "--expected-target-worktree-path",
+            selection["target_worktree_path"],
+            "--integration-ref",
+            selection["integration_ref"],
+            "--supersession-receipt",
+            selection["receipt"],
+            "--supersession-tip",
+            selection["tip"],
+            "--expected-handoff-db-path",
+            db_path,
+            "--expected-handoff-db-identity",
+            json.dumps({"st_dev": device, "st_ino": inode}),
+            *(["--expected-task-generation", generation] if generation else []),
+            *(_common.worktree_write_context_argv(repo) if operation == "archive" else []),
+        )
+        ok, detail, data = _completion_response(_common.run_handoff_subprocess(repo, argv))
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, f"supersession_handoff_unavailable: {type(exc).__name__}"
+    if not ok:
+        return None, str(data.get("error") or detail or "supersession_handoff_unavailable")
+    proof = data.get("task_supersession")
+    if not isinstance(proof, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("task_generation"))):
+        return None, "supersession_handoff_proof_unverified"
+    if generation is not None and proof["task_generation"] != generation:
+        return None, "supersession_task_generation_changed"
+    return proof, None
+
+
+def _finish_attached_supersession(
+    repo: Path,
+    primary: Path,
+    task_ref: str,
+    args: argparse.Namespace,
+    identity: dict[str, Any],
+    warnings: list[str],
+) -> int:
+    def hold(detail: str) -> int:
+        return _emit_supersession_hold(task_ref, identity, detail, warnings)
+
+    if args.operator_force:
+        return hold("supersession_requires_exact_linked_target_without_force")
+    if "task_supersession" in identity and identity.get("source") == "live":
+        return hold("supersession_task_generation_changed")
+    if identity.get("source") not in {"live", "archived"} or not identity.get("db_identity"):
+        return hold("supersession_selection_unverified")
+
+    try:
+        from workbay_orchestrator_mcp.orchestration.supersession_retirement import (  # noqa: PLC0415
+            retire_superseded_checkout,
+        )
+    except ImportError:
+        return hold("supersession_native_unavailable")
+    if _ensure_handoff_runtime(primary) != _HANDOFF_RUNTIME_CONFIGURED:
+        return hold("supersession_native_runtime_unavailable")
+
+    if identity["source"] == "archived":
+        proof = identity.get("task_supersession")
+        if (
+            identity.get("snapshot_corrupt")
+            or not isinstance(proof, dict)
+            or proof.get("schema_version") != 1
+            or proof.get("custody_phase") != "handoff_archived"
+            or not isinstance(proof.get("selection"), dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("task_generation")))
+        ):
+            return hold("supersession_archive_selection_mismatch")
+        selection = proof["selection"]
+        if (
+            selection.get("task_ref") != task_ref
+            or selection.get("target_branch") != identity["target_branch"]
+            or selection.get("target_worktree_path") != identity["target_worktree_path"]
+            or type(selection.get("revision")) is not int
+            or any(not isinstance(selection.get(key), str) for key in ("status", "integration_ref", "receipt", "tip"))
+            or (args.supersession_receipt is not None and args.supersession_receipt != selection.get("receipt"))
+            or (
+                args.integration_ref
+                and args.integration_ref.removeprefix("refs/heads/") != selection["integration_ref"]
+            )
+        ):
+            return hold("supersession_archive_selection_mismatch")
+        proof, detail = _supersession_handoff(
+            repo, selection, identity["db_identity"], "resume", generation=proof["task_generation"]
+        )
+    else:
+        branch, path = identity["target_branch"], identity["target_worktree_path"]
+        release = _release_target_branches(primary)
+        if not branch or not path or branch in release or _path_resolves_to_primary(primary, path):
+            return hold("supersession_requires_exact_linked_target_without_force")
+        if type(identity.get("revision")) is not int:
+            return hold("supersession_selection_unverified")
+
+        tip = _resolve_branch_tip_sha(primary, branch.removeprefix("refs/heads/"))
+        if tip is None:
+            return hold("supersession_source_unreadable")
+        selection = {
+            "task_ref": task_ref,
+            "revision": identity["revision"],
+            "status": identity["status"],
+            "target_branch": branch,
+            "target_worktree_path": path,
+            "integration_ref": (args.integration_ref or "main").removeprefix("refs/heads/"),
+            "receipt": args.supersession_receipt,
+            "tip": tip,
+        }
+        proof, detail = _supersession_handoff(repo, selection, identity["db_identity"], "select")
+        if proof is None:
+            return hold(detail or "supersession_selection_unverified")
+        state, detail = retire_superseded_checkout(primary, proof=proof)
+        if state != "prepared":
+            return hold(detail)
+        proof, detail = _supersession_handoff(
+            repo, selection, identity["db_identity"], "archive", generation=proof["task_generation"]
+        )
+        if proof is not None:
+            identity = {**identity, "source": "archived", "task_supersession": proof}
+
+    if proof is None:
+        return hold(detail or "supersession_archive_unverified")
+    state, detail = retire_superseded_checkout(primary, proof=proof)
+    if state != "completed":
+        return hold(detail)
+    _common.emit(
+        {
+            "ok": True,
+            "command": "task-finish",
+            "task_ref": task_ref,
+            "finish_status": "complete",
+            "cleanup_pending": False,
+            "retryable": False,
+            "cleanup": {"worktree_removed": True, "branch_retired": True},
+            "target_branch": selection["target_branch"],
+            "target_worktree_path": selection["target_worktree_path"],
+            "branch_tip": selection["tip"],
+            "events": ["supersession_retired"],
+            "warnings": warnings,
+        }
+    )
+    return 0
+
+
 def run(argv: list[str]) -> int:
-    _PLANNING_CUSTODY.set(None)
+    custody_token = _PLANNING_CUSTODY.set(None)
+    selection_token = _COMPLETION_SELECTION.set(None)
+    try:
+        return _run(argv)
+    finally:
+        _COMPLETION_SELECTION.reset(selection_token)
+        _PLANNING_CUSTODY.reset(custody_token)
+
+
+def _run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="lifecycle task-finish", add_help=True)
     parser.add_argument("--task", dest="task", default="")
     parser.add_argument("--json", dest="emit_json", action="store_true", default=False)
+    parser.add_argument("--supersession-receipt", help="Exact SHA of an operator-reviewed supersession declaration")
+    parser.add_argument("--integration-ref", help="Local integration branch named by the supersession declaration")
     parser.add_argument(
         "--force",
         dest="operator_force",
@@ -2715,6 +2929,8 @@ def run(argv: list[str]) -> int:
         help="Override active-worktree guard and proceed with teardown",
     )
     args = parser.parse_args(argv)
+    if args.integration_ref and args.supersession_receipt is None:
+        parser.error("--integration-ref requires --supersession-receipt")
 
     repo = _common.repo_root()
     warnings: list[str] = []
@@ -2797,11 +3013,20 @@ def run(argv: list[str]) -> int:
         )
         return 127
 
+    primary = resolver.canonical_workspace_root(repo) or repo
+    identity = _read_handoff_identity(repo, task_ref)
+    if args.supersession_receipt is not None or "task_supersession" in identity:
+        return _finish_attached_supersession(repo, primary, task_ref, args, identity, warnings)
+
     # internal+3: best-effort dual-spool reclaimer after preflight.
     # Never raise / never fail task-finish ([REF-20]/[AGT-10]).
     # warnings sink carries the degrade cause into the receipt [OBS-08][AGT-10].
     agent_errors_replay = _common.maybe_replay_agent_error_spool(repo, warnings=warnings)
     terminal_guard_replay = _common.maybe_replay_terminal_guard_spool(repo, warnings=warnings)
+    if agent_errors_replay is not None or terminal_guard_replay is not None:
+        identity = _read_handoff_identity(repo, task_ref)
+        if "task_supersession" in identity:
+            return _finish_attached_supersession(repo, primary, task_ref, args, identity, warnings)
     # internal: belt-and-suspenders stale /tmp/workbay-* reclaimer.
     stale_dev_temp_reap = _common.maybe_reap_stale_dev_temp(repo, warnings=warnings)
     events_seed: list[str] = []
@@ -2812,8 +3037,6 @@ def run(argv: list[str]) -> int:
     if stale_dev_temp_reap is not None and (stale_dev_temp_reap.get("removed") or []):
         events_seed.append("stale_dev_temp_reaped")
 
-    primary = resolver.canonical_workspace_root(repo) or repo
-    identity = _read_handoff_identity(repo, task_ref)
     target_worktree_path = ""
     raw_target = identity.get("target_worktree_path")
     if isinstance(raw_target, str):
@@ -2889,8 +3112,7 @@ def run(argv: list[str]) -> int:
         if verify_target_branch in release_branches
         else next(iter(sorted(release_branches - {"main"})), "main")
     )
-    # Bind the terminal writes to this exact selection for this invocation;
-    # the port, not this early hold, is the authority at write time.
+    hold = None
     _COMPLETION_SELECTION.set(_completion_selection(task_ref, identity, integration_ref))
 
     # Completion must be guarded BEFORE status/archive; a later teardown
@@ -2912,22 +3134,27 @@ def run(argv: list[str]) -> int:
                 )
             except (ImportError, OSError, RuntimeError):
                 hold = "completion guard unavailable"
-        if hold:
-            _common.emit(
-                {
-                    "ok": False,
-                    "command": "task-finish",
-                    "task_ref": task_ref,
-                    "events": events,
-                    "error": "task_completion_held",
-                    "detail_reason": hold,
-                    "detail_code": hold.split(":", 1)[0],
-                    "target_branch": verify_target_branch,
-                    "target_worktree_path": verify_target_worktree_path,
-                    "warnings": warnings,
-                }
-            )
-            return 2
+    if hold:
+        _common.emit(
+            {
+                "ok": False,
+                "command": "task-finish",
+                "task_ref": task_ref,
+                "events": events,
+                "error": "cleanup_incomplete" if already_terminal else "task_completion_held",
+                "detail_reason": hold,
+                "detail_code": hold.split(":", 1)[0],
+                "target_branch": verify_target_branch,
+                "target_worktree_path": verify_target_worktree_path,
+                "warnings": warnings,
+                **(
+                    {"finish_status": "cleanup_pending", "cleanup_pending": True, "retryable": True}
+                    if already_terminal
+                    else {}
+                ),
+            }
+        )
+        return 2
 
     if already_terminal:
         events.append("skipped_terminal")
@@ -3138,7 +3365,11 @@ def run(argv: list[str]) -> int:
             branch=target_branch,
             integration_ref=integration_ref,
         )
-        if refusal and already_terminal and refusal.split(":", 1)[0] in _PLANNING_BASIS_ABSENT_CODES:
+        if (
+            refusal
+            and already_terminal
+            and refusal.split(":", 1)[0] in _PLANNING_BASIS_ABSENT_CODES
+        ):
             # A re-run of an archived task skipped the early explicit proof, so
             # planning custody applies only when the accepted-planning proof is
             # the completion basis. Otherwise keep the regular guarded path
@@ -3168,14 +3399,15 @@ def run(argv: list[str]) -> int:
             _PLANNING_CUSTODY.set(custody)
             events.append("planning_unique_history_thin_verified")
 
+    custody = _PLANNING_CUSTODY.get()
+    observed_tip = _resolve_branch_tip_sha(primary, target_branch)
     branch_tip = _record_branch_tip_identity(
         primary,
         task_ref=task_ref,
         target_branch=target_branch,
-        tip_sha=_resolve_branch_tip_sha(primary, target_branch),
+        tip_sha=observed_tip,
     )
 
-    custody = _PLANNING_CUSTODY.get()
     if custody is not None:
         # Do not discard even the worktree until both recoverable history and
         # its durable task/lane identity are proven. Safe removal still owns

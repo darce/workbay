@@ -298,6 +298,7 @@ def record_terminal_guard_event(
     policy_source: str,
     fallback_source: str | None = None,
     created_at: str | None = None,
+    event_key: str | None = None,
 ) -> dict:
     normalized_task_ref = _normalize_optional_text(task_ref)
 
@@ -321,6 +322,7 @@ def record_terminal_guard_event(
                 policy_source=policy_source,
                 fallback_source=fallback_source,
                 created_at=created_at,
+                event_key=event_key,
                 git_common_dir=git_common_dir,
             )
             if error is not None or event_row is None:
@@ -352,6 +354,7 @@ def record_terminal_guard_event(
             policy_source=policy_source,
             fallback_source=fallback_source,
             created_at=created_at,
+            event_key=event_key,
         )
 
     return _envelope(
@@ -396,6 +399,7 @@ def _spool_terminal_guard_fallback(
     policy_source: str,
     fallback_source: str | None,
     created_at: str | None,
+    event_key: str | None,
 ) -> dict:
     """Spool a terminal-guard block when the DB write failed. Never raises."""
     normalized_task_ref = _normalize_optional_text(task_ref)
@@ -419,6 +423,8 @@ def _spool_terminal_guard_fallback(
         "created_at": _normalize_optional_text(created_at) or spooled_at,
         "spooled_at": spooled_at,
     }
+    if normalized_event_key := _normalize_optional_text(event_key):
+        event["event_key"] = normalized_event_key
     try:
         state_dir = get_runtime_config().state_dir
     except Exception as cfg_exc:  # noqa: BLE001 — fallback must never raise

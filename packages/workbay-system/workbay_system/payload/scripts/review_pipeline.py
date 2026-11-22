@@ -36,6 +36,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -208,6 +211,25 @@ def _landing_blocking_severities(root: Path) -> tuple[str, ...]:
 POR_PREFIXES = ("POR:", "PROOF-OF-READING:", "PROOF:")
 
 POR_DIR = Path(".task-state") / "review-por"
+STAGE_SCHEMA = 3
+STAGE_TITLE = "review: stage input patch for "
+_STAGE_TITLE_RE = re.compile(rf"{STAGE_TITLE}([^/\\\x00-\x1f\x7f]*) at ([0-9a-f]{{9}})")
+FULL_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_BINDING_PREFIX = b"WorkBay-Stage-Evidence: "
+_BINDING_FIELDS = (
+    "schema_version",
+    "slug",
+    "subject",
+    "subject_tip",
+    "integration",
+    "integration_tip",
+    "base",
+    "patch",
+    "patch_blob",
+    "patch_sha256",
+    "review_branch",
+    "rev",
+)
 ADJUDICATION_DIR = Path(".task-state") / "review-adjudication"
 
 # A branch may legitimately need to commit the *text* of a merge marker (a
@@ -298,8 +320,39 @@ def _coerce_bytes(value: bytes | str | None) -> bytes:
     return b""
 
 
+# A named checkout owns Git discovery and storage even when invoked by a hook.
+_CHECKOUT_GIT_SELECTORS = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+)
+
+
+def checkout_git_env() -> dict[str, str]:
+    """Copy the caller's environment with checkout selectors removed."""
+    env = os.environ.copy()
+    for name in _CHECKOUT_GIT_SELECTORS:
+        env.pop(name, None)
+    return env
+
+
+def _run_git(argv: list[str], *, env: dict[str, str] | None = None, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, env=checkout_git_env() if env is None else env, **kwargs)
+
+
 def _git(root: Path, *args: str) -> str:
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), *args],
         capture_output=True,
         text=True,
@@ -312,7 +365,7 @@ def _git(root: Path, *args: str) -> str:
 
 
 def _git_bytes(root: Path, *args: str) -> bytes:
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), *args],
         capture_output=True,
         text=False,
@@ -418,7 +471,10 @@ def _path_exists_including_broken_symlink(path: Path) -> bool:
 
 def derive_por_keys(patch_path: Path) -> dict:
     """Derive the proof-of-reading keys from a patch file's exact bytes."""
-    data = patch_path.read_bytes()
+    return _por_keys(patch_path.read_bytes())
+
+
+def _por_keys(data: bytes) -> dict:
     lines = data.decode("utf-8", errors="replace").splitlines()
     nonblank = [(index, line) for index, line in enumerate(lines, start=1) if line.strip()]
     selected: list[tuple[int, str]] = []
@@ -439,10 +495,25 @@ def derive_por_keys(patch_path: Path) -> dict:
     }
 
 
-def _run_subject_diff(root: Path, base: str, subject: str) -> DiffResult:
+def _run_subject_diff(root: Path, base: str, subject_tip: str) -> DiffResult:
     """Run the diff probe while preserving failed/empty/nonempty identity."""
-    proc = subprocess.run(
-        ["git", "-C", str(root), "diff", f"{base}..{subject}"],
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--binary",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--submodule=short",
+            "--ignore-submodules=none",
+            f"{base}..{subject_tip}",
+            "--",
+        ],
         capture_output=True,
         text=False,
         timeout=120,
@@ -451,10 +522,167 @@ def _run_subject_diff(root: Path, base: str, subject: str) -> DiffResult:
     data = _coerce_bytes(proc.stdout)
     stderr = _coerce_bytes(proc.stderr).decode("utf-8", "replace").strip()[:400]
     if proc.returncode != 0:
-        return DiffResult(DiffOutcome.FAILED, base, subject, stderr=stderr, returncode=proc.returncode)
+        return DiffResult(DiffOutcome.FAILED, base, subject_tip, stderr=stderr, returncode=proc.returncode)
     if not data.strip():
-        return DiffResult(DiffOutcome.EMPTY, base, subject, stderr=stderr)
-    return DiffResult(DiffOutcome.NONEMPTY, base, subject, data=data, stderr=stderr)
+        return DiffResult(DiffOutcome.EMPTY, base, subject_tip, stderr=stderr)
+    return DiffResult(DiffOutcome.NONEMPTY, base, subject_tip, data=data, stderr=stderr)
+
+
+def _stage_git(root: Path, *args: str) -> str | None:
+    try:
+        return _git(root, *args)
+    except (GitCommandError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def review_evidence_root(root: Path) -> Path | None:
+    """Resolve the shared evidence directory's checkout without rebasing Git probes."""
+    # Keep standalone invocations on the same primary-root convention as RuntimeConfig.
+    if (root / ".git").is_dir():
+        return root
+    common_dir = _stage_git(root, "rev-parse", "--git-common-dir")
+    if not common_dir:
+        return None
+    common_path = (root / common_dir).resolve()
+    return common_path.parent if common_path.name == ".git" else common_path
+
+
+def latest_review_stage(
+    root: Path, review_tip: str, *, git: Callable[..., str | None] = _stage_git
+) -> tuple[tuple[str, str, str] | None, str]:
+    """Find the unique newest stage commit reachable from the exact review tip."""
+    # cmd_stage commits the patch before publishing the sidecar. Start with Git
+    # so that an interrupted newer stage cannot fall back to an older sidecar.
+    log_args = ("log", "-1", "--topo-order", "--no-merges", f"--grep=^{STAGE_TITLE}", "--format=%H%x09%s")
+    newest = git(root, *log_args, review_tip, "--")
+    if newest is None:
+        return None, "stage_history_probe_failed"
+    entry = newest.strip()
+    if not entry:
+        return None, "stage_binding_missing"
+    stage, _, title = entry.partition("\t")
+    match = _STAGE_TITLE_RE.fullmatch(title)
+    if not FULL_OBJECT_ID.fullmatch(stage) or match is None:
+        return None, "stage_commit_malformed"
+
+    # A topological sort puts a descendant first, but can order parallel
+    # histories arbitrarily. Exclude the selected commit and its ancestors.
+    other = git(root, *log_args, review_tip, f"^{stage}", "--")
+    if other is None:
+        return None, "stage_history_probe_failed"
+    if other.strip():
+        return None, "stage_binding_ambiguous"
+    label, short = match.groups()
+    return (stage, label, short), ""
+
+
+def stage_record_path(root: Path, stage: str) -> Path:
+    return root / POR_DIR / f"stage-{stage}.json"
+
+
+def read_stage_record(path: Path) -> dict | None:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    return record if isinstance(record, dict) else None
+
+
+def read_review_stage(root: Path, stage: str, label: str, short: str) -> tuple[dict | None, str, Path]:
+    """Read evidence for the selected stage, with its historical filename fallback."""
+    sidecar = stage_record_path(root, stage)
+    try:
+        try:
+            record = read_stage_record(sidecar)
+        except FileNotFoundError:
+            sidecar = root / POR_DIR / f"{label}-{short}.json"
+            record = read_stage_record(sidecar)
+    except FileNotFoundError:
+        return None, "stage_sidecar_missing", sidecar
+    except (OSError, UnicodeError, ValueError):
+        return None, "stage_sidecar_unreadable", sidecar
+    if record is None:
+        return None, "stage_sidecar_malformed", sidecar
+    current = record.get("schema_version") == STAGE_SCHEMA
+    if current != (sidecar == stage_record_path(root, stage)):
+        return None, "stage_scope_mismatch", sidecar
+    return record, "", sidecar
+
+
+def stage_binding_line(record: dict) -> bytes:
+    binding = json.dumps({key: record.get(key) for key in _BINDING_FIELDS}, sort_keys=True, separators=(",", ":"))
+    return _BINDING_PREFIX + hashlib.sha256(binding.encode("ascii")).hexdigest().encode("ascii")
+
+
+def stage_binding_matches(message: bytes, record: dict) -> bool:
+    lines = [line for line in message.splitlines()[1:] if line.startswith(_BINDING_PREFIX)]
+    if record.get("schema_version") != STAGE_SCHEMA:
+        return not lines
+    return lines == [stage_binding_line(record)]
+
+
+def patch_matches_trees(
+    root: Path, base: str, subject_tip: str, patch: bytes, *, timeout: float, historical: bool = False
+) -> bool | None:
+    """Replay a patch in a private index and compare complete trees."""
+    if not patch or base == subject_tip:
+        return False
+    deadline = time.monotonic() + timeout
+
+    # Keep the primary index and object store read-only. Git apply can write
+    # blobs even for an ultimately invalid patch.
+    def run(*args: str, env: dict[str, str] | None = None, data: bytes | None = None):
+        return _run_git(
+            ["git", "--no-replace-objects", "-C", str(root), *args],
+            input=data,
+            capture_output=True,
+            check=False,
+            timeout=max(0, deadline - time.monotonic()),
+            env=env,
+        )
+
+    try:
+        objects = run("rev-parse", "--path-format=absolute", "--git-path", "objects")
+        if objects.returncode != 0:
+            return None
+        with tempfile.TemporaryDirectory(prefix="workbay-stage-proof-") as directory:
+            scratch = Path(directory)
+            scratch_objects = scratch / "objects"
+            info = scratch_objects / "info"
+            info.mkdir(parents=True)
+            (info / "alternates").write_bytes(objects.stdout)
+            env = {
+                **checkout_git_env(),
+                "GIT_INDEX_FILE": str(scratch / "index"),
+                "GIT_OBJECT_DIRECTORY": str(scratch_objects),
+            }
+            if run("-c", "core.splitIndex=false", "read-tree", "--no-sparse-checkout", base, env=env).returncode != 0:
+                return None
+            applied = run(
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "apply.ignoreWhitespace=false",
+                "apply",
+                "--cached",
+                "--unidiff-zero",
+                "--whitespace=nowarn",
+                "-",
+                env=env,
+                data=patch,
+            )
+            if applied.returncode == 0:
+                actual = run("write-tree", env=env)
+                expected = run("rev-parse", "--verify", f"{subject_tip}^{{tree}}")
+                if actual.returncode != 0 or expected.returncode != 0:
+                    return None
+                if actual.stdout == expected.stdout:
+                    return True
+        if historical:
+            # Some old renderings (such as binary summaries) cannot be replayed.
+            # Keep their original exact-byte proof when it is reproducible.
+            original = run("diff", "--no-ext-diff", "--no-textconv", f"{base}..{subject_tip}", "--")
+            return original.stdout == patch if original.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return False
 
 
 def _worktree_entries(root: Path) -> list[dict[str, str]]:
@@ -564,7 +792,7 @@ def _cleanup_created_review_worktree(root: Path, worktree: Path, branch: str) ->
     failures: list[dict] = []
     worktree_removed = False
     branch_deleted = False
-    remove = subprocess.run(
+    remove = _run_git(
         ["git", "-C", str(root), "worktree", "remove", "--force", str(worktree)],
         capture_output=True,
         text=True,
@@ -582,7 +810,7 @@ def _cleanup_created_review_worktree(root: Path, worktree: Path, branch: str) ->
             }
         )
     if worktree_removed:
-        delete = subprocess.run(
+        delete = _run_git(
             ["git", "-C", str(root), "branch", "-D", branch],
             capture_output=True,
             text=True,
@@ -634,7 +862,8 @@ def cmd_stage(args: argparse.Namespace) -> int:
     if provenance_error is not None:
         return _refuse("judge_provenance_mismatch", provenance_error)
     try:
-        subject_tip = _git(root, "rev-parse", args.subject)
+        subject_tip = _git(root, "rev-parse", "--verify", "--end-of-options", f"{args.subject}^{{commit}}")
+        integration_tip = _git(root, "rev-parse", "--verify", "--end-of-options", f"{args.integration}^{{commit}}")
     except GitCommandError as exc:
         return _refuse(
             "git_failed",
@@ -643,9 +872,12 @@ def cmd_stage(args: argparse.Namespace) -> int:
     short = subject_tip[:9]
     rev = int(args.rev)
     rev_branch = _review_branch(args.subject, rev)
-    sidecar = root / POR_DIR / f"{args.slug}-{short}.json"
-    if _path_exists_including_broken_symlink(sidecar):
-        return _refuse("por_sidecar_exists", {"sidecar": str(sidecar)})
+    evidence_root = review_evidence_root(root)
+    if evidence_root is None:
+        return _refuse("review_stage_evidence_root_unknown", {"root": str(root)})
+    previous_sidecar = evidence_root / POR_DIR / f"{args.slug}-{short}.json"
+    if _path_exists_including_broken_symlink(previous_sidecar):
+        return _refuse("por_sidecar_exists", {"sidecar": str(previous_sidecar)})
     created_worktree: Path | None = None
     if args.worktree:
         worktree = Path(args.worktree).resolve()
@@ -656,7 +888,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
         worktree = root.parent / f"{root.name}-rev{rev}-{_branch_file_slug(args.subject.split('/', 1)[-1])}"
         if _path_exists_including_broken_symlink(worktree):
             return _refuse("rev_worktree_path_exists", {"worktree": str(worktree)})
-        add = subprocess.run(
+        add = _run_git(
             [
                 "git",
                 "-C",
@@ -666,7 +898,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
                 "-b",
                 rev_branch,
                 str(worktree),
-                args.integration,
+                integration_tip,
             ],
             capture_output=True,
             text=True,
@@ -684,8 +916,8 @@ def cmd_stage(args: argparse.Namespace) -> int:
             )
         created_worktree = worktree
     try:
-        base = _git(root, "merge-base", args.integration, args.subject)
-        diff = _run_subject_diff(root, base, args.subject)
+        base = _git(root, "merge-base", integration_tip, subject_tip)
+        diff = _run_subject_diff(root, base, subject_tip)
         diff_detail = {
             "base": base,
             "subject": args.subject,
@@ -708,6 +940,14 @@ def cmd_stage(args: argparse.Namespace) -> int:
                 created_worktree=created_worktree,
                 created_branch=rev_branch if created_worktree else None,
             )
+        if patch_matches_trees(root, base, subject_tip, diff.data, timeout=120) is not True:
+            return _stage_refusal(
+                root,
+                "patch_not_actual_subject_diff",
+                diff_detail,
+                created_worktree=created_worktree,
+                created_branch=rev_branch if created_worktree else None,
+            )
 
         reviews_dir = worktree / "docs" / "reviews"
         reviews_dir.mkdir(parents=True, exist_ok=True)
@@ -725,43 +965,63 @@ def cmd_stage(args: argparse.Namespace) -> int:
 
         rel = patch_path.relative_to(worktree)
         _git(worktree, "add", "-f", "--", str(rel))
+        patch_blob = _git(worktree, "rev-parse", "--verify", f":{rel}")
+        if _git_bytes(worktree, "cat-file", "blob", patch_blob) != diff.data:
+            return _stage_refusal(
+                root,
+                "stage_patch_digest_mismatch",
+                {"patch": str(rel)},
+                created_worktree=created_worktree,
+                created_branch=rev_branch if created_worktree else None,
+            )
+        record = {
+            "schema_version": STAGE_SCHEMA,
+            "slug": args.slug,
+            "rev": rev,
+            "subject": args.subject,
+            "subject_tip": subject_tip,
+            "integration": args.integration,
+            "integration_tip": integration_tip,
+            "base": base,
+            "patch": str(rel),
+            "patch_blob": patch_blob,
+            "patch_sha256": hashlib.sha256(diff.data).hexdigest(),
+            "keys": _por_keys(diff.data),
+            "worktree": str(worktree),
+            "review_branch": rev_branch,
+            "judge_provenance": judge_provenance(),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        binding = stage_binding_line(record)
         _git(
             worktree,
             "commit",
             "-m",
-            f"review: stage input patch for {args.slug} at {short}",
+            f"{STAGE_TITLE}{args.slug} at {short}",
+            "-m",
+            binding.decode("ascii"),
             "--",
             str(rel),
         )
         staged_commit = _git(worktree, "rev-parse", "HEAD")
 
-        keys = derive_por_keys(patch_path)
-        sidecar_dir = root / POR_DIR
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text(
-            json.dumps(
-                {
-                    "schema_version": 2,
-                    "slug": args.slug,
-                    "rev": rev,
-                    "subject": args.subject,
-                    "subject_tip": subject_tip,
-                    "integration": args.integration,
-                    "base": base,
-                    "patch": str(rel),
-                    "patch_sha256": hashlib.sha256(diff.data).hexdigest(),
-                    "keys": keys,
-                    "staged_commit": staged_commit,
-                    "worktree": str(worktree),
-                    "review_branch": rev_branch,
-                    "judge_provenance": judge_provenance(),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+        if _git(worktree, "rev-parse", "--verify", f"{staged_commit}:{rel}") != patch_blob or not stage_binding_matches(
+            _git_bytes(worktree, "show", "-s", "--format=%B", staged_commit), record
+        ):
+            return _stage_refusal(
+                root,
+                "stage_commit_binding_mismatch",
+                {"staged_commit": staged_commit},
+                created_worktree=created_worktree,
+                created_branch=rev_branch if created_worktree else None,
+            )
+        sidecar = stage_record_path(evidence_root, staged_commit)
+        record["staged_commit"] = staged_commit
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".stage-", dir=sidecar.parent) as temp:
+            pending = Path(temp) / sidecar.name
+            pending.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            os.link(pending, sidecar)
     except GitCommandError as exc:
         return _stage_refusal(
             root,
@@ -850,7 +1110,7 @@ def cmd_harvest(args: argparse.Namespace) -> int:
             {"worktree": str(worktree), "doc": str(doc_path)},
         )
 
-    binding, binding_error = _stage_binding_for_review_worktree(root, worktree, branch)
+    binding, binding_error = _stage_binding_for_review_worktree(root, worktree, branch, detail["review_head"])
     if binding_error is not None:
         return _harvest_refuse(
             "harvest_por_invalid",
@@ -1128,22 +1388,22 @@ def _count_blocking_findings(doc_text: str) -> int:
 
 
 def _stage_sidecar_for_patch(
-    root: Path, patch_path: Path, subject: str, subject_tip: str
+    evidence_root: Path, patch_path: Path, subject: str, subject_tip: str
 ) -> tuple[Path | None, dict | None, dict | None]:
     """Find the unique sidecar that names this exact staged patch."""
-    sidecar_dir = root / POR_DIR
+    sidecar_dir = evidence_root / POR_DIR
     if not sidecar_dir.is_dir():
         return None, None, {"reason": "stage_sidecar_missing", "sidecar_dir": str(sidecar_dir)}
-    candidates = sorted(sidecar_dir.glob(f"*-{subject_tip[:9]}.json"))
+    candidates = sorted(set(sidecar_dir.glob(f"*-{subject_tip[:9]}.json")) | set(sidecar_dir.glob("stage-*.json")))
     matching: list[tuple[Path, dict]] = []
     malformed: list[str] = []
     for sidecar in candidates:
         try:
-            record = json.loads(sidecar.read_text(encoding="utf-8"))
+            record = read_stage_record(sidecar)
         except (OSError, UnicodeError, json.JSONDecodeError):
             malformed.append(str(sidecar))
             continue
-        if not isinstance(record, dict):
+        if record is None:
             malformed.append(str(sidecar))
             continue
         if record.get("subject") != subject or record.get("subject_tip") != subject_tip:
@@ -1180,7 +1440,7 @@ def _stage_sidecar_for_patch(
 
 
 def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool | None:
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
         capture_output=True,
         text=True,
@@ -1206,12 +1466,9 @@ def _committed_file_matches(worktree: Path, commit: str, relative: Path, path: P
 
 
 def _validate_stage_binding(
-    root: Path, patch_path: Path, subject: str, subject_tip: str
+    root: Path, evidence_root: Path, patch_path: Path, sidecar_path: Path, record: dict
 ) -> tuple[dict | None, dict | None]:
-    sidecar_path, record, error = _stage_sidecar_for_patch(root, patch_path, subject, subject_tip)
-    if error is not None:
-        return None, error
-    assert sidecar_path is not None and record is not None
+    subject, subject_tip = record.get("subject"), record.get("subject_tip")
     required = {
         "schema_version",
         "subject",
@@ -1227,7 +1484,8 @@ def _validate_stage_binding(
         "rev",
         "judge_provenance",
     }
-    if record.get("schema_version") != 2 or not required.issubset(record):
+    schema = record.get("schema_version")
+    if type(schema) is not int or schema not in {2, STAGE_SCHEMA} or not required.issubset(record):
         return None, {"reason": "stage_sidecar_malformed", "sidecar": str(sidecar_path)}
     try:
         worktree = Path(record["worktree"]).resolve()
@@ -1236,6 +1494,10 @@ def _validate_stage_binding(
         patch_data = patch_path.read_bytes()
     except (KeyError, TypeError, ValueError, OSError) as exc:
         return None, {"reason": "stage_binding_invalid", "error": str(exc)[:400]}
+    if not FULL_OBJECT_ID.fullmatch(staged_commit) or (
+        (schema == STAGE_SCHEMA) != (sidecar_path == stage_record_path(evidence_root, staged_commit))
+    ):
+        return None, {"reason": "stage_scope_mismatch", "sidecar": str(sidecar_path)}
     if str(relative_patch) != record["patch"]:
         return None, {"reason": "stage_patch_path_mismatch", "sidecar": str(sidecar_path)}
     try:
@@ -1262,6 +1524,11 @@ def _validate_stage_binding(
         }
     try:
         staged_patch = _git_bytes(worktree, "show", f"{staged_commit}:{relative_patch.as_posix()}")
+        message = _git_bytes(worktree, "show", "-s", "--format=%B", staged_commit)
+        if schema == STAGE_SCHEMA:
+            blob = _git(worktree, "rev-parse", "--verify", f"{staged_commit}:{relative_patch.as_posix()}")
+            if blob != record.get("patch_blob"):
+                return None, {"reason": "stage_patch_digest_mismatch", "sidecar": str(sidecar_path)}
     except GitCommandError as exc:
         return None, {
             "reason": "stage_patch_not_committed",
@@ -1278,8 +1545,11 @@ def _validate_stage_binding(
     keys = derive_por_keys(patch_path)
     if record["keys"] != keys or record["patch_sha256"] != hashlib.sha256(patch_data).hexdigest():
         return None, {"reason": "stage_por_mismatch", "sidecar": str(sidecar_path)}
+    if not stage_binding_matches(message, record):
+        return None, {"reason": "stage_commit_binding_mismatch", "sidecar": str(sidecar_path)}
     try:
-        base = _git(root, "merge-base", record["integration"], subject)
+        integration_tip = _git(root, "rev-parse", "--verify", "--end-of-options", f"{record['integration']}^{{commit}}")
+        base = _git(root, "merge-base", integration_tip, subject_tip)
     except GitCommandError as exc:
         return None, {"reason": "git_failed", "argv": list(exc.argv), "stderr": exc.stderr}
     if base != record["base"]:
@@ -1288,22 +1558,12 @@ def _validate_stage_binding(
             "staged_base": record["base"],
             "current_base": base,
         }
-    actual = _run_subject_diff(root, base, subject)
-    if actual.outcome is DiffOutcome.FAILED:
-        return None, {
-            "reason": "diff_failed",
-            "diff_outcome": actual.outcome.value,
-            "returncode": actual.returncode,
-            "stderr": actual.stderr,
-        }
-    if actual.outcome is DiffOutcome.EMPTY:
-        return None, {"reason": "empty_diff", "diff_outcome": actual.outcome.value}
-    if actual.data != patch_data:
-        return None, {
-            "reason": "patch_not_actual_subject_diff",
-            "actual_patch_sha256": hashlib.sha256(actual.data).hexdigest(),
-            "provided_patch_sha256": hashlib.sha256(patch_data).hexdigest(),
-        }
+    if schema == 2:
+        matches = patch_matches_trees(root, base, subject_tip, staged_patch, timeout=120, historical=True)
+        if matches is None:
+            return None, {"reason": "diff_failed", "diff_outcome": DiffOutcome.FAILED.value}
+        if not matches:
+            return None, {"reason": "patch_not_actual_subject_diff", "sidecar": str(sidecar_path)}
     return {
         "sidecar": str(sidecar_path),
         "record": record,
@@ -1312,67 +1572,46 @@ def _validate_stage_binding(
         "staged_commit": staged_commit,
         "review_head": current_head,
         "keys": keys,
-        "actual_diff": actual,
     }, None
 
 
-def _stage_binding_for_review_worktree(root: Path, worktree: Path, branch: str) -> tuple[dict | None, dict | None]:
-    """Load and fully validate the one staged patch sidecar for a review tree."""
-    sidecar_dir = root / POR_DIR
-    if not sidecar_dir.is_dir():
-        return None, {"reason": "stage_sidecar_missing", "sidecar_dir": str(sidecar_dir)}
+def _stage_binding_for_review_worktree(
+    root: Path, worktree: Path, branch: str, review_head: str
+) -> tuple[dict | None, dict | None]:
+    """Validate the sidecar for the newest stage in this checkout's history."""
+    latest, reason = latest_review_stage(worktree, review_head)
+    if latest is None:
+        return None, {"reason": reason, "review_head": review_head}
+    evidence_root = review_evidence_root(root)
+    if evidence_root is None:
+        return None, {"reason": "review_stage_evidence_root_unknown", "root": str(root)}
+    stage, label, short = latest
+    record, reason, sidecar = read_review_stage(evidence_root, stage, label, short)
+    if record is None:
+        return None, {"reason": reason, "sidecar": str(sidecar)}
 
-    matching: list[tuple[Path, dict]] = []
-    malformed: list[str] = []
-    for sidecar in sorted(sidecar_dir.glob("*.json")):
-        try:
-            record = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            malformed.append(str(sidecar))
-            continue
-        if not isinstance(record, dict):
-            malformed.append(str(sidecar))
-            continue
-        record_worktree = record.get("worktree")
-        if not isinstance(record_worktree, str) or record.get("review_branch") != branch:
-            continue
-        try:
-            resolved_worktree = Path(record_worktree).resolve()
-        except (OSError, RuntimeError, ValueError):
-            malformed.append(str(sidecar))
-            continue
-        if resolved_worktree == worktree:
-            matching.append((sidecar, record))
-
-    if len(matching) != 1:
-        if matching:
-            return None, {
-                "reason": "stage_sidecar_ambiguous",
-                "sidecars": [str(path) for path, _ in matching],
-            }
-        return None, {
-            "reason": "stage_sidecar_missing",
-            "sidecar_dir": str(sidecar_dir),
-            "malformed_sidecars": malformed,
-            "worktree": str(worktree),
-            "review_branch": branch,
-        }
-
-    sidecar, record = matching[0]
-    subject = record.get("subject")
-    subject_tip = record.get("subject_tip")
-    relative_patch = record.get("patch")
+    subject, subject_tip, relative_patch = (record.get(key) for key in ("subject", "subject_tip", "patch"))
     if not all(isinstance(value, str) and value for value in (subject, subject_tip, relative_patch)):
         return None, {"reason": "stage_sidecar_malformed", "sidecar": str(sidecar)}
-    binding, error = _validate_stage_binding(
-        root,
-        worktree / relative_patch,
-        subject,
-        subject_tip,
-    )
-    if error is not None:
-        return None, error
-    return binding, None
+    if (
+        record.get("staged_commit") != stage
+        or record.get("review_branch") != branch
+        or not FULL_OBJECT_ID.fullmatch(subject_tip)
+        or not subject_tip.startswith(short)
+        or relative_patch != f"docs/reviews/_input-{label}-{short}.patch"
+    ):
+        return None, {"reason": "stage_sidecar_mismatch", "sidecar": str(sidecar)}
+    try:
+        recorded_worktree = Path(record["worktree"]).resolve()
+    except (KeyError, TypeError, OSError, RuntimeError, ValueError):
+        return None, {"reason": "stage_sidecar_missing", "malformed_sidecars": [str(sidecar)]}
+    if recorded_worktree != worktree:
+        return None, {"reason": "stage_scope_mismatch", "sidecar": str(sidecar)}
+
+    binding, error = _validate_stage_binding(root, evidence_root, worktree / relative_patch, sidecar, record)
+    if binding is not None and binding["review_head"] != review_head:
+        return None, {"reason": "review_worktree_head_changed_during_probe", "review_head": binding["review_head"]}
+    return binding, error
 
 
 def _inspect_review_doc(
@@ -1497,7 +1736,14 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
             "subject_tip_moved_since_stage",
             {"staged_tip_short": staged.group(1), "current_tip": subject_tip},
         )
-    binding, binding_error = _validate_stage_binding(root, patch_path, args.subject, subject_tip)
+    evidence_root = review_evidence_root(root)
+    if evidence_root is None:
+        return _refuse("review_stage_evidence_root_unknown", {"root": str(root)})
+    sidecar, record, error = _stage_sidecar_for_patch(evidence_root, patch_path, args.subject, subject_tip)
+    if error is not None:
+        return _refuse(error.pop("reason"), error)
+    assert sidecar is not None and record is not None
+    binding, binding_error = _validate_stage_binding(root, evidence_root, patch_path, sidecar, record)
     if binding_error is not None:
         return _refuse(binding_error.pop("reason"), binding_error)
     assert binding is not None
@@ -1612,7 +1858,7 @@ def _conflict_marker_pattern(root: Path) -> str:
     in a repository that widened them. Quantifiers keep this module's own
     source free of a literal marker line, so the gate never rejects itself.
     """
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), "config", "--get", "merge.conflictMarkerSize"],
         capture_output=True,
         text=True,
@@ -1639,7 +1885,7 @@ def scan_tip_for_conflict_markers(root: Path, tip: str) -> tuple[list[str], str 
     gate that read a scan failure as "clean" would authorise exactly the merge
     it exists to refuse.
     """
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), "grep", "-I", "-n", "-E", _conflict_marker_pattern(root), tip, "--"],
         capture_output=True,
         text=True,
@@ -1669,7 +1915,7 @@ def check_merge_gate(root: Path, subject: str) -> tuple[bool, dict]:
         return False, {"reason": "verdict_not_merge", "verdict": record.get("verdict")}
     if record.get("subject") != subject:
         return False, {"reason": "subject_mismatch", "recorded_subject": record.get("subject")}
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(root), "rev-parse", subject],
         capture_output=True,
         text=True,

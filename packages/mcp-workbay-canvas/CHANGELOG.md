@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.28] — 2026-11-22
+
+### Changed
+- Raise the handoff and orchestrator dependency floors for the custody and retirement changes.
+
 ## [0.1.27] — 2026-11-21
 
 ### Changed

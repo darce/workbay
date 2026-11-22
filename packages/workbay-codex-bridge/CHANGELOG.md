@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.14] — 2026-11-22
+
+### Changed
+- Advance the Codex bridge package tag for the WorkBay v0.1.98 Git snapshot.
+
 ## [0.3.13] — 2026-11-21
 
 ### Changed

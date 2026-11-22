@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import stat
 import subprocess
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -168,81 +170,167 @@ def _manifest_worktree(value: object, *, primary_root: Path) -> Path | None:
         return None
 
 
-def _mentions_target_worktree(raw: bytes, worktree_path: Path, primary_root: Path) -> bool:
-    """Spot a damaged target manifest without rejecting unrelated broken JSON."""
-    text = raw.decode("utf-8", errors="ignore")
-    candidates = {str(worktree_path)}
-    try:
-        relative = worktree_path.relative_to(primary_root)
-    except ValueError:
-        relative = Path(os.path.relpath(worktree_path, primary_root))
-    if relative is not None:
-        candidates.add(str(relative))
-        candidates.add("{orchestrator_root}/" + str(relative))
-    return any(candidate and candidate in text for candidate in candidates)
+_MANIFEST_TOKEN_RE = re.compile(rb'[ \t\r\n]*+([{}\[\],:"]|[^{}\[\],:" \t\r\n]++)')
+_MANIFEST_STRING_BODY_RE = re.compile(rb'[^"\\]*+(?:\\.[^"\\]*+)*+', re.DOTALL)
+_MANIFEST_CLOSER = {b"{": b"}", b"[": b"]"}
 
 
-def _manifest_targets_worktree(path: Path, worktree: Path, primary_root: Path) -> bool:
-    """Identify candidates without parsing unrelated manifests or retaining them.
+def _manifest_tokens(chunks: Iterable[bytes], limit: int) -> Iterator[bytes]:
+    """Keep string and atom boundaries across bounded reads."""
+    quoted = escaped = continuing_atom = False
+    string: bytearray | None = None
+    for chunk in chunks:
+        position = 0
+        while position < len(chunk):
+            if quoted:
+                start = position
+                if escaped:
+                    position += 1
+                body = _MANIFEST_STRING_BODY_RE.match(chunk, position)
+                assert body is not None
+                position = body.end()
+                ending = chunk[position : position + 1]
+                position += len(ending)
+                escaped = ending == b"\\"
+                if string is not None:
+                    if len(string) + position - start > limit:
+                        string = None
+                    else:
+                        string.extend(chunk[start:position])
+                if ending == b'"':
+                    quoted = False
+                    # A larger string is opaque to recovery, but still one token.
+                    yield bytes(string) if string is not None else b'""'
+                continue
 
-    Keep one maximum manifest's overlap so even a path split across chunks is
-    recognized. Full strict parsing and size limits still apply to candidates.
+            match = _MANIFEST_TOKEN_RE.match(chunk, position)
+            if match is None:
+                continuing_atom = False
+                break
+            start = match.start(1)
+            first = chunk[start : start + 1]
+            position = match.end()
+            if first == b'"':
+                quoted = True
+                string = bytearray(first)
+            elif first in b"{}[],:":
+                yield first
+            elif not continuing_atom or start != 0:
+                yield b"?"
+            continuing_atom = first not in b'{}[],:"' and position == len(chunk)
+
+
+def _manifest_string(token: bytes) -> str | None:
+    if token.startswith(b'"'):
+        try:
+            value = json.loads(token.decode("utf-8"))
+        except ValueError:
+            return None
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _manifest_targets_worktree(
+    chunks: Iterable[bytes],
+    target_worktree: Path,
+    primary_root: Path,
+    limit: int,
+) -> bool:
+    """Detect an exact direct lane binding in a structurally readable prefix.
+
+    Only the native parse can supply configuration. This scan supplies scope
+    for a refusal after that parse fails or the manifest exceeds its size limit.
     """
-    from . import lane_manifest
+    tokens = _manifest_tokens(chunks, limit)
 
-    pattern = re.compile(r'"worktree_path"\s*:\s*("(?:[^"\\]|\\.)*")')
-    try:
-        with path.open("rb") as stream:
-            overlap = b""
-            while chunk := stream.read(64 * 1024):
-                raw = overlap + chunk
-                if _mentions_target_worktree(raw, worktree, primary_root):
+    def skip_value(value: bytes) -> None:
+        if value not in _MANIFEST_CLOSER:
+            return
+        closers = [_MANIFEST_CLOSER[value]]
+        while closers:
+            token = next(tokens)
+            if token in _MANIFEST_CLOSER:
+                if len(closers) >= limit:
+                    raise ValueError("manifest nesting exceeds recovery budget")
+                closers.append(_MANIFEST_CLOSER[token])
+            elif token in (b"}", b"]") and token != closers.pop():
+                raise ValueError("mismatched manifest container")
+
+    def contains_target(scope: Literal["root", "lanes", "lane"]) -> bool:
+        previous_string: bytes | None = None
+        awaiting_value = False
+        for token in tokens:
+            if token == b"}":
+                return False
+            if token == b"]":
+                raise ValueError("mismatched manifest container")
+            if token == b":":
+                # A colon introduces a member even if the preceding string
+                # looked like the value of an incomplete member.
+                awaiting_value = previous_string is not None
+                continue
+
+            key = previous_string if awaiting_value else None
+            previous_string = token if token.startswith(b'"') else None
+            # A quoted key at a member boundary may have a missing colon.
+            # Commas and unquoted atoms clear the pending member.
+            awaiting_value = key is None and previous_string is not None
+            if key is None:
+                skip_value(token)
+                continue
+
+            if scope == "root" and token == b"{" and _manifest_string(key) == "lanes":
+                if contains_target("lanes"):
                     return True
-                for match in pattern.finditer(raw.decode("utf-8", errors="ignore")):
-                    try:
-                        value = json.loads(match.group(1))
-                    except ValueError:
-                        continue
-                    if _manifest_worktree(value, primary_root=primary_root) == worktree:
-                        return True
-                overlap = raw[-lane_manifest.MANIFEST_BYTES_LIMIT :]
-    except OSError as exc:
-        raise CoordinationBridgeConfigurationError(f"cannot inspect primary lane manifest {path}: {exc}") from exc
-    return False
+            elif scope == "lanes" and token == b"{" and _manifest_string(key) is not None:
+                if contains_target("lane"):
+                    return True
+            elif (
+                scope == "lane"
+                and previous_string is not None
+                and _manifest_string(key) == "worktree_path"
+                and _manifest_worktree(_manifest_string(previous_string), primary_root=primary_root) == target_worktree
+            ):
+                return True
+            else:
+                skip_value(token)
+        return False
+
+    try:
+        return next(tokens) == b"{" and contains_target("root")
+    except (StopIteration, ValueError):
+        return False
 
 
-def _read_manifest(path: Path, *, target_worktree: Path, primary_root: Path) -> dict[str, object] | None:
+def _read_manifest(path: Path, *, target_worktree: Path, primary_root: Path) -> tuple[dict[str, object], int] | None:
     from . import lane_manifest
 
-    if path.is_symlink():
-        if path.stem:
-            raise CoordinationBridgeConfigurationError(
-                f"primary lane manifest {path} is a symlink; refusing an untrusted bridge source"
-            )
-        return None
+    limit = lane_manifest.MANIFEST_BYTES_LIMIT
     try:
-        stat = path.stat()
-    except OSError as exc:
-        raise CoordinationBridgeConfigurationError(f"cannot inspect primary lane manifest {path}: {exc}") from exc
-    if not path.is_file():
-        return None
-    if stat.st_size > lane_manifest.MANIFEST_BYTES_LIMIT:
-        raise CoordinationBridgeConfigurationError(
-            f"primary lane manifest {path} exceeds {lane_manifest.MANIFEST_BYTES_LIMIT} bytes"
-        )
-    try:
-        raw = path.read_bytes()
+        if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+            return None
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+            cause: ValueError | RecursionError | None = None
+            chunks: Iterable[bytes] = (raw.removeprefix(b"\xef\xbb\xbf"),)
+            if len(raw) > limit:
+                chunks = chain(chunks, iter(lambda: stream.read(limit), b""))
+                problem = f"exceeds {limit} bytes"
+            else:
+                try:
+                    # Validate the whole document before recovering any lane identity.
+                    parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+                except (ValueError, RecursionError) as exc:
+                    cause = exc
+                    problem = f"matching worktree {target_worktree} is malformed: {exc}"
+                else:
+                    return (parsed, len(raw)) if isinstance(parsed, dict) else None
+            if _manifest_targets_worktree(chunks, target_worktree, primary_root, limit):
+                raise CoordinationBridgeConfigurationError(f"primary lane manifest {path} {problem}") from cause
+            return None
     except OSError as exc:
         raise CoordinationBridgeConfigurationError(f"cannot read primary lane manifest {path}: {exc}") from exc
-    try:
-        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
-        if _mentions_target_worktree(raw, target_worktree, primary_root):
-            raise CoordinationBridgeConfigurationError(
-                f"primary lane manifest {path} matching worktree {target_worktree} is malformed: {exc}"
-            ) from exc
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
 def _safe_absolute_remote_path(value: object, *, field: str, suffix: str | None = None) -> str:
@@ -387,6 +475,7 @@ def resolve_coordination_bridge(
 
     Absence is a no-op. A malformed config on the exact target lane, a second
     exact-worktree binding, or an unreadable configured target fails closed.
+    The caller's task hint does not narrow the search for exact bindings.
     Branch names and lane-local config never participate in resolution.
     """
     worktree = Path(worktree_path).expanduser().resolve()
@@ -408,45 +497,22 @@ def resolve_coordination_bridge(
         manifest_paths = sorted(manifest_dir.glob("*.json"))
     except OSError as exc:
         raise CoordinationBridgeConfigurationError(f"cannot list primary lane manifests: {exc}") from exc
-    if task_ref is not None and (not isinstance(task_ref, str) or not _TASK_REF_RE.fullmatch(task_ref)):
-        # An opaque/malformed caller task name is not a safe file selector. The
-        # exact worktree lookup below remains authoritative and independent.
-        task_ref = None
-
     matches: list[tuple[str, str, bool, object]] = []
     total_bytes = 0
     candidate_count = 0
     for path in manifest_paths:
-        if path.is_symlink():
+        loaded = _read_manifest(path, target_worktree=worktree, primary_root=primary_root)
+        if loaded is None:
             continue
-        # Count exact-worktree bindings across tasks, even when the caller
-        # supplies a task hint. Lexically screen other tasks before charging
-        # parsing limits so unrelated archived manifests remain inexpensive.
-        if path.stem != task_ref and not _manifest_targets_worktree(path, worktree, primary_root):
-            continue
-        candidate_count += 1
-        if candidate_count > _MANIFEST_COUNT_LIMIT:
-            raise CoordinationBridgeConfigurationError(
-                f"primary lane manifest count exceeds bounded lookup limit {_MANIFEST_COUNT_LIMIT}"
-            )
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            raise CoordinationBridgeConfigurationError(f"cannot inspect primary lane manifest {path}: {exc}") from exc
-        total_bytes += max(size, 0)
-        if total_bytes > _MANIFEST_TOTAL_BYTES_LIMIT:
-            raise CoordinationBridgeConfigurationError(
-                f"primary lane manifests exceed bounded lookup size {_MANIFEST_TOTAL_BYTES_LIMIT} bytes"
-            )
-        manifest = _read_manifest(path, target_worktree=worktree, primary_root=primary_root)
-        if manifest is None:
-            continue
+        manifest, size = loaded
         manifest_task = manifest.get("task_ref")
         lanes = manifest.get("lanes")
         if not isinstance(manifest_task, str) or not _TASK_REF_RE.fullmatch(manifest_task):
             continue
         if manifest_task != path.stem or not isinstance(lanes, dict):
             continue
+        # Charge each manifest once, after at least one exact lane match.
+        first_match = len(matches)
         for candidate_lane_id, lane in lanes.items():
             if not isinstance(candidate_lane_id, str) or not isinstance(lane, dict):
                 continue
@@ -460,6 +526,18 @@ def resolve_coordination_bridge(
                         lane.get("coordination_bridge"),
                     )
                 )
+        if len(matches) == first_match:
+            continue
+        candidate_count += 1
+        if candidate_count > _MANIFEST_COUNT_LIMIT:
+            raise CoordinationBridgeConfigurationError(
+                f"primary lane manifest count exceeds bounded lookup limit {_MANIFEST_COUNT_LIMIT}"
+            )
+        total_bytes += size
+        if total_bytes > _MANIFEST_TOTAL_BYTES_LIMIT:
+            raise CoordinationBridgeConfigurationError(
+                f"primary lane manifests exceed bounded lookup size {_MANIFEST_TOTAL_BYTES_LIMIT} bytes"
+            )
 
     if not matches:
         return None

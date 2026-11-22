@@ -793,9 +793,12 @@ def reclaim_completed_review_worktrees(root, *, load_state, run=subprocess.run, 
     lane rows, reports, the registered worktree, its branch, its HEAD, and
     in-use/assigned-worker state are all re-read immediately before each
     deletion.  A final clean-tree probe uses the review worktree as its cwd.
-    Any doubt skips the candidate; removal is never forced and no branch or
-    database mutation is performed here.
+    Native review stages are left to guarded review retirement. Any doubt
+    skips the candidate; removal is never forced and no branch or database
+    mutation is performed here.
     """
+    from workbay_orchestrator_mcp.lane_reaping import _generic_review_worktree_deferral  # noqa: PLC0415
+
     root = os.path.abspath(os.fspath(root))
     candidates = _load_reclaim_candidates(root, load_state, run, in_use_probe=in_use_probe)
     removed = []
@@ -814,6 +817,8 @@ def reclaim_completed_review_worktrees(root, *, load_state, run=subprocess.run, 
         except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
             continue
         if clean.returncode != 0 or clean.stdout:
+            continue
+        if _generic_review_worktree_deferral(root, candidate):
             continue
         try:
             result = run(

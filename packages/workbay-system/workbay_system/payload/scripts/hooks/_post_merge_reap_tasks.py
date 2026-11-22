@@ -3,7 +3,8 @@
 
 Invoked by ``scripts/hooks/git/post-merge`` when the current branch is ``main``,
 ``master``, or any ``integration_branch`` registered in
-``config/lane-orchestration/*.json``. Identifies task rows whose
+``config/lane-orchestration/*.json``. Runs review-stage and rowless sweeps
+within one watchdog budget. Identifies task rows whose
 ``target_branch`` tip matches the commit just merged into the integration
 branch and runs a scoped ``reap_tasks(apply=True, task_ref=...)``. Rows that
 are active or ambiguous are left untouched — the reaper is conservative by
@@ -13,6 +14,7 @@ process still exits 0: a git hook must never break a merge.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import signal
@@ -20,11 +22,14 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
+from functools import partial
 from pathlib import Path
 
 _INTEGRATION_BRANCHES = frozenset({"main", "master"})
 _SOURCE = "post-merge-reap"
 _ROWLESS_REAP_TIMEOUT_S = 20.0
+_REVIEW_WAKE_LAUNCH_TIMEOUT_S = 0.5
 _RUN_FAILURES: list[dict[str, str | None]] | None = None
 # Signals whose Python handlers can unwind the hook; defer them while mutating
 # or restoring process-global signal state, including the default SIGINT handler.
@@ -520,165 +525,286 @@ class _RowlessReapWatchdog(BaseException):
     """Escape best-effort Exception handlers as soon as the watchdog fires."""
 
 
-def _reap_rowless_registry_safe(repo: Path) -> None:
-    """Run the narrow row-less registry arm under the hook's bounded policy."""
+def _report_sweep_failure(phase: str, detail: str, *, kind: str = "returncode") -> None:
+    message = f"{phase}: {detail}"
+    _record_failure(kind=kind, detail=message)
+    print(f"post-merge-reap: {message}", file=sys.stderr)
+
+
+def _reap_review_stage_safe(
+    repo: Path, *, deadline: float, current_worktree: Path, current_branch: str
+) -> tuple[bool, dict | None]:
+    """Return whether publication succeeded, with the foreground scan result."""
+    phase = "review_stage_reap"
+
+    def run_native(
+        deadline: float, watchdog_available: bool, schedule: Callable[[Iterable[str]], Iterable[str]]
+    ) -> dict | None:
+        from workbay_orchestrator_mcp.orchestration.review_stage_reap import (  # noqa: PLC0415
+            reap_review_stage_worktrees,
+        )
+
+        parameters = inspect.signature(reap_review_stage_worktrees).parameters
+        if "deadline" not in parameters and not watchdog_available:
+            _report_sweep_failure(phase, "watchdog unavailable while SIGALRM is blocked")
+            return None
+        kwargs = {}
+        if "deadline" in parameters:
+            kwargs["deadline"] = deadline
+        if "schedule_candidates" in parameters:
+            kwargs["schedule_candidates"] = schedule
+        elif current_worktree != repo:
+            from workbay_orchestrator_mcp.orchestration.review_stage_reap import _review_branch_parts  # noqa: PLC0415
+
+            # The older consumer protects its root only. A linked integration
+            # named like a review branch needs candidate selection to stay protected.
+            if _review_branch_parts(current_branch) is not None:
+                _report_sweep_failure(phase, "cannot protect invoking review worktree with this reaper")
+                return None
+        return reap_review_stage_worktrees(repo, apply=True, **kwargs)
+
     try:
+        from workbay_orchestrator_mcp.orchestration.post_merge_reap import (  # noqa: PLC0415
+            consume_review_sweep,
+            request_review_sweep,
+        )
+
+        # Commit the request under the original budget before entering native probes.
+        _run_sweep_watchdog(
+            lambda until, _: request_review_sweep(
+                repo, worktree=current_worktree, branch=current_branch, deadline=until
+            ),
+            deadline=deadline,
+            phase="review_stage_reap_request",
+        )
+    except (Exception, _RowlessReapWatchdog) as exc:  # noqa: BLE001 -- never break the merge
+        _report_sweep_failure(phase, f"request: {type(exc).__name__}: {exc}", kind="exception")
+        return False, None
+
+    try:
+        result = consume_review_sweep(
+            repo,
+            deadline=deadline,
+            run=lambda schedule: _run_sweep_watchdog(
+                lambda until, armed: run_native(until, armed, schedule), deadline=deadline, phase=phase
+            ),
+        )
+    except (Exception, _RowlessReapWatchdog) as exc:  # noqa: BLE001 -- never break the merge
+        _report_sweep_failure(phase, f"{type(exc).__name__}: {exc}", kind="exception")
+        return True, None
+    if result is None:
+        return True, None
+    if not isinstance(result, dict):
+        _report_sweep_failure(phase, "non-dict result")
+        return True, None
+    if result.get("error") == "main_ref_unavailable" and not result.get("kept"):
+        # Other integration branches can exist in repositories with no main
+        # and no review stages. The native reaper still requires main as proof.
+        return True, result
+    if result.get("ok") is not True:
+        failures = result.get("failures") or []
+        first = failures[0] if failures else {}
+        reason = result.get("error") or first.get("reason") or "ok!=True"
+        detail = result.get("detail") or first.get("detail") or ""
+        _report_sweep_failure(phase, f"{reason} failures={len(failures)} branch={first.get('branch', '-')} {detail}")
+    if result.get("cleanup_pending"):
+        _report_sweep_failure(
+            phase, f"cleanup_pending={result['cleanup_pending']} fence_release={result.get('fence_release')}"
+        )
+    return True, result
+
+
+def _wake_review_sweep_safe(repo: Path, *, result: dict | None, deadline: float) -> None:
+    def dispatch(_deadline: float, watchdog_available: bool) -> None:
+        from workbay_orchestrator_mcp.orchestration.post_merge_reap import review_sweep_complete  # noqa: PLC0415
+
+        if result is not None and review_sweep_complete(result):
+            return
+        if not watchdog_available:
+            raise RuntimeError("watchdog unavailable for review wake")
+        from workbay_orchestrator_mcp.orchestration.post_merge_review_worker import (  # noqa: PLC0415
+            dispatch_review_sweep,
+        )
+
+        dispatch_review_sweep(repo)
+
+    try:
+        _run_sweep_watchdog(
+            dispatch,
+            deadline=min(deadline, time.monotonic() + _REVIEW_WAKE_LAUNCH_TIMEOUT_S),
+            phase="review_stage_reap_wake",
+        )
+    except (Exception, _RowlessReapWatchdog) as exc:  # noqa: BLE001 -- the request remains durable
+        _report_sweep_failure("review_stage_reap_wake", f"{type(exc).__name__}: {exc}", kind="exception")
+
+
+def _run_sweep_watchdog(run: Callable[[float, bool], dict | None], *, deadline: float, phase: str) -> dict | None:
+    """Run one sweep while preserving the caller's alarm, timer, and mask."""
+    timeout_s = deadline - time.monotonic()
+    if timeout_s <= 0:
+        raise _RowlessReapWatchdog(f"{phase} exceeded its budget before starting")
+    if not _on_main_thread():
+        # Signal handlers and timers belong to the main thread.
+        detail = (
+            f"{phase} degraded_watchdog: off main thread, SIGALRM watchdog not armed; "
+            f"bounded by the {timeout_s:g}s deadline only"
+        )
+        _record_failure(kind="returncode", detail=detail)
+        print(f"post-merge-reap: {detail}", file=sys.stderr)
+        return run(deadline, False)
+
+    # Capture every piece of the caller's state before changing any of it.
+    # An interrupt during capture has nothing to restore.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    previous_alarm_pending = signal.SIGALRM in signal.sigpending()
+    started = time.monotonic()
+    watchdog_fired = alarm_pending = alarm_replayed = restored = False
+    restore_error: BaseException | None = None
+    # Mark before mutate: each flag is set before its call, because an
+    # interrupt can land inside the call after it took effect or right
+    # after it returns. Restoring an unchanged piece is a no-op.
+    mask_changed = handler_changed = timer_changed = watchdog_armed = False
+
+    def _timeout(_signum: int, _frame: object) -> None:
+        nonlocal watchdog_fired
+        watchdog_fired = True
+        # Another thread can receive SIGALRM and schedule this Python callback
+        # even while this thread blocks it. Honor the mask during restoration.
+        if signal.SIGALRM not in signal.pthread_sigmask(signal.SIG_BLOCK, set()):
+            raise _RowlessReapWatchdog(f"{phase} exceeded {timeout_s:g}s")
+
+    def _restore() -> None:
+        """One pass back to the captured state; every step runs even when an earlier one fails."""
+        nonlocal alarm_pending, alarm_replayed, restore_error, restored
+        error: BaseException | None = None
+        drained = False
+        try:
+            if mask_changed:
+                signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = exc
+        try:
+            if timer_changed:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        try:
+            # Drain both thread- and process-pending alarms before restoring
+            # ownership. Replay a caller's pre-existing notification below.
+            # Before the watchdog is armed a pending alarm is the caller's.
+            while watchdog_armed and _consume_pending(signal.SIGALRM):
+                alarm_pending = drained = True
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        try:
+            if handler_changed:
+                signal.signal(signal.SIGALRM, previous_handler)
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        try:
+            if timer_changed and previous_timer[0] > 0:
+                remaining = max(0.001, previous_timer[0] - (time.monotonic() - started))
+                signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        try:
+            # Replay the caller's alarm once; a later pass repeats it only
+            # when it drained the earlier replay back out.
+            if watchdog_armed and previous_alarm_pending and (drained or not alarm_replayed):
+                alarm_replayed = True
+                signal.raise_signal(signal.SIGALRM)
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        try:
+            if mask_changed:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except BaseException as exc:  # noqa: BLE001 -- keep restoring
+            error = error or exc
+        restore_error = restore_error or error
+        restored = error is None
+
+    # Restoration covers installation: a timer that fires while the handler is being
+    # installed or armed still gets the previous handler and periodic timer back.
+    try:
+        try:
+            try:
+                mask_changed = True
+                signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
+                timer_changed = True
+                signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+                # The caller's timer can expire between the read-only snapshot
+                # and disarm. Preserve that notification before owning SIGALRM.
+                previous_alarm_pending = previous_alarm_pending or signal.SIGALRM in signal.sigpending()
+                handler_changed = True
+                signal.signal(signal.SIGALRM, _timeout)
+                watchdog_armed = True
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
+                # A caller alarm already pending stays blocked for the caller;
+                # expiry is then measured by elapsed time below.
+                reap_mask = previous_mask | {signal.SIGALRM} if previous_alarm_pending else previous_mask
+                signal.pthread_sigmask(signal.SIG_SETMASK, reap_mask)
+                result = run(deadline, signal.SIGALRM not in reap_mask)
+            finally:
+                # Keep restoration in the outer finally: if the one-shot watchdog
+                # interrupts entry to this mask, restoration must still run.
+                if mask_changed:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        finally:
+            _restore()
+    finally:
+        # An interrupt can cut the pass above short, even between its guarded
+        # steps (a SIGINT taken by another thread still raises on this one).
+        # Every step converges on the captured state, so it simply runs again.
+        # The first error is raised only after the mask is back.
+        if not restored:
+            _restore()
+        if restore_error is not None:
+            raise restore_error
+    expired = watchdog_armed and (
+        watchdog_fired or (time.monotonic() >= deadline if previous_alarm_pending else alarm_pending)
+    )
+    if expired:
+        raise _RowlessReapWatchdog(f"{phase} exceeded {timeout_s:g}s")
+    return result
+
+
+def _reap_rowless_registry_safe(
+    repo: Path, *, deadline: float | None = None, current_worktree: Path | None = None
+) -> None:
+    """Run guarded registry cleanup with its native deadline."""
+    phase = "rowless_registry_reap"
+
+    def run(deadline: float, _watchdog_available: bool) -> dict:
         from workbay_orchestrator_mcp.lane_reaping import (  # noqa: PLC0415
             reap_merged_registry_worktrees,
         )
-    except ImportError as exc:
-        detail = f"rowless_registry_reap ImportError: {exc}"
-        _record_failure(kind="exception", detail=detail)
-        print(f"post-merge-reap: {detail}", file=sys.stderr)
-        return
+
+        kwargs = {}
+        if current_worktree is not None:
+            kwargs["current_worktree"] = current_worktree
+            if "schedule_candidates" in inspect.signature(reap_merged_registry_worktrees).parameters:
+                from workbay_orchestrator_mcp.orchestration.post_merge_reap import schedule_candidates  # noqa: PLC0415
+
+                kwargs["schedule_candidates"] = partial(schedule_candidates, root=repo, phase=phase, deadline=deadline)
+        return reap_merged_registry_worktrees(
+            apply=True, repo_root=repo, rowless_only=True, deadline=deadline, **kwargs
+        )
 
     try:
-        if not _on_main_thread():
-            # Off the main thread signal.signal fails after setitimer already took
-            # the caller's timer. Touch no signal state; the deadline still bounds
-            # every subprocess and SQLite wait.
-            detail = (
-                "rowless_registry_reap degraded_watchdog: off main thread, SIGALRM watchdog not armed; "
-                f"bounded by the {_ROWLESS_REAP_TIMEOUT_S:g}s deadline only"
-            )
-            _record_failure(kind="returncode", detail=detail)
-            print(f"post-merge-reap: {detail}", file=sys.stderr)
-            result = reap_merged_registry_worktrees(
-                apply=True, repo_root=repo, rowless_only=True, deadline=time.monotonic() + _ROWLESS_REAP_TIMEOUT_S
-            )
-        else:
-            # Capture every piece of the caller's state before changing any of it.
-            # An interrupt during capture has nothing to restore.
-            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-            previous_handler = signal.getsignal(signal.SIGALRM)
-            previous_timer = signal.getitimer(signal.ITIMER_REAL)
-            previous_alarm_pending = signal.SIGALRM in signal.sigpending()
-            started = time.monotonic()
-            watchdog_fired = alarm_pending = alarm_replayed = restored = False
-            restore_error: BaseException | None = None
-            # Mark before mutate: each flag is set before its call, because an
-            # interrupt can land inside the call after it took effect or right
-            # after it returns. Restoring an unchanged piece is a no-op.
-            mask_changed = handler_changed = timer_changed = watchdog_armed = False
-
-            def _timeout(_signum: int, _frame: object) -> None:
-                nonlocal watchdog_fired
-                watchdog_fired = True
-                # Another thread can receive SIGALRM and schedule this Python callback
-                # even while this thread blocks it. Honor the mask during restoration.
-                if signal.SIGALRM not in signal.pthread_sigmask(signal.SIG_BLOCK, set()):
-                    raise _RowlessReapWatchdog(f"rowless registry reap exceeded {_ROWLESS_REAP_TIMEOUT_S:g}s")
-
-            def _restore() -> None:
-                """One pass back to the captured state; every step runs even when an earlier one fails."""
-                nonlocal alarm_pending, alarm_replayed, restore_error, restored
-                error: BaseException | None = None
-                drained = False
-                try:
-                    if mask_changed:
-                        signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = exc
-                try:
-                    if timer_changed:
-                        signal.setitimer(signal.ITIMER_REAL, 0.0)
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                try:
-                    # Drain both thread- and process-pending alarms before restoring
-                    # ownership. Replay a caller's pre-existing notification below.
-                    # Before the watchdog is armed a pending alarm is the caller's.
-                    while watchdog_armed and _consume_pending(signal.SIGALRM):
-                        alarm_pending = drained = True
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                try:
-                    if handler_changed:
-                        signal.signal(signal.SIGALRM, previous_handler)
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                try:
-                    if timer_changed and previous_timer[0] > 0:
-                        remaining = max(0.001, previous_timer[0] - (time.monotonic() - started))
-                        signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                try:
-                    # Replay the caller's alarm once; a later pass repeats it only
-                    # when it drained the earlier replay back out.
-                    if watchdog_armed and previous_alarm_pending and (drained or not alarm_replayed):
-                        alarm_replayed = True
-                        signal.raise_signal(signal.SIGALRM)
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                try:
-                    if mask_changed:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-                except BaseException as exc:  # noqa: BLE001 -- keep restoring
-                    error = error or exc
-                restore_error = restore_error or error
-                restored = error is None
-
-            # Restoration covers installation: a timer that fires while the handler is being
-            # installed or armed still gets the previous handler and periodic timer back.
-            try:
-                try:
-                    try:
-                        mask_changed = True
-                        signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
-                        timer_changed = True
-                        signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
-                        # The caller's timer can expire between the read-only snapshot
-                        # and disarm. Preserve that notification before owning SIGALRM.
-                        previous_alarm_pending = previous_alarm_pending or signal.SIGALRM in signal.sigpending()
-                        handler_changed = True
-                        signal.signal(signal.SIGALRM, _timeout)
-                        watchdog_armed = True
-                        signal.setitimer(signal.ITIMER_REAL, _ROWLESS_REAP_TIMEOUT_S)
-                        # A caller alarm already pending stays blocked for the caller;
-                        # expiry is then measured by elapsed time below.
-                        reap_mask = previous_mask | {signal.SIGALRM} if previous_alarm_pending else previous_mask
-                        signal.pthread_sigmask(signal.SIG_SETMASK, reap_mask)
-                        result = reap_merged_registry_worktrees(
-                            apply=True, repo_root=repo, rowless_only=True, deadline=started + _ROWLESS_REAP_TIMEOUT_S
-                        )
-                    finally:
-                        # Keep restoration in the outer finally: if the one-shot watchdog
-                        # interrupts entry to this mask, restoration must still run.
-                        if mask_changed:
-                            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-                finally:
-                    _restore()
-            finally:
-                # An interrupt can cut the pass above short, even between its guarded
-                # steps (a SIGINT taken by another thread still raises on this one).
-                # Every step converges on the captured state, so it simply runs again.
-                # The first error is raised only after the mask is back.
-                if not restored:
-                    _restore()
-                if restore_error is not None:
-                    raise restore_error
-            expired = watchdog_armed and (
-                watchdog_fired
-                or (time.monotonic() - started >= _ROWLESS_REAP_TIMEOUT_S if previous_alarm_pending else alarm_pending)
-            )
-            if expired:
-                raise _RowlessReapWatchdog(f"rowless registry reap exceeded {_ROWLESS_REAP_TIMEOUT_S:g}s")
+        if deadline is None:
+            deadline = time.monotonic() + _ROWLESS_REAP_TIMEOUT_S
+        result = _run_sweep_watchdog(run, deadline=deadline, phase=phase)
     except (Exception, _RowlessReapWatchdog) as exc:  # noqa: BLE001 -- never break the merge
-        detail = f"rowless_registry_reap {type(exc).__name__}: {exc}"
-        _record_failure(kind="exception", detail=detail)
-        print(f"post-merge-reap: {detail}", file=sys.stderr)
+        _report_sweep_failure(phase, f"{type(exc).__name__}: {exc}", kind="exception")
         return
 
     if not isinstance(result, dict):
-        detail = "rowless_registry_reap: non-dict result"
-        _record_failure(kind="returncode", detail=detail)
-        print(f"post-merge-reap: {detail}", file=sys.stderr)
+        _report_sweep_failure(phase, "non-dict result")
         return
     if result.get("ok") is not True:
-        detail = f"rowless_registry_reap: {result.get('error') or 'ok!=True'}"
-        _record_failure(kind="returncode", detail=detail)
-        print(f"post-merge-reap: {detail}", file=sys.stderr)
+        _report_sweep_failure(phase, str(result.get("error") or "ok!=True"))
     for entry in result.get("failed") or []:
         if not isinstance(entry, dict):
             continue
@@ -757,7 +883,8 @@ def _main_body(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        configure_runtime(RuntimeConfig.for_repo(repo))
+        runtime = RuntimeConfig.for_repo(repo)
+        configure_runtime(runtime)
     except Exception as exc:  # noqa: BLE001 -- degrade loudly, never break merge
         _record_failure(
             kind="exception",
@@ -769,8 +896,27 @@ def _main_body(argv: list[str] | None = None) -> int:
     # independent of tip discovery. Squash is already short-circuited above.
     _RUN_STATE["phase"] = "lane_merge_close"
     _close_merged_lanes_safe(repo)
+    # The native CLI uses the same primary workspace for dispatcher evidence.
+    # Keep merge discovery and registry cwd protection anchored at the invocation.
+    started = time.monotonic()
+    if _on_main_thread():
+        _RUN_STATE["phase"] = "review_stage_reap"
+        review = _reap_review_stage_safe(
+            runtime.workspace_root,
+            deadline=started + _ROWLESS_REAP_TIMEOUT_S / 2,
+            current_worktree=repo,
+            current_branch=branch,
+        )
+        # Only the installed hook entry owns a detached continuation.
+        if __name__ == "__main__" and review[0]:
+            _RUN_STATE["phase"] = "review_stage_reap_wake"
+            _wake_review_sweep_safe(
+                runtime.workspace_root, result=review[1], deadline=started + _ROWLESS_REAP_TIMEOUT_S
+            )
     _RUN_STATE["phase"] = "rowless_registry_reap"
-    _reap_rowless_registry_safe(repo)
+    _reap_rowless_registry_safe(
+        runtime.workspace_root, deadline=started + _ROWLESS_REAP_TIMEOUT_S, current_worktree=repo
+    )
     _RUN_STATE["phase"] = "task_reap"
 
     # Discovery (list_handoff_rows import/query) and reap run under one broad
@@ -889,4 +1035,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Scrub the hook process before interpreter discovery and shared Git probes.
+    # Keep this in sync with review_pipeline.checkout_git_env so the hook can
+    # bootstrap with a Python that does not yet have the WorkBay package.
+    for name in (
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+    ):
+        os.environ.pop(name, None)
     sys.exit(main())

@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.43] — 2026-11-22
+
+### Changed
+- Bind review-stage cleanup to immutable Git evidence, preserve live task custody, and resume interrupted retirement.
+- Retire reviewed supersessions through native cleanup while preserving independently managed nested Git checkouts.
+- Validate the full trusted bridge lane manifest and bind malformed-manifest diagnostics to the exact worktree.
+
 ## [0.3.42] — 2026-11-21
 
 ### Changed

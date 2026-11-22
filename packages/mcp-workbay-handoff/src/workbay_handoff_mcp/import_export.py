@@ -16,7 +16,7 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
-from contextlib import closing
+from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -25,6 +25,7 @@ from typing import cast
 from workbay_protocol import resolve_env_alias
 
 from . import lane_completion_production as production
+from . import task_supersession as supersession
 from .current_task_rendering import (
     TaskSnapshot,
     _build_current_task_state_from_snapshot,
@@ -61,6 +62,7 @@ from .shared_schema import (
     _open_bounded_roster_read_connection,
     _retained_registration_store,
     archive_terminal_review_findings,
+    connect_handoff_db,
     review_history_unavailable,
 )
 from .shared_write_context import (
@@ -1483,6 +1485,7 @@ def _import_snapshot(
     set_active: bool,
     production_imports: dict[int, _ReportImport] | None = None,
     allow_destructive_clear: bool = False,
+    supersession_archive: str | None = None,
 ) -> dict[str, int]:
     _check_native_import(snapshot)
     data = _parse_import_snapshot(snapshot)
@@ -1509,10 +1512,15 @@ def _import_snapshot(
         fallback_branch=git_branch or "unknown-branch",
         fallback_commit=git_commit,
     )
-    if production_imports:
-        # Acquire before exact-row reconciliation, after external context
-        # resolution. Concurrent replays cannot both publish the same report.
+    if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
+    if (
+        set_active
+        and isinstance(active, dict)
+        and supersession.archived_custody_snapshot(conn, task_ref) != supersession_archive
+    ):
+        raise supersession.SupersessionRefusal("supersession_archive_changed_during_restore")
+    if production_imports:
         # Reconcile every intent before this transaction inserts a report, so
         # a sibling published below never reads as a changed original.
         for prepared in production_imports.values():
@@ -1522,8 +1530,6 @@ def _import_snapshot(
                     prepared.report_id = retained["id"]
     retained_live: set[tuple] = set()
     if mode == "replace_task":
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
         _check_native_import(snapshot, conn, task_ref, mode)
         retained_live = _retain_displaced_lanes(conn, task_ref, lanes)
         for table in (
@@ -1543,8 +1549,6 @@ def _import_snapshot(
             conn.execute(f"DELETE FROM {table} WHERE task_ref = ?", (task_ref,))
     if mode == "replace_task" and "review_findings_archive" in snapshot:
         conn.execute("DELETE FROM review_findings_archive WHERE task_ref = ?", (task_ref,))
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
     reconcile_findings, history_state, legacy_inputs = _restore_review_history(
         conn, task_ref, snapshot, data, mode, set_active, allow_destructive_clear, production_imports
     )
@@ -1942,9 +1946,12 @@ def import_handoff_state(
             tool="import_handoff_state",
             data={"error": "Invalid import payload: snapshot.active must be an object."},
         )
+    custody_archive = None
     try:
         with _get_db_connection() as conn:
             _check_native_import(snapshot, conn, task_ref, mode)
+            if set_active and isinstance(snapshot.get("active"), dict):
+                custody_archive = supersession.archived_custody_snapshot(conn, task_ref)
     except _NativeImportRefusal as exc:
         return _native_import_refusal(task_ref, exc)
     with _get_db_connection() as conn:
@@ -1975,23 +1982,29 @@ def import_handoff_state(
                     },
                     task_ref=task_ref,
                 )
+    production_imports = None
     try:
-        production_imports = _prepare_report_imports(task_ref, snapshot, mode)
-    except (ValueError, sqlite3.Error) as exc:
-        _log.exception("report import refused before publication")
-        return _envelope(
-            ok=False,
-            tool="import_handoff_state",
-            task_ref=task_ref,
-            data={
-                "production_history_unavailable": exc.reason
-                if isinstance(exc, _ReportImportRefusal)
-                else "prepare_failed",
-                "error": "Report import preparation failed.",
-            },
-        )
-    try:
-        with _get_db_connection() as conn:
+        with ExitStack() as custody:
+            proof = json.loads(custody_archive)["task_supersession"] if custody_archive is not None else None
+            reserved = custody.enter_context(supersession.reactivation_reservation(proof, task_ref=task_ref))
+            try:
+                production_imports = _prepare_report_imports(task_ref, snapshot, mode)
+            except (ValueError, sqlite3.Error) as exc:
+                _log.exception("report import refused before publication")
+                return _envelope(
+                    ok=False,
+                    tool="import_handoff_state",
+                    task_ref=task_ref,
+                    data={
+                        "production_history_unavailable": exc.reason
+                        if isinstance(exc, _ReportImportRefusal)
+                        else "prepare_failed",
+                        "error": "Report import preparation failed.",
+                    },
+                )
+            conn = custody.enter_context(_get_db_connection())
+            if reserved:
+                conn.execute("PRAGMA synchronous=FULL")
             counts = _import_snapshot(
                 conn,
                 task_ref=task_ref,
@@ -2000,7 +2013,10 @@ def import_handoff_state(
                 set_active=set_active,
                 production_imports=production_imports,
                 allow_destructive_clear=allow_destructive_clear,
+                supersession_archive=custody_archive,
             )
+    except supersession.SupersessionRefusal as exc:
+        return _reactivation_refusal("import_handoff_state", task_ref, str(exc))
     except _ReviewHistoryRefusal as exc:
         return _envelope(
             ok=False, tool="import_handoff_state", task_ref=task_ref, data={"error": str(exc), "error_kind": exc.code}
@@ -2959,6 +2975,8 @@ def task_completion_hold_reason(
     integration_ref: str = "main",
     explicit_completion: bool = False,
     task_updated_at: str | None = None,
+    supersession_receipt: str | None = None,
+    supersession_tip: str | None = None,
 ) -> str | None:
     """Return a conservative hold before automatic or explicit completion.
 
@@ -2978,6 +2996,13 @@ def task_completion_hold_reason(
     if not branch:
         return "target branch unknown"
     integration_target = _is_integration_target_branch(branch, integration_ref)
+    if supersession_receipt is not None and (
+        not explicit_completion
+        or integration_target
+        or branch == integration_ref.removeprefix("refs/heads/")
+        or not worktree
+    ):
+        return "supersession_requires_linked_task_target"
     if branch in {"main", "master"}:
         integration_ref = branch
     if integration_target and status != "done" and not explicit_completion:
@@ -3003,10 +3028,11 @@ def task_completion_hold_reason(
 
     root = Path(workspace_root)
     path = Path(worktree)
+    git = ["git", "--no-optional-locks"] if supersession_receipt is not None else ["git"]
 
     def probe(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            [*git, "-C", str(repo), *args],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -3036,6 +3062,19 @@ def task_completion_hold_reason(
         tip = probe(path, "rev-parse", "--verify", "HEAD")
         if tip.returncode != 0 or not tip.stdout.strip():
             return "target source unreadable"
+        if supersession_receipt is not None:
+            from workbay_orchestrator_mcp.orchestration.landing_cleanup import _registered_worktrees
+            from workbay_orchestrator_mcp.orchestration.landing_log import reviewed_supersession_hold
+
+            branch_ref = f"refs/heads/{branch}"
+            registered = [entry.resolve() for entry, ref in _registered_worktrees(root) if ref == branch_ref]
+            if path.resolve() == root.resolve() or path.is_symlink() or registered != [path.resolve()]:
+                return "supersession_worktree_registration_mismatch"
+            if supersession_tip is None or tip.stdout.strip() != supersession_tip:
+                return "supersession_source_changed"
+            return reviewed_supersession_hold(
+                root, branch=branch, tip=supersession_tip, receipt=supersession_receipt, integration_ref=integration_ref
+            )
         landed = probe(root, "merge-base", "--is-ancestor", tip.stdout.strip(), integration_ref)
         if landed.returncode != 0:
             # Explicit completion retains the existing single-patch squash /
@@ -3061,7 +3100,7 @@ def task_completion_hold_reason(
                     source_tip=tip.stdout.strip(),
                     integration_ref=integration_ref,
                 )
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+    except (ImportError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         return "target probe unavailable"
 
     if status != "done" and not explicit_completion:
@@ -3988,6 +4027,8 @@ def archives_retention_gc(
                 archived = _archive_registrations(ref, snapshot, require_lanes=False)
             except (TypeError, ValueError):
                 continue
+            if supersession.archive_has_custody(snapshot.get("task_supersession")):
+                continue
             if archived:
                 live = dict(conn.execute("SELECT id, lane_id FROM worktree_lanes WHERE task_ref=?", (ref,)))
                 if any(live.get(key) != lane["lane_id"] for key, lane in archived.items()):
@@ -4033,9 +4074,30 @@ def archive_task_state(
     completion_source: Mapping[str, object] | None = None,
     integration_ref: str = "main",
     completion_hold: Callable[[Mapping[str, object]], str | None] | None = None,
+    _task_supersession: supersession.ArchiveBinding | None = None,
 ) -> dict:
     cascade_archived: list[str] = []
-    with _get_db_connection() as conn:
+    exact_proof = None
+    with ExitStack() as custody:
+        if _task_supersession is not None:
+            _task_supersession.authority.check()
+            proof = _task_supersession.proof
+            custody.enter_context(
+                supersession.native_reservation(
+                    proof["selection"]["repository"],
+                    task_ref=proof["selection"]["task_ref"],
+                    operation="supersession_handoff_archive",
+                )
+            )
+            exact_proof = {**proof, "native_intent": supersession.require_prepared_intent(proof)}
+        conn = custody.enter_context(
+            _get_db_connection(existing_only=True) if _task_supersession is not None else _get_db_connection()
+        )
+        if _task_supersession is not None:
+            _task_supersession.authority.check(conn)
+            # Native cleanup can follow this commit. Keep the archive durable
+            # across a power loss even when the ordinary writer uses WAL NORMAL.
+            conn.execute("PRAGMA synchronous=FULL")
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         selected_row = conn.execute("SELECT * FROM handoff_state WHERE task_ref=?", (resolved_task_ref,)).fetchone()
         qualified = dict(selected_row) if selected_row is not None else None
@@ -4076,7 +4138,9 @@ def archive_task_state(
             if branch_row is not None and branch_row["target_branch"]
             else None
         )
-        if target_branch_for_ctx is not None and _worktree_derivation_enabled():
+        if _task_supersession is not None:
+            precomputed_target_worktree_path = _task_supersession.proof["selection"]["checkout"]["path"]
+        elif target_branch_for_ctx is not None and _worktree_derivation_enabled():
             try:
                 canonical_fn = _resolve_core_override("_canonical_worktree_for_task", _canonical_worktree_for_task)
                 precomputed_target_worktree_path = canonical_fn(target_branch_for_ctx)
@@ -4094,7 +4158,7 @@ def archive_task_state(
         )
         # Refresh bounded external evidence before the writer lock. A changed
         # row must not inherit this source qualification, even at the same revision.
-        if expected_state is not None:
+        if expected_state is not None and _task_supersession is None:
             if completion_hold is not None:
                 # Explicit finalization: the caller's qualifier refreshes the
                 # actual target for this exact row; findings use archive triage.
@@ -4117,7 +4181,16 @@ def archive_task_state(
         conn.execute("BEGIN IMMEDIATE")
         if qualified is not None and not _arch_c_matches(conn, qualified):
             return _arch_c_changed("archive_task_state", resolved_task_ref)
-        if expected_state is not None and completion_hold is None and _count_open_findings(conn, resolved_task_ref):
+        if _task_supersession is not None:
+            _task_supersession.check(conn, resolved_task_ref)
+        elif qualified is None and supersession.archived_custody_snapshot(conn, resolved_task_ref) is not None:
+            return _envelope(
+                ok=False,
+                tool="archive_task_state",
+                task_ref=resolved_task_ref,
+                data={"error": "supersession_archive_already_has_custody", "error_code": "completion_held"},
+            )
+        elif expected_state is not None and completion_hold is None and _count_open_findings(conn, resolved_task_ref):
             return _arch_c_changed("archive_task_state", resolved_task_ref)
         producer_binding = _recheck_task_resource_binding(
             conn, resolved_task_ref, producer_source_row, producer_binding
@@ -4163,7 +4236,8 @@ def archive_task_state(
         # All blockers above precede mutation. Reuse the pre-lock missing-target
         # probe; never run Git while holding the writer lock.
         if (
-            target_branch_for_ctx is not None
+            _task_supersession is None
+            and target_branch_for_ctx is not None
             and _worktree_derivation_enabled()
             and precomputed_target_worktree_path is None
         ):
@@ -4216,6 +4290,8 @@ def archive_task_state(
                 warnings = [*warnings, "archive auto-flipped non-done status to done before snapshot"]
         warnings.extend(_resource_warnings(lifecycle))
         snapshot = _snapshot_with_test_traces(conn, _collect_task_snapshot(conn, resolved_task_ref))
+        if exact_proof is not None:
+            snapshot["task_supersession"] = exact_proof
         # Restore the pre-clear target_branch/worktree into the snapshot so the
         # deleted-worktree forensic trail survives an off-canonical close.
         active_snapshot = snapshot.get("active")
@@ -4327,6 +4403,7 @@ def archive_task_state(
             "migrated_findings": migrated_findings,
             "backlog_task_ref": backlog_task_ref,
             "lifecycle_resource": lifecycle,
+            **({"task_supersession": exact_proof} if exact_proof is not None else {}),
         },
         task_ref=resolved_task_ref,
         mutation={
@@ -4424,6 +4501,10 @@ def get_archived_task(task_ref: str, include_snapshot: bool = True) -> dict:
         data=data,
         task_ref=normalized_task_ref,
     )
+
+
+def _reactivation_refusal(tool: str, task_ref: str, reason: str) -> dict:
+    return _envelope(ok=False, tool=tool, task_ref=task_ref, data={"error": reason, "error_code": reason})
 
 
 def update_task_status(
@@ -4703,7 +4784,7 @@ def update_task_status(
         assert active_path_envelope is not None
         return active_path_envelope
 
-    with _get_db_connection() as conn:
+    with ExitStack() as custody, _get_db_connection() as conn:
         ctx = _resolve_write_actor(conn, actor, task_ref=task_ref)
         warnings = collect_target_context_warnings(conn, ctx, task_ref=task_ref)
         archive_row = conn.execute(
@@ -4751,6 +4832,15 @@ def update_task_status(
             updated_branch=ctx.branch,
             updated_commit_sha=ctx.commit_sha,
         )
+        proof = snapshot.get("task_supersession")
+        try:
+            reserved = custody.enter_context(supersession.reactivation_reservation(proof, task_ref=task_ref))
+        except supersession.SupersessionRefusal as exc:
+            return _reactivation_refusal("set_handoff_state", task_ref, str(exc))
+        if reserved:
+            conn.execute("PRAGMA synchronous=FULL")
+        if status != "done" and supersession.archive_has_custody(proof):
+            proof["custody_phase"] = supersession.REACTIVATED
         # Archive status is intentionally revisionless in the public API. Fence
         # the exact observed snapshot and active-row absence under the write lock.
         conn.execute("BEGIN IMMEDIATE")
@@ -4847,10 +4937,12 @@ def switch_task(
         archive_row = conn.execute("SELECT snapshot_json FROM task_archives WHERE task_ref=?", (task_ref,)).fetchone()
         archive_json = archive_row["snapshot_json"] if archive_row is not None else None
         stored = existing or {}
+        proof = None
         if existing is None and archive_json is not None:
             try:
                 snapshot = json.loads(archive_json)
                 stored = snapshot.get("active") or {}
+                proof = snapshot.get("task_supersession")
             except (ValueError, TypeError):
                 stored = {}
             if not isinstance(stored, dict) or stored.get("task_ref", task_ref) != task_ref:
@@ -4918,7 +5010,15 @@ def switch_task(
                 raise
             # A new task cannot borrow an unrelated ambiguous workspace row.
             warnings = []
-    with _get_db_connection(begin_immediate=True) as conn:
+    with ExitStack() as custody:
+        try:
+            reserved = custody.enter_context(supersession.reactivation_reservation(proof, task_ref=task_ref))
+        except supersession.SupersessionRefusal as exc:
+            return _reactivation_refusal("switch_task", task_ref, str(exc))
+        conn = custody.enter_context(_get_db_connection())
+        if reserved:
+            conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("BEGIN IMMEDIATE")
         current = conn.execute("SELECT * FROM handoff_state WHERE task_ref=?", (task_ref,)).fetchone()
         current_archive = conn.execute(
             "SELECT snapshot_json FROM task_archives WHERE task_ref=?", (task_ref,)
@@ -5035,7 +5135,7 @@ def _completion_port_envelope(task_ref: str, outcome: str, error_code: str, erro
     )
 
 
-def _completion_port_outcome(task_ref: str, result: dict) -> dict:
+def _completion_port_outcome(task_ref: str, result: dict, *, lookup_current: bool = True) -> dict:
     """Re-stamp a checked writer's refusal with the port's outcome vocabulary."""
     data = dict(result.get("data") or {})
     code = data.get("error_code")
@@ -5043,15 +5143,199 @@ def _completion_port_outcome(task_ref: str, result: dict) -> dict:
         outcome = "conflict"
         data["error_code"] = "task_changed"
         data.setdefault("error", "Task changed after completion qualification; retry from selection.")
-        with _get_db_connection() as conn:
-            row = conn.execute("SELECT revision,status FROM handoff_state WHERE task_ref=?", (task_ref,)).fetchone()
-        data["current_revision"] = int(row["revision"]) if row is not None else None
-        data["current_status"] = str(row["status"]) if row is not None else None
+        if lookup_current:
+            with _get_db_connection() as conn:
+                row = conn.execute("SELECT revision,status FROM handoff_state WHERE task_ref=?", (task_ref,)).fetchone()
+            data["current_revision"] = int(row["revision"]) if row is not None else None
+            data["current_status"] = str(row["status"]) if row is not None else None
     else:
         outcome = "held"
         data["error_code"] = "completion_held"
     data["outcome"] = outcome
     return {**result, "ok": False, "tool": _COMPLETION_PORT_TOOL, "data": data}
+
+
+def _complete_exact_supersession(
+    *,
+    operation: str,
+    expected: dict,
+    db_path: str | Path | None,
+    db_identity: Mapping[str, object] | None,
+    generation: str | None,
+    clear_active_if_matches: bool,
+    notes: str | None,
+    actor: WriteActor | None,
+) -> dict:
+    task_ref = expected["task_ref"]
+    if not (
+        operation in {"select", "archive", "resume"}
+        and expected["status"] in {"in_progress", "done"}
+        and all(
+            isinstance(expected[key], str) and re.fullmatch(r"[0-9a-f]{40}", expected[key])
+            for key in ("receipt", "tip")
+        )
+        and expected["target_branch"]
+        and expected["target_worktree_path"]
+        and expected["integration_ref"]
+        and expected["revision"] >= 0
+        and clear_active_if_matches
+        and isinstance(db_path, (str, Path))
+        and Path(db_path).is_absolute()
+        and isinstance(db_identity, Mapping)
+        and db_identity.keys() == {"st_dev", "st_ino"}
+        and all(type(value) is int and value >= 0 for value in db_identity.values())
+        and (generation is None if operation == "select" else supersession.valid_generation(generation))
+    ):
+        return _completion_port_envelope(
+            task_ref,
+            "invalid",
+            "invalid_request",
+            "Exact supersession requires select, atomic archive or resume, a linked target, receipt, tip and selected Handoff DB identity. Archive and resume require the issued task generation.",
+        )
+
+    authority = supersession.HandoffAuthority(Path(db_path), cast(dict[str, int], dict(db_identity)))
+    branch = expected["target_branch"].removeprefix("refs/heads/")
+    path = expected["target_worktree_path"]
+    expected_fields = ("task_ref", "revision", "status", "target_branch", "target_worktree_path")
+    try:
+        authority.check()
+        repository = supersession.repository_identity()
+        with closing(connect_handoff_db(authority.path, read_only=True)) as conn:
+            authority.check(conn)
+            conn.execute("BEGIN")
+            row = conn.execute("SELECT * FROM handoff_state WHERE task_ref = ?", (task_ref,)).fetchone()
+            if operation == "archive" and row is not None:
+                store_id = supersession.generation_store(conn)
+                nonce = supersession.live_nonce(conn, task_ref) if store_id is not None else None
+            else:
+                store_id, nonce = None, None
+        if operation == "resume" or (operation == "archive" and row is None):
+            with _get_db_connection(begin_immediate=True, existing_only=True) as conn:
+                proof = supersession.resume_proof(
+                    conn,
+                    expected=expected,
+                    authority=authority,
+                    repository=repository,
+                    generation=cast(str, generation),
+                )
+            return _envelope(
+                ok=True,
+                tool=_COMPLETION_PORT_TOOL,
+                task_ref=task_ref,
+                data={
+                    "outcome": "already_archived",
+                    "operation": operation,
+                    "task_supersession": proof,
+                    "active_cleared": True,
+                    "archived_revision": expected["revision"],
+                },
+            )
+        if row is None:
+            return _completion_port_envelope(task_ref, "not_found", "task_not_live", "No live task to select.")
+        observed = dict(row)
+        if any(observed[key] != expected[key] for key in expected_fields):
+            return _completion_port_outcome(
+                task_ref, _arch_c_changed(_COMPLETION_PORT_TOOL, task_ref), lookup_current=False
+            )
+        if operation == "archive" and nonce is None:
+            raise supersession.SupersessionRefusal("supersession_task_generation_changed")
+
+        checkout = supersession.registered_checkout(path, branch=branch, tip=expected["tip"])
+        if checkout["git_common_dir"] != repository["git_common_dir"]:
+            raise supersession.SupersessionRefusal("supersession_repository_mismatch")
+        hold = task_completion_hold_reason(
+            task_ref=task_ref,
+            status=expected["status"],
+            target_branch=branch,
+            target_worktree_path=path,
+            workspace_root=repository["root"],
+            integration_ref=expected["integration_ref"],
+            explicit_completion=True,
+            supersession_receipt=expected["receipt"],
+            supersession_tip=expected["tip"],
+        )
+        if hold:
+            raise supersession.SupersessionRefusal(hold)
+        selection = {
+            **expected,
+            "repository": repository,
+            "checkout": checkout,
+            "owner": {
+                "kind": "handoff_task",
+                "task_ref": task_ref,
+            },
+        }
+        if operation == "select":
+            with _get_db_connection(existing_only=True) as conn:
+                authority.check(conn)
+                # Native prepare may persist this generation as soon as it is issued.
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("BEGIN IMMEDIATE")
+                if not _arch_c_matches(conn, observed):
+                    return _completion_port_outcome(
+                        task_ref,
+                        _arch_c_changed(_COMPLETION_PORT_TOOL, task_ref),
+                        lookup_current=False,
+                    )
+                supersession.check_owners(conn, selection, repository)
+                supersession.check_checkout_identity(selection)
+                store_id = supersession.generation_store(conn, create=True)
+                nonce = supersession.live_nonce(conn, task_ref, issue=True)
+
+        selection.update(handoff=supersession.handoff_identity(authority, cast(int, store_id)), task_nonce=nonce)
+        issued_generation = supersession.task_generation(selection)
+        proof = {
+            "schema_version": supersession.SCHEMA_VERSION,
+            "custody_phase": "selected" if operation == "select" else supersession.ARCHIVED,
+            "task_generation": issued_generation,
+            "selection": selection,
+        }
+        if operation == "select":
+            return _envelope(
+                ok=True,
+                tool=_COMPLETION_PORT_TOOL,
+                task_ref=task_ref,
+                data={
+                    "outcome": "selected",
+                    "operation": operation,
+                    "task_supersession": proof,
+                },
+            )
+        if generation != issued_generation:
+            raise supersession.SupersessionRefusal("supersession_task_generation_changed")
+        result = archive_task_state(
+            task_ref=task_ref,
+            notes=notes,
+            expected_state=observed,
+            archive_by=(actor or {}).get("agent"),
+            archive_branch=(actor or {}).get("branch"),
+            archive_commit_sha=(actor or {}).get("commit_sha"),
+            _task_supersession=supersession.ArchiveBinding(authority, proof),
+        )
+        if not result.get("ok"):
+            return _completion_port_outcome(task_ref, result, lookup_current=False)
+        data = dict(result.get("data") or {})
+        data.update(outcome="archived", operation=operation, archived_revision=expected["revision"])
+        return {**result, "tool": _COMPLETION_PORT_TOOL, "data": data}
+    except supersession.SupersessionRefusal as exc:
+        return _completion_port_envelope(task_ref, "held", "completion_held", str(exc))
+    except (
+        ImportError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        _log.warning("Exact supersession qualification failed for %s", task_ref, exc_info=True)
+        return _completion_port_envelope(
+            task_ref,
+            "held",
+            "completion_held",
+            f"supersession_authority_unavailable: {type(exc).__name__}",
+        )
 
 
 def complete_task_conditionally(
@@ -5066,10 +5350,15 @@ def complete_task_conditionally(
     notes: str | None = None,
     actor: WriteActor | None = None,
     clear_active_if_matches: bool = True,
+    supersession_receipt: str | None = None,
+    supersession_tip: str | None = None,
+    expected_handoff_db_path: str | Path | None = None,
+    expected_handoff_db_identity: Mapping[str, object] | None = None,
+    expected_task_generation: str | None = None,
 ) -> dict:
     """Apply explicit completion only to the exact generation the caller selected.
 
-    ``operation="done"`` writes status ``done`` at exactly ``expected_revision``;
+    Ordinary ``operation="done"`` writes status ``done`` at exactly ``expected_revision``.
     ``operation="archive"`` archives an exactly selected ``done`` row. Each call
     refreshes the bounded explicit-completion target proof for the stored row
     before the writer lock, then fences the complete row under BEGIN IMMEDIATE
@@ -5079,20 +5368,56 @@ def complete_task_conditionally(
     False keeps the selected Done row after persisting its archive snapshot.
     The external filesystem can still change after the probe: the proof is
     bound to the row generation, not a filesystem snapshot.
-    Canon v0.26.2 SECD-05 (Fail-safe defaults) and DATA-14 (No dual writes).
+    Exact supersession uses select, atomic archive, and idempotent resume.
+    Select issues a generation bound to the current row, authority and checkout.
+    Archive consumes a durable native prepare with the Done transition. Resume
+    validates the same Handoff archive and immutable native journal binding.
+
+    Canon v0.26.2: DATA-14 (Designing Data-Intensive Applications, ch. 11),
+    RES-19 (Operating Systems: Three Easy Pieces, ch. 42), GRPH-27 (Models of
+    Computation, §DFA), and CARD-02 / Principle 12 (correction at the source).
     """
+    if expected_status not in HANDOFF_ACTIVE_STATUSES:
+        return _completion_port_envelope(task_ref, "invalid", "invalid_request", "expected_status is not a task status")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+        return _completion_port_envelope(task_ref, "invalid", "invalid_request", "expected_revision must be an integer")
+    if operation in {"select", "resume"} or any(
+        value is not None
+        for value in (
+            supersession_receipt,
+            supersession_tip,
+            expected_handoff_db_path,
+            expected_handoff_db_identity,
+            expected_task_generation,
+        )
+    ):
+        return _complete_exact_supersession(
+            operation=operation,
+            expected={
+                "task_ref": task_ref,
+                "revision": expected_revision,
+                "status": expected_status,
+                "target_branch": _normalize_optional_text(expected_target_branch),
+                "target_worktree_path": _normalize_optional_text(expected_target_worktree_path),
+                "receipt": supersession_receipt,
+                "tip": supersession_tip,
+                "integration_ref": integration_ref.removeprefix("refs/heads/"),
+            },
+            db_path=expected_handoff_db_path,
+            db_identity=expected_handoff_db_identity,
+            generation=expected_task_generation,
+            clear_active_if_matches=clear_active_if_matches,
+            notes=notes,
+            actor=actor,
+        )
     if operation not in {"done", "archive"}:
         return _completion_port_envelope(
             task_ref, "invalid", "invalid_request", "operation must be 'done' or 'archive'"
         )
-    if expected_status not in HANDOFF_ACTIVE_STATUSES:
-        return _completion_port_envelope(task_ref, "invalid", "invalid_request", "expected_status is not a task status")
     if operation == "archive" and expected_status != "done":
         return _completion_port_envelope(
             task_ref, "invalid", "invalid_request", "archive requires a selected done row (expected_status='done')"
         )
-    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
-        return _completion_port_envelope(task_ref, "invalid", "invalid_request", "expected_revision must be an integer")
     selected = (
         task_ref,
         expected_revision,

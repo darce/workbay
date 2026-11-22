@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.38] — 2026-11-22
+
+### Changed
+- Raise the protocol and system dependency floors for the v0.1.98 runtime.
+
 ## [0.4.37] — 2026-11-21
 
 ### Changed

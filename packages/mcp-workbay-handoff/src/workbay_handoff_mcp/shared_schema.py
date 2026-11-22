@@ -6121,7 +6121,9 @@ def bounded_resolve_active_task_ref(
 
 
 @contextmanager
-def _get_db_connection(*, begin_immediate: bool = False, deadline: float | None = None) -> Iterator[sqlite3.Connection]:
+def _get_db_connection(
+    *, begin_immediate: bool = False, deadline: float | None = None, existing_only: bool = False
+) -> Iterator[sqlite3.Connection]:
     # sqlite3.Connection as a context manager only commits/rolls back — it
     # does NOT close the file handle. Wrapping the connection in this
     # contextmanager guarantees close-on-exit so callers using
@@ -6154,10 +6156,17 @@ def _get_db_connection(*, begin_immediate: bool = False, deadline: float | None 
     # would still violate [CON-18], which is why registration precedes BEGIN.
     from .db_writer_liveness import db_writer_heartbeat
 
-    conn = _open_db_connection() if deadline is None else _open_db_connection(deadline=deadline)
     db_path = get_runtime_config().db_path
+    if existing_only:
+        # Exact authority callers have already selected an existing database.
+        # Opening it cannot create a replacement or run bootstrap migrations.
+        conn = connect_handoff_db(db_path, deadline=deadline, existing_only=True)
+    else:
+        conn = _open_db_connection() if deadline is None else _open_db_connection(deadline=deadline)
     label = "handoff_db_connection begin_immediate=1" if begin_immediate else "handoff_db_connection"
     try:
+        if existing_only:
+            _assert_schema_version_compatible(conn)
         # Fail-open: a broken sidecar must not deny the write path; the
         # connection still works, only holder attribution is lost ([RES-06]).
         try:

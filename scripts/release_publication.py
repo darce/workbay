@@ -7,6 +7,7 @@ Readers never provision a receiver key. See remote-main-publication-v1.md.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -30,6 +32,7 @@ from urllib.parse import quote
 MAIN = "refs/heads/main"
 HELD = 3
 SCOPE = "workbay/remote-main-publication@1"
+COMPLETION_SCOPE = "workbay/remote-main-publication-completion@2"
 GITHUB_POLICY = "github-public-exact-tag-absence@1"
 GITHUB_API_VERSION = "2022-11-28"
 
@@ -313,6 +316,11 @@ def common(repo):
     return Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
 
 
+def path_identity(path):
+    info = Path(path).stat()
+    return [info.st_dev, info.st_ino]
+
+
 def authority(repo):
     return common(repo) / "workbay" / "remote-main-publication"
 
@@ -345,6 +353,21 @@ def private_bytes(path):
         return stream.read()
 
 
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_custody_entries(custody, *entry_dirs):
+    # append() syncs the bytes before linking. Finish syncing their names
+    # and the directories that make them reachable from the Git vault.
+    for directory in (*entry_dirs, custody, custody.parent, custody.parent.parent):
+        sync_dir(directory)
+
+
 def append(path, raw):
     """Durable immutable identity: publish complete bytes, never replace."""
     private_dir(path.parent)
@@ -360,11 +383,7 @@ def append(path, raw):
                 os.link(temporary, path)
             except FileExistsError:
                 require(private_bytes(path) == raw, "immutable_identity_conflict")
-            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            sync_dir(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -374,11 +393,10 @@ def source_identity(repo):
     # Export reads tracked working files, so HEAD alone is insufficient. Bind
     # tracked modifications too, including index/worktree differences and modes.
     storage = common(repo)
-    info = storage.stat()
     return dict(
         repository=str(repo),
         common_dir=str(storage),
-        storage_identity=[info.st_dev, info.st_ino],
+        storage_identity=path_identity(storage),
         head=git(repo, "rev-parse", "HEAD"),
         tree=git(repo, "rev-parse", "HEAD^{tree}"),
         working_diff=digest(git(repo, "diff", "--binary", "HEAD", "--")),
@@ -439,8 +457,7 @@ def remote_identity(repo, remote=None):
         url = "file://" + str(Path(url[7:]).resolve())
     local_identity = None
     if url.startswith("/") or url.startswith("file://"):
-        info = Path(url.removeprefix("file://")).stat()
-        local_identity = [info.st_dev, info.st_ino]
+        local_identity = path_identity(url.removeprefix("file://"))
     return dict(
         requested=remote,
         push_url=url,
@@ -700,15 +717,27 @@ def prepare(repo, export, *, remote, refspecs, gate, release):
     return plan_id, subject
 
 
-def load(repo, plan_id):
+def require_plan_id(plan_id):
     require(isinstance(plan_id, str) and re.fullmatch(r"[0-9a-f]{64}", plan_id), "invalid_plan_id")
+
+
+def read_prepared_subject(repo, plan_id):
+    require_plan_id(plan_id)
     root = store(repo) / plan_id
-    subject = json.loads(private_bytes(root / "plan.json"))
+    return json.loads(private_bytes(root / "plan.json")), root
+
+
+def validate_subject(subject, plan_id):
     require(digest(subject) == plan_id and subject["schema"] == SCOPE, "plan_digest_mismatch")
     require(
-        all(u.get("destination_kind") == "direct" for u in subject["updates"]),
+        subject["updates"] and all(u.get("destination_kind") == "direct" for u in subject["updates"]),
         "destination_binding_required_prepare_again",
     )
+
+
+def load(repo, plan_id):
+    subject, root = read_prepared_subject(repo, plan_id)
+    validate_subject(subject, plan_id)
     if "reference_provider" in subject.get("transport", {}):
         github_absent_tags(subject["remote"]["push_url"], subject["transport"], [])
     # Local identities are checked after the provider's network wait too.
@@ -741,10 +770,23 @@ def receiver_key(repo):
     return key
 
 
+def sign(receipt, key):
+    return dict(receipt, hmac_sha256=hmac.new(key, encoded(receipt), hashlib.sha256).hexdigest())
+
+
+def validate_signature(receipt, key, reason):
+    require(isinstance(receipt, dict), reason)
+    signature = receipt.pop("hmac_sha256", None)
+    require(isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{64}", signature)
+            and hmac.compare_digest(signature, sign(receipt, key)["hmac_sha256"]), reason)
+    return receipt
+
+
 def validate_approval(repo, plan_id):
+    require_plan_id(plan_id)
     key = receiver_key(repo)
-    receipt = json.loads(private_bytes(authority(repo) / "approvals" / (plan_id + ".json")))
-    signature = receipt.pop("hmac_sha256")
+    receipt = validate_signature(json.loads(private_bytes(authority(repo) / "approvals" / (plan_id + ".json"))),
+                                 key, "approval_authentication_failed")
     require(
         receipt.get("schema") == SCOPE
         and receipt.get("plan_id") == plan_id
@@ -754,11 +796,173 @@ def validate_approval(repo, plan_id):
         and bool(receipt["operator"]),
         "approval_identity_mismatch",
     )
-    require(
-        hmac.compare_digest(signature, hmac.new(key, encoded(receipt), hashlib.sha256).hexdigest()),
-        "approval_authentication_failed",
-    )
     return receipt
+
+
+def require_vault(vault, subject):
+    source = subject["source"]
+    require(source["common_dir"] == str(vault) and source["storage_identity"] == path_identity(vault),
+            "publication_vault_mismatch")
+
+
+def _publishes_main(subject):
+    return any(u["destination"] == MAIN for u in subject["updates"])
+
+
+def _approved_main_subject(vault, plan_id, approval):
+    if "subject" in approval:
+        subject = approval["subject"]
+    else:
+        # Approvals issued before the subject was embedded use retained plan.json.
+        subject, _ = read_prepared_subject(vault, plan_id)
+    validate_subject(subject, plan_id)
+    require(subject["gate"]["verdict"] == "pass", "install_receipt_required")
+    require_vault(vault, subject)
+    require(_publishes_main(subject), "publication_main_required")
+    return subject
+
+
+def observe_updates(repo, subject):
+    remote = subject["remote"]
+    receiver = remote["push_url"].removeprefix("file://")
+    expected_receiver = remote["local_identity"]
+    if expected_receiver is not None:
+        require(path_identity(receiver) == expected_receiver, "remote_configuration_changed")
+    updates = subject["updates"]
+    try:
+        observed = remote_refs(repo, remote, destinations=[u["destination"] for u in updates],
+                               transport=subject.get("transport", {}))
+    except UnicodeDecodeError as exc:
+        raise PublicationHeld("remote_namespace_unknown:incomplete_probe") from exc
+    if expected_receiver is not None:
+        require(path_identity(receiver) == expected_receiver, "remote_configuration_changed")
+    return observed
+
+
+def matches_updates(subject, observed):
+    return all(observed.get(u["destination"]) == u["new"] for u in subject["updates"])
+
+
+def _completion_path(vault, plan_id):
+    return authority(vault) / "completions" / (plan_id + ".json")
+
+
+def _completion_body(vault, plan_id, approval):
+    return dict(schema=COMPLETION_SCOPE, plan_id=plan_id, approval_sha256=digest(approval),
+                common_dir=str(vault), storage_identity=path_identity(vault))
+
+
+def _read_completion(vault, plan_id, approval):
+    path = _completion_path(vault, plan_id)
+    try:
+        raw = private_bytes(path)
+    except FileNotFoundError:
+        return False
+    signed = json.loads(raw)
+    require(raw == encoded(signed), "completion_encoding_mismatch")
+    receipt = validate_signature(signed, receiver_key(vault), "completion_authentication_failed")
+    require(receipt == _completion_body(vault, plan_id, approval), "completion_binding_mismatch")
+    custody = path.parent.parent
+    _sync_custody_entries(custody, custody / "approvals", path.parent)
+    return True
+
+
+def _pending_main_subject(vault, plan_id, approval):
+    """Return the approved subject, or None once completion is durable."""
+    if _read_completion(vault, plan_id, approval):
+        return None
+    try:
+        return _approved_main_subject(vault, plan_id, approval)
+    except FileNotFoundError:
+        # A predecessor's retained plan can retire once a sibling completes it.
+        if _read_completion(vault, plan_id, approval):
+            return None
+        raise
+
+
+@contextmanager
+def _coordinate_completion(vault, plan_id, approval):
+    if _read_completion(vault, plan_id, approval):
+        yield True
+        return
+    directory = authority(vault) / "executions"
+    private_dir(directory)
+    # Keep the lock inode so all linked checkouts and retries share the fence.
+    fd = os.open(directory / (plan_id + ".lock"), os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077,
+                "insecure_custody")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        require(approval == validate_approval(vault, plan_id), "approval_changed_during_publication")
+        yield _read_completion(vault, plan_id, approval)
+    finally:
+        os.close(fd)
+
+
+def _observe_and_complete(vault, plan_id, *, effect_source=None):
+    """Record exact main readback. Only the live effect path may push."""
+    approval = validate_approval(vault, plan_id)
+    reconciling = effect_source is None
+    result = dict(status="completed", plan_id=plan_id)
+    if reconciling:
+        subject = _pending_main_subject(vault, plan_id, approval)
+        if subject is None:
+            return result
+    else:
+        subject = _approved_main_subject(vault, plan_id, approval)
+
+    failure = None
+    if reconciling:
+        # Reconciliation can observe in parallel. Check for a committed receipt
+        # under the fence before using that observation or reporting a hold.
+        try:
+            require(matches_updates(subject, observe_updates(vault, subject)), "publication_readback_unknown")
+        except (OSError, PublicationHeld, subprocess.SubprocessError) as exc:
+            failure = exc
+
+    with _coordinate_completion(vault, plan_id, approval) as complete:
+        if reconciling:
+            if complete:
+                return result
+            if failure is not None:
+                raise failure
+        else:
+            repo, objects = effect_source
+            status = _effect_updates(repo, plan_id, subject, objects, approval=approval, complete=complete)
+            result = dict(status=status, plan_id=plan_id, updates=subject["updates"])
+        if not complete:
+            require_vault(vault, subject)
+            require(approval == validate_approval(vault, plan_id), "approval_changed_during_publication")
+            receipt = sign(_completion_body(vault, plan_id, approval), receiver_key(vault))
+            append(_completion_path(vault, plan_id), encoded(receipt))
+            require(_read_completion(vault, plan_id, approval), "publication_completion_missing")
+        return result
+
+
+def verify(repo, plan_id):
+    """Read back the exact approved mirror updates from the issuing Git vault."""
+    vault = common(repo)
+    subject = _approved_main_subject(vault, plan_id, validate_approval(vault, plan_id))
+    observed = observe_updates(vault, subject)
+    require_vault(vault, subject)
+    require(matches_updates(subject, observed), "publication_readback_unknown")
+    return dict(status="verified", plan_id=plan_id, updates=subject["updates"])
+
+
+def publication_status(repo, plan_id):
+    """Inspect historical completion using only the local Git vault."""
+    vault = common(repo)
+    approval = validate_approval(vault, plan_id)
+    subject = _pending_main_subject(vault, plan_id, approval)
+    # Completion can become durable while the approved subject is being validated.
+    complete = subject is None or _read_completion(vault, plan_id, approval)
+    return dict(status="completed" if complete else "pending", plan_id=plan_id)
+
+
+def reconcile(repo, plan_id):
+    """Record completion after exact mirror readback, with no public writes."""
+    return _observe_and_complete(common(repo), plan_id)
 
 
 def effect(repo, plan_id, *, remote=None, refspecs=None):
@@ -776,14 +980,24 @@ def effect(repo, plan_id, *, remote=None, refspecs=None):
         requested = [(u["destination"], u["new"]) for u in updates]
         frozen = [(u["destination"], u["new"]) for u in subject["updates"]]
         require(identity == subject["remote"] and requested == frozen, "requested_tuple_changed")
-    if any(u["destination"] == MAIN for u in subject["updates"]):
-        validate_approval(repo, plan_id)
-    current = remote_refs(objects, subject["remote"], destinations=[u["destination"] for u in subject["updates"]],
-                          transport=subject.get("transport", {}))
+    if _publishes_main(subject):
+        vault = Path(subject["source"]["common_dir"])
+        return _observe_and_complete(vault, plan_id, effect_source=(repo, objects))
+    status = _effect_updates(repo, plan_id, subject, objects)
+    return dict(status=status, plan_id=plan_id, updates=subject["updates"])
+
+
+def _effect_updates(repo, plan_id, subject, objects, *, approval=None, complete=False):
+    main = _publishes_main(subject)
+    current = observe_updates(objects, subject)
     # CON-11: repeat source/endpoint/custody validation after the network wait.
-    load(repo, plan_id)
-    if all(current.get(u["destination"]) == u["new"] for u in subject["updates"]):
-        return dict(status="already_applied", plan_id=plan_id, updates=subject["updates"])
+    live_subject, _ = load(repo, plan_id)
+    require(live_subject == subject, "plan_digest_mismatch")
+    if matches_updates(subject, current):
+        if main:
+            require(approval == validate_approval(repo, plan_id), "approval_changed_during_publication")
+        return "already_applied"
+    require(not complete, "publication_already_completed")
     for u in subject["updates"]:
         require(current.get(u["destination"]) == u["old"], "remote_tip_changed_prepare_again")
         if u["destination"].startswith("refs/heads/") and u["old"]:
@@ -793,6 +1007,8 @@ def effect(repo, plan_id, *, remote=None, refspecs=None):
     leases = [f"--force-with-lease={u['destination']}:{u['old'] or ''}" for u in subject["updates"]]
     specs = [f"{u['new']}:{u['destination']}" for u in subject["updates"]]
     load(repo, plan_id)
+    if main:
+        require(approval == validate_approval(repo, plan_id), "approval_changed_during_publication")
     # FF proof above + exact expected-old leases + atomic update set. Never raw
     # --force, HEAD, or a second export after approval. A racing writer loses CAS.
     git(
@@ -806,10 +1022,9 @@ def effect(repo, plan_id, *, remote=None, refspecs=None):
         *specs,
         transport=subject.get("transport", {}),
     )
-    observed = remote_refs(objects, subject["remote"], destinations=[u["destination"] for u in subject["updates"]],
-                           transport=subject.get("transport", {}))
-    require(all(observed.get(u["destination"]) == u["new"] for u in subject["updates"]), "publication_readback_unknown")
-    return dict(status="published", plan_id=plan_id, updates=subject["updates"])
+    observed = observe_updates(objects, subject)
+    require(matches_updates(subject, observed), "publication_readback_unknown")
+    return "published"
 
 
 def operator(repo, operation, plan_id=None):
@@ -849,11 +1064,14 @@ def operator(repo, operation, plan_id=None):
         operator_uid=os.getuid(),
         operator=pwd.getpwuid(os.getuid()).pw_name,
         approved_at=datetime.now(timezone.utc).isoformat(),
+        # Commit the plan and its approval together in the common Git vault.
+        subject=subject,
     )
-    receipt["hmac_sha256"] = hmac.new(key, encoded(receipt), hashlib.sha256).hexdigest()
-    path = authority(repo) / "approvals" / (plan_id + ".json")
+    custody = authority(repo)
+    path = custody / "approvals" / (plan_id + ".json")
     if path.exists():
         validate_approval(repo, plan_id)
     else:
-        append(path, encoded(receipt))
+        append(path, encoded(sign(receipt, key)))
+    _sync_custody_entries(custody, path.parent)
     return dict(status="approved", plan_id=plan_id)

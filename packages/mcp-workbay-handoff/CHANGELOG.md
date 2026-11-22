@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.37] — 2026-11-22
+
+### Changed
+- Add exact task supersession with shared custody and serialize task reopening against native cleanup intent.
+- Deduplicate redacted remote-gate refusal telemetry by producer event key.
+
 ## [0.3.36] — 2026-11-21
 
 ### Changed

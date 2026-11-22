@@ -1211,22 +1211,43 @@ def _finish_cleanup_impl(
                 "bundle_path": bundle_path,
             }
 
-        final_outcome, retire_outcome, retired_bundle, retire_detail, retire_fields = _retire(
-            manifest_root=manifest_root,
-            lanes=lanes,
-            orchestrator_lanes=orchestrator_lanes,
-            root=root,
-            branch=branch,
-            task_ref=identity["task_ref"],
-            lane_id=identity["lane_id"],
-            expected_tip=identity["expected_tip"],
-            integration_ref=identity["integration_ref"],
-            landing_commit=identity["landing_commit"],
-            landing_run_id=identity["run_id"],
-            contained_landing=contained_landing,
-            replay=replay,
-            projection_pending=False,
-        )
+        resumed, resume_detail = True, ""
+        resume_release = ""
+        if replay and not contained_landing:
+            from . import worktree_tombstone
+            from .branch_reclaim_delete import fence_release_of
+
+            try:
+                resumed, resume_detail = worktree_tombstone.resume_landing_retirement(
+                    root, intent, deadline=cleanup_deadline
+                )
+            except Exception as exc:
+                resumed, resume_detail = False, f"tombstone_replay_failed:{type(exc).__name__}"
+            resume_release = fence_release_of(resume_detail)
+        if resumed:
+            final_outcome, retire_outcome, retired_bundle, retire_detail, retire_fields = _retire(
+                manifest_root=manifest_root,
+                lanes=lanes,
+                orchestrator_lanes=orchestrator_lanes,
+                root=root,
+                branch=branch,
+                task_ref=identity["task_ref"],
+                lane_id=identity["lane_id"],
+                expected_tip=identity["expected_tip"],
+                integration_ref=identity["integration_ref"],
+                landing_commit=identity["landing_commit"],
+                landing_run_id=identity["run_id"],
+                contained_landing=contained_landing,
+                replay=replay,
+                projection_pending=False,
+            )
+        else:
+            final_outcome, retire_outcome, retired_bundle = "landed", "skipped:remove_failed", None
+            retire_detail, retire_fields = resume_detail, {}
+        if resume_release:
+            retire_fields = _retire_release_fields(
+                retire_fields, {"fence_release": [{"step": "worktree_reclaim", "release": resume_release}]}
+            )
         fresh_release_fields = _retire_release_fields(retire_fields)
         release_fields = _retire_release_fields(local_result, fresh_release_fields)
         if (
@@ -1875,6 +1896,7 @@ def _plan_authorized_supersede(ctx: _SupersedeContext, predecessor: str, branch:
         superseded_by=ctx.landing_commit,
         integration_ref=ctx.integration_ref,
         allow_main=True,
+        operator_review=False,
     )
     if isinstance(planned, lane_tombstone.SupersedeResult) and not planned.ok:
         raise _SupersedeStepComplete(_supersede_record(predecessor, branch, reason=planned.reason))

@@ -193,7 +193,7 @@ def _validate_listed_intent(payload: Mapping[str, Any], *, filename_id: str) -> 
     return dict(payload)
 
 
-def _cleanup_dir(root: Path | str) -> Path:
+def _cleanup_dir(root: Path | str, *, create: bool = True) -> Path:
     repo = Path(root).expanduser().resolve()
     try:
         result = subprocess.run(
@@ -218,10 +218,43 @@ def _cleanup_dir(root: Path | str) -> Path:
         # always resolve a git common directory above.
         directory = repo / ".workbay" / "landing-cleanup"
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise CleanupIntentError(f"cleanup_intent_directory_unavailable:{type(exc).__name__}") from exc
     return directory
+
+
+def _registered_worktrees(repo: Path, *, timeout: float = 3) -> list[tuple[Path, str | None]]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise OSError("landing_worktree_list_unavailable")
+    worktrees = []
+    for entry in result.stdout.split("\0\0"):
+        path, *fields = entry.split("\0")
+        if path.startswith("worktree "):
+            branch = next((field.removeprefix("branch ") for field in fields if field.startswith("branch ")), None)
+            worktrees.append((Path(path.removeprefix("worktree ")), branch))
+    return worktrees
+
+
+def _local_replay_root(root: Path | str, integration_ref: str, deadline: float) -> Path:
+    repo = Path(root).expanduser().resolve()
+    if not (repo / ".git").exists():
+        return repo  # Standalone state directories used by non-Git callers.
+    branch_ref = f"refs/heads/{integration_ref.removeprefix('refs/heads/')}"
+    timeout = max(0.01, min(3.0, deadline - _monotonic()))
+    matches = [path for path, branch in _registered_worktrees(repo, timeout=timeout) if branch == branch_ref]
+    if len(matches) != 1:
+        raise CleanupIntentError("landing_integration_worktree_unavailable")
+    return matches[0]
 
 
 def _identity(value: Mapping[str, Any]) -> dict[str, str]:
@@ -960,10 +993,18 @@ def settle_retired_local_intent(root: Path | str, intent: Mapping[str, Any]) -> 
             return probe_failed(branch_error)
         return dict(intent), "predecessor_branch_present", False
     try:
-        if Path(worktree).expanduser().exists():
+        path = Path(worktree).expanduser()
+        if path.exists() or path.is_symlink():
             return dict(intent), "predecessor_branch_absent_worktree_present", False
     except OSError as exc:
         return probe_failed(f"predecessor_worktree_probe_failed:{type(exc).__name__}")
+    from . import worktree_tombstone
+
+    try:
+        if worktree_tombstone.has_pending_landing_retirement(repo, intent):
+            return dict(intent), "landing_tombstone_pending", False
+    except (CleanupIntentError, OSError, subprocess.TimeoutExpired, ValueError):
+        return dict(intent), "tombstone_guard_unavailable", False
     try:
         rows = _registered_lane_rows()
     except Exception as exc:
@@ -1318,13 +1359,14 @@ def drain_pending_cleanup_intents(
                 replay_error = "cleanup_intent_identity_invalid"
             else:
                 try:
+                    replay_root = _local_replay_root(root, identity["integration_ref"], deadline)
                     replay_result = lane_land.land(
                         str(identity["task_ref"]),
                         str(identity["lane_id"]),
                         str(identity["expected_tip"]),
                         str(identity["run_id"]),
                         integration_ref=str(identity["integration_ref"]),
-                        orchestrator_root=Path(root).expanduser().resolve(),
+                        orchestrator_root=replay_root,
                         _drain_cleanup=False,
                         _cleanup_deadline=deadline,
                     )

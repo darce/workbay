@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.40] — 2026-11-22
+
+### Changed
+- Require durable publication completion before closing a release task, and coordinate reviewed task supersession with native retirement.
+- Sweep staged reviews on integration merges and recover bounded cleanup across retries.
+- Record redacted remote-gate refusal details and update the boundary runtime pin.
+
 ## [0.4.39] — 2026-11-21
 
 ### Changed
