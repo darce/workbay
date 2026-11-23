@@ -23,16 +23,17 @@ workbay install --target <repo> --remote-ref "$REF" --with-codebase-graph
 
 From a checkout of the same tag: `./scripts/install-workbay-cli.sh "$REF"`.
 
-On locked-down hosts, install the CLI with the explicit
-`uv tool install --no-sources` closure so the full runtime package list is
-written out:
+On locked-down hosts, install the CLI with the explicit runtime package list.
+Both manual recipes use `--link-mode copy` to install independent lifecycle
+provider files. To repair an existing installation at the same ref, add
+`--force` to the applicable `uv tool install` command.
 
 ```sh
 REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
 # --no-sources is required (each member pyproject carries a workspace source);
 # the whole runtime closure is git-sourced via --with at the same release tag.
-uv tool install --no-sources \
+uv tool install --no-sources --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/mcp-workbay-handoff" \
   --with "$R#subdirectory=packages/mcp-workbay-orchestrator" \
@@ -54,7 +55,7 @@ Or install the bootstrap CLI directly and pin a consumer tag:
 ```sh
 REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
-uv tool install --no-sources \
+uv tool install --no-sources --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/workbay-system" \
   --from "$R#subdirectory=packages/workbay-bootstrap" \

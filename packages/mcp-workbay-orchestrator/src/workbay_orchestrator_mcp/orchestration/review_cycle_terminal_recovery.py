@@ -135,12 +135,21 @@ def _historical_source_lane(runtime, binding: dict, source: dict, registered: di
 
     A status, a current notes marker, or a copied pass binding cannot establish
     historical custody. Verify the atomic lane-mutation snapshot and its R3
-    event/registration/evidence digests, including source commit/tree. Repeated
-    identical observations are one identity; contradictory ones hold.
-    Canon v0.26.2: GRPH-14 (Building Knowledge Graphs, ch. 8 + Mental Models,
-    ch. 8); SECD-03/SECD-05 (Security Engineering).
+    event/registration/evidence digests before selecting the exact source.
+    A lane identity can observe multiple commits within one epoch.
+    Canon v0.26.2 grounds the custody checks in GRPH-14 (Building Knowledge
+    Graphs, ch. 8 + Mental Models, ch. 8) and SECD-03/SECD-05 (Security
+    Engineering). Derive the witness from the native log (DATA-14, Designing
+    Data-Intensive Applications, ch. 11) and preserve typed holds (API-05,
+    RESTful Web API Patterns and Practices Cookbook, ch. 5).
     """
-    from workbay_protocol.resource_lifecycle import LifecycleEvent, Registration, canonical_digest, event_identity
+    from workbay_protocol.resource_lifecycle import (
+        GitSource,
+        LifecycleEvent,
+        Registration,
+        canonical_digest,
+        event_identity,
+    )
 
     try:
         with closing(
@@ -188,8 +197,7 @@ def _historical_source_lane(runtime, binding: dict, source: dict, registered: di
             and event.correlation.workbay.lane == binding["lane_id"]
             and event.resource.resource_kind == "git_worktree"
             and event.resource.identity == binding["worktree_path"]
-            and event.source.revision == source["head_sha"]
-            and event.source.tree == source["head_tree"]
+            and isinstance(event.source, GitSource)
             and event.model_dump(mode="json")["evidence"] == evidence
             and registration.model_dump(mode="json")["evidence"] == evidence
             and all(
@@ -197,7 +205,14 @@ def _historical_source_lane(runtime, binding: dict, source: dict, registered: di
                 for k in ("resource", "source", "policy_version", "correlation")
             ),
             "historical_lane_custody_invalid",
-            "unchanged original lane producer snapshot, identity, Git source and R3 receipt",
+            "unchanged lane producer snapshot, identity and R3 receipt",
+        )
+        if event.source.revision != source["head_sha"]:
+            continue
+        _require(
+            event.source.tree == source["head_tree"],
+            "historical_lane_custody_invalid",
+            "original source commit agrees with its authenticated Git tree",
         )
         matches.append(
             dict(
@@ -209,7 +224,9 @@ def _historical_source_lane(runtime, binding: dict, source: dict, registered: di
             )
         )
     _require(
-        bool(matches), "historical_lane_join_unavailable", "original source epoch witnessed by native lane producer"
+        bool(matches),
+        "historical_lane_join_unavailable",
+        "original source commit and tree witnessed in its epoch by native lane producer",
     )
     return matches[0]
 
@@ -587,20 +604,21 @@ def _authenticate(
         if registered is None
         else {k: registered.get(k) for k in ("id", "identity_seq", "task_ref", "lane_id", "branch", "worktree_path")}
     )
-    # A recovery authored while the original epoch was still current is a
-    # native historical witness. It can survive later closure of that SAME
-    # registry identity. It cannot qualify a fresh repair of an already-moved
-    # epoch, a different row/identity, or a reopened active cycle.
+    # A recovery authored while the original epoch was current can survive
+    # closure of the same registry identity. A fresh recovery of a retired
+    # epoch must join the original lane producer evidence.
     historical_join = (
         historical is not None
+        and historical.get("historical_lane_witness") is None
         and historical.get("lane_cycle_binding") == binding
         and historical.get("native_registry_identity") == native_identity
         and registered is not None
         and registered.get("status") in {"closed", "merged"}
     )
+    stamp = receipt.get("source_task_subject")
     witness = None
     if (
-        source_authority
+        (source_authority or (stamp is not None and not historical_join))
         and registered is not None
         and registered.get("status") in {"closed", "merged"}
         and registered.get("cycle_epoch") != binding["cycle_epoch"]
@@ -646,7 +664,7 @@ def _authenticate(
     correction = None
     if source_authority:
         _require(
-            receipt.get("source_task_subject") is None
+            stamp is None
             and (
                 state.get("tip_sha", source["head_sha"]) == source["head_sha"]
                 if detached
@@ -666,6 +684,12 @@ def _authenticate(
         )
     else:
         original, scope_path, scope_sha = _original_scope(repo, private, managed, binding, source)
+        if witness is not None:
+            _require(
+                stamp == original,
+                "source_scope_custody_invalid",
+                "original transport stamp matches the protected source-time scope",
+            )
     outcome = result.get("outcome")
     from .pass_outcome_class import PassOutcomeClass, classify_pass_outcome
 
@@ -734,6 +758,8 @@ def _authenticate(
     )
     if source_authority:
         proof.update(source_authority=correction, historical_lane_witness=witness, detached_source=detached_proof)
+    elif witness is not None:
+        proof["historical_lane_witness"] = witness
     _require(
         all(_digest(Path(p).read_bytes()) == sha for p, sha in records.items()),
         "stale_observation",
@@ -741,10 +767,9 @@ def _authenticate(
     )
     lane = dict(
         row_id=binding["row_id"],
-        **{
-            k: (registered[k] if source_authority else binding[k])
-            for k in ("task_ref", "lane_id", "branch", "worktree_path", "cycle_epoch")
-        },
+        # The publication fence checks the current row. The proof above
+        # retains the original epoch and the native event that witnessed it.
+        **{k: registered[k] for k in ("task_ref", "lane_id", "branch", "worktree_path", "cycle_epoch")},
     )
     return _Observed(proof, receipt, pass_path, scope_path, runtime.state_dir, lane)
 

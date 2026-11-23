@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.45] — 2026-11-23
+
+### Fixed
+- Stamped terminal recovery verifies the original lane event for the dispatch's Git commit and tree, even when a later observation shares the epoch.
+
+## [0.3.44] — 2026-11-23
+
+### Fixed
+- Historical recovery authenticates same-epoch lane observations against retained resource custody and selects the witness for the original Git commit and tree, even when a later observation records a different commit.
+
 ## [0.3.43] — 2026-11-22
 
 ### Changed

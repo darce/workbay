@@ -3,6 +3,17 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.97] — 2026-11-23
+
+### Changed
+- Refresh the exact stack pins for the stamped terminal recovery release.
+
+## [0.3.96] — 2026-11-23
+
+### Changed
+- Refresh the exact front-door runtime pins for the WorkBay v0.1.99 Git snapshot.
+- The Git installer and documented manual recipes use uv copy mode.
+
 ## [0.3.95] — 2026-11-22
 
 ### Changed

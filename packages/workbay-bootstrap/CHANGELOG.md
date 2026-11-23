@@ -3,6 +3,17 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.40] — 2026-11-23
+
+### Changed
+- Require workbay-system 0.4.42 so the bundled remote agent uses the updated boundary runtime.
+
+## [0.4.39] — 2026-11-23
+
+### Fixed
+- Use uv copy mode for managed Git installs and same-tag reinstalls, including an HTTPS-to-SSH source change.
+- Report a legacy launcher file occupying the lifecycle directory path as a doctor hold.
+
 ## [0.4.38] — 2026-11-22
 
 ### Changed

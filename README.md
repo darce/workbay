@@ -507,7 +507,7 @@ checkout:
 
 ```bash
 R="git+https://github.com/darce/workbay.git@main"
-uv tool install --no-sources \
+uv tool install --no-sources --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/mcp-workbay-handoff" \
   --with "$R#subdirectory=packages/mcp-workbay-orchestrator" \

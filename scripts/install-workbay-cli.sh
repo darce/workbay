@@ -50,7 +50,8 @@ for member in "${MEMBERS[@]}"; do
 done
 
 echo "install-workbay-cli: installing workbay from ${REPO}@${REF}"
-uv tool install --no-sources --compile-bytecode \
+# Lifecycle refresh verifies independent installed RECORD and payload files.
+uv tool install --no-sources --link-mode copy --compile-bytecode \
   "${FORCE_FLAG[@]}" \
   "${WITH_ARGS[@]}" \
   --from "${R}#subdirectory=packages/workbay" \

@@ -1001,7 +1001,8 @@ def build_uv_tool_install_argv(
     # from the explicit ``--with`` git/path specs below (the Q4 mechanism). This
     # is equally correct for the local-path dev install, where the ``--with``
     # paths already pin every member.
-    argv = ["tool", "install", "--no-sources", "--compile-bytecode"]
+    # Lifecycle refresh requires single-link wheel metadata and payload files.
+    argv = ["tool", "install", "--no-sources", "--link-mode", "copy", "--compile-bytecode"]
     if no_cache:
         argv.append("--no-cache")
     if force:

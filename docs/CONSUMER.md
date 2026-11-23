@@ -60,10 +60,9 @@ workbay apply-hooks --install-codex-stop-hook
 # re-run install-workbay-cli.sh with a newer tag to upgrade the CLI
 ```
 
-> If `uv tool install` prints `Failed to hardlink files; falling back
-> to full copy`, your `uv` cache and tool dir are on different
-> filesystems. The install still succeeds — silence the warning with
-> `export UV_LINK_MODE=copy` in your shell profile.
+The installer uses copy mode so lifecycle checks can verify independent
+installed payload and metadata files. Use `--link-mode copy` for manual
+tool or venv installs that supply the lifecycle payload.
 
 ### Manual `uv` closure (escape hatch)
 
@@ -75,7 +74,7 @@ in sync with `packages/workbay-bootstrap/.../gitonly_closure.py`):
 ```bash
 REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
-uv tool install --no-sources --force \
+uv tool install --no-sources --force --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/mcp-workbay-handoff" \
   --with "$R#subdirectory=packages/mcp-workbay-orchestrator" \
@@ -92,7 +91,7 @@ defaults `--source git_overlay` unless you pass `--source package`:
 ```bash
 REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
-uv tool install --no-sources --force \
+uv tool install --no-sources --force --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/workbay-system" \
   --from "$R#subdirectory=packages/workbay-bootstrap" \

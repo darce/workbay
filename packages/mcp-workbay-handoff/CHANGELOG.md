@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.39] — 2026-11-23
+
+### Changed
+- The lifecycle extra now requires orchestrator 0.3.45, which includes the stamped terminal recovery fix.
+
+## [0.3.38] — 2026-11-23
+
+### Changed
+- Raise the protocol dependency floor and the optional lifecycle orchestrator floor for WorkBay v0.1.99.
+
 ## [0.3.37] — 2026-11-22
 
 ### Changed

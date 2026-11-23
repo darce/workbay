@@ -15,13 +15,13 @@ import email.parser
 import fcntl
 import hashlib
 import importlib.metadata as metadata
-from importlib.util import source_from_cache
 import io
 import json
 import os
 import stat
 import uuid
 from contextlib import ExitStack
+from importlib.util import source_from_cache
 from pathlib import Path, PurePosixPath
 
 from workbay_protocol.bootstrap_ledger_view import HOST_RECEIPT_REL, overlay_ledger_view, parse_host_receipt
@@ -81,13 +81,13 @@ def _relative(raw: str) -> str:
     return raw
 
 
-def _safe(info: os.stat_result, *, directory=False, source=False) -> None:
+def _safe(info: os.stat_result, path: str, *, directory=False, source=False) -> None:
     if info.st_uid not in ({0, os.geteuid()} if source else {os.geteuid()}):
-        raise _Refused("unsafe_owner: path is not owned by the expected principal")
+        raise _Refused(f"unsafe_owner: path is not owned by the expected principal: {path}")
     if info.st_mode & 0o022:
-        raise _Refused("unsafe_permissions: group/world writable path")
+        raise _Refused(f"unsafe_permissions: group/world writable path: {path}")
     if not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-        raise _Refused("unsafe_file: single-link regular file required")
+        raise _Refused(f"unsafe_file: single-link regular file required: {path}")
 
 
 class _Tree:
@@ -96,7 +96,7 @@ class _Tree:
         self.dirs: dict[str, int] = {}
         fd = _absolute_directory(root)
         stack.callback(os.close, fd)
-        _safe(os.fstat(fd), directory=True, source=source)
+        _safe(os.fstat(fd), str(root), directory=True, source=source)
         self.dirs[""] = fd
 
     def directory(self, rel: str = "", *, create=False) -> int:
@@ -114,7 +114,7 @@ class _Tree:
             os.fsync(fd)
             child = os.open(name, _DIR_FLAGS, dir_fd=fd)
         self.stack.callback(os.close, child)
-        _safe(os.fstat(child), directory=True, source=self.source)
+        _safe(os.fstat(child), rel, directory=True, source=self.source)
         self.dirs[rel] = child
         return child
 
@@ -122,7 +122,7 @@ class _Tree:
         _relative(rel)
         parent, _, name = rel.rpartition("/")
         data, info = _read_file(self.directory(parent), name, limit=16 * 1024 * 1024)
-        _safe(info, source=self.source)
+        _safe(info, rel, source=self.source)
         return data, _signature(info)
 
     def optional(self, rel: str):
@@ -200,7 +200,7 @@ def _installed_tree(site: _Tree, rel: str, recorded: set[str]) -> set[str]:
                     except ValueError:
                         source = None
                     if source in recorded:
-                        _safe(info, source=True)
+                        _safe(info, path, source=True)
                         continue
                 found.add(path)
             else:
@@ -394,6 +394,15 @@ def refresh_lifecycle(*, target: Path, check: bool = False) -> dict[str, object]
             _git_root(target)
             git_identity = _consumer_identity(tree)
             manifest = _manifest(tree)
+            try:
+                tree.directory(_SURFACE)
+            except NotADirectoryError:
+                parent, _, name = _SURFACE.rpartition("/")
+                info = os.stat(name, dir_fd=tree.directory(parent), follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    _safe(info, _SURFACE)
+                    raise _Refused(f"legacy launcher file at {_SURFACE}; managed lifecycle package directory required")
+                raise
             sources, source = _load_source()
             receipt["source"] = source
             initial = {rel: tree.read(rel) for rel in sources}

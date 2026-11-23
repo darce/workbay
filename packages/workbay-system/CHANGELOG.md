@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.42] — 2026-11-23
+
+### Changed
+- The bundled remote agent pins boundary runtime 0.3.45 for stamped terminal recovery.
+
+## [0.4.41] — 2026-11-23
+
+### Changed
+- Align the shipped remote-agent boundary pin with the WorkBay v0.1.99 orchestrator.
+
 ## [0.4.40] — 2026-11-22
 
 ### Changed

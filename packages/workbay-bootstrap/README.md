@@ -32,7 +32,7 @@ door, use the manual git closure (escape hatch; kept in
 ```bash
 REF=v0.1.55
 R="git+https://github.com/darce/workbay.git@$REF"
-uv tool install --no-sources --force \
+uv tool install --no-sources --force --link-mode copy \
   --with "$R#subdirectory=packages/workbay-protocol" \
   --with "$R#subdirectory=packages/workbay-system" \
   --from "$R#subdirectory=packages/workbay-bootstrap" \
@@ -43,6 +43,10 @@ workbay-bootstrap status
 workbay-bootstrap doctor
 # workbay install defaults --source package; --hooks none|repo|all (recorded is repair-only)
 ```
+
+Use `--link-mode copy` for manual tool installs that supply the lifecycle
+payload. The lifecycle check requires single-link installed files. Reinstall
+with copy mode if the finding identifies a hardlinked provider file.
 
 ### From the monorepo source tree (development)
 
