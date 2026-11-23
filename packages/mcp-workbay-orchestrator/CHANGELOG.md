@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.47] — 2026-11-23
+
+### Changed
+- Persist zero-wait offload intent in the native pass store before acknowledging it, including the invocation identity, runtime scope, and completion inputs.
+- A retry with the same pass ID and immutable intent joins the original invocation, even if the first reply was lost.
+- A worker in a separate process can discover and claim a durably queued pass after the caller exits.
+- When a matching retry can prove the original detached job was submitted, it polls and collects that existing job by its recorded ID.
+- Legacy partial acceptance without protected predecessor evidence remains `UNKNOWN`.
+
 ## [0.3.46] — 2026-11-23
 
 ### Fixed

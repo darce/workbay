@@ -613,9 +613,9 @@ _RUN_OFFLOAD_PASS_GUIDANCE_CONTRACT = (
 # Main already states this resume contract. Reuse that sentence as the single
 # source shared by the tool description and the docstring.
 _REMOTE_JOB_PENDING_DOC = (
-    "remote_job_pending means the detached job was submitted and its id persisted. Repeating run_offload_pass "
-    "with the same pass_id checks the recorded job: an open job remains remote_job_pending, while a finished "
-    "job is collected, applied, self-verified, checkpointed, and returned with its terminal outcome. "
+    "remote_job_pending means the detached job was submitted and its id persisted. A durable queued pass joins "
+    "its recorded progress or result with the same pass_id and request. For synchronous passes, repeating "
+    "run_offload_pass checks the job and collects its terminal outcome when available. "
 )
 _OFFLOAD_PREVIEW_DOC = (
     "dry_run=True selects a separate synchronous preview contract, regardless of wait_seconds: "
@@ -673,7 +673,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         _OFFLOAD_PREVIEW_DOC +
         "Run one offload pass over an actionable lane: bounded execute→review→fix with a commit gate; positive "
         "token_budget and timeout_seconds are mandatory. Omit wait_seconds for the existing synchronous behavior; "
-        "wait_seconds=0 submits to a process-owned worker and immediately returns pass_id with status=running. "
+        "wait_seconds=0 durably queues a pass and returns pass_id with status=running. "
         "Typed outcomes (handoff_ready|review_complete|escalated|needs_guidance|rate_limited|transport_failure|"
         "completed_unreviewed|no_actionable_work|uncommitted_work|token_budget_exceeded|timeout|error|still_running|"
         "lane_not_found|self_verify_failed|self_verify_inconclusive|composer_violation_quarantined|checkpoint|"
@@ -4476,6 +4476,7 @@ def _run_offload_pass_impl(
             # The engine's review-cycle reservation is the only consumer; the
             # ledger validates the proposal against the trusted Canon.
             canon_proposal_path=canon_proposal_path,
+            **prepared.get("native_validation", {}),
         )
     except ValueError as exc:
         return core._json_response(_offload_payload({"ok": False, "error": str(exc)}))
@@ -4579,10 +4580,13 @@ def run_offload_pass(
     ``remote_required`` and is never silently substituted.
 
     ``timeout_seconds`` bounds the pass engine. Omit ``wait_seconds`` to retain
-    the existing synchronous behavior. Set ``wait_seconds=0`` to submit the pass
-    to a process-owned worker and return its ``pass_id`` with ``status=running``;
+    the existing synchronous behavior. Set ``wait_seconds=0`` to durably queue
+    the pass and return its ``pass_id`` with ``status=running``;
     positive values submit and wait for that many seconds. A still-running poll
-    returns ``ok: true`` and ``terminal: false``. ``turn_timeout_seconds``
+    returns ``ok: true`` and ``terminal: false``. During lease contention, a
+    matching retry of a durably queued pass only observes the existing pass.
+    Zero and omitted waits take one snapshot, and positive waits observe up
+    to the requested duration. ``turn_timeout_seconds``
     requires a per-cycle bound enforced by the backend (token-budget cycle bounds
     or an adapter timeout); ``timeout_seconds`` is checked cooperatively between
     phases.
@@ -4619,40 +4623,6 @@ def run_offload_pass(
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < math.inf:
             return core._json_response({"ok": False, "error": f"{name} must be a positive finite number."})
 
-    can_resume_detached = (
-        pass_id is not None
-        and not isinstance(token_budget, bool)
-        and isinstance(token_budget, int)
-        and token_budget > 0
-        and timeout_seconds is not None
-        and timeout_seconds > 0
-        and not isinstance(max_review_cycles, bool)
-        and isinstance(max_review_cycles, int)
-        and max_review_cycles >= 1
-        and (turn_timeout_seconds is None or turn_timeout_seconds <= timeout_seconds)
-    )
-    if can_resume_detached:
-        assert pass_id is not None
-        paths = _worker_paths()
-        resume_engine = _import_orchestration_module("offload_pass")
-        try:
-            previous_pass = resume_engine.read_pass_state(paths["state_dir"], pass_id, strict=True)
-        except resume_engine.PassStateUnreadable as exc:
-            return core._json_response(exc.hold())
-        if (
-            isinstance(previous_pass, dict)
-            and isinstance(previous_pass.get("job_id"), str)
-            and previous_pass.get("job_id")
-            and previous_pass.get("lane_id") == lane_id
-            and (task_ref is None or previous_pass.get("task_ref") == task_ref)
-        ):
-            completion = resume_engine.complete_remote_pass(
-                previous_pass["job_id"],
-                state_dir=paths["state_dir"],
-                orchestrator_root=paths["workspace_root"],
-            )
-            return core._json_response({"ok": completion.get("ok") is not False, **completion})
-
     run_args = dict(
         lane_id=lane_id,
         task_ref=task_ref,
@@ -4675,34 +4645,33 @@ def run_offload_pass(
     )
     if dry_run:
         return _run_offload_preview(run_args)
-    if wait_seconds is None:
+    valid_bounds = (
+        not isinstance(token_budget, bool)
+        and isinstance(token_budget, int)
+        and token_budget > 0
+        and not isinstance(max_review_cycles, bool)
+        and isinstance(max_review_cycles, int)
+        and max_review_cycles >= 1
+        and timeout_seconds is not None
+        and (turn_timeout_seconds is None or turn_timeout_seconds <= timeout_seconds)
+    )
+    wait_window = None
+    if wait_seconds is not None:
+        # Invalid passes retain the engine's mandatory-bound refusal.
+        if not valid_bounds:
+            return _run_offload_pass_impl(**run_args)
+        if isinstance(wait_seconds, bool):
+            return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
+        try:
+            wait_window = float(wait_seconds)
+        except (TypeError, ValueError):
+            return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
+        if not math.isfinite(wait_window):
+            return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
+        wait_window = max(0.0, wait_window)
+
+    if wait_window is None:
         return _run_offload_pass_synchronous(run_args)
-
-    # Keep mandatory-bound refusals synchronous; an invalid pass is never
-    # acknowledged as queued work.
-    if (
-        isinstance(token_budget, bool)
-        or not isinstance(token_budget, int)
-        or token_budget <= 0
-        or timeout_seconds is None
-        or timeout_seconds <= 0
-        or isinstance(max_review_cycles, bool)
-        or not isinstance(max_review_cycles, int)
-        or max_review_cycles < 1
-        or (turn_timeout_seconds is not None and turn_timeout_seconds > timeout_seconds)
-    ):
-        return _run_offload_pass_impl(**run_args)
-
-    if isinstance(wait_seconds, bool):
-        return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
-    try:
-        wait_window = float(wait_seconds)
-    except (TypeError, ValueError):
-        return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
-    if not math.isfinite(wait_window):
-        return core._json_response({"ok": False, "error": "wait_seconds must be a finite number."})
-    wait_window = max(0.0, wait_window)
-
     return _submit_offload_pass(run_args, wait_window)
 
 
@@ -4795,7 +4764,7 @@ class _OffloadAdmissionRefused(RuntimeError):
         super().__init__(reason)
 
 
-def _offload_invocation_lease(state_dir: Path, pass_id: str):
+def _offload_invocation_lease(state_dir: Path, pass_id: str, *, timeout: float = 1.0):
     """Bounded per-pass EX; same-thread nested retries may borrow it."""
     from workbay_handoff_mcp.shared_write_context import assert_no_write_lock_held  # noqa: PLC0415
     from workbay_protocol.lifecycle_coordination import (  # noqa: PLC0415
@@ -4807,9 +4776,21 @@ def _offload_invocation_lease(state_dir: Path, pass_id: str):
 
     assert_no_write_lock_held("offload invocation lease")
     try:
-        return pass_invocation_lease(state_dir, pass_id)
+        return pass_invocation_lease(state_dir, pass_id, timeout=timeout)
     except (LifecycleLeaseTimeout, LifecycleOwnershipError) as exc:
         raise _OffloadInvocationBusy(str(exc)) from exc
+
+
+def _offload_submission_lease(offload_pass: Any, state_dir: Path, pass_id: str, *, deadline: float | None = None):
+    # A visible acceptance can be observed immediately after a failed attempt.
+    # Concurrent first submissions still get the normal bounded admission
+    # window. The hint conveys no authority in either path.
+    hint = offload_pass.read_pass_state(state_dir, pass_id)
+    if hint is not None and "queue_intent_committed" in hint:
+        timeout = 0.0
+    else:
+        timeout = 1.0 if deadline is None else max(0.0, min(1.0, deadline - time.monotonic()))
+    return _offload_invocation_lease(state_dir, pass_id, timeout=timeout)
 
 
 def _refuse_foreign_invocation(offload_pass: Any, state_dir: Path, pass_id: str, lease: Any, *, queued: bool) -> None:
@@ -4817,6 +4798,8 @@ def _refuse_foreign_invocation(offload_pass: Any, state_dir: Path, pass_id: str,
     state = offload_pass.read_pass_state(state_dir, pass_id)
     if not isinstance(state, dict):
         return
+    if "queue_intent" in state:
+        raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
     api_acceptance = bool(state.get("invocation_token"))
     if lease.borrowed:
         # This thread's owner is still inside its callback, possibly after engine done.
@@ -4917,6 +4900,25 @@ def _offload_admission_failure(exc: RuntimeError) -> dict:
     return core._json_response({"ok": False, "reason": reason, "error": str(exc)})
 
 
+def _legacy_offload_job_id(state: dict | None, run_args: dict) -> str | None:
+    if (
+        state
+        and isinstance(state.get("job_id"), str)
+        and state["job_id"]
+        and state.get("lane_id") == run_args["lane_id"]
+        and (run_args["task_ref"] is None or state.get("task_ref") == run_args["task_ref"])
+    ):
+        return state["job_id"]
+    return None
+
+
+def _complete_legacy_offload_job(offload_pass: Any, job_id: str, paths: dict) -> dict:
+    completion = offload_pass.complete_remote_pass(
+        job_id, state_dir=paths["state_dir"], orchestrator_root=paths["workspace_root"]
+    )
+    return core._json_response({"ok": completion.get("ok") is not False, **completion})
+
+
 def _run_offload_pass_synchronous(run_args: dict) -> dict:
     """Use the same admission as queued work, without a submitted receipt."""
     import uuid  # noqa: PLC0415
@@ -4941,53 +4943,85 @@ def _run_offload_pass_synchronous(run_args: dict) -> dict:
     ):
         return _run_offload_pass_impl(**run_args, reserved_slot_idx=None, reserved_admission=None)
     run_args["pass_id"] = run_args["pass_id"] or str(uuid.uuid4())
+    offload_pass = _import_orchestration_module("offload_pass")
+    legacy_job_id = None
     try:
         paths = _worker_paths()
-        offload_pass = _import_orchestration_module("offload_pass")
         accepted_token = uuid.uuid4().hex
-        with _offload_invocation_lease(paths["state_dir"], run_args["pass_id"]) as lease:
-            _refuse_foreign_invocation(offload_pass, paths["state_dir"], run_args["pass_id"], lease, queued=False)
-            with _offload_request_admission(paths["state_dir"], run_args, lease) as (prepared, response):
-                if response is not None:
-                    return response
-                task_ref = run_args["task_ref"]
-                offload_pass.write_pass_state(
+        with _offload_submission_lease(offload_pass, paths["state_dir"], run_args["pass_id"]) as lease:
+            state = offload_pass.read_pass_state(paths["state_dir"], run_args["pass_id"], strict=True)
+            if state is not None and "queue_intent" in state:
+                try:
+                    _validate_queued_offload_join(state, run_args, get_runtime_config())
+                except (OSError, ValueError) as exc:
+                    return core._json_response({"ok": False, "error": f"Could not submit offload pass: {exc}"})
+            elif (legacy_job_id := _legacy_offload_job_id(state, run_args)) is None:
+                _refuse_foreign_invocation(offload_pass, paths["state_dir"], run_args["pass_id"], lease, queued=False)
+                with _offload_request_admission(paths["state_dir"], run_args, lease) as (prepared, response):
+                    if response is not None:
+                        return response
+                    task_ref = run_args["task_ref"]
+                    offload_pass.write_pass_state(
+                        paths["state_dir"],
+                        run_args["pass_id"],
+                        {"status": "admitted", "task_ref": task_ref, "lane_id": run_args["lane_id"]},
+                        invocation_token=accepted_token,
+                    )
+                    run_args["task_ref"] = task_ref
+                try:
+                    response = _run_offload_pass_impl(
+                        **run_args, reserved_slot_idx=None, reserved_admission=None, prepared_request=prepared
+                    )
+                except Exception as exc:  # noqa: BLE001 — terminalize only this accepted invocation
+                    response = core._json_response({"ok": False, "outcome": "error", "error": str(exc)})
+                _write_offload_invocation_fallback(
+                    offload_pass,
                     paths["state_dir"],
                     run_args["pass_id"],
-                    {"status": "admitted", "task_ref": task_ref, "lane_id": run_args["lane_id"]},
-                    invocation_token=accepted_token,
+                    task_ref,
+                    run_args["lane_id"],
+                    accepted_token,
+                    dict(response) if isinstance(response, dict) else {},
                 )
-                run_args["task_ref"] = task_ref
-            try:
-                response = _run_offload_pass_impl(
-                    **run_args, reserved_slot_idx=None, reserved_admission=None, prepared_request=prepared
-                )
-            except Exception as exc:  # noqa: BLE001 — terminalize only this accepted invocation
-                response = core._json_response({"ok": False, "outcome": "error", "error": str(exc)})
-            _write_offload_invocation_fallback(
-                offload_pass,
-                paths["state_dir"],
-                run_args["pass_id"],
-                task_ref,
-                run_args["lane_id"],
-                accepted_token,
-                dict(response) if isinstance(response, dict) else {},
-            )
-            return response
-    except (_OffloadInvocationBusy, _OffloadAdmissionRefused, LanePassPublicationRefused) as exc:
+                return response
+    except offload_pass.PassStateUnreadable as exc:
+        return core._json_response(exc.hold())
+    except _OffloadInvocationBusy as exc:
+        return _observe_busy_queued_offload_pass(run_args, exc)
+    except (_OffloadAdmissionRefused, LanePassPublicationRefused) as exc:
         return _offload_admission_failure(exc)
+
+    if legacy_job_id is not None:
+        return _complete_legacy_offload_job(offload_pass, legacy_job_id, paths)
+    assert state is not None
+    return _join_queued_offload_pass(run_args, 0, state)
 
 
 def _run_offload_pass_background(
-    run_args: dict, offload_pass: Any, state_dir: Path, resolved_task_ref: str | None, accepted_token: str
+    run_args: dict,
+    offload_pass: Any,
+    state_dir: Path,
+    resolved_task_ref: str | None,
+    accepted_token: str,
+    *,
+    queue_state: dict | None = None,
 ) -> None:
     """Run the worker and persist a terminal fallback unless the engine did so."""
+    import uuid  # noqa: PLC0415
+
+    from workbay_orchestrator_mcp.orchestration import offload_queue_intent  # noqa: PLC0415
+
     normalized_pass_id = run_args["pass_id"]
     lane_id = run_args["lane_id"]
+    claim = None
     try:
         with _offload_invocation_lease(state_dir, normalized_pass_id):
             state = offload_pass.read_pass_state(state_dir, normalized_pass_id)
             if not isinstance(state, dict) or state.get("invocation_token") != accepted_token:
+                return
+            if queue_state is None and "queue_intent" in state:
+                return
+            if queue_state is not None and state != queue_state:
                 return
             try:
                 with _offload_lane_admission(
@@ -5040,6 +5074,13 @@ def _run_offload_pass_background(
                             checkout = prepared["worktree_path"]
                             if not checkout.is_dir() or not (checkout / ".git").exists():
                                 raise _OffloadAdmissionRefused("refused_worktree_missing")
+                            if queue_state is not None:
+                                inputs = queue_state["queue_intent"]["completion_inputs"]
+                                if offload_queue_intent.completion_inputs(prepared) != inputs:
+                                    raise _OffloadAdmissionRefused("offload_queue_completion_inputs_changed")
+                                prepared["native_validation"] = {
+                                    key: inputs[key] for key in ("native_validation_config", "native_validation_digest")
+                                }
                     if response is not None:
                         _write_offload_invocation_fallback(
                             offload_pass,
@@ -5051,9 +5092,30 @@ def _run_offload_pass_background(
                             dict(response),
                         )
                         return
-                response = _run_offload_pass_impl(**run_args, prepared_request=prepared)
+                    if queue_state is not None:
+                        # Only a committed claim can enter the engine. An interrupted
+                        # or doubtful write leaves either a queueable row or a hold.
+                        claim = uuid.uuid4().hex
+                        if not offload_pass.write_pass_state(
+                            state_dir,
+                            normalized_pass_id,
+                            {"status": "running", "task_ref": resolved_task_ref, "lane_id": lane_id},
+                            expected_invocation_token=accepted_token,
+                            expected_record=queue_state,
+                            queue_claim=claim,
+                        ):
+                            return
+                owner = (
+                    offload_queue_intent.owning_claim(state_dir, normalized_pass_id, claim)
+                    if claim is not None else contextlib.nullcontext()
+                )
+                with owner:
+                    response = _run_offload_pass_impl(**run_args, prepared_request=prepared)
                 terminal_result = dict(response) if isinstance(response, dict) else {}
             except Exception as exc:  # noqa: BLE001 — terminalize only this accepted invocation
+                if claim is not None:
+                    _logger.exception("offload queue execution held for %s", normalized_pass_id)
+                    return
                 if isinstance(exc, _OffloadAdmissionRefused) and exc.reason in (
                     "lane_pass_publication_destructive_owner",
                     "refused_lane_publication_busy",
@@ -5099,6 +5161,7 @@ def _write_offload_invocation_fallback(
             "result": terminal_result,
         },
         expected_invocation_token=accepted_token,
+        expected_record=state if isinstance(state, dict) and "queue_intent" in state else None,
     )
 
 
@@ -5115,63 +5178,286 @@ def _submit_offload_pass(run_args: dict, wait_window: float) -> dict:
 
     normalized_pass_id = str(pass_id or "").strip() or str(uuid.uuid4())
     run_args["pass_id"] = normalized_pass_id
+    if wait_window <= 0:
+        return _submit_durable_offload_pass(run_args, wait_window)
+    offload_pass = _import_orchestration_module("offload_pass")
+    deadline = time.monotonic() + wait_window
+    legacy_job_id = None
     try:
         paths = _worker_paths()
-        offload_pass = _import_orchestration_module("offload_pass")
         wave_dispatch = _import_orchestration_module("wave_dispatch")
         accepted_token = uuid.uuid4().hex
-        with _offload_invocation_lease(paths["state_dir"], normalized_pass_id) as lease:
-            _refuse_foreign_invocation(offload_pass, paths["state_dir"], normalized_pass_id, lease, queued=True)
-            with _offload_request_admission(paths["state_dir"], run_args, lease) as (_, response):
-                if response is not None:
-                    return response
-                resolved_task_ref = run_args["task_ref"]
-                if not offload_pass.write_pass_state(
-                    paths["state_dir"],
-                    normalized_pass_id,
-                    {"status": "submitted", "task_ref": resolved_task_ref, "lane_id": lane_id},
-                    invocation_token=accepted_token,
-                ):
-                    raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
-                run_args["task_ref"] = resolved_task_ref
-            try:
-                wave_dispatch._BACKGROUND_WAVE_EXECUTOR.submit(
-                    contextvars.copy_context().run,
-                    _run_offload_pass_background,
-                    run_args,
-                    offload_pass,
-                    paths["state_dir"],
-                    resolved_task_ref,
-                    accepted_token,
-                )
-            except RuntimeError as exc:
-                failure = {
-                    "ok": False,
-                    "outcome": "error",
-                    "pass_id": normalized_pass_id,
-                    "task_ref": resolved_task_ref,
-                    "lane_id": lane_id,
-                    "commit_landed": False,
-                    "failed_stage": None,
-                    "findings": [],
-                    "error": str(exc),
-                }
-                _write_offload_invocation_fallback(
-                    offload_pass,
-                    paths["state_dir"],
-                    normalized_pass_id,
-                    resolved_task_ref,
-                    lane_id,
-                    accepted_token,
-                    failure,
-                )
-                return core._json_response(failure)
-    except (_OffloadInvocationBusy, _OffloadAdmissionRefused, LanePassPublicationRefused) as exc:
+        with _offload_submission_lease(offload_pass, paths["state_dir"], normalized_pass_id, deadline=deadline) as lease:
+            state = offload_pass.read_pass_state(paths["state_dir"], normalized_pass_id, strict=True)
+            if state is not None and "queue_intent" in state:
+                _validate_queued_offload_join(state, run_args, get_runtime_config())
+            elif (legacy_job_id := _legacy_offload_job_id(state, run_args)) is None:
+                _refuse_foreign_invocation(offload_pass, paths["state_dir"], normalized_pass_id, lease, queued=True)
+                with _offload_request_admission(paths["state_dir"], run_args, lease) as (_, response):
+                    if response is not None:
+                        return response
+                    resolved_task_ref = run_args["task_ref"]
+                    if not offload_pass.write_pass_state(
+                        paths["state_dir"],
+                        normalized_pass_id,
+                        {"status": "submitted", "task_ref": resolved_task_ref, "lane_id": lane_id},
+                        invocation_token=accepted_token,
+                    ):
+                        raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
+                    run_args["task_ref"] = resolved_task_ref
+                try:
+                    wave_dispatch._BACKGROUND_WAVE_EXECUTOR.submit(
+                        contextvars.copy_context().run,
+                        _run_offload_pass_background,
+                        run_args,
+                        offload_pass,
+                        paths["state_dir"],
+                        resolved_task_ref,
+                        accepted_token,
+                    )
+                except RuntimeError as exc:
+                    failure = {
+                        "ok": False,
+                        "outcome": "error",
+                        "pass_id": normalized_pass_id,
+                        "task_ref": resolved_task_ref,
+                        "lane_id": lane_id,
+                        "commit_landed": False,
+                        "failed_stage": None,
+                        "findings": [],
+                        "error": str(exc),
+                    }
+                    _write_offload_invocation_fallback(
+                        offload_pass,
+                        paths["state_dir"],
+                        normalized_pass_id,
+                        resolved_task_ref,
+                        lane_id,
+                        accepted_token,
+                        failure,
+                    )
+                    return core._json_response(failure)
+    except offload_pass.PassStateUnreadable as exc:
+        return core._json_response(exc.hold())
+    except _OffloadInvocationBusy as exc:
+        return _observe_busy_queued_offload_pass(run_args, exc, deadline=deadline)
+    except (_OffloadAdmissionRefused, LanePassPublicationRefused) as exc:
         return _offload_admission_failure(exc)
     except Exception as exc:  # noqa: BLE001 — cannot acknowledge an unpersisted submission
         return core._json_response({"ok": False, "error": f"Could not submit offload pass: {exc}"})
 
+    if legacy_job_id is not None:
+        return _complete_legacy_offload_job(offload_pass, legacy_job_id, paths)
+    if state is not None and "queue_intent" in state:
+        return _join_queued_offload_pass(run_args, wait_window, state)
     return _poll_submitted_offload_pass(normalized_pass_id, resolved_task_ref, lane_id, wait_window)
+
+
+def _validate_queued_offload_join(
+    state: dict, run_args: dict, config: RuntimeConfig, *, observe_only: bool = False
+) -> None:
+    """Authenticate the stored request, requiring durable proof for lock-free observers."""
+    from workbay_orchestrator_mcp.orchestration import offload_queue_intent  # noqa: PLC0415
+
+    if "queue_intent" not in state:
+        raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
+    intent = offload_queue_intent.read_intent(state, run_args["pass_id"])
+    if observe_only and (
+        state.get("queue_intent_committed") != intent["sha256"]
+        or not isinstance(state.get("invocation_token"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", state["invocation_token"]) is None
+    ):
+        raise ValueError("unproven offload queue acceptance")
+    if intent.get("runtime") != offload_queue_intent.runtime_scope(config):
+        raise _OffloadAdmissionRefused("offload_queue_runtime_mismatch")
+    if not offload_queue_intent.matches_request(intent, run_args):
+        raise _OffloadAdmissionRefused("offload_queue_intent_conflict")
+    if not observe_only:
+        from workbay_orchestrator_mcp.orchestration.remote_job_ledger import _fsync_directory  # noqa: PLC0415
+
+        # Recover older records, or a writer that stopped after the first rename.
+        _fsync_directory(config.state_dir)
+
+
+def _observe_busy_queued_offload_pass(
+    run_args: dict, busy: _OffloadInvocationBusy, *, deadline: float | None = None
+) -> dict:
+    """A contended retry can only observe authenticated native queue snapshots."""
+    offload_pass = _import_orchestration_module("offload_pass")
+    config = get_runtime_config()
+    pass_id = run_args["pass_id"]
+    accepted_identity = None
+    while True:
+        try:
+            state = offload_pass.read_pass_state(config.state_dir, pass_id, strict=True)
+            if state is None or "queue_intent" not in state:
+                return _offload_admission_failure(busy)
+            _validate_queued_offload_join(state, run_args, config, observe_only=True)
+        except (offload_pass.PassStateUnreadable, OSError, ValueError, TypeError, AttributeError, OverflowError):
+            return _offload_admission_failure(busy)
+        except _OffloadAdmissionRefused as exc:
+            return _offload_admission_failure(exc)
+        identity = (state["invocation_token"], state["queue_intent_committed"])
+        if accepted_identity is not None and identity != accepted_identity:
+            return _offload_admission_failure(busy)
+        accepted_identity = identity
+        result = _multipass_pass_entry(offload_pass, config.state_dir, pass_id, state, observe_only=True)
+        if result.get("terminal") or deadline is None or (remaining := deadline - time.monotonic()) <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+    if deadline is None and result.get("outcome") == "still_running":
+        result["status"] = "running"
+    return _offload_poll_response(result)
+
+
+def _join_queued_offload_pass(run_args: dict, wait_window: float, state: dict) -> dict:
+    """Observe a matched queue record after leaving invocation admission."""
+    from workbay_orchestrator_mcp.orchestration import offload_queue_intent, offload_queue_worker  # noqa: PLC0415
+
+    pass_id = run_args["pass_id"]
+    config = get_runtime_config()
+    if offload_queue_intent.claimable(state):
+        offload_queue_worker.wake(config, pass_id)
+        if wait_window <= 0:
+            return _poll_submitted_offload_pass(pass_id, state["task_ref"], run_args["lane_id"], wait_window)
+    offload_pass = _import_orchestration_module("offload_pass")
+    return _poll_queued_offload_retry(offload_pass, config, pass_id, state, wait_window)
+
+
+def _submit_durable_offload_pass(run_args: dict, wait_window: float) -> dict:
+    """Join an immutable intent, or commit the first claimable pass publication."""
+    import uuid  # noqa: PLC0415
+
+    from workbay_orchestrator_mcp.orchestration import offload_queue_intent, offload_queue_worker  # noqa: PLC0415
+    from workbay_orchestrator_mcp.orchestration.lane_publication_fence import (  # noqa: PLC0415
+        LanePassPublicationRefused,
+    )
+
+    pass_id = run_args["pass_id"]
+    lane_id = run_args["lane_id"]
+    config = get_runtime_config()
+    state_dir = config.state_dir
+    offload_pass = _import_orchestration_module("offload_pass")
+
+    try:
+        with _offload_submission_lease(offload_pass, state_dir, pass_id) as lease:
+            state = offload_pass.read_pass_state(state_dir, pass_id, strict=True)
+            if state is not None:
+                _validate_queued_offload_join(state, run_args, config)
+            else:
+                if lease.borrowed:
+                    raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
+                with _offload_request_admission(state_dir, run_args, lease) as (prepared, response):
+                    if response is not None:
+                        return response
+                    assert prepared is not None
+                    task_ref = run_args["task_ref"]
+                    request = offload_queue_intent.normalize_request(run_args, task_ref=task_ref)
+                    if not offload_pass.write_pass_state(
+                        state_dir,
+                        pass_id,
+                        {"status": "submitted", "task_ref": task_ref, "lane_id": lane_id},
+                        invocation_token=uuid.uuid4().hex,
+                        enqueue_intent=offload_queue_intent.make_intent(request, prepared, config),
+                    ):
+                        raise _OffloadAdmissionRefused("refused_pass_foreign_invocation")
+        if state is not None:
+            return _join_queued_offload_pass(run_args, wait_window, state)
+        offload_queue_worker.wake(config, pass_id)
+        return _poll_submitted_offload_pass(pass_id, task_ref, lane_id, wait_window)
+    except offload_pass.PassStateUnreadable as exc:
+        return core._json_response(exc.hold())
+    except _OffloadInvocationBusy as exc:
+        return _observe_busy_queued_offload_pass(run_args, exc)
+    except (_OffloadAdmissionRefused, LanePassPublicationRefused) as exc:
+        return _offload_admission_failure(exc)
+    except Exception as exc:  # noqa: BLE001 — cannot acknowledge an unpersisted submission
+        return core._json_response({"ok": False, "error": f"Could not submit offload pass: {exc}"})
+
+
+def _queued_remote_job_id(offload_pass: Any, state_dir: Path, pass_id: str, accepted: dict) -> str | None:
+    """Read the claimed invocation's transport binding after its submitter exits."""
+    from workbay_orchestrator_mcp.orchestration.remote_job_ledger import (  # noqa: PLC0415
+        RemoteJobLedger,
+        RemoteJobLedgerError,
+    )
+
+    try:
+        with _offload_invocation_lease(state_dir, pass_id, timeout=0) as lease:
+            if lease.borrowed:
+                return None
+            state = offload_pass.read_pass_state(state_dir, pass_id, strict=True) or {}
+            job_id = state.get("job_id")
+            if (
+                not state.get("queue_claim")
+                or state.get("invocation_token") != accepted.get("invocation_token")
+                or not isinstance(job_id, str)
+                or not job_id
+            ):
+                return None
+            recorded = state.get("result")
+            if state.get("status") == "done" and (
+                not isinstance(recorded, dict) or recorded.get("outcome") != "remote_job_pending"
+            ):
+                return None
+            # A job ID is allocated before the transport can send. The ledger
+            # must bind the same delivery and show that send was possible.
+            job = RemoteJobLedger(state_dir / "remote-jobs").read_job(job_id)
+            spec = job.get("spec")
+            if (
+                not isinstance(spec, dict)
+                or spec.get("pass_id") != pass_id
+                or any(spec.get(key) != state.get(key) for key in ("task_ref", "lane_id", "attempt"))
+                or job.get("stage") not in {"intent", "submitted", "done", "completed"}
+                or job.get("submit_state") == "before_send"
+            ):
+                return None
+            return job_id
+    except (_OffloadInvocationBusy, OSError, RemoteJobLedgerError):
+        return None
+
+
+def _poll_queued_offload_retry(
+    offload_pass: Any, config: RuntimeConfig, pass_id: str, accepted: dict, wait_window: float
+) -> dict:
+    """Wait for the original binding and give native completion one attempt per retry."""
+    from workbay_orchestrator_mcp.orchestration.remote_job_reconcile import RemoteJobReconcileError  # noqa: PLC0415
+
+    state_dir = config.state_dir
+    deadline = time.monotonic() + wait_window if wait_window > 0 else None
+    while True:
+        result = _multipass_snapshot_one(offload_pass, state_dir, pass_id, accepted["task_ref"])
+        if result.get("terminal"):
+            break
+        has_remote_work = result.get("outcome") == "remote_job_pending" or result.get("progress", {}).get("job_id")
+        if has_remote_work and (deadline is None or time.monotonic() < deadline):
+            job_id = _queued_remote_job_id(offload_pass, state_dir, pass_id, accepted)
+            if job_id:
+                try:
+                    # Native completion serializes pollers and the reconciler on the job lock.
+                    completion = offload_pass.complete_remote_pass(
+                        job_id,
+                        state_dir=state_dir,
+                        orchestrator_root=config.workspace_root,
+                        completion_deadline=deadline,
+                    )
+                except offload_pass.CompletionDeadlineExceeded:
+                    pass
+                except RemoteJobReconcileError as exc:
+                    if exc.reason != "reconcile_lock_timeout":
+                        raise
+                else:
+                    completion.setdefault("pass_id", pass_id)
+                    completion.setdefault("failed", completion.get("outcome") in _MULTIPASS_TERMINAL_FAILURE_OUTCOMES)
+                    return _offload_poll_response(completion)
+                result = _multipass_snapshot_one(offload_pass, state_dir, pass_id, accepted["task_ref"])
+                break
+        if deadline is None or (remaining := deadline - time.monotonic()) <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+    if wait_window <= 0 and result.get("outcome") == "still_running":
+        result["status"] = "running"
+    return _offload_poll_response(result)
 
 
 def _poll_submitted_offload_pass(
@@ -5220,7 +5506,10 @@ def await_offload_pass(
     entries = joined.get("passes")
     if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
         return core._json_response({"ok": False, "error": "Could not read offload pass result."})
-    result = dict(entries[0])
+    return _offload_poll_response(dict(entries[0]))
+
+
+def _offload_poll_response(result: dict) -> dict:
     result.setdefault("ok", result.get("outcome") not in {"unknown_pass", "task_mismatch", "empty_result"})
     return core._json_response(result)
 
@@ -5466,6 +5755,8 @@ def _multipass_snapshot_one(
     state_dir: Path,
     pass_id: str,
     task_ref: str | None,
+    *,
+    wake_queued: bool = False,
 ) -> dict[str, Any]:
     """Resolve one pass id to a join entry without waiting.
 
@@ -5512,6 +5803,18 @@ def _multipass_snapshot_one(
             "terminal": True,
             "failed": True,
         }
+    return _multipass_pass_entry(offload_pass, state_dir, normalized, state, wake_queued=wake_queued)
+
+
+def _multipass_pass_entry(
+    offload_pass: Any,
+    state_dir: Path,
+    normalized: str,
+    state: dict,
+    *,
+    wake_queued: bool = False,
+    observe_only: bool = False,
+) -> dict:
     if state.get("status") == "done":
         result = state.get("result")
         # Empty / non-dict / outcome-less result: wrapper-lie failure, not success and not absent.
@@ -5533,10 +5836,37 @@ def _multipass_snapshot_one(
         entry["terminal"] = outcome not in _MULTIPASS_NONTERMINAL_OUTCOMES
         entry["failed"] = outcome in _MULTIPASS_TERMINAL_FAILURE_OUTCOMES
         return entry
+    progress = {
+        k: v for k, v in state.items() if k not in {"result", "queue_intent", "queue_intent_committed", "queue_claim"}
+    }
+    if "queue_intent" in state:
+        from workbay_orchestrator_mcp.orchestration import offload_queue_intent, offload_queue_worker  # noqa: PLC0415
+
+        if offload_queue_intent.claimable(state):
+            progress["queue_status"] = "queued"
+            if wake_queued:
+                offload_queue_worker.wake(get_runtime_config(), normalized)
+        elif state.get("job_id"):
+            progress["queue_status"] = "remote_job_pending"
+        else:
+            progress["queue_status"] = "claimed"
+            if not observe_only:
+                try:
+                    with _offload_invocation_lease(state_dir, normalized, timeout=0) as lease:
+                        if not lease.borrowed:
+                            # An OS-released lease leaves the durable claim intact.
+                            current = offload_pass.read_pass_state(state_dir, normalized, strict=True)
+                            if current == state:
+                                progress["queue_status"] = "held"
+                                progress["queue_hold_reason"] = "offload_queue_execution_uncertain"
+                except _OffloadInvocationBusy:
+                    pass
+                except offload_pass.PassStateUnreadable as exc:
+                    return {**exc.hold(), "failed": False}
     return {
         "pass_id": normalized,
         "outcome": "still_running",
-        "progress": {k: v for k, v in state.items() if k != "result"},
+        "progress": progress,
         "terminal": False,
         "failed": False,
     }
@@ -5593,11 +5923,13 @@ def await_offload_passes(
     state_dir = paths["state_dir"]
     deadline = time.monotonic() + wait_seconds
 
-    def _snapshot() -> list[dict[str, Any]]:
-        return [_multipass_snapshot_one(offload_pass, state_dir, pid, task_ref) for pid in requested]
-
+    wake_queued = True
     while True:
-        entries = _snapshot()
+        entries = [
+            _multipass_snapshot_one(offload_pass, state_dir, pid, task_ref, wake_queued=wake_queued)
+            for pid in requested
+        ]
+        wake_queued = False
         any_failed = any(bool(e.get("failed")) for e in entries)
         all_terminal = all(bool(e.get("terminal")) for e in entries)
         if normalized_mode == "first_failure" and any_failed:

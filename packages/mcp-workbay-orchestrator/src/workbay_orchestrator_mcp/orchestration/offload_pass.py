@@ -1073,6 +1073,10 @@ def _merge_pass_state(
     # never accepted as producer fields on a later invocation.
     payload.pop("administration", None)
     payload.pop("observed_execution", None)
+    for key in ("queue_intent", "queue_intent_committed", "queue_claim"):
+        payload.pop(key, None)
+        if key in previous:
+            payload[key] = previous[key]
     task_ref, lane_id = _pass_lane_identity(payload, previous)
     if task_ref is not None:
         payload["task_ref"] = task_ref
@@ -1328,6 +1332,32 @@ def _terminal_attempt_facts(state_dir: Path, record: dict, previous: dict | None
         return
 
 
+def _publish_pass_record(path: Path, record: dict[str, Any]) -> None:
+    try:
+        # The strict reader refuses nonfinite numbers.
+        encoded = json.dumps(record, sort_keys=False, allow_nan=False)
+    except ValueError as exc:
+        raise LanePassPublicationRefused("native_pass_payload_nonfinite") from exc
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        # Protect the new inode before replacement, regardless of the umask.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _completion_remaining()
+        os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def write_pass_state(
     state_dir: Path,
     pass_id: str,
@@ -1336,6 +1366,8 @@ def write_pass_state(
     invocation_token: str | None = None,
     expected_invocation_token: str | None = None,
     expected_record: dict[str, Any] | None = None,
+    enqueue_intent: dict[str, Any] | None = None,
+    queue_claim: str | None = None,
 ) -> bool:
     """Publish one pass record under lane SH + per-pass EX (CON-11).
 
@@ -1403,6 +1435,25 @@ def write_pass_state(
                 # publication. The fence and write share this native lock.
                 if previous_record is None and os.path.lexists(path):
                     raise LanePassPublicationRefused("native_pass_evidence_invalid")
+                if enqueue_intent is not None and (
+                    previous_record is not None or invocation_token is None or payload.get("status") != "submitted"
+                ):
+                    return False
+                if previous_record is not None and "queue_intent" in previous_record:
+                    from .offload_queue_intent import claimable
+
+                    token = previous_record.get("invocation_token")
+                    if invocation_token not in (None, token) or payload.get("status") == "submitted":
+                        return False
+                    if claimable(previous_record):
+                        if expected_record is None or not token or expected_invocation_token != token:
+                            return False
+                        if payload.get("status") != ("running" if queue_claim is not None else "done"):
+                            return False
+                    elif queue_claim is not None:
+                        return False
+                elif queue_claim is not None:
+                    return False
                 try:
                     if not publication_allowed(
                         state_dir,
@@ -1434,32 +1485,18 @@ def write_pass_state(
                 published = _merge_pass_state(
                     pass_id, payload, previous_record, invocation_token, hint, validated_completion, not path.exists()
                 )
+                if enqueue_intent is not None:
+                    published["queue_intent"] = enqueue_intent
+                if queue_claim is not None:
+                    published["queue_claim"] = queue_claim
                 _terminal_attempt_facts(state_dir, published, previous_record)
-                try:
-                    # The strict reader refuses nonfinite numbers; never publish
-                    # bytes that would turn the existing record unreadable.
-                    encoded = json.dumps(published, sort_keys=False, allow_nan=False)
-                except ValueError as exc:
-                    raise LanePassPublicationRefused("native_pass_payload_nonfinite") from exc
-                tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-                try:
-                    # Protect the new inode before replacement publishes it,
-                    # regardless of the process umask or a stale temporary.
-                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                        os.fchmod(stream.fileno(), 0o600)
-                        stream.write(encoded)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    _completion_remaining()
-                    os.replace(tmp, path)
-                    directory_fd = os.open(path.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                finally:
-                    tmp.unlink(missing_ok=True)
+                _publish_pass_record(path, published)
+                if enqueue_intent is not None:
+                    # Lock-free readers can see a rename before its directory
+                    # sync. Publish proof in the same record only after the
+                    # original acceptance is durable.
+                    published["queue_intent_committed"] = enqueue_intent["sha256"]
+                    _publish_pass_record(path, published)
             # The derived index is short and bounded; lane SH lasts through
             # visibility, while the per-pass lock is already released.
             if task_ref is not None and lane_id is not None:
@@ -10808,7 +10845,25 @@ def run_offload_pass_engine(
     pass_sweep_state: dict[str, Any] = {"terminal_durable": False, "trigger": None}
     # Durable authority this callback accepted at its first source-bearing
     # publication. Engine rewrites never change these fields.
-    accepted = read_pass_state(resolved_state_dir, resolved_pass_id) or {}
+    try:
+        accepted = read_pass_state(
+            resolved_state_dir, resolved_pass_id,
+            strict=pass_id is not None and detached_completion_job_id is None,
+        ) or {}
+    except PassStateUnreadable as exc:
+        return exc.hold()
+    if "queue_intent" in accepted and detached_completion_job_id is None:
+        from .offload_queue_intent import owns_claim
+
+        if not owns_claim(resolved_state_dir, resolved_pass_id, accepted.get("queue_claim")):
+            return {
+                "ok": False,
+                "outcome": "dispatch_refused",
+                "reason": "offload_queue_claim_required",
+                "pass_id": resolved_pass_id,
+                "task_ref": task_ref,
+                "lane_id": lane_id,
+            }
     if detached_completion_job_id is None:
         # Freeze the inputs before worker execution can append another ask/report.
         # Failure leaves the snapshot unknown, never an apparently empty success.

@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.99] — 2026-11-23
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.1.101 Git release.
+- Include durable zero-wait offload, retries that rejoin the original invocation, and collection of existing detached jobs.
+
 ## [0.3.98] — 2026-11-23
 
 ### Changed

@@ -1706,7 +1706,11 @@ def main() -> None:
 
     # --- serve ---
     if cmd in (None, "serve", "serve-stdio"):
+        from workbay_orchestrator_mcp.orchestration.offload_queue_worker import wake
+
         mcp = build_orchestrator_mcp(config)
+        if config.state_dir.is_dir():
+            wake(config)
         mcp.run()
         return
 

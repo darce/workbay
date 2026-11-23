@@ -181,7 +181,7 @@ _BACKGROUND_WAVE_EXECUTOR = _DaemonThreadPoolExecutor(
 _LIVE_PREFLIGHT_BACKENDS = frozenset({"codex-remote", "openrouter-remote"})
 
 
-def pass_invocation_lease(state_dir: Path, pass_id: str) -> Any:
+def pass_invocation_lease(state_dir: Path, pass_id: str, *, timeout: float = 1.0) -> Any:
     """Bounded per-pass invocation EX shared with API admission.
 
     The holder owns the pass until its callback returns, even after the engine
@@ -189,7 +189,7 @@ def pass_invocation_lease(state_dir: Path, pass_id: str) -> Any:
     """
     from workbay_protocol.lifecycle_coordination import LifecycleLease  # noqa: PLC0415
 
-    return LifecycleLease(Path(state_dir) / f".offload-pass-{pass_id}.json.api-invocation", exclusive=True, timeout=1.0)
+    return LifecycleLease(Path(state_dir) / f".offload-pass-{pass_id}.json.api-invocation", exclusive=True, timeout=timeout)
 
 
 def _requires_live_sandbox_preflight(spec: LaneSpec) -> bool:

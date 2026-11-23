@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.41] — 2026-11-23
+
+### Changed
+- Refresh the protocol and optional lifecycle orchestrator dependency floors for WorkBay v0.1.101.
+
 ## [0.3.40] — 2026-11-23
 
 ### Changed
