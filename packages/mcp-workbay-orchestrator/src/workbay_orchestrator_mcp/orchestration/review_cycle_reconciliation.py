@@ -1325,6 +1325,23 @@ class HolderReleaseWalk:
         return (isinstance(row, dict) and row.get("decision") == "reserved" and row.get("kind") in {"implement", "gate"}
                 and all(row.get(key) == identity.get(key) for key in ("dispatch_id", "subject_branch", "kind")))
 
+    def authenticates_source_reservation(self, path: Path, receipt: dict, digest: str) -> bool:
+        """Read the exact protected source and reservation, without settling or releasing either."""
+        directory = self._ledger_path.parent / "review_cycle_dispatch"
+        if path.parent != directory or not self.has_reservation(receipt["identity"]):
+            return False
+        try:
+            with _dispatch_lock(path):
+                protected, observed = _read(path, directory.parent)
+                if observed != digest or protected != receipt:
+                    return False
+                row = _receipt_reservation(self.repo, path, protected, self._data["rows"])
+                info = self._ledger_path.lstat()
+                return (row.get("legacy_source") is None and self._ledger_path.resolve() == self._ledger_path
+                        and (info.st_dev, info.st_ino, info.st_ctime_ns) == self._ledger_identity)
+        except (EvidenceHold, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return False
+
     def landed_self_source_releases(self, path: Path, receipt: dict, digest: str, proof: dict) -> bool:
         """One automatic landing proof for dispatch and reconciliation; no settlement is inferred."""
         identity = receipt["identity"]

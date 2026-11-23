@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.46] — 2026-11-23
+
+### Fixed
+- Use authenticated producer evidence and source-time scope to decide whether a retained review holder blocks managed admission.
+- Recover the original issuer and scope proof for legacy holders whose current registry binding has changed.
+- Resolve short branch names and fully qualified local Git refs consistently when checking holder landing evidence.
+- Return a bounded page of holder diagnostics and counts across the evaluated holders, with specific reasons for proven overlaps and unresolved evidence.
+
 ## [0.3.45] — 2026-11-23
 
 ### Fixed

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.43] — 2026-11-23
+
+### Changed
+- Refresh the protocol development dependency floor and align the shipped remote-agent boundary pin with the WorkBay v0.2.0 orchestrator.
+
 ## [0.4.42] — 2026-11-23
 
 ### Changed

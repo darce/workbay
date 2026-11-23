@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.98] — 2026-11-23
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.2.0 Git release.
+
 ## [0.3.97] — 2026-11-23
 
 ### Changed
