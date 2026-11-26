@@ -27,7 +27,7 @@ line. "not stated" means the file has no Status line yet. Attachments live in [`
 """
 
 STATUS_LINE_RE = re.compile(
-    r"^\s*(?:>\s*)?(?:-\s*)?\**status(?:\s+(\d{4}-\d{2}-\d{2}))?\**\s*:?\**\s*:?\**\s*(.+)$",
+    r"^\s*(?:>\s*)?(?:-\s*)?\**status(?:\s+(\d{4}-\d{2}-\d{2}))?\**\s*:\**\s*(.+)$",
     re.I,
 )
 FIRST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;])\s")

@@ -1690,6 +1690,54 @@ def _worktree_dirty(worktree_path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def _attach_lane_commit_message_readback(
+    result: dict[str, Any],
+    worktree_path: Path | str,
+    *,
+    commit_sha: str | None = None,
+    forbidden_patterns: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Attach additive commit-message readback and trailer violations on landed commits.
+
+    Fail-open: any git or screening error is logged and never fails the pass.
+    """
+    if not result.get("commit_landed") and not commit_sha:
+        return result
+    sha = commit_sha.strip() if isinstance(commit_sha, str) and commit_sha.strip() else None
+    if sha is None:
+        raw_sha = result.get("commit_sha")
+        if isinstance(raw_sha, str) and raw_sha.strip():
+            sha = raw_sha.strip()
+    if sha is None:
+        try:
+            sha = _git_stdout(Path(worktree_path), "rev-parse", "HEAD") or None
+        except (OSError, RuntimeError, TypeError, ValueError):
+            sha = None
+    if sha is None:
+        checkpoints_raw = result.get("checkpoint_commits")
+        if isinstance(checkpoints_raw, list) and checkpoints_raw:
+            last_cp = checkpoints_raw[-1]
+            if isinstance(last_cp, str) and last_cp.strip():
+                sha = last_cp.strip()
+    if not sha:
+        return result
+    try:
+        from workbay_orchestrator_mcp.orchestration.commit_subject import (  # noqa: PLC0415
+            read_and_screen_lane_commit_message,
+        )
+
+        screened = read_and_screen_lane_commit_message(
+            worktree_path,
+            sha,
+            forbidden_patterns=forbidden_patterns,
+        )
+        result["commit_message"] = screened["commit_message"]
+        result["commit_message_violations"] = list(screened["violations"])
+    except Exception as exc:  # noqa: BLE001 — readback is additive; fail-open
+        logger.warning("lane commit message readback unavailable for %s: %s", sha, exc)
+    return result
+
+
 def build_checkpoint_commit_message(*, lane_id: str, checkpoint_number: int, job_id: str | None = None) -> str:
     """Pure builder for the checkpoint commit subject line.
 
@@ -2385,11 +2433,22 @@ def _install_detached_result(
         result_payload = backend_result.to_dict()
     raw_payload = result_payload.get("raw_payload")
     raw_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    persisted_stamp = spec.get("remote_exec_mode")
+    persisted_mode = (
+        persisted_stamp.get("mode")
+        if isinstance(persisted_stamp, dict) and persisted_stamp.get("mode") in ("attached", "detached")
+        else (persisted_stamp if persisted_stamp in ("attached", "detached") else "detached")
+    )
     raw_payload.update(
         {
             "job_id": job_id,
             "attempt": spec.get("attempt", 0),
-            "remote_exec_mode": "detached",
+            "remote_exec_mode": persisted_mode,
+            **(
+                {"remote_exec_selection": dict(persisted_stamp)}
+                if isinstance(persisted_stamp, dict)
+                else {}
+            ),
         }
     )
     _stamp_detached_off_box_capture(result_payload, raw_payload, paths.get("selfverify"))
@@ -10703,26 +10762,84 @@ def run_offload_pass_engine(
     if tier is not None and tier not in ("junior", "senior"):
         raise ValueError("tier must be 'junior' or 'senior'.")
 
+    from .adapters import remote_exec  # noqa: PLC0415
     from .remote_exec_mode import (
         ACTIVE_REMOTE_EXEC_SELECTION,
         RemoteExecModeError,
         resolve_remote_exec_mode,
     )
 
-    try:
-        mode_selection = resolve_remote_exec_mode(backend, repo_root=orchestrator_root)
-    except RemoteExecModeError as exc:
-        return {
-            "ok": False,
-            "outcome": "dispatch_refused",
-            "reason": exc.code,
-            "failure_reason": exc.code,
-            "error": str(exc),
-            "task_ref": task_ref,
-            "lane_id": lane_id,
-            "pass_id": pass_id,
-            "typed_outcome": True,
-        }
+    pre_mode_state_dir = Path(state_dir) if state_dir is not None else Path(orchestrator_root) / ".task-state"
+    existing_pass_for_mode: dict[str, Any] | None = None
+    if pass_id is not None or detached_completion_job_id is not None:
+        try:
+            existing_pass_for_mode = read_pass_state(pre_mode_state_dir, pass_id or "") if pass_id else None
+        except OSError:
+            existing_pass_for_mode = None
+    existing_job_id = detached_completion_job_id or (
+        existing_pass_for_mode.get("job_id")
+        if isinstance(existing_pass_for_mode, dict) and isinstance(existing_pass_for_mode.get("job_id"), str)
+        else None
+    )
+    mode_selection = None
+    if isinstance(existing_job_id, str) and existing_job_id:
+        try:
+            existing_job_record = remote_exec._lookup_persisted_job_record(pre_mode_state_dir, existing_job_id)
+        except (OSError, RemoteJobLedgerError):
+            existing_job_record = None
+        if existing_job_record is not None or isinstance(existing_pass_for_mode, dict):
+            persisted_selection, persisted_err = remote_exec.resolve_persisted_remote_exec_selection(
+                existing_job_record,
+                existing_pass_for_mode,
+                expected_job_id=existing_job_id,
+                backend_id=backend,
+                repo_root=orchestrator_root,
+            )
+            if persisted_err is not None:
+                return {
+                    "ok": False,
+                    "terminal": False,
+                    "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+                    "reason": persisted_err,
+                    "failure_reason": persisted_err,
+                    "error": "persisted job record has no submit-time remote_exec_mode stamp or bound submit evidence",
+                    "task_ref": task_ref,
+                    "lane_id": lane_id,
+                    "pass_id": pass_id,
+                    "job_id": existing_job_id,
+                    "typed_outcome": True,
+                }
+            mode_selection = persisted_selection
+    elif (
+        isinstance(existing_pass_for_mode, dict)
+        and existing_pass_for_mode.get("status") == "running"
+        and existing_pass_for_mode.get("remote_exec_selection") is not None
+    ):
+        persisted_selection, persisted_err = remote_exec.resolve_persisted_remote_exec_selection(
+            None,
+            existing_pass_for_mode,
+            expected_job_id=None,
+            backend_id=backend,
+            repo_root=orchestrator_root,
+        )
+        if persisted_err is None and persisted_selection is not None:
+            mode_selection = persisted_selection
+
+    if mode_selection is None:
+        try:
+            mode_selection = resolve_remote_exec_mode(backend, repo_root=orchestrator_root)
+        except RemoteExecModeError as exc:
+            return {
+                "ok": False,
+                "outcome": "dispatch_refused",
+                "reason": exc.code,
+                "failure_reason": exc.code,
+                "error": str(exc),
+                "task_ref": task_ref,
+                "lane_id": lane_id,
+                "pass_id": pass_id,
+                "typed_outcome": True,
+            }
     remote_exec_selection = mode_selection.to_mapping()
 
     if dry_run:
@@ -11461,6 +11578,8 @@ def run_offload_pass_engine(
             result["review"] = review
         if raw_tail is not None:
             result["raw_tail"] = raw_tail
+        if landed:
+            _attach_lane_commit_message_readback(result, worktree_path)
         return result
 
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
@@ -15130,6 +15249,10 @@ def _complete_remote_pass_owned(
         }
 
     pass_state = read_pass_state(resolved_state_dir, pass_id, strict=True) or {}
+    is_review_gate = (
+        pass_state.get("kind") == "review_gate"
+        and isinstance(pass_state.get("review_gate_context"), dict)
+    )
     if "plan_review_binding" in spec:
         # A plan review has no lane-pass configuration. Its original
         # coordinator owns collection and the canonical review verdict.
@@ -15162,6 +15285,33 @@ def _complete_remote_pass_owned(
             "findings": [],
         }
 
+    from workbay_orchestrator_mcp.orchestration.adapters import remote_exec as _remote_exec_mod  # noqa: PLC0415
+
+    persisted_selection, persisted_mode_err = _remote_exec_mod.resolve_persisted_remote_exec_selection(
+        job,
+        pass_state,
+        expected_job_id=job_id,
+        backend_id=str(spec.get("backend") or "remote"),
+        repo_root=root,
+    )
+    if persisted_mode_err is not None:
+        return {
+            "ok": False,
+            "terminal": False,
+            "status": "running",
+            "outcome": OffloadOutcome.REMOTE_JOB_PENDING.value,
+            "reason": persisted_mode_err,
+            "failure_reason": persisted_mode_err,
+            "job_id": job_id,
+            "attempt": attempt,
+            "pass_id": pass_id,
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "summary": "Remote job submit-time execution mode is unknown; retaining custody.",
+            "error": "persisted job record has no submit-time remote_exec_mode stamp or bound submit evidence",
+        }
+    persisted_selection_mapping = persisted_selection.to_mapping()
+
     def persist_terminal(
         result: dict[str, Any], *, publish: bool = True, retain_custody: bool = False
     ) -> dict[str, Any]:
@@ -15175,9 +15325,11 @@ def _complete_remote_pass_owned(
             "pass_id": pass_id,
             "task_ref": task_ref,
             "lane_id": lane_id,
+            "remote_exec_mode": persisted_selection.mode,
+            "remote_exec_selection": persisted_selection_mapping,
         }
         latest_pass_state = read_pass_state(resolved_state_dir, pass_id, strict=True) or pass_state
-        if publish and "production_history" not in terminal:
+        if publish and "production_history" not in terminal and not is_review_gate:
             # A terminal that bypassed the engine (error, lost, deferred or exhausted
             # custody) must not drop the original open prepare; project it typed.
             begun = pass_state.get("result")
@@ -15199,6 +15351,7 @@ def _complete_remote_pass_owned(
                 "lane_id": lane_id,
                 "job_id": job_id,
                 "attempt": attempt,
+                "remote_exec_selection": latest_pass_state.get("remote_exec_selection") or persisted_selection_mapping,
                 "result": terminal,
                 **(
                     {"custody_hold": {**latest_pass_state["custody_hold"], "active": retain_custody}}
@@ -15222,16 +15375,17 @@ def _complete_remote_pass_owned(
                     "lane_id": lane_id,
                     "summary": "Detached pass disposition was refused; retry the same job.",
                 }
-        report_summary = str(terminal.get("summary") or terminal.get("error") or terminal.get("outcome"))
-        _completion_remaining()
-        _worker_daemon_module()._record_terminal_outcome(
-            orchestrator_root=root,
-            task_ref=task_ref,
-            lane_id=lane_id,
-            session=str(pass_state.get("session") or f"{task_ref}-{lane_id}"),
-            summary=report_summary,
-            outcome=str(terminal.get("outcome") or "error"),
-        )
+        if not is_review_gate:
+            report_summary = str(terminal.get("summary") or terminal.get("error") or terminal.get("outcome"))
+            _completion_remaining()
+            _worker_daemon_module()._record_terminal_outcome(
+                orchestrator_root=root,
+                task_ref=task_ref,
+                lane_id=lane_id,
+                session=str(pass_state.get("session") or f"{task_ref}-{lane_id}"),
+                summary=report_summary,
+                outcome=str(terminal.get("outcome") or "error"),
+            )
         latest = ledger.read_job(job_id)
         if latest.get("stage") != "completed":
             _completion_remaining()
@@ -15356,6 +15510,8 @@ def _complete_remote_pass_owned(
             approved = _approved_terminal_receipt_view(resolved_state_dir, pass_id, job_id, recorded_result)
 
             def view(terminal: dict[str, Any]) -> dict[str, Any]:
+                if is_review_gate:
+                    return terminal
                 return _terminal_production_view(
                     terminal, task_ref=task_ref, lane_id=lane_id, pass_id=pass_id, job_id=job_id
                 )
@@ -15640,7 +15796,11 @@ def _complete_remote_pass_owned(
         if job.get("supervisor_failure") is True:
             return settle_dead_job(job)
 
-    if not isinstance(worktree_text, str) or not worktree_text or not isinstance(completion_config, dict):
+    if (
+        not isinstance(worktree_text, str)
+        or not worktree_text
+        or (not is_review_gate and not isinstance(completion_config, dict))
+    ):
         failure = {
             "ok": False,
             "terminal": True,
@@ -15789,6 +15949,7 @@ def _complete_remote_pass_owned(
         )
     except OSError as exc:
         return custody_hold("detached_artifact_persistence_retryable", error=str(exc))
+    review_gate_success_rc = is_review_gate and vm_rc in (0, 4)
     if not retained and not reharvest_open:
         # collect propagates the VM exit status, so a failed execution's receive
         # uses fresh destinations. Old artifacts can never certify a failed fetch.
@@ -15800,7 +15961,7 @@ def _complete_remote_pass_owned(
                 temporary = receive_directory
                 collect_argv = list(argv)
                 receive_paths = paths
-                if vm_rc != 0:
+                if vm_rc != 0 and not review_gate_success_rc:
                     receive_paths = {name: Path(temporary) / name for name in paths}
                     if "provenance" in receive_paths:
                         receive_paths["preflight_effect"] = Path(str(receive_paths["provenance"]) + ".effect")
@@ -15886,7 +16047,7 @@ def _complete_remote_pass_owned(
                     )
                 try:
                     provenance: dict[str, Any] = {}
-                    if vm_rc != 0:
+                    if vm_rc != 0 and not review_gate_success_rc:
                         _detached_collection_manifest(receive_paths)
                         if "patch" not in receive_paths or not receive_paths["patch"].is_file():
                             raise _DetachedCollectionUnavailable("detached_patch_unavailable")
@@ -15996,7 +16157,7 @@ def _complete_remote_pass_owned(
             "pre_dispatch_refusal": refusal,
             "review_cycle": {"reservation": receipt["decision"], "settlement": asdict(settled)},
         })
-    if vm_rc != 0:
+    if vm_rc != 0 and not review_gate_success_rc:
         # The exit code alone certifies nothing: keep every AVAILABLE authentic
         # fact of a paid attempt at first publication (same derivation as repair).
         return persist_terminal(
@@ -16049,6 +16210,21 @@ def _complete_remote_pass_owned(
                 "custody_hold": {**retained_hold, "resume_pending": True, "superseded_results": superseded},
             },
         )
+
+    if is_review_gate:
+        from . import review_runner as _review_runner_mod  # noqa: PLC0415
+
+        gate_result = _review_runner_mod.finalize_detached_review_gate(
+            job=job,
+            pass_state=pass_state,
+            persisted_selection=persisted_selection,
+            worktree_path=worktree_path,
+            orchestrator_root=root,
+            result_file=paths.get("result"),
+            debug_file=paths.get("debug"),
+            stream_file=paths.get("stream"),
+        )
+        return persist_terminal(gate_result)
 
     engine_args = dict(completion_config)
     _completion_remaining()

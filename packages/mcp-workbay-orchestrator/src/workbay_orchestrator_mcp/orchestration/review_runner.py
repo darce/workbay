@@ -2155,6 +2155,7 @@ def run_review(
     progress_callback: Callable[..., None] | None = None,
     rules_dir: str | Path | None = None,
     expected_preceding_pass_id: str | None = None,
+    nonblocking: bool = False,
 ) -> dict[str, Any]:
     """Run a full review cycle: discover changes, build prompt, execute backend, validate, optionally record.
 
@@ -2384,6 +2385,9 @@ def run_review(
         raise RuntimeError(
             "Review output schema violates strict structured-output mode: " + "; ".join(schema_violations)
         )
+    review_job_id: str | None = None
+    review_state_dir: Path | None = None
+    existing_review_job: dict[str, Any] | None = None
     detached_identity: dict[str, str] = {}
     if task_ref and task_ref.strip() and lane_id and lane_id.strip():
         reviewed_head_sha = _git_stdout(worktree_path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}")
@@ -2430,6 +2434,150 @@ def run_review(
                     execution_settings_digest=execution_settings_digest,
                 ),
             }
+            from workbay_orchestrator_mcp.orchestration.adapters import remote_exec as _remote_exec_mod  # noqa: PLC0415
+            from workbay_orchestrator_mcp.orchestration.lane_lifecycle_contracts import (  # noqa: PLC0415
+                RemoteJobIdentity,
+            )
+
+            review_job_id = RemoteJobIdentity(
+                detached_identity["task_ref"],
+                detached_identity["lane_id"],
+                detached_identity["pass_id"],
+                0,
+            ).job_id
+            review_state_dir = _remote_exec_mod._state_dir_for_remote_exec(mode_repo_root, env)
+            try:
+                existing_review_job = _remote_exec_mod._lookup_persisted_job_record(review_state_dir, review_job_id)
+            except Exception:  # noqa: BLE001 — preserve existing review flow on unreadable optional ledger
+                existing_review_job = None
+            if existing_review_job is not None:
+                persisted_selection, persisted_err = _remote_exec_mod.resolve_persisted_remote_exec_selection(
+                    existing_review_job,
+                    None,
+                    expected_job_id=review_job_id,
+                    backend_id=backend_name,
+                    repo_root=mode_repo_root,
+                )
+                if persisted_err is not None:
+                    return {
+                        "kind": "refused",
+                        "review": "refused",
+                        "refusal_cause": "policy_or_classifier_refusal",
+                        "failure_reason": persisted_err,
+                        "retryable": True,
+                        "findings": [],
+                        "converged": False,
+                        "summary": "Review job submit-time execution mode is unknown; retaining custody.",
+                        "excluded_findings_count": 0,
+                        "job_id": review_job_id,
+                        "changed_files": changed,
+                        "review_subject": review_subject,
+                        "out_of_diff_findings": [],
+                        "stack_guides": guides,
+                        "review_kind": scope["review_kind"],
+                        "scope_source": scope["scope_source"],
+                        "scope_reason": scope["scope_reason"],
+                    }
+                mode_selection = persisted_selection
+
+    review_kind_value = (
+        scope["review_kind"].value if hasattr(scope["review_kind"], "value") else str(scope["review_kind"])
+    )
+    nonblocking_detached = bool(nonblocking and mode_selection.mode == "detached")
+    if nonblocking_detached and (not detached_identity or review_job_id is None or review_state_dir is None):
+        return {
+            "kind": "refused",
+            "review": "refused",
+            "refusal_cause": "policy_or_classifier_refusal",
+            "failure_reason": "remote_job_identity_missing",
+            "retryable": False,
+            "findings": [],
+            "converged": False,
+            "summary": "Nonblocking detached review requires task_ref, lane_id, and a committed HEAD.",
+            "excluded_findings_count": 0,
+            "changed_files": changed,
+            "review_subject": review_subject,
+            "out_of_diff_findings": [],
+            "stack_guides": guides,
+            "review_kind": scope["review_kind"],
+            "scope_source": scope["scope_source"],
+            "scope_reason": scope["scope_reason"],
+        }
+
+    review_gate_pass_state: dict[str, Any] | None = None
+    if nonblocking_detached and review_job_id is not None and review_state_dir is not None:
+        from workbay_orchestrator_mcp.orchestration import offload_pass as _offload_pass_mod  # noqa: PLC0415
+
+        if existing_review_job is not None:
+            resumed = _offload_pass_mod.complete_remote_pass(
+                review_job_id,
+                state_dir=review_state_dir,
+                orchestrator_root=mode_repo_root,
+            )
+            if resumed.get("terminal") is False and resumed.get("outcome") == "remote_job_pending":
+                return {
+                    **resumed,
+                    "kind": "pending",
+                    "review": "pending",
+                    "pending": True,
+                    "resumable_work": True,
+                    "job_id": review_job_id,
+                    "pass_id": detached_identity["pass_id"],
+                    "task_ref": detached_identity["task_ref"],
+                    "lane_id": detached_identity["lane_id"],
+                    "attempt": int(resumed.get("attempt", 0)),
+                    "remote_exec_mode": mode_selection.mode,
+                    "remote_exec_selection": mode_selection.to_mapping(),
+                    "findings": [],
+                    "converged": False,
+                    "excluded_findings_count": 0,
+                    "changed_files": changed,
+                    "review_subject": review_subject,
+                    "out_of_diff_findings": [],
+                    "stack_guides": guides,
+                    "review_kind": scope["review_kind"],
+                    "scope_source": scope["scope_source"],
+                    "scope_reason": scope["scope_reason"],
+                    "final_result_path": str(final_result_path) if final_result_path is not None else None,
+                }
+            return resumed
+
+        review_gate_context = {
+            "review_subject": review_subject,
+            "changed_files": list(changed),
+            "stack_guides": list(guides),
+            "review_kind": review_kind_value,
+            "scope_source": scope["scope_source"],
+            "scope_reason": scope["scope_reason"],
+            "owned_paths": list(lane_cfg["owned_paths"]) if isinstance(lane_cfg.get("owned_paths"), list) else None,
+            "final_result_path": str(final_result_path) if final_result_path is not None else None,
+            "record_findings": bool(record_findings),
+            "review_round": review_round,
+            "branch": branch,
+            "started_at": started_at,
+            "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }
+        review_gate_pass_state = {
+            "status": "running",
+            "kind": "review_gate",
+            "task_ref": detached_identity["task_ref"],
+            "lane_id": detached_identity["lane_id"],
+            "pass_id": detached_identity["pass_id"],
+            "job_id": review_job_id,
+            "attempt": 0,
+            "session": session or f"{detached_identity['task_ref']}-{detached_identity['lane_id']}",
+            "worktree_path": str(Path(worktree_path).resolve()),
+            "orchestrator_root": str(mode_repo_root.resolve()),
+            "backend": backend_name,
+            "model": model_name,
+            "reasoning_effort": reasoning_effort,
+            "speed": speed,
+            "remote_exec_mode": mode_selection.mode,
+            "remote_exec_selection": mode_selection.to_mapping(),
+            "review_gate_context": review_gate_context,
+        }
+        _offload_pass_mod.write_pass_state(review_state_dir, detached_identity["pass_id"], review_gate_pass_state)
+
     adapter = get_adapter(backend_name, **adapter_kwargs)
     result = adapter.execute(
         prompt=prompt,
@@ -2442,9 +2590,68 @@ def run_review(
         progress_callback=progress_callback,
         orchestrator_root=mode_repo_root,
         remote_exec_selection=mode_selection,
+        **({"detached_pass_begin": True} if nonblocking_detached else {}),
         **detached_identity,
     )
     raw_result = result.raw_payload
+    if isinstance(raw_result, dict) and raw_result.get("outcome") == "remote_job_pending":
+        pending_job_id = str(raw_result.get("job_id") or review_job_id or "")
+        pending_attempt = int(raw_result.get("attempt", 0))
+        pending_selection = (
+            dict(raw_result["remote_exec_selection"])
+            if isinstance(raw_result.get("remote_exec_selection"), dict)
+            else mode_selection.to_mapping()
+        )
+        pending_output: dict[str, Any] = {
+            "kind": "pending",
+            "review": "pending",
+            "outcome": "remote_job_pending",
+            "terminal": False,
+            "pending": True,
+            "resumable_work": True,
+            "job_id": pending_job_id,
+            "pass_id": detached_identity.get("pass_id"),
+            "task_ref": detached_identity.get("task_ref"),
+            "lane_id": detached_identity.get("lane_id"),
+            "attempt": pending_attempt,
+            "unit": raw_result.get("unit"),
+            "remote_state": raw_result.get("remote_state") or "submitted",
+            "remote_exec_mode": pending_selection.get("mode", mode_selection.mode),
+            "remote_exec_selection": pending_selection,
+            "findings": [],
+            "converged": False,
+            "summary": result.summary or "Detached review job submitted; pending collection.",
+            "excluded_findings_count": 0,
+            "changed_files": changed,
+            "review_subject": review_subject,
+            "out_of_diff_findings": [],
+            "stack_guides": guides,
+            "review_kind": scope["review_kind"],
+            "scope_source": scope["scope_source"],
+            "scope_reason": scope["scope_reason"],
+            "final_result_path": str(final_result_path) if final_result_path is not None else None,
+        }
+        if (
+            review_state_dir is not None
+            and detached_identity.get("pass_id")
+            and review_gate_pass_state is not None
+        ):
+            from workbay_orchestrator_mcp.orchestration import offload_pass as _offload_pass_mod  # noqa: PLC0415
+
+            persisted_pending = {**pending_output, "review_kind": review_kind_value}
+            _offload_pass_mod.write_pass_state(
+                review_state_dir,
+                detached_identity["pass_id"],
+                {
+                    **review_gate_pass_state,
+                    "status": "done",
+                    "job_id": pending_job_id,
+                    "attempt": pending_attempt,
+                    "remote_exec_selection": pending_selection,
+                    "result": persisted_pending,
+                },
+            )
+        return pending_output
     # Retryable VM admission defer (remote_agent.sh exit 75): the marker dict is
     # non-empty, so it would otherwise tolerant-degrade to skipped_unparseable →
     # converged, masking the defer. No review ran — surface the typed defer so
@@ -2556,6 +2763,13 @@ def run_review(
         "scope_reason": scope["scope_reason"],
         "result_parse": result_parse,
     }
+    if isinstance(raw_result, dict):
+        if raw_result.get("remote_exec_mode") in ("attached", "detached"):
+            output["remote_exec_mode"] = raw_result["remote_exec_mode"]
+        if isinstance(raw_result.get("remote_exec_selection"), dict):
+            output["remote_exec_selection"] = dict(raw_result["remote_exec_selection"])
+        if isinstance(raw_result.get("job_id"), str) and raw_result["job_id"]:
+            output["job_id"] = raw_result["job_id"]
     if (
         review_subject["kind"] == "unbounded"
         and not changed
@@ -2741,6 +2955,190 @@ def run_review(
             _atomic_write(final_result_path, json.dumps(carrier))
 
     return output
+
+
+def finalize_detached_review_gate(
+    *,
+    job: Mapping[str, Any],
+    pass_state: Mapping[str, Any],
+    persisted_selection: Any,
+    worktree_path: Path,
+    orchestrator_root: Path,
+    result_file: Path | None,
+    debug_file: Path | None = None,
+    stream_file: Path | None = None,
+) -> dict[str, Any]:
+    """Validate and materialize a collected detached review/gate result under its original identity."""
+    from workbay_orchestrator_mcp.orchestration.adapters import remote_exec as _remote_exec_mod  # noqa: PLC0415
+    from workbay_orchestrator_mcp.orchestration.pass_rescue import _atomic_write  # noqa: PLC0415
+
+    spec = job.get("spec")
+    spec = spec if isinstance(spec, Mapping) else {}
+    ctx = pass_state.get("review_gate_context")
+    ctx = ctx if isinstance(ctx, Mapping) else {}
+    job_id = str(spec.get("job_id") or pass_state.get("job_id") or "")
+    pass_id = str(spec.get("pass_id") or pass_state.get("pass_id") or "")
+    task_ref = str(spec.get("task_ref") or pass_state.get("task_ref") or "")
+    lane_id = str(spec.get("lane_id") or pass_state.get("lane_id") or "")
+    raw_attempt = spec.get("attempt", pass_state.get("attempt", 0))
+    attempt = int(raw_attempt) if isinstance(raw_attempt, int) and not isinstance(raw_attempt, bool) else 0
+    backend_name = str(pass_state.get("backend") or spec.get("backend") or "codex-remote")
+    review_subject = dict(ctx["review_subject"]) if isinstance(ctx.get("review_subject"), Mapping) else {}
+    changed = list(ctx.get("changed_files") or [])
+    guides = list(ctx.get("stack_guides") or [])
+    review_kind = ctx.get("review_kind") or "branch"
+    scope_source = ctx.get("scope_source") or "detached_review_gate"
+    scope_reason = ctx.get("scope_reason") or "collected_from_detached_job"
+    owned_paths = list(ctx["owned_paths"]) if isinstance(ctx.get("owned_paths"), list) else None
+    final_result_path_str = ctx.get("final_result_path")
+    final_result_path = Path(final_result_path_str) if isinstance(final_result_path_str, str) and final_result_path_str else None
+    selection_mapping = (
+        persisted_selection.to_mapping()
+        if hasattr(persisted_selection, "to_mapping")
+        else (dict(persisted_selection) if isinstance(persisted_selection, Mapping) else {})
+    )
+    persisted_mode = (
+        persisted_selection.mode
+        if hasattr(persisted_selection, "mode")
+        else str(selection_mapping.get("mode") or "detached")
+    )
+
+    backend_result = _remote_exec_mod._result_from_json(result_file) if result_file is not None else None
+    if backend_result is None:
+        return {
+            "ok": False,
+            "terminal": True,
+            "kind": "review_gate",
+            "outcome": "review_incomplete",
+            "failure_reason": "persisted_result_unavailable",
+            "review": "refused",
+            "findings": [],
+            "converged": False,
+            "excluded_findings_count": 0,
+            "summary": f"Detached review job {job_id} finished without a readable result artifact.",
+            "changed_files": changed,
+            "review_subject": review_subject,
+            "out_of_diff_findings": [],
+            "stack_guides": guides,
+            "review_kind": review_kind,
+            "scope_source": scope_source,
+            "scope_reason": scope_reason,
+            "job_id": job_id,
+            "pass_id": pass_id,
+            "task_ref": task_ref,
+            "lane_id": lane_id,
+            "attempt": attempt,
+            "remote_exec_mode": persisted_mode,
+            "remote_exec_selection": selection_mapping,
+            "final_result_path": final_result_path_str,
+        }
+
+    backend_result = _remote_exec_mod._stamp_backend_result_token_usage(
+        backend_result,
+        debug_file=debug_file,
+        stream_file=stream_file,
+        backend_id=backend_name,
+    )
+    raw_result = dict(backend_result.raw_payload) if isinstance(backend_result.raw_payload, Mapping) else {}
+    raw_result.update(
+        {
+            "job_id": job_id,
+            "attempt": attempt,
+            "pass_id": pass_id,
+            "remote_exec_mode": persisted_mode,
+            "remote_exec_selection": selection_mapping,
+            "collected_from_persisted_job": True,
+        }
+    )
+
+    _spec = get_backend_spec(backend_name)
+    tolerant = backend_supports_token_budget_cycle_bounds(backend_name) or not (
+        _spec and _spec.capabilities.supports_structured_output
+    )
+    validated = _validate_review_result(raw_result, tolerant=tolerant)
+    review_status = validated.get("review")
+    findings = [_mark_format_stage(item) for item in validated.get("findings") or []]
+    summary = str(validated.get("summary") or "")
+    result_parse = str(validated.get("result_parse") or "ok")
+    if review_status == REVIEW_SKIPPED_UNPARSEABLE:
+        result_parse = "degraded"
+    scope_files = None if review_subject.get("scope_kind") == "unresolved_base" else changed
+    in_scope_findings, excluded_findings_count = _findings_within_lane_scope(
+        findings,
+        owned_paths=owned_paths,
+        changed_files=scope_files,
+    )
+    if scope_files is None:
+        findings = in_scope_findings
+
+    output: dict[str, Any] = {
+        "ok": True,
+        "terminal": True,
+        "kind": "review_gate",
+        "outcome": "review_complete",
+        "findings": findings,
+        "summary": summary,
+        "converged": findings_converged(in_scope_findings, review_subject=review_subject),
+        "excluded_findings_count": excluded_findings_count,
+        "changed_files": changed,
+        "review_subject": review_subject,
+        "out_of_diff_findings": _out_of_diff_findings(findings, scope_files),
+        "stack_guides": guides,
+        "review_kind": review_kind,
+        "scope_source": scope_source,
+        "scope_reason": scope_reason,
+        "result_parse": result_parse,
+        "job_id": job_id,
+        "pass_id": pass_id,
+        "task_ref": task_ref,
+        "lane_id": lane_id,
+        "attempt": attempt,
+        "remote_exec_mode": persisted_mode,
+        "remote_exec_selection": selection_mapping,
+        "final_result_path": final_result_path_str,
+    }
+    if review_status == REVIEW_SKIPPED_UNPARSEABLE:
+        output["review"] = REVIEW_SKIPPED_UNPARSEABLE
+    if validated.pop("_missing_findings_key", False):
+        output["review"] = REVIEW_SKIPPED_UNPARSEABLE
+        output["result_parse"] = "degraded"
+    if "raw_tail" in validated:
+        output["raw_tail"] = validated["raw_tail"]
+
+    if final_result_path is not None:
+        carrier = {
+            **output,
+            "review_result_carrier": True,
+            "raw_payload": raw_result,
+            "details": "GROK_REVIEW_FINDINGS_JSON\n" + json.dumps(findings),
+        }
+        final_result_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(final_result_path, json.dumps(carrier))
+
+    return output
+
+
+def collect_pending_review(
+    job_id: str,
+    *,
+    orchestrator_root: Path,
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Collect or observe a pending detached review/gate job under its original identity."""
+    from workbay_orchestrator_mcp.orchestration import offload_pass  # noqa: PLC0415
+    from workbay_orchestrator_mcp.orchestration.adapters import remote_exec as _remote_exec_mod  # noqa: PLC0415
+
+    resolved_root = Path(orchestrator_root)
+    resolved_state_dir = (
+        Path(state_dir)
+        if state_dir is not None
+        else _remote_exec_mod._state_dir_for_remote_exec(resolved_root, None)
+    )
+    return offload_pass.complete_remote_pass(
+        job_id,
+        state_dir=resolved_state_dir,
+        orchestrator_root=resolved_root,
+    )
 
 
 # ---------------------------------------------------------------------------

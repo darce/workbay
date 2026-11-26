@@ -1663,3 +1663,139 @@ def test_fallback_grammar_force_loaded_boundary_pins(monkeypatch: pytest.MonkeyP
     # Reject uppercase name.
     assert fallback.match("feature/Internal-37") is None
     assert _mod._is_conforming_or_protected("feature/Internal-37") is False
+
+
+# ---------------------------------------------------------------------------
+# Remote-agent transport namespace (refs/workbay/remote-agent/<slug>)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "refs/workbay/remote-agent/feature-wbsa-namespace-20261010-1f9eb2eb-97762-82c2f08848718f03",
+        "refs/workbay/remote-agent/feature-wbsa-namespace-20261010-nonce123",
+        "refs/workbay/remote-agent/lane_1-abc123",
+        "refs/heads/feature/wbsa-namespace-20261010",
+        "refs/heads/main",
+        "refs/tags/v1.0.0",
+    ],
+)
+def test_validate_push_ref_allows_conforming_and_remote_agent_transport(ref: str) -> None:
+    assert _mod.validate_push_ref(ref) is True
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "refs/heads/feature-wbsa-namespace-20261010-nonce",
+        "refs/heads/feature-wbsa-namespace-20261010-1f9eb2eb-97762-82c2f08848718f03",
+        "refs/heads/feature/bad-name",
+        "refs/workbay/",
+        "refs/workbay/remote-agent/",
+        "refs/workbay/remote-agent/..",
+        "refs/workbay/remote-agent/a/../b",
+        "refs/workbay/remote-agent/nested/slug",
+        "refs/workbay/remote-agent/-leading-dash",
+        "refs/workbay/remote-agent/slug.lock",
+        "refs/workbay/other/feature-wbsa-namespace-20261010-nonce",
+        "refs/workbay/remote-agent-evil/slug",
+        "",
+    ],
+)
+def test_validate_push_ref_blocks_nonconforming_and_malformed_workbay_refs(ref: str) -> None:
+    assert _mod.validate_push_ref(ref) is False
+
+
+def test_git_push_remote_agent_transport_ref_succeeds_without_override(tmp_path: Path) -> None:
+    """End-to-end: pushing a pinned commit to refs/workbay/remote-agent/<slug>
+    passes the real pre-push hook without WORKBAY_ALLOW_NONCONFORMING_BRANCH_PUSH."""
+    repo, bare = _init_repo_with_pre_push_hook(tmp_path, "feature/wbsa-namespace-20261010")
+    head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    transport_ref = "refs/workbay/remote-agent/feature-wbsa-namespace-20261010-1f9eb2eb-97762-82c2f08848718f03"
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "push", "--force", "origin", f"{head_sha}:{transport_ref}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    remote_sha = _git(bare, "rev-parse", "--verify", transport_ref).stdout.strip()
+    assert remote_sha == head_sha
+
+
+def test_git_push_nonconforming_heads_transport_like_ref_remains_blocked(tmp_path: Path) -> None:
+    """End-to-end: pushing to refs/heads/feature-wbsa-namespace-20261010-nonce
+    from a conforming branch MUST remain blocked."""
+    repo, _bare = _init_repo_with_pre_push_hook(tmp_path, "feature/wbsa-namespace-20261010")
+    head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    bad_dest = "refs/heads/feature-wbsa-namespace-20261010-nonce"
+
+    for refspec in (f"{head_sha}:{bad_dest}", f"HEAD:{bad_dest}"):
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "push", "--force", "origin", refspec],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode != 0, f"expected block for {refspec}"
+        combined = proc.stdout + proc.stderr
+        assert "BLOCKED" in combined, combined
+        assert "feature-wbsa-namespace-20261010-nonce" in combined, combined
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        "refs/workbay/remote-agent/..",
+        "refs/workbay/remote-agent/",
+        "refs/workbay/remote-agent/a/../b",
+        "refs/workbay/remote-agent/nested/slug",
+        "refs/workbay/other/feature-wbsa-namespace-20261010-nonce",
+        "refs/workbay/",
+    ],
+)
+def test_pre_push_helper_blocks_malformed_or_forged_workbay_refs(tmp_path: Path, bad_ref: str) -> None:
+    """Malformed or forged refs/workbay/ refs must be blocked by the pre-push helper."""
+    repo = _init_repo(tmp_path, "feature/wbsa-namespace-20261010")
+    refs = f"{_SHA_A} {_SHA_A} {bad_ref} {_ZERO40}\n"
+    proc = _run_helper_with_refs(repo, refs)
+    assert proc.returncode == 1, f"expected block for {bad_ref}, got stderr={proc.stderr!r}"
+    assert "BLOCKED" in proc.stderr
+    assert bad_ref in proc.stderr
+
+
+def test_git_push_forged_workbay_prefix_ref_is_blocked_end_to_end(tmp_path: Path) -> None:
+    """End-to-end: pushing to a wrong refs/workbay/ prefix or nested path is blocked."""
+    repo, _bare = _init_repo_with_pre_push_hook(tmp_path, "feature/wbsa-namespace-20261010")
+    head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for forged_ref in (
+        "refs/workbay/other/feature-wbsa-namespace-20261010-nonce",
+        "refs/workbay/remote-agent/nested/slug",
+    ):
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "push", "--force", "origin", f"{head_sha}:{forged_ref}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode != 0, f"expected block for {forged_ref}"
+        combined = proc.stdout + proc.stderr
+        assert "BLOCKED" in combined, combined
+        assert forged_ref in combined, combined
+
+
+@pytest.mark.parametrize(
+    "hook_path",
+    _HOOK_TWINS,
+    ids=lambda p: p.as_posix(),
+)
+def test_twin_remote_agent_transport_ref_contract(hook_path: Path) -> None:
+    """Both root and payload twins must allow valid remote-agent transport refs
+    and reject nonconforming heads / malformed workbay refs."""
+    mod = _load_hook_module(hook_path)
+    assert mod.validate_push_ref("refs/workbay/remote-agent/feature-wbsa-namespace-20261010-nonce123") is True
+    assert mod.validate_push_ref("refs/heads/feature-wbsa-namespace-20261010-nonce123") is False
+    assert mod.validate_push_ref("refs/workbay/remote-agent/..") is False
+    assert mod.validate_push_ref("refs/workbay/other/slug") is False

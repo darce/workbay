@@ -23,8 +23,11 @@ from __future__ import annotations
 import bisect
 import hashlib
 import re
+import subprocess
 import unicodedata
-from typing import Iterable
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, Iterable
 
 # Git's hard wrap for a commit subject applies to the whole first line.
 _MAX_COMMIT_SUBJECT = 72
@@ -2012,7 +2015,132 @@ def build_remote_turn_commit_message(
 
 def read_patch_text(patch_file) -> str:
     """Decode a patch file defensively (never raise on non-UTF-8 content)."""
-    from pathlib import Path
-
     path = Path(patch_file)
     return path.read_bytes().decode("utf-8", "replace")
+
+
+_LANE_COMMIT_READ_TIMEOUT_SECONDS = 10.0
+
+_SIGNED_OFF_BY_TRAILER_RE = re.compile(r"^\s*signed[\s\-]*off[\s\-]*by\s*:\s*(.+)$")
+_VENDOR_TRAILER_EMAIL_RE = re.compile(
+    r"[a-z0-9._%+\-]*@(?:[a-z0-9\-]+\.)*(?:anthropic|openai|cursor|x\.ai|xai|deepseek|mistral|windsurf|codeium)\.[a-z]{2,}"
+)
+
+
+def _has_signed_off_by_vendor_trailer(normalized_line: str) -> bool:
+    """True when a ``Signed-off-by:`` trailer attributes work to an LLM/vendor."""
+    match = _SIGNED_OFF_BY_TRAILER_RE.match(normalized_line)
+    if match is None:
+        return False
+    value = match.group(1)
+    if _VENDOR_TRAILER_EMAIL_RE.search(value):
+        return True
+    for token in (*VENDOR_CREDIT_TOKENS, *_BYLINE_EXTRA_REFERENTS):
+        if _contains_token(value, normalize_for_match(token)):
+            return True
+    return False
+
+
+def _screen_lane_commit_message_text(
+    message: str,
+    *,
+    forbidden_patterns: Sequence[str] | None = None,
+) -> list[str]:
+    """Screen every non-empty line of a lane-authored commit message.
+
+    Restricts built-in screening to Tier-1 credit idioms, Tier-2 attribution
+    grammar, ``Co-authored-by:`` / vendor ``Signed-off-by:`` trailers, and
+    caller-supplied ``forbidden_patterns`` regexes. Bare backend/vendor names
+    in ordinary commit prose (e.g. mentioning ``codex`` or ``claude``) are
+    intentionally NOT flagged as attribution.
+    """
+    violations: list[str] = []
+    compiled_patterns: list[tuple[str, re.Pattern[str]]] = []
+    if forbidden_patterns:
+        for raw_pattern in forbidden_patterns:
+            if not raw_pattern:
+                continue
+            try:
+                compiled_patterns.append((raw_pattern, re.compile(raw_pattern, re.IGNORECASE)))
+            except re.error:
+                compiled_patterns.append((raw_pattern, re.compile(re.escape(raw_pattern), re.IGNORECASE)))
+
+    for lineno, raw_line in enumerate(message.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        normalized = normalize_for_match(stripped)
+
+        if _COAUTHOR_RE.search(normalized):
+            violations.append(f"line {lineno}: forbidden co-author trailer: {stripped}")
+        elif _has_signed_off_by_vendor_trailer(normalized):
+            violations.append(f"line {lineno}: forbidden vendor trailer: {stripped}")
+        elif _has_credit_idiom(normalized, stripped) or _has_attribution_byline(normalized):
+            violations.append(f"line {lineno}: forbidden attribution/credit: {stripped}")
+
+        for raw_pattern, compiled in compiled_patterns:
+            if compiled.search(stripped):
+                violations.append(f"line {lineno}: forbidden pattern {raw_pattern!r}: {stripped}")
+
+    return violations
+
+
+def read_and_screen_lane_commit_message(
+    worktree_path: Path | str,
+    commit_sha: str,
+    *,
+    forbidden_patterns: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Read back a landed lane commit message from git and screen it for forbidden attribution.
+
+    Runs ``git -C <worktree_path> log -1 --format=%B <commit_sha>`` with a
+    bounded timeout. Never raises on git/worktree issues, but fails closed on
+    ``clean`` (``clean=False`` whenever ``read_error`` is set) so unreadable
+    commits are never reported clean ([OBS-08], [SECD-05]).
+    """
+    sha = str(commit_sha).strip() if commit_sha is not None else ""
+    if not sha:
+        return {
+            "commit_sha": sha,
+            "commit_message": "",
+            "violations": [],
+            "clean": False,
+            "read_error": "empty commit_sha",
+        }
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree_path), "log", "-1", "--format=%B", sha],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_LANE_COMMIT_READ_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "commit_sha": sha,
+            "commit_message": "",
+            "violations": [],
+            "clean": False,
+            "read_error": str(exc),
+        }
+
+    if proc.returncode != 0:
+        err_text = (proc.stderr or proc.stdout or f"git log exited with status {proc.returncode}").strip()
+        return {
+            "commit_sha": sha,
+            "commit_message": "",
+            "violations": [],
+            "clean": False,
+            "read_error": err_text,
+        }
+
+    msg = proc.stdout.strip()
+    violations = _screen_lane_commit_message_text(msg, forbidden_patterns=forbidden_patterns)
+    return {
+        "commit_sha": sha,
+        "commit_message": msg,
+        "violations": violations,
+        "clean": bool(not violations),
+    }

@@ -1552,6 +1552,8 @@ def _is_inert(command: list[str], scan: _Scan | None = None) -> bool:
         return _git_is_inert(command)
     if name == "gh":
         return len(command) > 1 and command[1] in {"issue", "pr"}
+    if name == "orca":
+        return len(command) > 2 and command[1] == "orchestration" and command[2] == "send"
     if name == "find":
         return not any(token in _FIND_EXEC_ACTIONS for token in command[1:])
     if name == "sort":
@@ -3195,7 +3197,11 @@ def _refusal_message(findings: list[_Finding]) -> str:
         word = next((word for kind, _target, _via, word in findings if kind == reason), None)
         if word is not None:
             if reason == "unverified_size":
-                return f"BLOCKED (unverified_size): {prefix}.\n\n{_blocked_message(targets)}"
+                return (
+                    f"BLOCKED (unverified_size): {prefix}. "
+                    "Move large data into a quoted heredoc (cat > file <<'EOF') or a separate file, "
+                    f"or route test runs through make check-remote.\n\n{_blocked_message(targets)}"
+                )
             if reason == "make_goal_not_allowlisted" and word == "maint-start":
                 return (
                     f"BLOCKED ({reason}): {prefix}; refused word '{word}'.\n"
@@ -3233,7 +3239,8 @@ def _refusal_message(findings: list[_Finding]) -> str:
             return (
                 f"BLOCKED ({_UNPARSED_SHAPE}): {prefix}; found test-run word '{word}'. "
                 f"If this is not a test run, retry once with the audited override {_BYPASS_ENV}=1.\n\n"
-                "For selector/spec data, cat > file <<'EOF' writes data without running it.\n\n"
+                "For selector/spec data or status notes, use cat > file <<'EOF' or orca orchestration send "
+                "without running it.\n\n"
                 f"{_blocked_message(targets)}"
             )
     return _blocked_message(targets)
@@ -3263,6 +3270,50 @@ def _policy_refusal(findings: list[_Finding], ledger_error: str | None) -> str:
     if ledger_error is not None:
         return f"BLOCKED (ledger_unreadable): {ledger_error}. Test routing cannot opt out on a faulty ledger.\n\n{message}"
     return message
+
+
+_TERMINAL_GUARD_SPOOL_FILE = "terminal_guard.jsonl"
+_POLICY_VERSION = "remote-gate-routing-v1"
+_MAX_SPOOL_LINE_BYTES = 2048
+
+
+def _spool_policy_refusal(
+    *,
+    root: Path,
+    reason: str,
+    harness: str,
+    source: str,
+    event_key: str,
+) -> None:
+    """Best-effort bounded, redacted JSONL spool fallback when the CLI recorder cannot run."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    record = {
+        "ts": now.isoformat(),
+        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "decision": "block",
+        "tool_name": "Bash",
+        "reason": reason,
+        "trigger": reason,
+        "policy_revision": _POLICY_VERSION,
+        "policy_version": _POLICY_VERSION,
+        "policy_source": source,
+        "fallback_source": "spool",
+        "worktree": str(root),
+        "worktree_path": str(root),
+        "harness": harness,
+        "command_preview": "[REDACTED]",
+        "event_key": event_key,
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    if len(line.encode("utf-8")) > _MAX_SPOOL_LINE_BYTES:
+        bounded_root = _bounded_text(str(root), 256)
+        record["worktree"] = bounded_root
+        record["worktree_path"] = bounded_root
+        line = json.dumps(record, separators=(",", ":"))
+    state_dir = root / ".task-state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with (state_dir / _TERMINAL_GUARD_SPOOL_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 
 def _record_policy_refusal(
@@ -3311,19 +3362,28 @@ def _record_policy_refusal(
             "--harness", harness,
             "--worktree-path", str(root),
             "--command-preview", "[REDACTED]",
-            "--policy-version", "remote-gate-routing-v1",
+            "--policy-version", _POLICY_VERSION,
             "--policy-source", source,
             "--trigger", reason,
             "--event-key", event_key,
         ])
-        subprocess.Popen(
-            argv,
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        try:
+            subprocess.Popen(
+                argv,
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            _spool_policy_refusal(
+                root=root,
+                reason=reason,
+                harness=harness,
+                source=source,
+                event_key=event_key,
+            )
     except Exception:  # noqa: BLE001 - recorder failures must preserve the guard outcome.
         pass
 
@@ -3349,16 +3409,17 @@ def _apply_findings(
     message = _policy_refusal(findings, ledger_error)
     if unbypassed and not ambient_bypass:
         _emit_diagnostic(message)
-        if payload is not None:
-            _record_policy_refusal(findings, ledger_error, root, payload)
+        _record_policy_refusal(findings, ledger_error, root, payload or {})
         return 2
     via = "env" if ambient_bypass else (findings[0][2] or "")
     if not via:
         _emit_diagnostic(message)
+        _record_policy_refusal(findings, ledger_error, root, payload or {})
         return 2
     audit_error = _log_bypass(command=command, via=via, root=root)
     if audit_error is not None:
         _emit_diagnostic(f"BLOCKED: {audit_error}.\n\n{message}")
+        _record_policy_refusal(findings, ledger_error, root, payload or {})
         return 2
     return 0
 
@@ -3505,6 +3566,7 @@ def _run() -> int:
                         [(_UNPARSED_SHAPE, word[1], via, word[0])],
                         ledger_error,
                         _repo_root() if root is None else root,
+                        payload=payload if isinstance(payload, dict) else None,
                     )
             return _diagnostic(f"ALLOW: {error}")
         except Exception as second_exc:  # noqa: BLE001 - the recovery path is bounded too.

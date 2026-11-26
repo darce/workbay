@@ -24,12 +24,13 @@ older consumer DB.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sqlite3
 from pathlib import Path
 
-from .agent_errors import _resolve_primary_state_dir
+from .agent_errors import _resolve_primary_state_dir, mark_agent_errors_harvested
 
 _AGENT_ERROR_COLUMNS = (
     "id",
@@ -47,6 +48,7 @@ _AGENT_ERROR_COLUMNS = (
     "occurrence_count",
     "created_at",
     "last_seen_at",
+    "harvested_at",
 )
 
 _SAMPLE_FIELDS = (
@@ -207,9 +209,13 @@ def build_errors_report(rows: list[dict]) -> dict:
         )
     )
 
+    unharvested_rows = [r for r in rows if not r.get("harvested_at")]
     return {
         "total_rows": len(rows),
+        "unharvested_rows": len(unharvested_rows),
+        "harvested_rows": len(rows) - len(unharvested_rows),
         "total_occurrences": sum(int(r.get("occurrence_count") or 1) for r in rows),
+        "unharvested_occurrences": sum(int(r.get("occurrence_count") or 1) for r in unharvested_rows),
         "clusters": rendered,
     }
 
@@ -230,14 +236,54 @@ def errors_report(
     *,
     since: str | None = None,
     cwd: Path | str | None = None,
+    mark_harvested: bool = False,
+    error_class: str | None = None,
+    before: str | None = None,
 ) -> dict:
-    """Cluster agent_errors rows from the given sources (or the local DB)."""
+    """Cluster agent_errors rows from the given sources (or the local DB).
+
+    When ``mark_harvested=True``, marks matching unharvested rows in each
+    target SQLite database as harvested (optionally filtered by ``error_class``
+    and/or ``before``) and returns a concise receipt instead of clustering.
+    """
     mode = "collect" if sources else "local"
     if not sources:
         local = _resolve_local_db(cwd)
         if isinstance(local, dict):
             return local
         sources = [local]
+
+    if mark_harvested:
+        receipts: list[dict] = []
+        total_marked = 0
+        for source in sources:
+            src_path = Path(source)
+            if not src_path.is_file():
+                return {"ok": False, "error": f"{src_path}: no such file"}
+            if src_path.suffix == ".jsonl":
+                return {
+                    "ok": False,
+                    "error": f"{src_path}: --mark-harvested requires a SQLite handoff.db, not a .jsonl bundle",
+                }
+            try:
+                marked = mark_agent_errors_harvested(
+                    src_path,
+                    error_class=error_class,
+                    before=before,
+                )
+            except sqlite3.Error as exc:
+                return {"ok": False, "error": f"{src_path}: failed to mark harvested: {exc}"}
+            receipts.append({"path": str(src_path), "marked_harvested": marked})
+            total_marked += marked
+        return {
+            "ok": True,
+            "mode": "mark_harvested",
+            "marked_harvested": total_marked,
+            "error_class": error_class,
+            "before": before,
+            "sources": receipts,
+        }
+
     try:
         collected = collect_agent_error_rows(list(sources), since=since)
     except ValueError as exc:
@@ -273,3 +319,60 @@ def errors_export(
         "db_path": str(db_path),
         "rows": collected["rows"],
     }
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="errors-report",
+        description=(
+            "Report or harvest agent_errors rows. In report mode, prints "
+            "unharvested vs lifetime counts and clusters. With --mark-harvested, "
+            "stamps harvested_at on matching unharvested rows and prints a receipt."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        dest="sources",
+        default=None,
+        help="A handoff.db path or errors-export .jsonl bundle (repeatable).",
+    )
+    parser.add_argument("--since", help="Keep rows with last_seen_at >= this timestamp (report mode).")
+    parser.add_argument(
+        "--mark-harvested",
+        action="store_true",
+        help="Mark matching unharvested agent_errors rows as harvested and print a receipt.",
+    )
+    parser.add_argument(
+        "--class",
+        dest="error_class",
+        default=None,
+        help="Optional error_class filter for --mark-harvested.",
+    )
+    parser.add_argument(
+        "--before",
+        default=None,
+        help="Optional upper-bound timestamp (last_seen_at <= BEFORE) for --mark-harvested.",
+    )
+    parser.add_argument("--cwd", default=None, help="Working directory for local DB resolution.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    sources = [Path(s) for s in args.sources] if args.sources else None
+    result = errors_report(
+        sources,
+        since=args.since,
+        cwd=args.cwd,
+        mark_harvested=args.mark_harvested,
+        error_class=args.error_class,
+        before=args.before,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -422,7 +422,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.50
+_BOUNDARY_RUNTIME_VERSION=0.3.51
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -9280,7 +9280,7 @@ PY
     # preflight evidence must join this nonce/ref, never supply its own scope.
     if [ -z "$_prepare_launch" ]; then
         _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
-            "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" || exit 76
+            "$DISPATCH_NONCE" "refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}" || exit 76
     fi
     # Named systemd scope unit: workbay-lane-<LANE_KEY>.scope so active lanes are
     # countable + debuggable ([RES-14] concurrency ceiling; implementation note S5).
@@ -9489,7 +9489,7 @@ _agent_root='${AGENT_ROOT}'; case "\$_agent_root" in /*) ;; *) _agent_root="\$HO
                 "\$_agent_root/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.argv" \
                 2>/dev/null; \
                 rmdir "\$_agent_root/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}" 2>/dev/null; \
-                git -C "\$HOME/${REMOTE_DIR}" update-ref -d 'refs/heads/${LANE_KEY}-${DISPATCH_NONCE}' 2>/dev/null; \
+                git -C "\$HOME/${REMOTE_DIR}" update-ref -d 'refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}' 2>/dev/null; \
             fi; \
             true
 CLEANUP_EOF
@@ -10284,21 +10284,22 @@ PRODUCTION_CONTEXT_PY
     fi
     if [ -z "$_prepare_launch" ]; then
     _review_cycle_bridge bind "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" \
-        "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" "$_production_context_b64" || exit 76
+        "$DISPATCH_NONCE" "refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}" "$_production_context_b64" || exit 76
 
     # 1) push the pinned commit to the remote clone (only committed state is built).
-    # Push target is LANE_KEY + per-dispatch nonce: LANE_KEY alone is shared by
+    # Push target is LANE_KEY + per-dispatch nonce under the dedicated
+    # refs/workbay/remote-agent/ transport namespace: LANE_KEY alone is shared by
     # concurrent same-branch dispatches and would let the second overwrite the
     # first's ref mid-run. The local side of the refspec is the full immutable
     # commit id resolved above, never the branch name a concurrent writer can move.
-    _phase "pushing $BRANCH -> ${REMOTE_HOST}:${REMOTE_DIR} (refs/heads/${LANE_KEY}-${DISPATCH_NONCE})"
+    _phase "pushing $BRANCH -> ${REMOTE_HOST}:${REMOTE_DIR} (refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE})"
     # BatchMode/ConnectTimeout (matching the SSH array): the push must FAIL FAST,
     # never prompt or hang, even if a caller leaves stdin attached — belt to the
     # `exec </dev/null` above (implementation note).
     # implementation note S1: transport = push only (absolute integer Unix seconds).
     _transport_start_ts="$(date +%s)"
     GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4' \
-        git push --quiet --force "${REMOTE_HOST}:${REMOTE_DIR}" "${SOURCE_COMMIT}:refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" >&2
+        git push --quiet --force "${REMOTE_HOST}:${REMOTE_DIR}" "${SOURCE_COMMIT}:refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}" >&2
     _transport_end_ts="$(date +%s)"
     _emit_host_phase transport "$_transport_start_ts" "$_transport_end_ts"
     # Arm EXIT cleanup at the FIRST remote state (the push). Waiting until after
@@ -13752,7 +13753,7 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
         # failed for-each-ref used to yield an empty stream and silently
         # no-op the whole ref sweep — warn once, still non-fatal [AGT-10].
         _reap_refs_warned=
-        _ref_list=\$(git -C "\$SRC" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null) || {
+        _ref_list=\$(git -C "\$SRC" for-each-ref --format='%(refname)' refs/workbay/remote-agent/ refs/heads/ 2>/dev/null) || {
             if [ -z "\${_reap_refs_warned:-}" ]; then
                 echo 'remote_agent: dispatch reaper cannot list refs (git for-each-ref failed) — ref sweep degraded' >&2
                 _reap_refs_warned=1
@@ -13767,7 +13768,21 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
         # trip set -u.
         _keep_refs='${KEEP_REFS}'
         _reap_legacy='${REAP_LEGACY_REFS}'
-        while IFS= read -r _bn; do
+        while IFS= read -r _full_ref; do
+            [ -n "\$_full_ref" ] || continue
+            case "\$_full_ref" in
+                refs/workbay/remote-agent/*)
+                    _ref_prefix='refs/workbay/remote-agent/'
+                    _bn="\${_full_ref#refs/workbay/remote-agent/}"
+                    ;;
+                refs/heads/*)
+                    _ref_prefix='refs/heads/'
+                    _bn="\${_full_ref#refs/heads/}"
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
             [ -n "\$_bn" ] || continue
             if [ -n "\$_self_nonce" ]; then
                 case "\$_bn" in
@@ -13788,7 +13803,7 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                 fi
             fi
             # Never delete the mirror's checked-out branch (empty = detached HEAD).
-            if [ -n "\$_co" ]; then
+            if [ "\$_ref_prefix" = 'refs/heads/' ] && [ -n "\$_co" ]; then
                 if [ "\$_bn" = "\$_co" ]; then
                     continue
                 fi
@@ -13815,7 +13830,10 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
             if [ -z "\$_olk" ] || _lane_occupant_live "\$_olk" || _lane_lock_held "\$_olk"; then
                 continue
             fi
-            _rl="\$SRC/.git/logs/refs/heads/\$_bn"
+            _rl="\$SRC/.git/logs/\$_full_ref"
+            if [ ! -f "\$_rl" ] && [ "\$_ref_prefix" = 'refs/workbay/remote-agent/' ]; then
+                _rl="\$SRC/.git/\$_full_ref"
+            fi
             [ -f "\$_rl" ] || continue
             _reap_mtime "\$_rl" || continue
             [ "\$((_now - _mt))" -gt ${DISPATCH_TTL_SEC} ] || continue
@@ -13833,8 +13851,8 @@ if [ '${DISPATCH_TTL_SEC}' -gt 0 ] 2>/dev/null; then
                 continue
             fi
             _del_rc=0
-            git -C "\$SRC" update-ref -d "refs/heads/\$_bn" 2>/dev/null || _del_rc=\$?
-            git -C "\$SRC" show-ref --verify --quiet "refs/heads/\$_bn" 2>/dev/null && _probe_rc=0 || _probe_rc=\$?
+            git -C "\$SRC" update-ref -d "\$_full_ref" 2>/dev/null || _del_rc=\$?
+            git -C "\$SRC" show-ref --verify --quiet "\$_full_ref" 2>/dev/null && _probe_rc=0 || _probe_rc=\$?
             _journal_deletion_outcome "\$_bn" "\$_del_rc" "\$_probe_rc" dispatch_ref "\$_age" || true
             _lane_lock_release
         done <<< "\$_ref_list"
@@ -14327,7 +14345,7 @@ fi
 # Bound ladder: resolve once before occupancy re-check so arm-4 exit 7 runs
 # before _lane_write_live_lease and before rm -rf of this lane's sandbox.
 resolve_agent_bound
-_custody_source_ref='refs/heads/${LANE_KEY}-${DISPATCH_NONCE}'
+_custody_source_ref='refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}'
 # BEGIN LANE_WIPE_GUARD
 # Occupancy re-check after lock [CON-11][RES-10]: a prior same-key dispatch may
 # have lost its shell (and the lock) while its agent still holds an unexpired
@@ -14445,8 +14463,8 @@ _phase_record remote_preamble "\$_RP_ENTRY" "\$_archive_start"
 # Verify receive-pack materialized the host's immutable source pin before
 # reading or extracting it. Keep both commit and tree checks: the former binds
 # history identity, while the latter makes the transported content explicit.
-if ! REMOTE_SOURCE_COMMIT=\$(git -C "\$SRC" rev-parse --verify 'refs/heads/${LANE_KEY}-${DISPATCH_NONCE}^{commit}' 2>/dev/null); then
-    echo 'remote_agent: source_identity_failure=source_ref_missing dispatch_ref=refs/heads/${LANE_KEY}-${DISPATCH_NONCE}' >&2
+if ! REMOTE_SOURCE_COMMIT=\$(git -C "\$SRC" rev-parse --verify 'refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}^{commit}' 2>/dev/null); then
+    echo 'remote_agent: source_identity_failure=source_ref_missing dispatch_ref=refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}' >&2
     exit 12
 fi
 if [ "\$REMOTE_SOURCE_COMMIT" != '${SOURCE_COMMIT}' ]; then
@@ -14519,7 +14537,7 @@ _phase_record git_init "\$_git_init_start" "\$_git_init_end"
 # both the history-stripped sandbox and nonce ref are removed:
 # AgentSpec head -> exact requested ref label -> nonce dispatch ref -> verified
 # remote commit/tree -> synthetic sandbox commit/tree.
-printf '{"schema_version":1,"dispatch_nonce":"%s","requested_branch":"%s","requested_ref":"refs/heads/%s","agent_spec_head_sha":"%s","dispatch_ref":"refs/heads/%s-%s","remote_source_commit":"%s","remote_source_tree":"%s","sandbox_base_commit":"%s","sandbox_base_tree":"%s","history_stripped":true}\n' \
+printf '{"schema_version":1,"dispatch_nonce":"%s","requested_branch":"%s","requested_ref":"refs/heads/%s","agent_spec_head_sha":"%s","dispatch_ref":"refs/workbay/remote-agent/%s-%s","remote_source_commit":"%s","remote_source_tree":"%s","sandbox_base_commit":"%s","sandbox_base_tree":"%s","history_stripped":true}\n' \
     '${DISPATCH_NONCE}' '${BRANCH}' '${BRANCH}' '${SOURCE_COMMIT}' '${LANE_KEY}' '${DISPATCH_NONCE}' \
     "\$REMOTE_SOURCE_COMMIT" "\$REMOTE_SOURCE_TREE" "\$SANDBOX_BASE_COMMIT" "\$SANDBOX_BASE_TREE" \
     > "\$OUT_DIR/.workbay-source-provenance.json"
@@ -18369,7 +18387,7 @@ ADMISSION_B64='${_admission_b64}'
 case "\$AGENT_ROOT" in /*) ROOT="\$AGENT_ROOT" ;; *) ROOT="\$HOME/\$AGENT_ROOT" ;; esac
 export BRIEF_PATH="\$ROOT/.brief-${LANE_KEY}-${DISPATCH_NONCE}.md"
 export OUTBOX_PATH="\$ROOT/.lane-out-${LANE_KEY}-${DISPATCH_NONCE}"
-export REF_NAME='refs/heads/${LANE_KEY}-${DISPATCH_NONCE}'
+export REF_NAME='refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}'
 export REMOTE_GIT="\$HOME/${REMOTE_DIR}"
 export WORKBAY_REMOTE_SUBMIT_CRASH_AFTER="\${WORKBAY_REMOTE_SUBMIT_CRASH_AFTER:-}"
 _remote_submit_job
@@ -18514,7 +18532,7 @@ SUBMIT_EOF
         if run_submit; then rc=0; else rc=$?; fi
         if [ "$rc" -eq 0 ]; then
             _review_cycle_finished=1
-            _review_cycle_bridge pending "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$rc" "" "" "" "$DISPATCH_NONCE" "refs/heads/${LANE_KEY}-${DISPATCH_NONCE}" || true
+            _review_cycle_bridge pending "$JOB_ID" "$REVIEW_SUBJECT_BRANCH" "$REVIEW_KIND" "$AGENT_SPEC" "$CANON_PROPOSAL_PATH" "$rc" "" "" "" "$DISPATCH_NONCE" "refs/workbay/remote-agent/${LANE_KEY}-${DISPATCH_NONCE}" || true
         fi
         exit "$rc"
     fi

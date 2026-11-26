@@ -73,7 +73,7 @@ _MAX_FINDING_IDS = 5
 _FENCE_OPEN = "```workbay-reinject"
 _FENCE_CLOSE = "```"
 _RECOVER_HINT = 'recover: compaction(get_latest) | get_handoff_state(read_profile="hot_summary")'
-_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "manual")
+_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "agy-cli", "manual")
 # SessionStart registers this hook with no timeout, so the harness default of
 # 60s bounds it. ensure_deps_interpreter() gives every subprocess it waits on
 # (git, the origin probe, the version-skew probes; both passes of the venv

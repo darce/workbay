@@ -3706,6 +3706,37 @@ def land(
                 {"lane_id": lane_id, "reason": f"predecessor_drain_failed:{type(exc).__name__}"}
             ]
             result["predecessor_cleanup_drain"] = {"ok": False, "error": f"{type(exc).__name__}"}
+    if result.get("integrated") is True:
+        try:
+            from workbay_bootstrap import dev_temp  # noqa: PLC0415
+
+            reap_repo = (
+                Path(orchestrator_root).expanduser().resolve()
+                if orchestrator_root is not None
+                else Path(lanes._workspace_root()).expanduser().resolve()
+            )
+            host_tmp_summary = dev_temp.reap_and_report_host_tmp(
+                apply=True,
+                repo=reap_repo,
+                scope="lifecycle",
+            )
+            unrecognized = host_tmp_summary.get("unrecognized_tmp_trees") or []
+            if (
+                host_tmp_summary.get("removed")
+                or host_tmp_summary.get("stale_count")
+                or unrecognized
+                or host_tmp_summary.get("errors")
+            ):
+                result["host_tmp_reap"] = host_tmp_summary
+                logging.getLogger(__name__).info(
+                    "lane_land host_tmp_reap: removed=%d stale=%d unrecognized=%d errors=%d",
+                    len(host_tmp_summary.get("removed") or []),
+                    int(host_tmp_summary.get("stale_count") or 0),
+                    len(unrecognized),
+                    len(host_tmp_summary.get("errors") or []),
+                )
+        except Exception:  # noqa: BLE001 — best-effort fail-open epilogue; never fails a land
+            logging.getLogger(__name__).debug("lane_land host_tmp_reap skipped", exc_info=True)
     return result
 
 

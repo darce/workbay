@@ -438,6 +438,7 @@ def _dedup_insert_or_bump(
         WHERE error_class = ?
           AND summary = ?
           AND task_ref IS ?
+          AND harvested_at IS NULL
           AND last_seen_at >= datetime('now', ?)
         ORDER BY last_seen_at DESC, id DESC
         LIMIT 1
@@ -1076,3 +1077,55 @@ def replay_agent_error_spool(
             "failed": 0,
             "quarantined": 0,
         }
+
+
+def mark_agent_errors_harvested(
+    db_path: Path | str,
+    *,
+    error_class: str | None = None,
+    before: str | None = None,
+    harvested_at: str | None = None,
+) -> int:
+    """Stamp ``harvested_at`` on matching unharvested ``agent_errors`` rows.
+
+    Only updates rows where ``harvested_at IS NULL``. Optional filters narrow
+    the update to a single ``error_class`` and/or rows with
+    ``last_seen_at <= before``. Upgrades legacy databases lacking the
+    ``harvested_at`` column idempotently before updating. Returns the number
+    of rows marked harvested.
+    """
+    resolved_db = Path(db_path)
+    if not resolved_db.is_file():
+        return 0
+    harvested_ts = _normalize_optional_text(harvested_at) or datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    normalized_class = _normalize_optional_text(error_class)
+    normalized_before = _normalize_optional_text(before)
+
+    conn = _connect_handoff_sqlite(resolved_db)
+    try:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_errors'"
+        ).fetchone()
+        if table is None:
+            return 0
+        cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(agent_errors)").fetchall()}
+        clauses = ["harvested_at IS NULL"]
+        params: list[object] = [harvested_ts]
+        if normalized_class is not None:
+            clauses.append("error_class = ?")
+            params.append(normalized_class)
+        if normalized_before is not None:
+            clauses.append("last_seen_at <= ?")
+            params.append(normalized_before)
+        sql = f"UPDATE agent_errors SET harvested_at = ? WHERE {' AND '.join(clauses)}"
+        with conn:
+            if "harvested_at" not in cols:
+                try:
+                    conn.execute("ALTER TABLE agent_errors ADD COLUMN harvested_at TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+            cursor = conn.execute(sql, params)
+            return int(cursor.rowcount)
+    finally:
+        conn.close()

@@ -3,6 +3,15 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.103] — 2026-11-26
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.1.105 Git release (`pubrate01`, `VRE-06` `s5`/`s7w`/`s9`, `fleetwatch01`, `hygiene105`, `agyv105train`, and `agyv105w2train`).
+- `pubrate01`: Reduce unauthenticated GitHub API calls in `scripts/release_publication.py` (~22 -> 3 calls/pass for 9 absent tags) via per-pass `github_profile()` deduplication and bounded `matching-refs/tags/` with fail-closed `Link`-header rejection and exact 404 fallback.
+- `VRE-06` Slices `s5`, `s7w`, `s9`: Preserve in-flight submit-time mode immutability across host restart (`31412`), collect finished attached gates (`31449`), add `scripts/verify_detached_acceptance.py` (PR330-08 exit codes `0..4`, strict `mode=ro` `turn_metrics`, unchanged `BARS`), and support durable nonblocking detached review/gate submit and restart collection.
+- `fleetwatch01`: Add stdlib-only lightweight terminal TUI `workbay fleet watch` (~20 MB RAM, `--interval`, `--once`, `--no-alt-screen`, `--json`) over `fleet_snapshot`.
+- `hygiene105` + Wave 1 & Wave 2 tech-debt trains (`agyv105train` + `agyv105w2train`): Sync all 4 hook twins + `_agy_hook_adapter.py` root mirror, add lifecycle-scoped `dev_temp` reaping, canonical `terminal_guard.jsonl` spool, `commit_subject` read-error/prose screening, and dual transport prefix observation.
+
 ## [0.3.102] — 2026-11-26
 
 ### Changed

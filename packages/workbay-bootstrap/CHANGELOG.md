@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.46] — 2026-11-26
+
+### Changed
+- Wave 1 & Wave 2 tech-debt trains (`agyv105train` + `agyv105w2train`): Add lifecycle-scoped `dev_temp` reaping and bootstrap subcommand hardening.
+- Refresh the protocol and system dependency floors for WorkBay v0.1.105 and align bootstrap install and profile handling with the v0.1.105 runtime.
+
 ## [0.4.45] — 2026-11-26
 
 ### Changed

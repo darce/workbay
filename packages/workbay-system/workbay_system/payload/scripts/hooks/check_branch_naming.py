@@ -45,6 +45,16 @@ from typing import Callable
 _PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})
 _PROTECTED_BRANCH_PREFIXES: tuple[str, ...] = ("release/", "hotfix/")
 
+# Dedicated non-branch transport namespace for remote_agent.sh dispatches.
+# Strictly single-segment slug under refs/workbay/remote-agent/ (alphanumeric
+# start, only [A-Za-z0-9_-]; no dots, slashes, or path traversal). Any other
+# refs/workbay/... ref is refused by the pre-push guard.
+_WORKBAY_REF_PREFIX = "refs/workbay/"
+_REMOTE_AGENT_TRANSPORT_PREFIX = "refs/workbay/remote-agent/"
+_REMOTE_AGENT_TRANSPORT_REF_RE = re.compile(
+    r"^refs/workbay/remote-agent/[A-Za-z0-9][A-Za-z0-9_-]*$"
+)
+
 # implementation note — bounded override audit. The 2 s wall-clock timeout is the
 # load-bearing invariant: the override path NEVER blocks the commit.
 # A hung handoff DB or stuck mcp client must fall through to the
@@ -749,13 +759,44 @@ def _branch_name_from_ref(ref: str) -> str | None:
     return None
 
 
+def _is_valid_remote_agent_transport_ref(ref: str) -> bool:
+    """True iff ``ref`` is a strictly well-formed remote-agent transport ref."""
+    return _REMOTE_AGENT_TRANSPORT_REF_RE.match(ref) is not None
+
+
+def validate_push_ref(ref: str) -> bool:
+    """Validate a full git push ref against the WorkBay pre-push contract.
+
+    Returns ``True`` when the ref is permitted without override, ``False``
+    when it must be blocked:
+    - ``refs/workbay/remote-agent/<slug>`` matching the strict transport
+      grammar -> ``True``
+    - Any other ``refs/workbay/...`` ref (empty slug, ``..``, nested path,
+      wrong prefix) -> ``False``
+    - ``refs/heads/<branch>`` -> ``True`` iff conforming or protected
+    - Non-branch, non-workbay refs (e.g. tags, notes) -> ``True``
+    """
+    if not ref:
+        return False
+    if ref.startswith(_WORKBAY_REF_PREFIX):
+        return _is_valid_remote_agent_transport_ref(ref)
+    branch = _branch_name_from_ref(ref)
+    if branch is not None:
+        return _is_conforming_or_protected(branch)
+    return True
+
+
 def collect_pre_push_branch_updates(stdin_text: str) -> list[str]:
-    """Parse git pre-push stdin ref lines into non-delete branch names.
+    """Parse git pre-push stdin ref lines into ref/branch names to validate.
 
     Each line is ``<local_ref> <local_sha> <remote_ref> <remote_sha>``.
-    Deletes (local_sha all zeros) are allowed and omitted. Non-branch
-    refs (tags, notes, etc.) are ignored. Order is preserved; duplicates
-    are kept so each published name is classified.
+    Deletes (local_sha all zeros) are allowed and omitted. Strictly
+    well-formed ``refs/workbay/remote-agent/<slug>`` transport destinations
+    are allowed (though any ``refs/heads/...`` source ref is still checked).
+    Malformed or forged ``refs/workbay/...`` refs are emitted verbatim so
+    ``run_pre_push_refspecs`` blocks them. Other non-branch refs (tags,
+    notes, etc.) are ignored. Order is preserved; duplicates are kept so
+    each published name is classified.
     """
     branches: list[str] = []
     for raw in stdin_text.splitlines():
@@ -768,9 +809,21 @@ def collect_pre_push_branch_updates(stdin_text: str) -> list[str]:
         local_ref, local_sha, remote_ref, _remote_sha = parts
         if _is_zero_sha(local_sha):
             continue
-        branch = _branch_name_from_ref(local_ref) or _branch_name_from_ref(remote_ref)
-        if branch is not None:
-            branches.append(branch)
+        local_branch = _branch_name_from_ref(local_ref)
+        if remote_ref.startswith(_WORKBAY_REF_PREFIX):
+            if _is_valid_remote_agent_transport_ref(remote_ref):
+                if local_branch is not None:
+                    branches.append(local_branch)
+            else:
+                branches.append(remote_ref)
+            continue
+        remote_branch = _branch_name_from_ref(remote_ref)
+        if remote_branch is not None:
+            if local_branch is not None and local_branch != remote_branch:
+                branches.append(local_branch)
+            branches.append(remote_branch)
+        elif local_branch is not None:
+            branches.append(local_branch)
     return branches
 
 
@@ -835,15 +888,17 @@ def main(argv: list[str] | None = None) -> int:
         return run_post_checkout(_current_branch())
     if args.trigger == "pre-commit":
         return run_pre_commit(_current_branch())
-    # Publish gate: classify the branch names on the ref lines being pushed,
+    # Publish gate: classify the branch/ref names on the ref lines being pushed,
     # not merely ``git branch --show-current``. Pushing a nonconforming ref
     # from main / a conforming branch / detached HEAD must still refuse.
-    # When no heads updates appear on stdin (TTY / empty / deletes-only),
-    # fall back to the current branch so direct helper invocations and
-    # existing unit tests keep working; detached HEAD with no refspecs
-    # publishes nothing and is allowed.
-    ref_branches = collect_pre_push_branch_updates(_read_pre_push_stdin())
-    if ref_branches:
+    # When stdin is empty (TTY / direct helper invocation), fall back to the
+    # current branch so direct invocations and existing unit tests keep working.
+    # When stdin carries ref lines (git pre-push), classify only those lines so
+    # valid transport pushes (refs/workbay/remote-agent/...) and deletes are
+    # never falsely blocked by an unrelated local HEAD.
+    stdin_text = _read_pre_push_stdin()
+    if stdin_text.strip():
+        ref_branches = collect_pre_push_branch_updates(stdin_text)
         return run_pre_push_refspecs(ref_branches)
     return run_pre_push(_current_branch())
 

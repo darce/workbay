@@ -22,14 +22,16 @@
 #   FLAGS   — extra flags forwarded to scripts/release.sh
 #   DOGFOOD_SOURCE         — git_overlay (default), package, or worktree
 #   DOGFOOD_STUDIO         — 0 (default) or 1; install Studio after worktree install/status
-#   DOGFOOD_BOOTSTRAP_SPEC — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
-#   DOGFOOD_SYSTEM_SPEC    — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
-#   DOGFOOD_PROTOCOL_SPEC  — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name).
-#                            Required: workbay-bootstrap pins workbay-protocol>=0.3.0 and the
-#                            newest workbay-protocol on any index is a stale 0.2.0, so omitting
-#                            this resolves to that abandoned upload and the closure fails.
-#   DOGFOOD_GIT_URL        — public mirror URL composed into the package-mode specs
-#   DOGFOOD_PACKAGE_REF    — tag/branch for package-mode specs (DOGFOOD_REF, else TAG, else main)
+#   DOGFOOD_BOOTSTRAP_SPEC    — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_SYSTEM_SPEC       — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_PROTOCOL_SPEC     — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_HANDOFF_SPEC      — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#   DOGFOOD_ORCHESTRATOR_SPEC — git+ uv spec used when DOGFOOD_SOURCE=package (never a bare dist name)
+#                               Runtime closure members are derived dynamically from
+#                               workbay_bootstrap.gitonly_closure.GITONLY_RUNTIME_MEMBERS; any future
+#                               member can also be overridden via DOGFOOD_SPEC_<UPPER_SNAKE>.
+#   DOGFOOD_GIT_URL           — public mirror URL composed into the package-mode specs
+#   DOGFOOD_PACKAGE_REF       — tag/branch for package-mode specs (DOGFOOD_REF, else TAG, else main)
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -71,6 +73,14 @@ DOGFOOD_PACKAGE_REF ?= $(if $(strip $(DOGFOOD_REF)),$(DOGFOOD_REF),$(if $(strip 
 DOGFOOD_BOOTSTRAP_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/workbay-bootstrap
 DOGFOOD_SYSTEM_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/workbay-system
 DOGFOOD_PROTOCOL_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/workbay-protocol
+DOGFOOD_HANDOFF_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/mcp-workbay-handoff
+DOGFOOD_ORCHESTRATOR_SPEC ?= git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/mcp-workbay-orchestrator
+# Authoritative runtime member set, derived lazily from workbay_bootstrap.gitonly_closure
+# so adding a member there flows into package-mode dogfood without editing this Makefile.
+DOGFOOD_CLOSURE_PYTHONPATH := $(JUDGE_ROOT)/packages/workbay-bootstrap/src:$(JUDGE_ROOT)/packages/workbay-protocol/src
+DOGFOOD_RUNTIME_MEMBERS = $(shell PYTHONPATH="$(DOGFOOD_CLOSURE_PYTHONPATH)" "$(JUDGE_PYTHON)" -c "from workbay_bootstrap.gitonly_closure import GITONLY_RUNTIME_MEMBERS; print(' '.join(GITONLY_RUNTIME_MEMBERS))" 2>/dev/null)
+dogfood-member-spec = $(if $(filter workbay-bootstrap,$(1)),$(DOGFOOD_BOOTSTRAP_SPEC),$(if $(filter workbay-system,$(1)),$(DOGFOOD_SYSTEM_SPEC),$(if $(filter workbay-protocol,$(1)),$(DOGFOOD_PROTOCOL_SPEC),$(if $(filter mcp-workbay-handoff,$(1)),$(DOGFOOD_HANDOFF_SPEC),$(if $(filter mcp-workbay-orchestrator,$(1)),$(DOGFOOD_ORCHESTRATOR_SPEC),$(or $(DOGFOOD_SPEC_$(shell printf '%s' '$(1)' | tr '[:lower:]-' '[:upper:]_')),git+$(DOGFOOD_GIT_URL)@$(DOGFOOD_PACKAGE_REF)\#subdirectory=packages/$(1)))))))
+DOGFOOD_EXTRA_WITH_ARGS = $(foreach m,$(filter-out workbay-bootstrap workbay-system,$(DOGFOOD_RUNTIME_MEMBERS)),--with $(call shell-quote,$(call dogfood-member-spec,$(m))))
 DOGFOOD_UVX_FLAGS ?= --refresh
 # Extra flags forwarded verbatim to every `workbay-bootstrap install`
 # invocation inside `make dogfood` — the sanctioned opt-in path for the
@@ -650,12 +660,13 @@ check-all: check-disk-space check-review-pipeline ## Format+lint+mypy+tests for 
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-orchestrator --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/mcp-workbay-orchestrator packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml packages/mcp-workbay-handoff/src packages/mcp-workbay-handoff/pyproject.toml packages/workbay-codex-bridge/src packages/workbay-codex-bridge/pyproject.toml packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/mcp-workbay-orchestrator check-orchestrator
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-bridge --paths packages/workbay-codex-bridge packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/workbay-codex-bridge check-bridge
 	$(call workbay_checkall_cache,check-protocol,packages/workbay-protocol packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock,$(MAKE) check-protocol)
-	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-system --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/workbay-system scripts config .claude docs/workbay Makefile pyproject.toml uv.lock packages/mcp-workbay-handoff/src/workbay_handoff_mcp/api.py packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/api.py packages/workbay-protocol/src/workbay_protocol/tool_serving_index.py -- $(MAKE) check-system
+	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-system --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/workbay-system scripts config .claude docs/workbay docs/tech-debt Makefile pyproject.toml uv.lock packages/mcp-workbay-handoff/src/workbay_handoff_mcp/api.py packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/api.py packages/workbay-protocol/src/workbay_protocol/tool_serving_index.py -- $(MAKE) check-system
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-hooks --paths scripts/hooks packages/workbay-system/workbay_system/payload/scripts/hooks Makefile -- $(MAKE) -o check-hook-twin-parity check-hooks
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-system-integration --paths packages/workbay-system scripts config .claude docs/workbay Makefile pyproject.toml uv.lock -- $(MAKE) check-system-integration
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-workbay --paths packages/workbay Makefile pyproject.toml uv.lock -- $(MAKE) check-workbay
 	$(MAKE) check-overlay-gates
 	$(MAKE) check-overlay-drift
+	$(MAKE) check-tech-debt-index
 	$(MAKE) check-mcp-pins
 	$(MAKE) mcp-pins-check
 	$(MAKE) stack-pins-check
@@ -1081,15 +1092,19 @@ dogfood: ## Install latest/TAG git overlay, package (git-mirror uv specs), or wo
 	    exit 2; \
 	fi; \
 	if [ "$$source" = "package" ]; then \
+	    runtime_members=$(call shell-quote,$(DOGFOOD_RUNTIME_MEMBERS)); \
+	    if [ -z "$$runtime_members" ]; then \
+	        echo "dogfood: failed to derive GITONLY_RUNTIME_MEMBERS from workbay_bootstrap.gitonly_closure" >&2; \
+	        exit 1; \
+	    fi; \
 	    bootstrap_spec=$(call shell-quote,$(DOGFOOD_BOOTSTRAP_SPEC)); \
 	    system_spec=$(call shell-quote,$(DOGFOOD_SYSTEM_SPEC)); \
-	    protocol_spec=$(call shell-quote,$(DOGFOOD_PROTOCOL_SPEC)); \
 	    uvx_flags="$(DOGFOOD_UVX_FLAGS)"; \
 	    echo "==> dogfood installing package overlay into $(CURDIR)"; \
-	    echo "==> using $$bootstrap_spec with $$system_spec $$protocol_spec"; \
-	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" --with "$$protocol_spec" \
+	    echo "==> using $$bootstrap_spec with closure members: $$runtime_members"; \
+	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" $(DOGFOOD_EXTRA_WITH_ARGS) \
 	        workbay-bootstrap install --source package --target "$(CURDIR)" --remote-url $(call shell-quote,$(DOGFOOD_GIT_URL)) --remote-ref $(call shell-quote,$(DOGFOOD_PACKAGE_REF)) $(DOGFOOD_INSTALL_FLAGS) && \
-	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" --with "$$protocol_spec" \
+	    uvx $$uvx_flags --from "$$bootstrap_spec" --with "$$system_spec" $(DOGFOOD_EXTRA_WITH_ARGS) \
 	        workbay-bootstrap status --target "$(CURDIR)"; \
 	    exit $$?; \
 	fi; \

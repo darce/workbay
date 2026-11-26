@@ -582,7 +582,7 @@ _HANDOFF_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     # (agent_errors inserts target workbay_release). Registering it flags the
     # missing column so _migrate_add_column_extensions ADD COLUMNs it (the stale
     # workstate_release column is left in place, harmless).  brand-check: allow
-    "agent_errors": frozenset({"workbay_release"}),
+    "agent_errors": frozenset({"workbay_release", "harvested_at"}),
     # implementation note S1: duration_seconds is in CREATE DDL (fresh DBs) and added via
     # _migrate_add_column_extensions; register so a stamped-current DB missing
     # the column re-bootstraps (same trap as worktree_lanes.test_cmd).
@@ -1229,9 +1229,9 @@ CREATE TABLE IF NOT EXISTS terminal_guard_events (
 
 CREATE TABLE IF NOT EXISTS agent_errors (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_instance_id  TEXT NOT NULL,
+    repo_instance_id  TEXT NOT NULL DEFAULT '',
     task_ref          TEXT,
-    harness           TEXT NOT NULL,
+    harness           TEXT NOT NULL DEFAULT 'unknown',
     error_class       TEXT NOT NULL,
     summary           TEXT NOT NULL,
     detail            TEXT,
@@ -1242,7 +1242,9 @@ CREATE TABLE IF NOT EXISTS agent_errors (
     workbay_release TEXT,
     occurrence_count  INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    first_seen_at     TEXT,
     last_seen_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    harvested_at      TEXT,
     FOREIGN KEY (repo_instance_id) REFERENCES repo_instances(repo_instance_id)
 );
 
@@ -2449,7 +2451,10 @@ def _migrate_add_column_extensions(conn: sqlite3.Connection) -> None:
     # implementation note R8: retrofit workbay_release onto a pre-rebrand agent_errors table
     # (the rename left already-stamped DBs with the old workstate_release column  brand-check: allow
     # and no workbay_release, so inserts failed silently and telemetry went dark).
-    _add_column_if_missing(conn, "agent_errors", "workbay_release", "TEXT")
+    if _sqlite_table_exists(conn, "agent_errors"):
+        _add_column_if_missing(conn, "agent_errors", "workbay_release", "TEXT")
+        _add_column_if_missing(conn, "agent_errors", "first_seen_at", "TEXT")
+        _add_column_if_missing(conn, "agent_errors", "harvested_at", "TEXT")
     # implementation note S1: wall-clock duration for turn_metrics. Guard table existence:
     # on ancient DBs turn_metrics is first created later in _migrate_add_turn_metrics;
     # _add_column_if_missing would raise OperationalError: no such table.
@@ -3038,9 +3043,9 @@ def _migrate_add_agent_errors(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS agent_errors (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            repo_instance_id  TEXT NOT NULL,
+            repo_instance_id  TEXT NOT NULL DEFAULT '',
             task_ref          TEXT,
-            harness           TEXT NOT NULL,
+            harness           TEXT NOT NULL DEFAULT 'unknown',
             error_class       TEXT NOT NULL,
             summary           TEXT NOT NULL,
             detail            TEXT,
@@ -3051,11 +3056,15 @@ def _migrate_add_agent_errors(conn: sqlite3.Connection) -> None:
             workbay_release TEXT,
             occurrence_count  INTEGER NOT NULL DEFAULT 1,
             created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            first_seen_at     TEXT,
             last_seen_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            harvested_at      TEXT,
             FOREIGN KEY (repo_instance_id) REFERENCES repo_instances(repo_instance_id)
         )
         """
     )
+    _add_column_if_missing(conn, "agent_errors", "first_seen_at", "TEXT")
+    _add_column_if_missing(conn, "agent_errors", "harvested_at", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_agent_errors_repo_created ON agent_errors(repo_instance_id, created_at DESC)"
     )
@@ -6198,3 +6207,20 @@ def _get_db_connection(
                     _log.exception("db writer unregister failed during connect cleanup")
     finally:
         conn.close()
+
+
+def init_handoff_db(db_path: Path | str) -> Path:
+    """Create or migrate a handoff SQLite database at ``db_path``.
+
+    Idempotent: opens ``db_path`` with the standard handoff connection setup,
+    bootstraps schema and additive migrations (including
+    ``agent_errors.harvested_at``), and closes the connection cleanly.
+    """
+    resolved = Path(db_path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect_handoff_sqlite(resolved)
+    try:
+        _prepare_handoff_connection(conn)
+    finally:
+        conn.close()
+    return resolved

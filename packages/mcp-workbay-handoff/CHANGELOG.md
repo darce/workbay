@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.45] — 2026-11-26
+
+### Changed
+- Wave 1 tech-debt train (`agyv105train`): Add `errors-report` harvest flags in `cli.py`, post-harvest deduplication guard, and legacy DB table-exists guard in `agent_errors` and `shared_schema`.
+- Refresh the protocol and optional lifecycle orchestrator dependency floors for WorkBay v0.1.105.
+
 ## [0.3.44] — 2026-11-26
 
 ### Changed

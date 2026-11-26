@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.51] — 2026-11-26
+
+### Changed
+- `VRE-06` Slices `s5`, `s7w`, `s9`: Preserve in-flight submit-time mode immutability across host restart (`31412`), collect finished attached gates (`31449`), and support durable nonblocking detached review/gate submit and restart collection.
+- `fleetwatch01`: Add stdlib-only lightweight terminal TUI `workbay fleet watch` (~20 MB RAM, `--interval`, `--once`, `--no-alt-screen`, `--json`) over `fleet_snapshot`.
+- Wave 1 & Wave 2 tech-debt trains (`agyv105train` + `agyv105w2train`): Add `commit_subject` read-error/prose screening and dual transport prefix observation in `lane_close_observation`.
+- Refresh the protocol, handoff, system, and optional Codex bridge dependency floors for WorkBay v0.1.105.
+
 ## [0.3.50] — 2026-11-26
 
 ### Changed

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.36] — 2026-11-26
+
+### Changed
+- Refresh the handoff and orchestrator dependency floors for WorkBay v0.1.105 (`pubrate01`, `VRE-06` `s5`/`s7w`/`s9`, `fleetwatch01`, `hygiene105`, `agyv105train`, and `agyv105w2train`).
+
 ## [0.1.35] — 2026-11-26
 
 ### Changed

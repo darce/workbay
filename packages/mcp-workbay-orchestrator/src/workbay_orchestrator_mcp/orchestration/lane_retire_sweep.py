@@ -4131,6 +4131,24 @@ def sweep(
         summary.setdefault("started_at", receipt_started_at)
         summary.setdefault("identity_filter_timing", _empty_identity_filter_timing())
         summary.setdefault("wake", {"outcome": "not_needed"})
+        try:
+            from workbay_bootstrap import dev_temp  # noqa: PLC0415
+
+            host_tmp_summary = dev_temp.reap_and_report_host_tmp(
+                apply=bool(apply),
+                repo=root,
+                scope="lifecycle",
+            )
+            unrecognized = host_tmp_summary.get("unrecognized_tmp_trees") or []
+            if (
+                host_tmp_summary.get("removed")
+                or host_tmp_summary.get("stale_count")
+                or unrecognized
+                or host_tmp_summary.get("errors")
+            ):
+                summary["host_tmp_reap"] = host_tmp_summary
+        except Exception:  # noqa: BLE001 — best-effort fail-open epilogue; never fails a retire sweep
+            pass
         if not _defer_receipt:
             try:
                 _write_receipt(root, summary)

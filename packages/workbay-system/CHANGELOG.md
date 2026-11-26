@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.48] — 2026-11-26
+
+### Changed
+- `hygiene105` + Wave 1 & Wave 2 tech-debt trains (`agyv105train` + `agyv105w2train`): Sync all 4 hook twins and `_agy_hook_adapter.py` root mirror, and route `guard-bash-remote-gate-routing.py` telemetry to the canonical `terminal_guard.jsonl` spool.
+- Refresh the protocol development dependency floor and align the shipped remote-agent boundary pin with the WorkBay v0.1.105 orchestrator (`0.3.51`).
+
 ## [0.4.47] — 2026-11-26
 
 ### Changed

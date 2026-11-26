@@ -3729,11 +3729,13 @@ def _doctor_unharvested_agent_errors(target: Path) -> list[Finding]:
             ).fetchone()
             if table is None:
                 return []
-            total = conn.execute("SELECT COUNT(*) FROM agent_errors").fetchone()[0]
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(agent_errors)").fetchall()}
+            where_clause = " WHERE harvested_at IS NULL" if "harvested_at" in columns else ""
+            total = conn.execute(f"SELECT COUNT(*) FROM agent_errors{where_clause}").fetchone()[0]
             if not total:
                 return []
             top = conn.execute(
-                "SELECT error_class, COUNT(*) AS n FROM agent_errors"
+                f"SELECT error_class, COUNT(*) AS n FROM agent_errors{where_clause}"
                 " GROUP BY error_class ORDER BY n DESC, error_class ASC LIMIT 1"
             ).fetchone()
         finally:

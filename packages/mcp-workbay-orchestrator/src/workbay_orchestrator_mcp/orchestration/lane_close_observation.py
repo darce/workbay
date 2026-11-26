@@ -146,18 +146,28 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout
 
 
-def _lane_prefix(branch: str) -> str:
+def _lane_key(branch: str) -> str:
     name = re.sub(r"[^A-Za-z0-9-]", "-", branch.encode().decode("latin1"))[:40].lstrip("-") or "lane"
-    return f"refs/heads/{name}-{hashlib.sha256(branch.encode()).hexdigest()[:8]}-"
+    return f"{name}-{hashlib.sha256(branch.encode()).hexdigest()[:8]}"
 
 
-def _ref_rows(output: str, ref: str, prefix: str, exact: set[str]) -> dict[str, str]:
+def _lane_prefix(branch: str) -> str:
+    return f"refs/workbay/remote-agent/{_lane_key(branch)}-"
+
+
+def _lane_prefixes(branch: str) -> tuple[str, str]:
+    key = _lane_key(branch)
+    return (f"refs/workbay/remote-agent/{key}-", f"refs/heads/{key}-")
+
+
+def _ref_rows(output: str, ref: str, prefixes: str | tuple[str, ...], exact: set[str]) -> dict[str, str]:
+    prefix_tuple = (prefixes,) if isinstance(prefixes, str) else prefixes
     result = {}
     for line in output.splitlines():
         parts = line.split("\t")
         require(len(parts) == 2 and _matches(parts[0], OID), "ref_inventory_unavailable")
         oid, name = parts
-        if name == ref or name.startswith(prefix) or name in exact:
+        if name == ref or any(name.startswith(prefix) for prefix in prefix_tuple) or name in exact:
             result[name] = oid
     return result
 
@@ -228,11 +238,13 @@ def collect_git_inventory(
     from .adapters.remote_exec import _parse_remote_gate_env_line
 
     ref = "refs/heads/" + branch
-    prefix = _lane_prefix(branch)
+    prefixes = _lane_prefixes(branch)
+    prefix = prefixes[0]
+    prefix_globs = tuple(item + "*" for item in prefixes)
     _git(repo, "check-ref-format", ref)
-    local_args = ("for-each-ref", "--format=%(objectname)%09%(refname)", ref, prefix + "*", *sorted(dispatch_refs))
+    local_args = ("for-each-ref", "--format=%(objectname)%09%(refname)", ref, *prefix_globs, *sorted(dispatch_refs))
     local_output = _git(repo, *local_args)
-    local = _ref_rows(local_output, ref, prefix, dispatch_refs)
+    local = _ref_rows(local_output, ref, prefixes, dispatch_refs)
     if sources is not None:
         sources.append(_git_source(str(repo), local_args, local_output))
     checked = [{"store": str(repo), "refs": local}]
@@ -262,11 +274,11 @@ def collect_git_inventory(
         for url in urls:
             targets.setdefault(url, set()).add("git-remote:" + remote)
     for target, locators in sorted(targets.items()):
-        patterns = (ref, prefix + "*", *sorted(dispatch_refs))
+        patterns = (ref, *prefix_globs, *sorted(dispatch_refs))
         output = _git(repo, "ls-remote", "--refs", "--", target, *patterns)
         if sources is not None:
             sources.append(_git_source(", ".join(sorted(locators)), ("ls-remote", "--refs", "--", *patterns), output))
-        refs = _ref_rows(output, ref, prefix, dispatch_refs)
+        refs = _ref_rows(output, ref, prefixes, dispatch_refs)
         # Only the native worker receives attempt objects outside published refs.
         if object_stores is not None and "configured_remote_gate" in locators and not refs and not local:
             url = _git(repo, "ls-remote", "--get-url", "--", target).strip()
@@ -292,6 +304,7 @@ def collect_git_inventory(
         dispatch_ref_observations=checked,
         dispatch_ref_names=sorted({ref, *dispatch_refs}),
         dispatch_ref_prefix=prefix,
+        dispatch_ref_prefixes=list(prefixes),
     )
 
 
@@ -880,15 +893,17 @@ def collect_close_inventory(
             require(settlement.get("row") == row, "pass_settlement_unproven")
         native = receipt.get("native_dispatch")
         if native is not None:
-            prefix = _lane_prefix(closure.branch)
+            prefixes = _lane_prefixes(closure.branch)
             nonce = native.get("dispatch_nonce")
+            dispatch_ref = native.get("dispatch_ref")
             require(
                 isinstance(nonce, str)
                 and re.fullmatch(r"[0-9]+-[0-9a-f]{16}", nonce)
-                and native.get("dispatch_ref") == prefix + nonce,
+                and isinstance(dispatch_ref, str)
+                and any(dispatch_ref == prefix + nonce for prefix in prefixes),
                 "dispatch_ref_unproven",
             )
-            dispatch_refs.add(native["dispatch_ref"])
+            dispatch_refs.add(dispatch_ref)
             remote_required = True
         proof = receipt.get("source_task_subject")
         if proof is not None:
@@ -1752,10 +1767,14 @@ def _attributable_commits(
         reflogs = probe(reflog).split("\0")
         require(reflogs[-1] == "" and (len(reflogs) - 1) % 2 == 0, reason, locator=store.locator)
         lane_ref = "refs/heads/" + closure.branch
-        prefix = _lane_prefix(closure.branch)
+        prefixes = _lane_prefixes(closure.branch)
         for oid, selector in zip(reflogs[0:-1:2], reflogs[1:-1:2], strict=True):
             ref = selector.rpartition("@{")[0]
-            if oid != base and (ref == lane_ref or ref in dispatch_refs or ref.startswith(prefix)):
+            if oid != base and (
+                ref == lane_ref
+                or ref in dispatch_refs
+                or any(ref.startswith(prefix) for prefix in prefixes)
+            ):
                 raise CloseObservationHold("attributable_commit_present", locator=store.locator, commit=oid)
         fields = output.split("\0")
         require(fields[-1] == "" and (len(fields) - 1) % 3 == 0, reason, locator=store.locator)

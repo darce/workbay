@@ -35,6 +35,7 @@ SCOPE = "workbay/remote-main-publication@1"
 COMPLETION_SCOPE = "workbay/remote-main-publication-completion@2"
 GITHUB_POLICY = "github-public-exact-tag-absence@1"
 GITHUB_API_VERSION = "2022-11-28"
+GITHUB_MATCHING_REFS_LIMIT = 100
 
 
 class PublicationHeld(ValueError):
@@ -220,7 +221,7 @@ def _github_https_get(path):
         response = connection.getresponse()
         require(response.status in (200, 404), "remote_namespace_unknown:github_status")
         require(not any(response.getheader(k) for k in
-                        ("Location", "WWW-Authenticate", "Retry-After", "Content-Encoding")),
+                        ("Location", "WWW-Authenticate", "Retry-After", "Content-Encoding", "Link")),
                 "remote_namespace_unknown:github_response")
         remaining = response.getheader("X-RateLimit-Remaining", "")
         require(remaining.isdecimal() and int(remaining) > 0,
@@ -253,8 +254,13 @@ def github_get(path, deadline):
             [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve()), path],
             {"PATH": os.defpath, "LANG": "C.UTF-8"}, timeout=min(10, remaining))
         status, data = github_json(out)
-        require(type(status) is int and status in (200, 404) and isinstance(data, dict),
-                "remote_namespace_unknown:github_schema")
+        is_matching = "/git/matching-refs/" in path
+        require(
+            type(status) is int
+            and status in (200, 404)
+            and (isinstance(data, list) if (is_matching and status == 200) else isinstance(data, dict)),
+            "remote_namespace_unknown:github_schema",
+        )
         return status, data
     except (ValueError, OSError) as exc:
         raise PublicationHeld("remote_namespace_unknown:github_observation_failed") from exc
@@ -285,11 +291,56 @@ def reference_settings(repo, url):
     return settings
 
 
-def github_absent_tags(url, settings, missing):
+def _github_exact_tag_absent(provider, dest, deadline):
+    path = "/repos/" + provider["repository"] + "/git/ref/" + quote(dest[5:], safe="/")
+    status, data = github_get(path, deadline)
+    require(
+        isinstance(data, dict)
+        and status == 404
+        and data.get("message") == "Not Found"
+        and data.get("status") == "404"
+        and data.get("documentation_url") == "https://docs.github.com/rest/git/refs#get-a-reference"
+        and set(data) <= {"message", "status", "documentation_url"},
+        "remote_namespace_unknown:github_exact_absence_unproved:" + dest,
+    )
+
+
+def _github_batch_tags_absent(provider, missing, deadline):
+    """Prove absence for multiple tags in one bounded matching-refs call.
+
+    Fail closed on unexpected status/schema or present tags. If the returned
+    list reaches GITHUB_MATCHING_REFS_LIMIT (potential truncation), never
+    conclude absence from it; fall back to exact per-tag 404 proofs.
+    """
+    path = "/repos/" + provider["repository"] + "/git/matching-refs/tags/"
+    status, data = github_get(path, deadline)
+    require(
+        status == 200 and isinstance(data, list),
+        "remote_namespace_unknown:github_exact_absence_unproved:" + missing[0],
+    )
+    present = set()
+    for item in data:
+        require(isinstance(item, dict), "remote_namespace_unknown:github_schema")
+        ref = item.get("ref")
+        require(
+            isinstance(ref, str) and ref.startswith("refs/tags/") and ref not in present,
+            "remote_namespace_unknown:github_schema",
+        )
+        present.add(ref)
+    for dest in missing:
+        require(dest not in present, "remote_namespace_unknown:github_exact_absence_unproved:" + dest)
+    if len(data) >= GITHUB_MATCHING_REFS_LIMIT:
+        for dest in missing:
+            _github_exact_tag_absent(provider, dest, deadline)
+
+
+def github_absent_tags(url, settings, missing, *, _provider_verified=False):
     """Service contract proof, not inference from ref-object JSON shape.
 
-    Exact public repository accessibility and identity bracket exact 404s.
-    A 200 for an unadvertised ref is UNKNOWN, even with a plausible object.
+    Exact public repository accessibility and identity bracket exact absence
+    proofs. A 200 for an unadvertised ref is UNKNOWN, even with a plausible
+    object. Multiple missing tags use a single bounded matching-refs query
+    with fail-closed schema/truncation checks and exact-ref fallback.
     """
     provider = settings.get("reference_provider")
     if not provider:
@@ -297,17 +348,15 @@ def github_absent_tags(url, settings, missing):
             raise PublicationHeld("remote_namespace_unknown:destination_unadvertised:" + missing[0])
         return
     deadline = time.monotonic() + 30
-    require(provider == github_profile(url, deadline), "remote_namespace_unknown:github_identity_changed")
+    if not _provider_verified:
+        require(provider == github_profile(url, deadline), "remote_namespace_unknown:github_identity_changed")
     require(len(missing) <= 32, "remote_namespace_unknown:github_ref_limit")
     for dest in missing:
         require(dest.startswith("refs/tags/"), "remote_namespace_unknown:destination_unadvertised:" + dest)
-        path = "/repos/" + provider["repository"] + "/git/ref/" + quote(dest[5:], safe="/")
-        status, data = github_get(path, deadline)
-        require(status == 404 and data.get("message") == "Not Found"
-                and data.get("status") == "404"
-                and data.get("documentation_url") == "https://docs.github.com/rest/git/refs#get-a-reference"
-                and set(data) <= {"message", "status", "documentation_url"},
-                "remote_namespace_unknown:github_exact_absence_unproved:" + dest)
+    if len(missing) == 1:
+        _github_exact_tag_absent(provider, missing[0], deadline)
+    elif len(missing) > 1:
+        _github_batch_tags_absent(provider, missing, deadline)
     if missing:
         require(provider == github_profile(url, deadline), "remote_namespace_unknown:github_identity_changed")
 
@@ -532,7 +581,7 @@ def v2_refs(trace):
     return refs, symbolic
 
 
-def remote_refs(repo, identity, *, destinations=(), transport=None):
+def remote_refs(repo, identity, *, destinations=(), transport=None, _provider_verified=False):
     """Observe OIDs without discarding the receiver's symbolic mappings.
 
     Only direct destinations are supported. An OID lease does not bind a
@@ -542,7 +591,8 @@ def remote_refs(repo, identity, *, destinations=(), transport=None):
     absence service profile. Receiver admins must
     keep that namespace stable through receive-pack (see the contract).
     """
-    settings = transport if transport is not None else reference_settings(repo, identity["push_url"])
+    fresh_settings = transport is None
+    settings = reference_settings(repo, identity["push_url"]) if fresh_settings else transport
     network = identity["local_identity"] is None
     result = git(repo, "ls-remote", "--symref", identity["push_url"], transport=settings, packet_trace=network)
     if network:
@@ -584,7 +634,12 @@ def remote_refs(repo, identity, *, destinations=(), transport=None):
         else:
             require(not target, "symbolic_destination_unsupported:" + dest)
     if network:
-        github_absent_tags(identity["push_url"], settings, missing)
+        github_absent_tags(
+            identity["push_url"],
+            settings,
+            missing,
+            _provider_verified=_provider_verified or fresh_settings,
+        )
     return refs
 
 
@@ -646,14 +701,16 @@ def origin_tag_ref_sha(repo, identity, ref, *, transport=None):
     return refs.get(ref)
 
 
-def resolve_updates(repo, objects, remote=None, refspecs=None, *, transport=None):
+def resolve_updates(repo, objects, remote=None, refspecs=None, *, transport=None, _provider_verified=False):
     """Resolve supported Git routes before deciding authority; fail closed on
     wildcard/matching/deletion/force/duplicate/ambiguous routes. No push here.
     All supported sources must identify the checked export HEAD.
     """
     identity = remote_identity(repo, remote)
-    settings = transport if transport is not None else reference_settings(objects, identity["push_url"])
-    refs = remote_refs(objects, identity, transport=settings)
+    fresh_settings = transport is None
+    settings = reference_settings(objects, identity["push_url"]) if fresh_settings else transport
+    provider_verified = _provider_verified or fresh_settings
+    refs = remote_refs(objects, identity, transport=settings, _provider_verified=provider_verified)
     if refspecs is None:
         refspecs = identity["configured_push"]
         if not refspecs:
@@ -688,7 +745,13 @@ def resolve_updates(repo, objects, remote=None, refspecs=None, *, transport=None
         sha = git(objects, "rev-parse", "--verify", src + "^{commit}")
         require(sha == head, "only_checked_export_supported")
         result.append(dict(destination=dest, destination_kind="direct", new=sha, old=None))
-    refs = remote_refs(objects, identity, destinations=[u["destination"] for u in result], transport=settings)
+    refs = remote_refs(
+        objects,
+        identity,
+        destinations=[u["destination"] for u in result],
+        transport=settings,
+        _provider_verified=True,
+    )
     for update in result:
         update["old"] = refs.get(update["destination"])
     return identity, result
@@ -702,7 +765,9 @@ def prepare(repo, export, *, remote, refspecs, gate, release):
     source = source_identity(repo)
     identity = remote_identity(repo, remote)
     settings = reference_settings(export, identity["push_url"])
-    observed_identity, updates = resolve_updates(repo, export, remote, refspecs, transport=settings)
+    observed_identity, updates = resolve_updates(
+        repo, export, remote, refspecs, transport=settings, _provider_verified=True
+    )
     require(identity == observed_identity, "remote_configuration_changed")
     export_head = git(export, "rev-parse", "HEAD^{commit}")
     tree = git(export, "rev-parse", export_head + "^{tree}")

@@ -648,7 +648,13 @@ def _dispatch_errors_report(args: argparse.Namespace) -> dict:
     from .agent_errors_report import errors_report  # noqa: PLC0415
 
     sources = [Path(s) for s in args.sources] if args.sources else None
-    return errors_report(sources, since=args.since)
+    return errors_report(
+        sources,
+        since=args.since,
+        mark_harvested=bool(getattr(args, "mark_harvested", False)),
+        error_class=getattr(args, "error_class", None),
+        before=getattr(args, "before", None),
+    )
 
 
 def _dispatch_errors_export(args: argparse.Namespace) -> None:
@@ -1515,6 +1521,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="A handoff.db path or errors-export .jsonl bundle (repeatable).",
     )
     errors_report_parser.add_argument("--since", help="Keep rows with last_seen_at >= this timestamp.")
+    errors_report_parser.add_argument(
+        "--mark-harvested",
+        action="store_true",
+        help="Mark matching unharvested agent_errors rows as harvested and print a receipt.",
+    )
+    errors_report_parser.add_argument(
+        "--class",
+        dest="error_class",
+        default=None,
+        help="Optional error_class filter for --mark-harvested.",
+    )
+    errors_report_parser.add_argument(
+        "--before",
+        default=None,
+        help="Optional upper-bound timestamp (last_seen_at <= BEFORE) for --mark-harvested.",
+    )
     errors_export_parser = subparsers.add_parser(
         "errors-export",
         help=(
@@ -1630,9 +1652,9 @@ def _apply_embedding_env_for_config(config: RuntimeConfig) -> None:
         print(f"Warning: could not load .workbay/embedding.env: {exc!r}", file=sys.stderr)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config = RuntimeConfig.from_args(args)
     configure_runtime(config)
 

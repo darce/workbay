@@ -13,6 +13,7 @@ to empty reports.
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import os
 import shutil
 import socket
@@ -25,6 +26,20 @@ from typing import Any
 DEFAULT_MAX_AGE_H = 24.0
 DEFAULT_TMP_ROOT = Path("/tmp")
 DEV_TEMP_GLOB = "workbay-*"
+DEFAULT_UNRECOGNIZED_MIN_BYTES = 50 * 1024 * 1024
+_UNRECOGNIZED_MAX_ENTRIES = 100_000
+_SYSTEM_TMP_EXACT = frozenset({"lost+found", "snap-private-tmp"})
+_SYSTEM_TMP_PREFIXES = (
+    ".",
+    "com.apple.",
+    "systemd-private-",
+    "ssh-",
+    "tmux-",
+    "orbit-",
+    "pulse-",
+    "gpg-",
+    "dbus-",
+)
 # Repo-relative second root. Everything directly under it is a candidate: the
 # entries are task refs, not a ``workbay-*`` naming convention.
 SCRATCH_RELATIVE = (".workbay", "scratch")
@@ -366,3 +381,152 @@ def _empty_report(
         "errors": [error] if error else [],
         "stale_count": 0,
     }
+
+
+def _is_system_tmp_dir(name: str) -> bool:
+    return name in _SYSTEM_TMP_EXACT or name.startswith(_SYSTEM_TMP_PREFIXES)
+
+
+def _bounded_dir_bytes(root: Path, *, max_entries: int = _UNRECOGNIZED_MAX_ENTRIES) -> int:
+    """Compute bounded byte size of ``root`` without ever following symlinks."""
+    total = 0
+    seen = 0
+    stack: list[Path] = [root]
+    while stack and seen < max_entries:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for child in it:
+                    seen += 1
+                    if seen > max_entries:
+                        break
+                    try:
+                        if child.is_symlink():
+                            continue
+                        if child.is_dir(follow_symlinks=False):
+                            stack.append(Path(child.path))
+                        elif child.is_file(follow_symlinks=False):
+                            total += child.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def report_unrecognized_tmp_trees(
+    tmp_root: Path | str | None = None,
+    *,
+    min_bytes: int = DEFAULT_UNRECOGNIZED_MIN_BYTES,
+    max_entries_per_tree: int = _UNRECOGNIZED_MAX_ENTRIES,
+) -> list[dict[str, object]]:
+    """Report large unrecognized direct-child directories under ``tmp_root``.
+
+    Fail-closed ([OBS-08], [RES-07], [SECD-05]): skips symlinks, skips
+    recognized ``workbay-*`` trees and system directories, computes bounded
+    directory size and mtime age without following symlinks, and returns
+    entries ``>= min_bytes`` sorted descending by ``bytes``. Never deletes
+    anything and never raises.
+    """
+    try:
+        root = _resolve_tmp_root(tmp_root)
+        if not root.is_dir():
+            return []
+        root_real = root.resolve()
+    except Exception:  # noqa: BLE001 -- fail-closed, never-raise
+        return []
+
+    try:
+        threshold = max(0, int(min_bytes))
+    except (TypeError, ValueError):
+        threshold = DEFAULT_UNRECOGNIZED_MIN_BYTES
+
+    try:
+        entry_cap = max(1, int(max_entries_per_tree))
+    except (TypeError, ValueError):
+        entry_cap = _UNRECOGNIZED_MAX_ENTRIES
+
+    now = time.time()
+    results: list[dict[str, object]] = []
+    try:
+        with os.scandir(root) as it:
+            entries = list(it)
+    except OSError:
+        return []
+
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            name = entry.name
+            if fnmatch.fnmatch(name, DEV_TEMP_GLOB) or _is_system_tmp_dir(name):
+                continue
+            entry_path = Path(entry.path)
+            real = entry_path.resolve()
+            if real == root_real or real.parent != root_real:
+                continue
+            size_bytes = _bounded_dir_bytes(entry_path, max_entries=entry_cap)
+            if size_bytes < threshold:
+                continue
+            mtime = entry.stat(follow_symlinks=False).st_mtime
+            age_seconds = max(0.0, round(now - mtime, 3))
+            results.append(
+                {
+                    "name": name,
+                    "path": str(entry_path),
+                    "bytes": size_bytes,
+                    "age_seconds": age_seconds,
+                }
+            )
+        except Exception:  # noqa: BLE001 -- per-entry degrade, never-raise
+            continue
+
+    results.sort(key=lambda item: (-int(item["bytes"]), str(item["name"])))
+    return results
+
+
+def reap_and_report_host_tmp(
+    *,
+    apply: bool = False,
+    max_age_h: float | int | str | None = DEFAULT_MAX_AGE_H,
+    tmp_root: Path | str | None = None,
+    repo: Path | str | None = None,
+    scope: str = "lifecycle",
+    min_unrecognized_bytes: int = DEFAULT_UNRECOGNIZED_MIN_BYTES,
+) -> dict[str, Any]:
+    """Reap stale recognized dev temp trees and report unrecognized large trees.
+
+    Defaults to ``scope="lifecycle"`` so automatic epilogues never delete
+    ambient ``/tmp/workbay-*`` trees; explicit operator callers may pass
+    ``scope="operator"``. Combines ``reap_stale_dev_temp`` and
+    ``report_unrecognized_tmp_trees`` without ever following symlinks or
+    deleting unrecognized trees. Never raises.
+    """
+    try:
+        reap_report = reap_stale_dev_temp(
+            apply=apply,
+            max_age_h=max_age_h,
+            tmp_root=tmp_root,
+            repo=repo,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never-raise
+        reap_report = _empty_report(
+            apply=apply,
+            max_age_h=_coerce_max_age_h(max_age_h),
+            tmp_root=str(tmp_root) if tmp_root is not None else None,
+            error=str(exc),
+        )
+    try:
+        unrecognized = report_unrecognized_tmp_trees(
+            tmp_root,
+            min_bytes=min_unrecognized_bytes,
+        )
+    except Exception:  # noqa: BLE001 -- never-raise
+        unrecognized = []
+    combined = dict(reap_report)
+    combined["unrecognized_tmp_trees"] = unrecognized
+    combined["unrecognized_count"] = len(unrecognized)
+    return combined

@@ -437,6 +437,316 @@ def _bind_detached_transport(begin):
     return bound
 
 
+def _state_dir_for_remote_exec(orchestrator_root: Path, env: Mapping[str, str] | None = None) -> Path:
+    """Resolve the handoff state directory for remote job ledger lookups."""
+    state_dir_value = str((env or {}).get("WORKBAY_HANDOFF_STATE_DIR") or "").strip()
+    if not state_dir_value:
+        state_dir_value = str(os.environ.get("WORKBAY_HANDOFF_STATE_DIR") or "").strip()
+    if state_dir_value:
+        state_dir = Path(state_dir_value).expanduser()
+        if not state_dir.is_absolute():
+            state_dir = Path(orchestrator_root) / state_dir
+        return state_dir
+    try:
+        from workbay_handoff_mcp.runtime import (  # noqa: PLC0415
+            RuntimeNotConfiguredError,
+            get_runtime_config,
+        )
+    except ImportError:
+        return Path(orchestrator_root) / ".task-state"
+    try:
+        return Path(get_runtime_config().state_dir)
+    except RuntimeNotConfiguredError:
+        return Path(orchestrator_root) / ".task-state"
+
+
+def _lookup_persisted_job_record(state_dir: Path, job_id: str) -> dict[str, Any] | None:
+    """Read an existing ledger record for ``job_id``, returning None only when absent."""
+    try:
+        return RemoteJobLedger(state_dir / "remote-jobs").read_job(job_id)
+    except RemoteJobLedgerError as exc:
+        if exc.reason == "job_not_found":
+            return None
+        raise
+    except FileNotFoundError:
+        return None
+
+
+def _selection_from_persisted_stamp(
+    stamp: Any,
+    *,
+    fallback_backend: str,
+    fallback_root: Path | str,
+):
+    """Parse an immutable submit-time mode stamp into a RemoteExecSelection."""
+    from ..remote_exec_mode import RemoteExecSelection  # noqa: PLC0415
+
+    valid_sources = ("environment", "per_backend", "config_default", "builtin_default")
+    if isinstance(stamp, Mapping):
+        mode = stamp.get("mode")
+        if mode not in ("attached", "detached"):
+            return None
+        stamp_backend = stamp.get("backend_id")
+        backend_id = stamp_backend if isinstance(stamp_backend, str) and stamp_backend else fallback_backend
+        raw_source = stamp.get("source")
+        source = raw_source if raw_source in valid_sources else "builtin_default"
+        raw_root = stamp.get("repo_root")
+        repo_root = Path(raw_root).resolve() if isinstance(raw_root, str) and raw_root else Path(fallback_root).resolve()
+        raw_identity = stamp.get("config_identity")
+        config_identity = raw_identity if isinstance(raw_identity, str) else None
+        return RemoteExecSelection(
+            mode=mode,
+            backend_id=backend_id,
+            source=source,
+            repo_root=repo_root,
+            config_identity=config_identity,
+        )
+    if stamp in ("attached", "detached"):
+        return RemoteExecSelection(
+            mode=stamp,
+            backend_id=fallback_backend,
+            source="builtin_default",
+            repo_root=Path(fallback_root).resolve(),
+            config_identity=None,
+        )
+    return None
+
+
+def resolve_persisted_remote_exec_selection(
+    job_record: Mapping[str, Any] | None,
+    pass_state: Mapping[str, Any] | None = None,
+    *,
+    expected_job_id: str | None = None,
+    backend_id: str,
+    repo_root: Path | str,
+) -> tuple[Any, str | None]:
+    """Read submit-time execution mode from persisted records once a job_id exists.
+
+    Never reads current environment variables or repository policy. Unstamped
+    legacy records may be adopted only from durable submit-time evidence bound
+    to the same job identity; otherwise returns ``(None, "submit_mode_unknown")``
+    so callers retain custody for operator diagnosis.
+    """
+    from ..remote_exec_mode import RemoteExecSelection  # noqa: PLC0415
+
+    spec = job_record.get("spec") if isinstance(job_record, Mapping) else None
+    spec_backend = str(spec.get("backend") or backend_id) if isinstance(spec, Mapping) else backend_id
+    if isinstance(spec, Mapping) and "remote_exec_mode" in spec and spec["remote_exec_mode"] is not None:
+        selection = _selection_from_persisted_stamp(
+            spec["remote_exec_mode"],
+            fallback_backend=spec_backend,
+            fallback_root=repo_root,
+        )
+        if selection is not None:
+            return selection, None
+        return None, "submit_mode_unknown"
+
+    if isinstance(pass_state, Mapping):
+        bound_job = expected_job_id is None or pass_state.get("job_id") == expected_job_id
+        if bound_job:
+            pass_stamp = pass_state.get("remote_exec_selection")
+            if pass_stamp is not None:
+                selection = _selection_from_persisted_stamp(
+                    pass_stamp,
+                    fallback_backend=spec_backend,
+                    fallback_root=repo_root,
+                )
+                if selection is not None:
+                    return selection, None
+                return None, "submit_mode_unknown"
+            exec_mode = pass_state.get("execution_mode")
+            if exec_mode in ("attached", "detached"):
+                return (
+                    RemoteExecSelection(
+                        mode=exec_mode,
+                        backend_id=spec_backend,
+                        source="builtin_default",
+                        repo_root=Path(repo_root).resolve(),
+                        config_identity=None,
+                    ),
+                    None,
+                )
+            pass_result = pass_state.get("result")
+            if isinstance(pass_result, Mapping):
+                result_stamp = pass_result.get("remote_exec_selection")
+                if result_stamp is None:
+                    result_stamp = pass_result.get("remote_exec_mode")
+                if result_stamp is not None:
+                    selection = _selection_from_persisted_stamp(
+                        result_stamp,
+                        fallback_backend=spec_backend,
+                        fallback_root=repo_root,
+                    )
+                    if selection is not None:
+                        return selection, None
+                if (
+                    pass_result.get("outcome") == "remote_job_pending"
+                    and (expected_job_id is None or pass_result.get("job_id") == expected_job_id)
+                ):
+                    return (
+                        RemoteExecSelection(
+                            mode="detached",
+                            backend_id=spec_backend,
+                            source="builtin_default",
+                            repo_root=Path(repo_root).resolve(),
+                            config_identity=None,
+                        ),
+                        None,
+                    )
+            detached_collection = pass_state.get("detached_collection")
+            if (
+                isinstance(detached_collection, Mapping)
+                and expected_job_id is not None
+                and detached_collection.get("job_id") == expected_job_id
+            ):
+                return (
+                    RemoteExecSelection(
+                        mode="detached",
+                        backend_id=spec_backend,
+                        source="builtin_default",
+                        repo_root=Path(repo_root).resolve(),
+                        config_identity=None,
+                    ),
+                    None,
+                )
+
+    if isinstance(spec, Mapping) and "plan_review_binding" in spec:
+        return (
+            RemoteExecSelection(
+                mode="detached",
+                backend_id=spec_backend,
+                source="builtin_default",
+                repo_root=Path(repo_root).resolve(),
+                config_identity=None,
+            ),
+            None,
+        )
+
+    return None, "submit_mode_unknown"
+
+
+def _collect_finished_persisted_job_result(
+    *,
+    job_record: Mapping[str, Any],
+    persisted_selection: Any,
+    state_dir: Path,
+    worktree_path: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    backend_id: str,
+    effective_model: str | None,
+    applied_effort: str | None,
+) -> BackendResult:
+    """Collect a finished persisted job (attached or detached) without resubmitting."""
+    spec = job_record.get("spec")
+    spec = spec if isinstance(spec, Mapping) else {}
+    job_id = str(spec.get("job_id") or "")
+    attempt = spec.get("attempt", 0)
+    argv = list(spec.get("argv") or [])
+    result_arg = _argv_value(argv, "--result-out")
+    debug_arg = _argv_value(argv, "--debug-out")
+    stream_arg = _argv_value(argv, "--stream-out")
+
+    def _resolve_artifact(arg: str | None) -> Path | None:
+        if not arg:
+            return None
+        path = Path(arg).expanduser()
+        return path if path.is_absolute() else worktree_path / path
+
+    result_file = _resolve_artifact(result_arg)
+    debug_file = _resolve_artifact(debug_arg)
+    stream_file = _resolve_artifact(stream_arg)
+
+    if (
+        result_file is not None
+        and not result_file.is_file()
+        and job_record.get("stage") == "done"
+        and len(argv) >= 2
+        and argv[1] == "build"
+    ):
+        identity = RemoteJobIdentity(
+            task_ref=str(spec.get("task_ref") or ""),
+            lane_id=str(spec.get("lane_id") or ""),
+            pass_id=str(spec.get("pass_id") or ""),
+            attempt=int(attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) else 0,
+        )
+        collect_env = {**dict(env), **identity.to_env()}
+        collected = remote_job_runner.collect_only(
+            argv,
+            cwd=str(worktree_path),
+            env=collect_env,
+            timeout=max(1.0, float(timeout)),
+        )
+        if collected.returncode != 0:
+            return _attribute_refusal(
+                BackendResult(
+                    handoff_action="needs_guidance",
+                    summary=f"{backend_id} could not collect finished job {job_id}",
+                    details=(collected.stderr or "").strip() or f"collect exited rc={collected.returncode}",
+                    merge_ready=False,
+                    blockers=["persisted_job_collection_failed"],
+                    response_model=effective_model,
+                    reasoning_effort=applied_effort,
+                    raw_payload=_typed_payload(
+                        {
+                            "failure_reason": "persisted_job_collection_failed",
+                            "retryable": True,
+                            "job_id": job_id,
+                            "attempt": attempt,
+                            "remote_exec_mode": persisted_selection.mode,
+                            "remote_exec_selection": persisted_selection.to_mapping(),
+                        }
+                    ),
+                ),
+                backend_id=backend_id,
+            )
+
+    backend_result = _result_from_json(result_file) if result_file is not None else None
+    if backend_result is None:
+        return _attribute_refusal(
+            BackendResult(
+                handoff_action="needs_guidance",
+                summary=f"{backend_id} finished job {job_id} has no readable result artifact",
+                details="The persisted job result artifact was absent or unreadable.",
+                merge_ready=False,
+                blockers=["persisted_result_unavailable"],
+                response_model=effective_model,
+                reasoning_effort=applied_effort,
+                raw_payload=_typed_payload(
+                    {
+                        "failure_reason": "persisted_result_unavailable",
+                        "retryable": True,
+                        "job_id": job_id,
+                        "attempt": attempt,
+                        "remote_exec_mode": persisted_selection.mode,
+                        "remote_exec_selection": persisted_selection.to_mapping(),
+                    }
+                ),
+            ),
+            backend_id=backend_id,
+        )
+
+    backend_result = _stamp_backend_result_token_usage(
+        backend_result,
+        debug_file=debug_file,
+        stream_file=stream_file,
+        backend_id=backend_id,
+    )
+    raw = dict(backend_result.raw_payload) if isinstance(backend_result.raw_payload, Mapping) else {}
+    raw.update(
+        {
+            "job_id": job_id,
+            "attempt": attempt,
+            "remote_exec_mode": persisted_selection.mode,
+            "remote_exec_selection": persisted_selection.to_mapping(),
+            "collected_from_persisted_job": True,
+        }
+    )
+    if job_record.get("stage") == "done":
+        RemoteJobLedger(state_dir / "remote-jobs").mark_completed(job_id)
+    return replace(backend_result, raw_payload=raw)
+
+
 @_bind_detached_transport
 def _detached_begin_result(
     *,
@@ -460,6 +770,47 @@ def _detached_begin_result(
     )
     from ..remote_job_ledger import SubmitPreparationTimeout
 
+    state_dir = _state_dir_for_remote_exec(orchestrator_root, env)
+    existing_job = _lookup_persisted_job_record(state_dir, identity.job_id)
+    if existing_job is not None:
+        persisted_selection, persisted_err = resolve_persisted_remote_exec_selection(
+            existing_job,
+            None,
+            expected_job_id=identity.job_id,
+            backend_id=backend_id,
+            repo_root=orchestrator_root,
+        )
+        if persisted_err is not None:
+            return BackendResult(
+                handoff_action="needs_guidance",
+                summary=f"{backend_id} retained custody: submit-time execution mode is unknown",
+                details="Existing job record has no submit-time remote_exec_mode stamp or bound submit evidence.",
+                blockers=[persisted_err],
+                raw_payload={
+                    "failure_reason": persisted_err,
+                    "reason": persisted_err,
+                    "job_id": identity.job_id,
+                    "attempt": identity.attempt,
+                    "typed_outcome": True,
+                },
+            )
+        if persisted_selection.mode != "detached":
+            return BackendResult(
+                handoff_action="needs_guidance",
+                summary=f"{backend_id} refused detached begin for persisted {persisted_selection.mode} job",
+                details=f"Job {identity.job_id} was submitted in {persisted_selection.mode} mode.",
+                blockers=["submit_mode_conflict"],
+                raw_payload={
+                    "failure_reason": "submit_mode_conflict",
+                    "job_id": identity.job_id,
+                    "attempt": identity.attempt,
+                    "remote_exec_mode": persisted_selection.mode,
+                    "remote_exec_selection": persisted_selection.to_mapping(),
+                    "typed_outcome": True,
+                },
+            )
+        remote_exec_selection = persisted_selection.to_mapping()
+
     try:
         if remote_exec_selection is None:
             selection = current_remote_exec_selection(backend_id, repo_root=orchestrator_root)
@@ -477,24 +828,6 @@ def _detached_begin_result(
     lock_deadline = time.monotonic() + max(0.0, timeout)
     if deadline is not None:
         lock_deadline = min(lock_deadline, deadline)
-    state_dir_value = str(env.get("WORKBAY_HANDOFF_STATE_DIR") or "").strip()
-    if state_dir_value:
-        state_dir = Path(state_dir_value).expanduser()
-        if not state_dir.is_absolute():
-            state_dir = Path(orchestrator_root) / state_dir
-    else:
-        try:
-            from workbay_handoff_mcp.runtime import (  # noqa: PLC0415
-                RuntimeNotConfiguredError,
-                get_runtime_config,
-            )
-        except ImportError:
-            state_dir = Path(orchestrator_root) / ".task-state"
-        else:
-            try:
-                state_dir = Path(get_runtime_config().state_dir)
-            except RuntimeNotConfiguredError:
-                state_dir = Path(orchestrator_root) / ".task-state"
     if refresh_clocks is not None:
         try:
             timeout = refresh_clocks(command)
@@ -765,9 +1098,17 @@ def _detached_begin_result(
                     "resumable_reason": "remote_job_pending",
                     "job_id": identity.job_id,
                     "attempt": identity.attempt,
+                    "pass_id": identity.pass_id,
+                    "task_ref": identity.task_ref,
+                    "lane_id": identity.lane_id,
                     "unit": unit.strip(),
                     "remote_state": state,
                     "remote_exec_mode": "detached",
+                    **(
+                        {"remote_exec_selection": dict(remote_exec_selection)}
+                        if isinstance(remote_exec_selection, Mapping)
+                        else {}
+                    ),
                 },
             )
     close_rc = int(completed.returncode)
@@ -9124,44 +9465,115 @@ class RemoteExecAdapter(BackendAdapter):
         )
 
         mode_repo_root = Path(kwargs.get("orchestrator_root") or worktree_path)
-        try:
-            mode_selection = kwargs.get("remote_exec_selection") or current_remote_exec_selection(
-                self.backend_id,
+        persisted_state_dir: Path | None = None
+        persisted_job: dict[str, Any] | None = None
+        persisted_job_id: str | None = None
+        raw_explicit_job_id = kwargs.get("job_id")
+        if isinstance(raw_explicit_job_id, str) and raw_explicit_job_id.strip():
+            persisted_job_id = raw_explicit_job_id.strip()
+        elif kwargs.get("orchestrator_root") is not None:
+            raw_id_fields = [kwargs.get(key) for key in ("task_ref", "lane_id", "pass_id")]
+            if all(isinstance(value, str) and value.strip() for value in raw_id_fields):
+                attempt_token = str(mode_env.get("WORKBAY_REMOTE_JOB_ATTEMPT", "0"))
+                if re.fullmatch(r"[0-9]+", attempt_token):
+                    persisted_job_id = RemoteJobIdentity(
+                        *(value.strip() for value in raw_id_fields),
+                        int(attempt_token),
+                    ).job_id
+        if persisted_job_id is not None:
+            persisted_state_dir = _state_dir_for_remote_exec(mode_repo_root, mode_env)
+            try:
+                persisted_job = _lookup_persisted_job_record(persisted_state_dir, persisted_job_id)
+            except (OSError, RemoteJobLedgerError):
+                persisted_job = None
+
+        if persisted_job is not None:
+            persisted_selection, persisted_err = resolve_persisted_remote_exec_selection(
+                persisted_job,
+                None,
+                expected_job_id=persisted_job_id,
+                backend_id=self.backend_id,
                 repo_root=mode_repo_root,
             )
-            if mode_selection is not None and (
-                mode_selection.backend_id != self.backend_id or mode_selection.repo_root != mode_repo_root.resolve()
+            if persisted_err is not None:
+                return _attribute_refusal(
+                    BackendResult(
+                        handoff_action="needs_guidance",
+                        summary=f"{self.backend_id} retained custody: submit-time execution mode is unknown",
+                        details="Persisted job record has no submit-time remote_exec_mode stamp or bound submit evidence.",
+                        merge_ready=False,
+                        blockers=[persisted_err],
+                        response_model=effective_model,
+                        reasoning_effort=applied_effort,
+                        raw_payload=_typed_payload(
+                            {
+                                REFUSAL_CAUSE_KEY: POLICY_OR_CLASSIFIER_REFUSAL,
+                                "failure_reason": persisted_err,
+                                "reason": persisted_err,
+                                "job_id": persisted_job_id,
+                            }
+                        ),
+                    ),
+                    backend_id=self.backend_id,
+                    constructor_refusal=True,
+                )
+            mode_selection = persisted_selection
+            if (
+                persisted_job.get("stage") in {"done", "completed"}
+                and persisted_job.get("rc") == 0
+                and kwargs.get("detached_pass_begin") is not True
+                and persisted_state_dir is not None
             ):
-                raise RemoteExecModeError("remote execution selection differs from the adapter repository/backend")
-            if mode_selection is None:
-                mode_selection = resolve_remote_exec_mode(
+                return _collect_finished_persisted_job_result(
+                    job_record=persisted_job,
+                    persisted_selection=persisted_selection,
+                    state_dir=persisted_state_dir,
+                    worktree_path=worktree_path,
+                    env=mode_env,
+                    timeout=float(getattr(self, "_timeout", None) or persisted_job.get("spec", {}).get("bound_seconds") or 60),
+                    backend_id=self.backend_id,
+                    effective_model=effective_model,
+                    applied_effort=applied_effort,
+                )
+        else:
+            try:
+                mode_selection = kwargs.get("remote_exec_selection") or current_remote_exec_selection(
                     self.backend_id,
                     repo_root=mode_repo_root,
-                    effective_env=mode_env,
                 )
-        except RemoteExecModeError as exc:
-            invalid_mode = str(getattr(exc, "value", str(exc)))
-            summary = f"{self.backend_id} refused unknown WORKBAY_REMOTE_EXEC_MODE"
-            return _attribute_refusal(
-                BackendResult(
-                    handoff_action="needs_guidance",
-                    summary=summary,
-                    details=_refusal_details(str(exc)),
-                    merge_ready=False,
-                    blockers=["invalid_remote_exec_mode"],
-                    response_model=effective_model,
-                    reasoning_effort=applied_effort,
-                    raw_payload=_typed_payload(
-                        {
-                            REFUSAL_CAUSE_KEY: POLICY_OR_CLASSIFIER_REFUSAL,
-                            "failure_reason": "invalid_remote_exec_mode",
-                            "remote_exec_mode": invalid_mode,
-                        }
+                if mode_selection is not None and (
+                    mode_selection.backend_id != self.backend_id or mode_selection.repo_root != mode_repo_root.resolve()
+                ):
+                    raise RemoteExecModeError("remote execution selection differs from the adapter repository/backend")
+                if mode_selection is None:
+                    mode_selection = resolve_remote_exec_mode(
+                        self.backend_id,
+                        repo_root=mode_repo_root,
+                        effective_env=mode_env,
+                    )
+            except RemoteExecModeError as exc:
+                invalid_mode = str(getattr(exc, "value", str(exc)))
+                summary = f"{self.backend_id} refused unknown WORKBAY_REMOTE_EXEC_MODE"
+                return _attribute_refusal(
+                    BackendResult(
+                        handoff_action="needs_guidance",
+                        summary=summary,
+                        details=_refusal_details(str(exc)),
+                        merge_ready=False,
+                        blockers=["invalid_remote_exec_mode"],
+                        response_model=effective_model,
+                        reasoning_effort=applied_effort,
+                        raw_payload=_typed_payload(
+                            {
+                                REFUSAL_CAUSE_KEY: POLICY_OR_CLASSIFIER_REFUSAL,
+                                "failure_reason": "invalid_remote_exec_mode",
+                                "remote_exec_mode": invalid_mode,
+                            }
+                        ),
                     ),
-                ),
-                backend_id=self.backend_id,
-                constructor_refusal=True,
-            )
+                    backend_id=self.backend_id,
+                    constructor_refusal=True,
+                )
         remote_exec_mode = mode_selection.mode
         remote_exec_selection = mode_selection.to_mapping()
         if progress_callback is not None:
@@ -11821,12 +12233,28 @@ class RemoteExecAdapter(BackendAdapter):
                                     command.deadline = time.monotonic() + local_timeout
                                 dispatch_started = True
                                 if remote_exec_mode == "detached":
-                                    completed = remote_job_runner.run_detached(
-                                        command,
-                                        cwd=str(worktree_path),
-                                        env=run_env,
-                                        timeout=local_timeout,
-                                    )
+                                    if persisted_job is not None and persisted_job.get("stage") in {"intent", "submitted"}:
+                                        completed = remote_job_runner.resume_pending(
+                                            command,
+                                            cwd=str(worktree_path),
+                                            env=run_env,
+                                            timeout=local_timeout,
+                                        )
+                                        if (
+                                            completed.returncode == 0
+                                            and persisted_state_dir is not None
+                                            and persisted_job_id is not None
+                                        ):
+                                            ledger = RemoteJobLedger(persisted_state_dir / "remote-jobs")
+                                            ledger.mark_done(persisted_job_id, 0)
+                                            ledger.mark_completed(persisted_job_id)
+                                    else:
+                                        completed = remote_job_runner.run_detached(
+                                            command,
+                                            cwd=str(worktree_path),
+                                            env=run_env,
+                                            timeout=local_timeout,
+                                        )
                                 else:
                                     completed = runner(
                                         command, cwd=str(worktree_path), env=run_env, timeout=local_timeout

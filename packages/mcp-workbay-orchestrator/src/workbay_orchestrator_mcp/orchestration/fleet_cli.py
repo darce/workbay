@@ -366,6 +366,10 @@ def workbay_front_door(argv=None) -> int:
         return _tree_command(argv[1:])
     if argv[:1] == ["checklist"]:
         return _checklist_command(argv[1:])
+    if argv[:1] == ["watch"]:
+        from . import fleet_watch
+
+        return fleet_watch.main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="workbay fleet",
         description="Launch graphical Fleet with read-only VM inventory; use --json or --text for finite output.",
