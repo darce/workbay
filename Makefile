@@ -504,6 +504,22 @@ statechart-render: ## Regenerate the lifecycle statechart Markdown + Mermaid doc
 statechart-check: ## Fail (exit 1) when the generated statechart docs drift from the chart
 	.venv/bin/python -m workbay_orchestrator_mcp.orchestration.statechart_render --check
 
+TLA_PIN ?= config/tla/tla2tools.pin.json
+TLA_JAVA ?= java
+TLA_DIR := docs/specs/tla
+
+.PHONY: tla-generate
+tla-generate: ## Regenerate the chart TLA+ modules and cfgs in docs/specs/tla from lifecycle_statechart.json
+	.venv/bin/python -m workbay_orchestrator_mcp.orchestration.statechart_tla --out $(TLA_DIR)
+
+.PHONY: tla-drift-check
+tla-drift-check: ## Fail (exit 1) when generated TLA+ modules drift from the chart (python only, no java)
+	.venv/bin/python -m workbay_orchestrator_mcp.orchestration.statechart_tla --out $(TLA_DIR) --check
+
+.PHONY: tla-check
+tla-check: tla-drift-check ## TLC on every cfg vs expected_verdicts.json with the pinned jar (exit 2 = tlc_unavailable, 3 = refused; never PASS without TLC)
+	.venv/bin/python scripts/check_tla.py --pin $(TLA_PIN) --specs $(TLA_DIR) --expected $(TLA_DIR)/expected_verdicts.json --scratch .task-state/tla/scratch --java $(TLA_JAVA) --report .task-state/tla/tla-check.json
+
 .PHONY: lane-supersede
 lane-supersede: ## Preview a supersede tombstone; pass SUPERSEDE_ARGS="--apply --plan-digest <hex> --branch X --superseded-by SHA --integration-ref REF [--allow-main]" to apply a reviewed plan.
 	.venv/bin/python -m workbay_orchestrator_mcp.orchestration.lane_tombstone $(SUPERSEDE_ARGS)

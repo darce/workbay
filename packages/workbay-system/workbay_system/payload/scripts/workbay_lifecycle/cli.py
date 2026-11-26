@@ -13,6 +13,9 @@ Three handler categories live here:
 * :data:`SHELL_OUT_HANDLERS` — ``review-run``, ``handoff-review-run``,
   and ``handoff-close-check`` shell out to the matching
   ``mcp-workbay-handoff`` subcommand and propagate its exit code.
+
+:data:`READ_ONLY_COMMANDS` names the orientation and readiness commands that
+dispatch without the maintenance and projection write paths.
 """
 
 from __future__ import annotations
@@ -64,6 +67,40 @@ SHELL_OUT_HANDLERS: tuple[str, ...] = (
     "handoff-close-check",
     "handoff-set",
 )
+
+# The remote-only routing hook admits these as read-only make goals, so their
+# dispatch must write nothing on its own: no spool or dead-letter drain, no
+# session heartbeat write or GC, no stale-row reap (a detached
+# ``task-reap --apply``) and no projection preflight, whose probe can rewrite
+# breaker state. Every other command keeps the maintenance cadence.
+# ``compaction-status`` keeps the same contract here, although its Make recipe
+# reaches the handoff compaction CLI rather than this dispatcher. A command
+# whose handler body writes or dispatches a maintaining child does not belong
+# here: ``handoff-close-check`` (child ``close-check`` dispatch) and ``context``
+# (spool replays and scratch reap) keep the maintenance cadence (gate rel93g140).
+READ_ONLY_COMMANDS: frozenset[str] = frozenset(
+    {
+        "compaction-status",
+        "review-ready",
+        "status",
+        "task-reap",
+        "tasks",
+    }
+)
+
+
+def is_read_only_dispatch(command: str, rest: Sequence[str]) -> bool:
+    """True when this invocation skips every maintenance and projection write path.
+
+    ``task-reap`` is read-only only as a dry run. argparse accepts any
+    unambiguous prefix of ``--apply`` and ``--apply`` is its only ``--a``
+    option, so every ``--a`` word counts as an apply request.
+    """
+    if command not in READ_ONLY_COMMANDS:
+        return False
+    if command == "task-reap":
+        return not any(str(arg).startswith("--a") for arg in rest)
+    return True
 
 
 def _emit_stub(name: str, owning_slice: str) -> int:
@@ -317,6 +354,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
+def _run_maintenance(command: str) -> dict | None:
+    """Run the drains, heartbeat, stale-row reap and projection preflight for one command.
+
+    Returns the preflight refusal receipt, or None to continue the dispatch.
+    """
+    from handlers import _common as common_mod  # noqa: PLC0415
+
+    common_mod.maybe_auto_drain_projection_spool(command)
+    common_mod.maybe_auto_drain_dead_letter(command)
+    repo = resolver.repo_root()
+    if repo is None:
+        return None
+    import session_heartbeat as session_heartbeat_mod  # noqa: PLC0415
+
+    session_heartbeat_mod.touch_heartbeat(repo)
+    session_heartbeat_mod.gc_heartbeats(repo)
+    common_mod.maybe_auto_reap_stale_rows(command)
+    return projection_queue.projection_preflight(repo, command)
+
+
 def _dispatch(argv: Sequence[str] | None = None) -> int:
     raw = list(argv) if argv is not None else sys.argv[1:]
     if not raw:
@@ -325,18 +382,8 @@ def _dispatch(argv: Sequence[str] | None = None) -> int:
 
     command, rest = raw[0], raw[1:]
 
-    from handlers import _common as common_mod  # noqa: PLC0415
-
-    common_mod.maybe_auto_drain_projection_spool(command)
-    common_mod.maybe_auto_drain_dead_letter(command)
-    repo = resolver.repo_root()
-    if repo is not None:
-        import session_heartbeat as session_heartbeat_mod  # noqa: PLC0415
-
-        session_heartbeat_mod.touch_heartbeat(repo)
-        session_heartbeat_mod.gc_heartbeats(repo)
-        common_mod.maybe_auto_reap_stale_rows(command)
-        preflight_receipt = projection_queue.projection_preflight(repo, command)
+    if not is_read_only_dispatch(command, rest):
+        preflight_receipt = _run_maintenance(command)
         if preflight_receipt is not None:
             json.dump(preflight_receipt, sys.stdout)
             sys.stdout.write("\n")

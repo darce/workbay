@@ -3,6 +3,22 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.42] — 2026-11-26
+
+### Fixed
+- `find_related_prior_work` no longer loads the whole embedding store into memory for each query.
+- A store with more than 32,766 distinct interned hashes no longer fails with "too many SQL variables".
+- `backfill_concept_embeddings` now reads its source rows in pages of `commit_every` rows and checks existing embeddings with one query per chunk instead of one query per concept.
+- When an MCP client cancels a `find_related_prior_work` call, the scan stops at its next chunk and the server no longer sends a late reply to the cancelled request.
+- Enforce landing-ref close, done, archive, and reap guards with the `merged`-stays-terminal lane statechart invariant, holding `reap_done` until landing proof and findings scope are verified.
+
+### Changed
+- Only one `find_related_prior_work` query scans at a time in each server process.
+- Refresh the protocol and optional lifecycle orchestrator dependency floors for WorkBay v0.1.102.
+
+### Migration
+- A caller that switches on `find_related_prior_work` statuses should handle `busy`: the query did not run, so retry it later.
+
 ## [0.3.41] — 2026-11-23
 
 ### Changed

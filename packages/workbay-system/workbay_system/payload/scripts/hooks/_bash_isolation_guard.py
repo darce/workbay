@@ -31,6 +31,7 @@ from _branch_isolation_guard import (
     resolve_path_branch,
 )
 from _harness_protocol import BranchIsolationPolicy, is_branch_isolation_protected_path
+from _shell_tool_payload import ShellWriteEffect, python_write_targets
 
 # Unexpanded shell cwd tokens: expand from the effective stage cwd before
 # identity / protected-path checks so `$PWD/...` cannot land in the allow
@@ -53,15 +54,7 @@ _DESTRUCTIVE_VERBS = {
     "dd": "after_flag:of=",
 }
 
-_PYTHON_WRITE_OPEN_RE = re.compile(
-    r"""open\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"][waxt+]+['"]""",
-)
-_PYTHON_PATH_WRITE_RE = re.compile(
-    r"""Path\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\.\s*(write_text|write_bytes|unlink|touch|replace|rename)""",
-)
-_PYTHON_OS_WRITE_RE = re.compile(
-    r"""(?:os\.(?:remove|unlink|rename)|shutil\.(?:rmtree|move|copy|copyfile|copy2|copytree))\s*\(\s*['"]([^'"]+)['"]""",
-)
+_PYTHON_VERB = re.compile(r"python(?:\d+(?:\.\d+)*)?")
 
 _SED_IN_PLACE_FLAGS = {"-i", "--in-place"}
 
@@ -173,38 +166,83 @@ def _is_flag(token: str) -> bool:
     return token.startswith("-") and token != "-"
 
 
-def _iter_stages(command: str) -> list[tuple[str | None, str, list[str]]]:
-    """Split ``command`` into ``(joiner, raw_stage, tokens)`` stages.
+_SHELL_QUOTED = r"""'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]"""
+_SHELL_SYNTAX = re.compile(
+    rf"""{_SHELL_QUOTED}|\|&>|\|>|&>>?|<<<"""
+    rf"""|(?P<heredoc><<-?(?![<-])[ \t]*(?:{_SHELL_QUOTED}|[^\s;|&<>'"\\])+)"""
+    r"|(?P<comment>(?<!\S)#[^\n]*)|(?P<joiner>\|\||&&|[|;&\n])"
+)
 
-    ``joiner`` is the separator that *precedes* the stage (``None`` for the
-    first stage). implementation note: the joiner is load-bearing for effective-cwd
-    tracking — a ``cd`` only changes the cwd of a following stage joined by
-    ``&&`` or ``;``; through ``|`` it runs in a subshell, and after ``||`` it
-    ran only when the cd itself failed.
-    """
-    pattern = re.compile(r"(\|\||&&|\||;|&(?!>))")
-    stages: list[tuple[str | None, str, list[str]]] = []
+
+def _parse_shell_stages(
+    command: str,
+) -> list[tuple[str | None, str, list[str], list[tuple[str | None, bool]]]]:
+    """Split shell stages while keeping quoted code and heredoc data intact."""
+    stages = []
+    pending = []
+    bodies: list[tuple[str | None, bool]] = []
+    start = cursor = 0
     joiner: str | None = None
-    for raw_stage in pattern.split(command):
-        stage = raw_stage.strip()
-        if stage in {"||", "&&", "|", ";", "&"}:
-            joiner = stage
+    comment_start: int | None = None
+    while True:
+        match = _SHELL_SYNTAX.search(command, cursor)
+        end = match.start() if match else len(command)
+        cursor = match.end() if match else end
+        separator = match.group("joiner") if match else None
+        if match and match.group("heredoc"):
+            spec = match.group()
+            strip_tabs = spec.startswith("<<-")
+            spelling = spec[3 if strip_tabs else 2:].lstrip(" \t")
+            delimiter = shlex.split(spelling)[0]
+            index = len(bodies)
+            bodies.append((None, False))
+            pending.append((delimiter, strip_tabs, spelling == delimiter, bodies, index))
             continue
-        if not stage:
+        if match and match.group("comment"):
+            comment_start = end
             continue
-        try:
-            tokens = shlex.split(stage, comments=False, posix=True)
-        except ValueError:
-            tokens = stage.split()
-        if tokens:
-            stages.append((joiner, stage, tokens))
-            joiner = None
+        if match and separator is None:
+            continue
+
+        stage = command[start:comment_start if comment_start is not None else end].strip()
+        if stage:
+            try:
+                tokens = shlex.split(stage, comments=False, posix=True)
+            except ValueError:
+                tokens = stage.split()
+            stages.append((joiner, stage, tokens, bodies))
+            bodies = []
+        if separator is None:
+            break
+        if separator == "\n":
+            for delimiter, strip_tabs, shell_expands, stage_bodies, index in pending:
+                lines = []
+                while cursor < len(command):
+                    newline = command.find("\n", cursor)
+                    line = command[cursor:] if newline < 0 else command[cursor:newline]
+                    cursor = len(command) if newline < 0 else newline + 1
+                    if strip_tabs:
+                        line = line.lstrip("\t")
+                    if line == delimiter:
+                        stage_bodies[index] = ("\n".join(lines), shell_expands)
+                        break
+                    lines.append(line)
+            pending.clear()
+        if stage or separator != "\n":
+            joiner = ";" if separator == "\n" else separator
+        start = cursor
+        comment_start = None
     return stages
 
 
+def _iter_stages(command: str) -> list[tuple[str | None, str, list[str]]]:
+    """Project shell stages for the main-branch hook's branch-switch checks."""
+    return [(joiner, raw, tokens) for joiner, raw, tokens, _bodies in _parse_shell_stages(command)]
+
+
 def _iter_words(command: str) -> list[tuple[str | None, list[str]]]:
-    """Split ``command`` into ``(joiner, tokens)`` stages."""
-    return [(joiner, tokens) for joiner, _stage, tokens in _iter_stages(command)]
+    """Project the same shell stages for the main-branch hook's prefix checks."""
+    return [(joiner, tokens) for joiner, _raw, tokens in _iter_stages(command)]
 
 
 # implementation note: separators through which a preceding `cd` stage propagates its
@@ -376,15 +414,40 @@ def _scan_sed_in_place(args: list[str]) -> list[str]:
     return [a for a in args if not _is_flag(a) and not a.startswith("+")]
 
 
-def _scan_python_inline(command: str) -> list[str]:
-    matches: list[str] = []
-    for match in _PYTHON_WRITE_OPEN_RE.finditer(command):
-        matches.append(match.group(1))
-    for match in _PYTHON_PATH_WRITE_RE.finditer(command):
-        matches.append(match.group(1))
-    for match in _PYTHON_OS_WRITE_RE.finditer(command):
-        matches.append(match.group(1))
-    return matches
+_PYTHON_REDIRECT = re.compile(r"(?:\d*|&)(?:>>?|<(?!<))")
+
+
+def _python_source(
+    args: list[str], bodies: list[tuple[str | None, bool]],
+) -> tuple[str | None, bool, int | None] | None:
+    """Extract Python's executable source and the argv index of inline code."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg.startswith("-c"):
+            if arg != "-c":
+                source, source_index = arg[2:], index
+            elif index + 1 < len(args):
+                source_index = index + 1
+                source = args[source_index]
+            else:
+                return None, False, None
+            # shlex has removed the quotes. Treat any potential interpolation
+            # in the resulting source as unprovable.
+            return source, True, source_index
+        if arg == "-" or arg.startswith(("<<", "0<<")):
+            break
+        redirect = _PYTHON_REDIRECT.match(arg)
+        if redirect:
+            index += 2 if redirect.end() == len(arg) else 1
+            continue
+        if not arg.startswith("-") or arg == "--" or arg.startswith("-m"):
+            return None
+        index += 2 if arg in {"-W", "-X"} else 1
+    if bodies:
+        source, expands = bodies[-1]
+        return source, expands, None
+    return None
 
 
 def _split_git_global_opts(args: list[str]) -> tuple[str | None, list[str]]:
@@ -503,6 +566,43 @@ def _to_repo_relative(path: str, repo_root: Path) -> str | None:
         return None
 
 
+def _shell_write_effects(command: str, initial_cwd: Path | None) -> list[ShellWriteEffect]:
+    """Classify each stage once for isolation and worktree-drift checks."""
+    effects = []
+    cwd = initial_cwd
+    pending_cd: tuple[Path | None] | None = None
+    for joiner, _raw, tokens, bodies in _parse_shell_stages(command):
+        if pending_cd is not None:
+            cwd = pending_cd[0] if joiner in _CD_PROPAGATING_JOINERS else None
+            pending_cd = None
+        verb, args = _verb_of(tokens)
+        redirect_tokens = tokens
+        if _PYTHON_VERB.fullmatch(verb):
+            script = _python_source(args, bodies)
+            if script is not None:
+                source, expands, source_index = script
+                if source_index is not None:
+                    token_index = len(tokens) - len(args) + source_index
+                    redirect_tokens = tokens[:token_index] + tokens[token_index + 1:]
+                effects.extend(
+                    ShellWriteEffect(target, cwd)
+                    for target in python_write_targets(source, shell_expands=expands)
+                )
+
+        effects.extend(ShellWriteEffect(target, cwd) for target in _scan_redirects(redirect_tokens))
+        if verb == "cd":
+            pending_cd = (_resolve_cd_target(args, cwd),)
+            continue
+        if verb == "sed":
+            effects.extend(ShellWriteEffect(target, cwd) for target in _scan_sed_in_place(args))
+        effects.extend(ShellWriteEffect(target, cwd) for target in _scan_verb_targets(verb, args))
+        git_targets, git_base = _git_stage_targets(verb, args, cwd)
+        effects.extend(ShellWriteEffect(target, git_base) for target in git_targets)
+        if _detect_formatter(verb, args):
+            effects.append(ShellWriteEffect(None, cwd, formatter=True))
+    return effects
+
+
 def extract_raw_write_targets(command: str) -> list[str]:
     """Return the write-target tokens parsed out of `command`.
 
@@ -519,35 +619,11 @@ def extract_raw_write_targets(command: str) -> list[str]:
     into. Relative targets with no tracked cd are returned raw (the caller
     resolves them against its own workspace root, unchanged behavior).
     """
-    if not command or not command.strip():
-        return []
-    targets: list[str] = []
-    # implementation note: track the effective cwd across `&&`/`;`-joined `cd` stages so
-    # relative targets after a cd are reported against the cd-target worktree.
-    # No fallback base here: without a tracked cd the raw (relative) token is
-    # preserved because the drift-guard caller resolves against its own
-    # workspace root.
-    effective_cwd: Path | None = None
-    pending_cd: tuple[Path | None] | None = None
-    for joiner, stage, tokens in _iter_stages(command):
-        if pending_cd is not None:
-            effective_cwd = pending_cd[0] if joiner in _CD_PROPAGATING_JOINERS else None
-            pending_cd = None
-        stage_targets = _scan_redirects(tokens)
-        verb, args = _verb_of(tokens)
-        if verb == "cd":
-            pending_cd = (_resolve_cd_target(args, effective_cwd),)
-        elif verb:
-            if verb == "sed":
-                stage_targets.extend(_scan_sed_in_place(args))
-            stage_targets.extend(_scan_verb_targets(verb, args))
-            git_targets, git_base = _git_stage_targets(verb, args, effective_cwd)
-            targets.extend(_absolutize_target(t, git_base, None) for t in git_targets)
-        stage_targets.extend(_scan_python_inline(stage))
-        targets.extend(
-            _absolutize_target(t, effective_cwd, None) for t in stage_targets
-        )
-    return targets
+    return [
+        _absolutize_target(effect.target, effect.cwd, None)
+        for effect in _shell_write_effects(command, None)
+        if effect.target is not None
+    ]
 
 
 def scan_bash_command(
@@ -563,41 +639,8 @@ def scan_bash_command(
     except OSError:
         root_abs = repo_root
 
-    candidate_paths: list[str] = []
-    formatter_cwds: list[Path | None] = []
-
-    # implementation note: thread an effective cwd through the stage loop. A `cd` stage
-    # updates it only when the following stage is joined by `&&`/`;`
-    # (_CD_PROPAGATING_JOINERS); pipe/`&`/`||` joins and unresolvable cd
-    # targets degrade to unknown (None). Relative targets absolutize against
-    # the stage cwd when known, else against the repo root — fail-closed and
-    # independent of the hook process cwd (pre-fix, relative targets leaked
-    # into resolve_path_branch and resolved against whatever directory the
-    # hook process happened to run in).
-    effective_cwd: Path | None = root_abs
-    pending_cd: tuple[Path | None] | None = None
-    for joiner, stage, tokens in _iter_stages(command):
-        if pending_cd is not None:
-            effective_cwd = pending_cd[0] if joiner in _CD_PROPAGATING_JOINERS else None
-            pending_cd = None
-        stage_targets = _scan_redirects(tokens)
-        verb, args = _verb_of(tokens)
-        if verb == "cd":
-            pending_cd = (_resolve_cd_target(args, effective_cwd),)
-        elif verb:
-            if verb == "sed":
-                stage_targets.extend(_scan_sed_in_place(args))
-            stage_targets.extend(_scan_verb_targets(verb, args))
-            git_targets, git_base = _git_stage_targets(verb, args, effective_cwd)
-            candidate_paths.extend(
-                _absolutize_target(t, git_base, root_abs) for t in git_targets
-            )
-            if _detect_formatter(verb, args):
-                formatter_cwds.append(effective_cwd)
-        stage_targets.extend(_scan_python_inline(stage))
-        candidate_paths.extend(
-            _absolutize_target(t, effective_cwd, root_abs) for t in stage_targets
-        )
+    effects = _shell_write_effects(command, root_abs)
+    formatter_cwds = [effect.cwd for effect in effects if effect.formatter]
 
     # Single shared set with the inline/branch guards so the protected set
     # cannot drift. Policy dataclass does not yet model protected_branches.
@@ -607,7 +650,16 @@ def scan_bash_command(
     blocked: list[str] = []
     seen: set[str] = set()
     protected_inodes: frozenset[tuple[int, int]] | None = None
-    for raw in candidate_paths:
+    for effect in effects:
+        if effect.formatter:
+            continue
+        if effect.target is None:
+            label = "(unresolved Python write target)"
+            if label not in seen and (policy.code_roots or policy.root_protected_files):
+                blocked.append(label)
+                seen.add(label)
+            continue
+        raw = _absolutize_target(effect.target, effect.cwd, root_abs)
         relative = _to_repo_relative(raw, repo_root)
         if relative is None:
             # Unrelativizable after resolve: refuse when an existing ancestor

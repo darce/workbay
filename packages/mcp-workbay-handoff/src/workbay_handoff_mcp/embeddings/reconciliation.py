@@ -2,11 +2,13 @@
 
 There is no second source queue and no persisted cursor ([DATA-14]). Each pass
 asks SQL for source rows with no vector for their current text and model,
-newest first, so committed embeddings are the only progress state: a restarted
+newest first, so committed embeddings are the only durable progress state: a restarted
 server resumes past already-current rows without charging them, and a later
 write is its source's first candidate on the next pass. A failed row costs at
-most one slot per pass and stays pending. Server lifespan owns the worker, never a
-short-lived write hook.
+most one slot per pass and stays pending. A surviving worker may scan past a
+completed failure (budget refusal, error or row timeout, never a cancellation or
+lock) until its coverage check reopens discovery. Server
+lifespan owns the worker, never a short-lived write hook.
 """
 
 from __future__ import annotations
@@ -51,21 +53,21 @@ _inflight: dict[tuple[str, str, str], threading.Thread] = {}
 
 @dataclass
 class _Marks:
-    """What a surviving worker already verified for one (kind, model_id)."""
+    """Scan progress for one (kind, model_id), including budget deferrals."""
 
     created: float
-    top: int | None = None  # every key in [low, top] was current or attempted
-    low: int | None = None  # None while top is set: verified down to the first key
+    top: int | None = None  # newest key in the scanned range
+    low: int | None = None  # None while top is set: scanned down to the first key
     changed_since: str | None = None
 
 
 @dataclass
 class ReconciliationCursor:
-    """Worker memory that only saves cost; source rows and vectors decide progress.
+    """Worker memory for discovery; source rows and vectors decide coverage.
 
     ``source`` rotates the round-robin start. ``marks`` let a surviving worker
-    skip re-proving INTEGER keys and finding updates it verified, until
-    ``mark_ttl_seconds`` pass; a fresh cursor rediscovers the same pending rows
+    skip previously scanned INTEGER keys and finding updates, until coverage
+    reopens discovery or ``mark_ttl_seconds`` pass. A fresh cursor finds pending rows
     by scanning. Live inference is bounded separately at process scope, so
     replacing this cursor cannot duplicate an outstanding inference.
     """
@@ -159,7 +161,7 @@ def _done_prefix(keys: list[object], done: set[object]) -> int:
 
 
 def _record_marks(cursor: ReconciliationCursor, sources: list[_Source], model_id: str, limit: int) -> None:
-    """Extend marks only over keys this pass proved current or attempted."""
+    """Extend marks over current, ineligible, or budget-deferred keys."""
     for src in sources:
         mark = cursor.marks.get((src.kind, model_id)) or _Marks(created=time.monotonic())
         changed = src.lanes.get("changed")
@@ -326,9 +328,11 @@ def reconcile_concept_embeddings(
                     if stopped() or time.monotonic() >= row_deadline:
                         _mark_abandoned(inference)
                         result["failed"] += 1
-                        src.done.add(key)
                         if result["status"] == "cancelled":
                             return result
+                        # A completed per-row timeout advances the scan like a
+                        # budget refusal; the coverage census still reopens it.
+                        src.done.add(key)
                         result["status"] = "timeout"
                         timed_out = True
                         break
@@ -342,6 +346,8 @@ def reconcile_concept_embeddings(
                 embedded, over_budget = batches[0]
                 if over_budget:
                     result["failed"] += 1
+                    # The singleton was priced and refused. Let older keys run;
+                    # the coverage census still sees this pending vector.
                     src.done.add(key)
                     continue
                 conn.execute(f"PRAGMA busy_timeout={max(1, min(100, int((deadline - time.monotonic()) * 1000)))}")
@@ -358,20 +364,38 @@ def reconcile_concept_embeddings(
             except TimeoutError:
                 result["status"] = "timeout"
                 result["failed"] += 1
-                src.done.add(key)
                 continue
             except Exception as exc:
-                # Source rows stay authoritative: the row is still pending and a
-                # later pass (or a fresh one) rediscovers it. A lock is transient,
-                # so leave the row unverified and let the next pass retry it.
+                # A completed failure advances the scan so persistent failures
+                # cannot starve older keys; the coverage census reopens it. A
+                # lock is transient: leave it outside the prefix for the next pass.
                 result["failed"] += 1
                 if not store._is_sqlite_lock_error(exc):
                     src.done.add(key)
                 _log.warning("embedding reconciliation deferred %s/%s", kind, key, exc_info=True)
-        if exhausted and result["status"] == "bounded" and charged < max_rows:
-            result["status"] = "complete"
+        if exhausted and result["status"] == "bounded" and charged < max_rows and not stopped():
+            # Cursor marks and bounded candidate pages only guide discovery.
+            # Verify completion from a single source/vector snapshot.
+            conn.set_progress_handler(lambda: int(stopped()), 1000)
+            try:
+                conn.execute("BEGIN")
+                coverage = store.concept_embedding_coverage(conn, model_id)
+                if not stopped():
+                    result["status"] = "complete" if coverage["status"] == "complete" else "pending"
+            except (sqlite3.Error, TimeoutError):
+                if not stopped():
+                    result["status"] = "coverage_unknown"
+                    _log.warning("embedding reconciliation could not verify coverage", exc_info=True)
+            finally:
+                conn.set_progress_handler(None, 0)
+                store._end_deferred_read_txn(conn)
     finally:
-        _record_marks(cursor, sources, model_id, discovery_limit)
+        if result["status"] == "pending":
+            # Reopen discovery for deferred or changed sources inside marked ranges.
+            for src in sources:
+                cursor.marks.pop((src.kind, model_id), None)
+        else:
+            _record_marks(cursor, sources, model_id, discovery_limit)
         # Cleanup must work even when either phase's deadline has expired.
         if tracked:
             setattr(conn, "_handoff_deadline", None)

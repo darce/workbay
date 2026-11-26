@@ -37,7 +37,7 @@ ENTRYPOINTS = {
 PROBE_SECONDS = 60.0
 PROBE_SECONDS_RANGE = (30.0, 90.0)
 PROBE_SECONDS_ENV = "WORKBAY_NATIVE_PROBE_SECONDS"
-RECEIPT_SCHEMA = "workbay/native-receipt@1"
+RECEIPT_SCHEMA = "workbay/native-receipt@2"
 MAX_OUTPUT = 1024 * 1024
 MAX_FILE = 4 * 1024 * 1024
 # Fingerprints stream instead of parsing: static interpreters exceed MAX_FILE.
@@ -245,6 +245,8 @@ def _read_receipt(path, key):
             raise ValueError("receipt_key")
         proof = {**data["proof"], "stats": data["stats"]}
         _validate_proof(proof, key["request"])
+        if str(Path(__file__).resolve()) not in proof["files"]:
+            raise ValueError("receipt_probe")
         records = {f: d for f, d in proof["files"].items() if Path(f).name == "RECORD"}
         if not records or data["records"] != records:
             raise ValueError("receipt_records")
@@ -517,16 +519,19 @@ def _validate_proof(result, request):
         or not required <= set(result["capabilities"])
     ):
         raise ValueError("probe_missing_capabilities")
-    required_providers = {"workbay_handoff_mcp", "workbay_protocol"}
-    if request["console"] == "mcp-workbay-orchestrator":
-        required_providers.add("workbay_orchestrator_mcp")
-    if not isinstance(result["providers"], dict) or set(result["providers"]) != required_providers:
+    entry_top = ENTRYPOINTS[request["console"]][1].split(".")[0]
+    if not isinstance(result["providers"], dict) or entry_top not in result["providers"]:
         raise ValueError("probe_missing_providers")
     for top, provider in result["providers"].items():
         if not isinstance(provider, dict) or set(provider) != {"name", "version", "package", "editable"}:
             raise ValueError("probe_malformed_provider")
         if (
-            not isinstance(provider["version"], str)
+            not isinstance(top, str)
+            or not top.startswith("workbay_")
+            or not top.isidentifier()
+            or not isinstance(provider["name"], str)
+            or not provider["name"]
+            or not isinstance(provider["version"], str)
             or not provider["version"]
             or type(provider["editable"]) is not bool
         ):
@@ -668,10 +673,13 @@ def select_console(
 def _probe(request: dict) -> dict:
     """Executed by the candidate interpreter, with site startup disabled."""
     import base64
+    import csv
+    import email.parser
     import importlib
     import importlib.abc
     import importlib.metadata as metadata
     import importlib.util
+    from pathlib import PurePosixPath
     from urllib.parse import unquote, urlparse
 
     script = Path(request["script"])
@@ -731,140 +739,13 @@ def _probe(request: dict) -> dict:
     remember(script)
     remember(python)
     remember(prefix / "pyvenv.cfg")
-    sys.path[:0] = [str(script.parent), *request.get("python_path", [])]
-    sys.path.append(str(site))
     # The existing _interp origin policy admits same-checkout editable sources
     # and noneditable prefix installs. Reuse it rather than weakening that rule.
     spec = importlib.util.spec_from_file_location("_native_origin_policy", Path(__file__).with_name("_interp.py"))
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    dist_names = {"workbay_handoff_mcp": "mcp-workbay-handoff", "workbay_protocol": "workbay-protocol"}
-    if request["console"] == "mcp-workbay-orchestrator":
-        dist_names["workbay_orchestrator_mcp"] = "mcp-workbay-orchestrator"
     providers = {}
     packages = {}
-    for top, name in dist_names.items():
-        # Bound metadata before asking importlib.metadata to parse it. Only the
-        # named provider's dist-info is relevant; never scan arbitrary METADATA.
-        prefix_name = name.replace("-", "_") + "-"
-        infos = [
-            p
-            for p in site.iterdir()
-            if p.name.replace("-", "_").startswith(prefix_name.replace("-", "_")) and p.name.endswith(".dist-info")
-        ]
-        if len(infos) != 1 or not infos[0].resolve().is_relative_to(site.resolve()):
-            raise ValueError("provider_missing_or_ambiguous:" + name)
-        info = infos[0]
-        for file in info.iterdir():
-            if file.is_file():
-                remember(file)
-        dist = metadata.PathDistribution(info)
-        if (dist.metadata["Name"] or "").replace("_", "-").lower() != name:
-            raise ValueError("provider_metadata_name_mismatch")
-        direct = _json(dist.read_text("direct_url.json") or "{}")
-        editable = direct.get("dir_info", {}).get("editable") is True
-        source = site
-        if editable:
-            url = urlparse(direct.get("url", ""))
-            if url.scheme != "file" or url.netloc not in {"", "localhost"}:
-                raise ValueError("editable_source_invalid")
-            source = Path(unquote(url.path)).resolve()
-            if not guard._origin_under_trust_roots(str(source), tuple(request["anchors"]), (), editable=True):
-                raise ValueError("editable_provider_untrusted")
-            source = source / "src"
-        package = source / top
-        if not package.is_dir() or not guard._origin_under_trust_roots(
-            str(package), tuple(request["anchors"]), (str(site.resolve()),), editable=editable
-        ):
-            raise ValueError("provider_origin_untrusted:" + top)
-        records = {str(Path(dist.locate_file(f)).absolute()): f for f in (dist.files or [])}
-        remember(package)
-        remember(info)
-        packages[top] = package
-        if not editable:
-            # RECORD is the wheel's own source manifest: each recorded module must
-            # be on disk with its bound digest and size, not only the modules a
-            # directory walk happens to find. dist.files drops rows whose file is
-            # missing, so read the bounded RECORD itself. Bytecode stays inert.
-            import csv
-            from pathlib import PurePosixPath
-
-            rows = list(csv.reader(_bytes(info / "RECORD").decode("utf-8").splitlines()))
-            owned = [
-                row for row in rows if row and PurePosixPath(row[0]).parts[:1] == (top,) and row[0].endswith(".py")
-            ]
-            if not owned or len(owned) > MAX_FILES:
-                raise ValueError("provider_source_limit")
-            if any(len(row) != 3 or ".." in PurePosixPath(row[0]).parts for row in owned):
-                raise ValueError("provider_record_escape")
-            if len({str(PurePosixPath(row[0])) for row in owned}) != len(owned):
-                raise ValueError("provider_record_duplicate")
-            for relative, digest, size in owned:
-                path = Path(dist.locate_file(relative)).absolute()
-                if not os.path.lexists(path):
-                    raise ValueError("provider_record_source_missing:" + relative)
-                if not path.resolve().is_relative_to(package.resolve()):
-                    raise ValueError("provider_source_escape")
-                if not digest.startswith("sha256=") or not size.isdigit():
-                    raise ValueError("provider_record_missing")
-                remember(path)
-                if (
-                    base64.urlsafe_b64encode(bytes.fromhex(files[str(path)])).decode().rstrip("=")
-                    != digest[len("sha256=") :]
-                ):
-                    raise ValueError("provider_record_mismatch")
-                if path.stat().st_size != int(size):
-                    raise ValueError("provider_record_size_mismatch")
-        paths = list(package.rglob("*.py"))
-        if not paths or len(paths) > MAX_FILES:
-            raise ValueError("provider_source_limit")
-        for path in paths:
-            if not path.resolve().is_relative_to(package.resolve()):
-                raise ValueError("provider_source_escape")
-            remember(path)
-            if not editable:
-                record = records.get(str(path.absolute()))
-                if record is None or record.hash is None or record.hash.mode != "sha256":
-                    raise ValueError("provider_record_missing")
-                actual = base64.urlsafe_b64encode(bytes.fromhex(files[str(path.absolute())])).decode().rstrip("=")
-                if actual != record.hash.value:
-                    raise ValueError("provider_record_mismatch")
-        providers[top] = {
-            "name": name,
-            "version": dist.version,
-            "package": str(package.resolve()),
-            "editable": editable,
-        }
-        if name == ENTRYPOINTS[request["console"]][0]:
-            eps = [e for e in dist.entry_points if e.group == "console_scripts" and e.name == request["console"]]
-            if len(eps) != 1 or eps[0].value != ENTRYPOINTS[request["console"]][1] + ":main":
-                raise ValueError("provider_entrypoint_mismatch")
-    # Only static .pth entries are needed for supported editable source layouts.
-    # Skip virtualenv's distutils compatibility hook; never execute .pth code.
-    for pth in site.glob("*.pth"):
-        remember(pth)
-        for line in _bytes(pth, 65536).decode("utf-8").splitlines():
-            if not line.strip() or line.startswith("#"):
-                continue
-            if line.startswith(("import ", "import\t")):
-                if pth.name == "_virtualenv.pth" and line.strip() == "import _virtualenv":
-                    continue
-                raise ValueError("unsupported_executable_pth")
-            path = (site / line).resolve()
-            sys.path.append(str(path))
-
-    # Bind potential shadows too: creating __init__.py in an existing namespace
-    # directory changes that directory, not its search root. A receipt must not
-    # bypass the foreign-import refusal that a fresh probe would have produced.
-    for entry in sys.path:
-        base = Path(entry).absolute()
-        watch(base)
-        if base.is_dir():
-            for top in dist_names:
-                watch(base / (top + ".py"))
-                watch(base / top)
-                if (base / top).is_dir():
-                    watch(base / top / "__init__.py")
 
     # Mediate every WorkBay import before any candidate source is executed.
     class ReadSource(importlib.machinery.SourceFileLoader):
@@ -923,14 +804,225 @@ def _probe(request: dict) -> dict:
 
     sys.addaudithook(readonly)
 
+    # packaging is an installed dependency of the native handoff contract. Do
+    # not let the console directory or inherited PYTHONPATH supply the parser.
+    sys.path.append(str(site))
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    sys.path[:0] = [str(script.parent), *request.get("python_path", [])]
+
+    # Only static .pth entries are needed for supported editable source layouts.
+    # Skip virtualenv's distutils compatibility hook; never execute .pth code.
+    editable_paths = set()
+    for pth in site.glob("*.pth"):
+        remember(pth)
+        for line in _bytes(pth, 65536).decode("utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            if line.startswith(("import ", "import\t")):
+                if pth.name == "_virtualenv.pth" and line.strip() == "import _virtualenv":
+                    continue
+                raise ValueError("unsupported_executable_pth")
+            path = (site / line).resolve()
+            sys.path.append(str(path))
+            editable_paths.add(path)
+
+    def bind_provider(top, source, name, version, editable, owned):
+        if top in providers:
+            raise ValueError("provider_ownership_ambiguous:" + top)
+        package = source / top
+        if not package.is_dir() or not guard._origin_under_trust_roots(
+            str(package), tuple(request["anchors"]), (str(site.resolve()),), editable=editable
+        ):
+            raise ValueError("provider_origin_untrusted:" + top)
+        remember(package)
+        if not editable:
+            # Check both directions: RECORD must describe every source on disk
+            # and every source it names must still exist with the bound digest.
+            if not owned or len(owned) > MAX_FILES:
+                raise ValueError("provider_source_limit")
+            if any(len(row) != 3 or ".." in PurePosixPath(row[0]).parts for row in owned):
+                raise ValueError("provider_record_escape")
+            if len({str(PurePosixPath(row[0])) for row in owned}) != len(owned):
+                raise ValueError("provider_record_duplicate")
+            recorded_paths = set()
+            for relative, digest, size in owned:
+                path = (site / relative).absolute()
+                if not os.path.lexists(path):
+                    raise ValueError("provider_record_source_missing:" + relative)
+                if not path.resolve().is_relative_to(package.resolve()):
+                    raise ValueError("provider_source_escape")
+                if not digest.startswith("sha256=") or not size.isdigit():
+                    raise ValueError("provider_record_missing")
+                recorded_paths.add(path)
+                remember(path)
+                if (
+                    base64.urlsafe_b64encode(bytes.fromhex(files[str(path)])).decode().rstrip("=")
+                    != digest[len("sha256=") :]
+                ):
+                    raise ValueError("provider_record_mismatch")
+                if path.stat().st_size != int(size):
+                    raise ValueError("provider_record_size_mismatch")
+        paths = list(package.rglob("*.py"))
+        if not paths or len(paths) > MAX_FILES:
+            raise ValueError("provider_source_limit")
+        for path in paths:
+            if not path.resolve().is_relative_to(package.resolve()):
+                raise ValueError("provider_source_escape")
+            if editable:
+                remember(path)
+            elif path.absolute() not in recorded_paths:
+                raise ValueError("provider_record_missing")
+        packages[top] = package
+        providers[top] = {
+            "name": name,
+            "version": version,
+            "package": str(package.resolve()),
+            "editable": editable,
+        }
+
+    # Follow active Requires-Dist edges, including requested extras. Only
+    # distributions reached from the console can contribute WorkBay providers.
+    console = request["console"]
+    entry_dist, entry = ENTRYPOINTS[console]
+    entry_top = entry.split(".")[0]
+    infos = {}
+    for info in site.glob("*.dist-info"):
+        name, separator, version = info.name.removesuffix(".dist-info").rpartition("-")
+        if separator and version:
+            infos.setdefault(canonicalize_name(name), []).append(info)
+
+    def load_distribution(name):
+        matches = infos.get(name, [])
+        workbay_dist = name.startswith(("workbay-", "mcp-workbay-"))
+        if not matches and not workbay_dist and name != entry_dist:
+            # Third-party availability remains the responsibility of the
+            # public capability imports below.
+            return ()
+        if len(matches) != 1:
+            raise ValueError("provider_missing_or_ambiguous:" + name)
+        info = matches[0]
+        if workbay_dist and not info.resolve().is_relative_to(site.resolve()):
+            raise ValueError("provider_missing_or_ambiguous:" + name)
+        metadata_path = remember(info / "METADATA")
+        metadata_bytes = _bytes(metadata_path)
+        watch(metadata_path)
+        direct_path = info / "direct_url.json"
+        watch(direct_path)
+        if direct_path.is_file():
+            remember(direct_path)
+            direct = _json(_bytes(direct_path).decode("utf-8"))
+        else:
+            direct = {}
+        editable = direct.get("dir_info", {}).get("editable") is True
+        sources = {}
+        if editable:
+            url = urlparse(direct.get("url", ""))
+            if url.scheme != "file" or url.netloc not in {"", "localhost"}:
+                raise ValueError("editable_source_invalid")
+            project = Path(unquote(url.path)).resolve()
+            for source in (project / "src", project):
+                if source in editable_paths:
+                    watch(source)
+                    for package in source.glob("workbay_*"):
+                        if package.is_dir() and package.name.isidentifier():
+                            if package.name in sources:
+                                raise ValueError("provider_ownership_ambiguous:" + package.name)
+                            sources[package.name] = (source, [])
+            if (workbay_dist or sources) and not guard._origin_under_trust_roots(
+                str(project), tuple(request["anchors"]), (), editable=True
+            ):
+                raise ValueError("editable_provider_untrusted")
+        else:
+            record_path = info / "RECORD"
+            watch(record_path)
+            rows_by_top = {}
+            metadata_relative = PurePosixPath(metadata_path.relative_to(site))
+            metadata_rows = []
+            if record_path.is_file():
+                remember(record_path)
+                for row in csv.reader(_bytes(record_path).decode("utf-8").splitlines()):
+                    if row and PurePosixPath(row[0]) == metadata_relative:
+                        metadata_rows.append(row)
+                    elif row and row[0].endswith(".py"):
+                        parts = PurePosixPath(row[0]).parts
+                        if len(parts) > 1 and parts[0].startswith("workbay_") and parts[0].isidentifier():
+                            rows_by_top.setdefault(parts[0], []).append(row)
+            # Requires-Dist can admit providers even when this distribution has
+            # no WorkBay sources. Verify the exact bytes we will parse below.
+            if not metadata_rows:
+                raise ValueError("provider_metadata_record_missing:" + name)
+            if len(metadata_rows) != 1:
+                raise ValueError("provider_metadata_record_duplicate:" + name)
+            row = metadata_rows[0]
+            if len(row) != 3 or not row[1].startswith("sha256=") or not row[2].isdigit():
+                raise ValueError("provider_metadata_record_invalid:" + name)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(metadata_bytes).digest()).decode().rstrip("=")
+            if row[1] != "sha256=" + digest:
+                raise ValueError("provider_metadata_record_mismatch:" + name)
+            if row[2] != str(len(metadata_bytes)):
+                raise ValueError("provider_metadata_record_size_mismatch:" + name)
+            sources = {top: (site, rows) for top, rows in rows_by_top.items()}
+        headers = email.parser.BytesParser().parsebytes(metadata_bytes, headersonly=True)
+        if canonicalize_name(headers.get("Name", "")) != name:
+            raise ValueError("provider_metadata_name_mismatch")
+        if (workbay_dist or name == entry_dist) and not sources:
+            raise ValueError("provider_source_limit:" + name)
+        if sources:
+            if not info.resolve().is_relative_to(site.resolve()):
+                raise ValueError("provider_missing_or_ambiguous:" + name)
+            remember(info)
+            for file in info.iterdir():
+                if file.is_file() and str(file.absolute()) not in files:
+                    remember(file)
+            for top, (source, owned) in sources.items():
+                bind_provider(top, source, name, headers["Version"], editable, owned)
+        if name == entry_dist:
+            _bytes(info / "entry_points.txt")
+            dist = metadata.PathDistribution(info)
+            eps = [e for e in dist.entry_points if e.group == "console_scripts" and e.name == console]
+            if entry_top not in sources or len(eps) != 1 or eps[0].value != entry + ":main":
+                raise ValueError("provider_entrypoint_mismatch")
+        return tuple(Requirement(requirement) for requirement in headers.get_all("Requires-Dist", ()))
+
+    requirements = {}
+    pending = [(entry_dist, "")]
+    visited = set()
+    while pending:
+        name, extra = pending.pop()
+        if (name, extra) in visited:
+            continue
+        visited.add((name, extra))
+        if name not in requirements:
+            requirements[name] = load_distribution(name)
+        for requirement in requirements[name]:
+            if requirement.marker and not requirement.marker.evaluate({"extra": extra}):
+                continue
+            dependency = canonicalize_name(requirement.name)
+            pending.append((dependency, ""))
+            pending.extend((dependency, canonicalize_name(e)) for e in requirement.extras)
+
+    # Bind potential shadows too: creating __init__.py in an existing namespace
+    # directory changes that directory, not its search root. A receipt must not
+    # bypass the foreign-import refusal that a fresh probe would have produced.
+    for search_path in sys.path:
+        base = Path(search_path).absolute()
+        watch(base)
+        if base.is_dir():
+            for top in providers:
+                watch(base / (top + ".py"))
+                watch(base / top)
+                if (base / top).is_dir():
+                    watch(base / top / "__init__.py")
+
     def public(module, name):
         value = getattr(importlib.import_module(module), name)
         if not callable(value):
             raise ValueError("missing_public_callable:" + module + ":" + name)
         return value
 
-    entry = ENTRYPOINTS[request["console"]][1]
-    cli = packages[entry.split(".")[0]] / "cli.py"
+    cli = packages[entry_top].joinpath(*entry.split(".")[1:]).with_suffix(".py")
     cli_tree = ast.parse(_bytes(cli))
     if not any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in cli_tree.body):
         raise ValueError("missing_public_entrypoint")

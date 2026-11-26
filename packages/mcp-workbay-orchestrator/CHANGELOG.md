@@ -3,6 +3,16 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.48] — 2026-11-26
+
+### Changed
+- Add Git-lineage holder proofs (`holder_blocks` in `review_cycle_holds.py`), pinned exact-tip supersede tombstones, native `MERGECLOSE` multi-sibling resolution, foreign task subject binding guard, authorized scope growth, linear snapshot git probes, and replacement-lane boundary enforcement.
+- Enforce landing-ref close, done, archive, and reap guards with the `merged`-stays-terminal lane statechart invariant.
+- Add the stdlib-only `candidate_custody.py` `export-and-claim` CLI covering all gate `custody_candidates` tips with pre-rename staged `custody_verified` verification and producer input/environment hardening.
+- Add native stranded review-cycle settlement (`stranded_preview` and `stranded_apply`) for reservations whose pass is provably dead.
+- Generate TLA+ specifications for lane and task statecharts and the land-reap protocol, with a pinned `tla2tools` runner.
+- Refresh the protocol, handoff, system, and optional Codex bridge dependency floors for WorkBay v0.1.102.
+
 ## [0.3.47] — 2026-11-23
 
 ### Changed

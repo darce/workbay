@@ -6,6 +6,9 @@ source_preview / source_apply additionally join an original empty native source
 (synchronous or detached) to its authenticated current scope and registry
 correction, with native historical custody for a retired original epoch.
 No worker result, scope, route, outcome or authority path is an input.
+stranded_preview / stranded_apply (same key sets) settle a reservation whose
+pass is provably dead, from native death evidence instead of a terminal result,
+with the started-model charge (VERDICT, never an INFRA_STOP refund).
 
 The immutable recovery record is an intent, not another accounting ledger. It
 becomes usable only when the canonical ledger has its charged terminal fact.
@@ -461,13 +464,9 @@ def _detached_source(
     ), records
 
 
-def _authenticate(
-    repo: Path, data: dict, dispatch_id: str, *, historical: dict | None = None, source_authority: bool = False
-) -> _Observed:
+def _reservation(repo: Path, data: dict, dispatch_id: str) -> SimpleNamespace:
+    """The protected engine-owned reservation receipt joined to its native ledger row."""
     from workbay_handoff_mcp import RuntimeConfig, configure_runtime
-
-    from .review_cycle_bootstrap import _lane
-    from .terminal_history_repair import _expected_completion
 
     primary, private = _host(repo)
     runtime = RuntimeConfig.for_repo(primary)
@@ -516,6 +515,22 @@ def _authenticate(
         "pass_identity_mismatch",
         "original native managed pass locator",
     )
+    return SimpleNamespace(
+        primary=primary, private=private, runtime=runtime, path=path, receipt=receipt, receipt_sha=receipt_sha,
+        row=row, decision=decision, managed=managed, source=source, pass_id=pass_id,
+    )
+
+
+def _authenticate(
+    repo: Path, data: dict, dispatch_id: str, *, historical: dict | None = None, source_authority: bool = False
+) -> _Observed:
+    from .review_cycle_bootstrap import _lane
+    from .terminal_history_repair import _expected_completion
+
+    held = _reservation(repo, data, dispatch_id)
+    primary, private, runtime, path = held.primary, held.private, held.runtime, held.path
+    receipt, receipt_sha, row, decision = held.receipt, held.receipt_sha, held.row, held.decision
+    managed, source, pass_id = held.managed, held.source, held.pass_id
     pass_path = runtime.state_dir / f"offload-pass-{pass_id}.json"
     state, pass_sha = _read(pass_path, runtime.state_dir)
     binding, config, result = state.get("lane_cycle_binding"), state.get("completion_config"), state.get("result")
@@ -806,16 +821,288 @@ def _event(repo: Path, dispatch_id: str) -> dict | None:
     return record
 
 
+_STRANDED_SCHEMA = "workbay/stranded-reservation@1"
+# Registry facts that survive settlement and archiving; re-observed on every use.
+_ISSUING_LANE = ("id", "identity_seq", "task_ref", "lane_id", "branch", "worktree_path", "status", "cycle_epoch")
+
+
+def _stranded_path(repo: Path, dispatch_id: str) -> Path:
+    return cycle.authority(repo) / "review_cycle_stranded_settlement" / (_digest(dispatch_id.encode()) + ".json")
+
+
+def _stranded(repo: Path, data: dict, dispatch_id: str) -> SimpleNamespace:
+    """Death proof for an engine-owned reservation whose own pass can no longer settle it.
+
+    The protected reservation (the terminal-recovery identity checks) plus
+    native facts that its producer is gone: the pass record absent, or readable
+    under custody and terminal; the issuing registry row terminal at or after
+    the pass binding's epoch, or no row and the archived task's lane snapshot
+    terminal; the source head an ancestor of refs/heads/main. A live, off-main,
+    unreadable or unknown fact holds with a typed reason (CAL-02, SECD-05).
+    """
+    from workbay_handoff_mcp.enums import TERMINAL_LANE_STATUSES
+
+    from .offload_pass import _terminal_pass_terminal_at
+    from .review_cycle_bootstrap import _lane
+    from .terminal_history_repair import _expected_completion
+
+    held = _reservation(repo, data, dispatch_id)
+    receipt, row, managed, source = held.receipt, held.row, held.managed, held.source
+    recovery = _recovery_path(repo, dispatch_id)
+    _require(
+        not recovery.exists() and not recovery.is_symlink(),
+        "terminal_recovery_present",
+        "no original terminal recovery intent for this reservation",
+    )
+    _require(
+        all(isinstance(managed.get(k), str) and managed[k] for k in ("task_ref", "lane_id", "worktree_path"))
+        and source
+        == dict(branch=receipt.get("source_branch"), head_sha=receipt.get("source_head"),
+                head_tree=receipt.get("source_tree"))
+        and isinstance(source.get("branch"), str)
+        and all(isinstance(source.get(k), str) and _OID.fullmatch(source[k]) for k in ("head_sha", "head_tree"))
+        and ratchet._commit(repo, source["head_sha"]) == source["head_sha"]
+        and cycle._git(repo, "rev-parse", source["head_sha"] + "^{tree}") == source["head_tree"],
+        "source_git_mismatch",
+        "original native managed identity and source commit/tree/branch",
+    )
+    main = ratchet._commit(repo, "refs/heads/main")
+    _require(
+        main is not None and cycle._ancestry(repo, source["head_sha"], main) == "ancestor",
+        "stranded_source_not_on_main",
+        "reservation source head an ancestor of refs/heads/main",
+    )
+    row_ids, epoch = set(), None
+    if "source_issuer" in receipt:
+        issuer = receipt["source_issuer"]
+        _require(
+            cycle._matches_issuer_binding(issuer, managed["task_ref"], managed["lane_id"]),
+            "stranded_lane_identity_mismatch",
+            "protected source issuer of the managed lane",
+        )
+        row_ids.add(issuer["row_id"])
+    pass_path = held.runtime.state_dir / f"offload-pass-{held.pass_id}.json"
+    if not pass_path.exists() and not pass_path.is_symlink():
+        pass_evidence = dict(state="absent")
+    else:
+        state, pass_sha = _read(pass_path, held.runtime.state_dir)
+        binding = state.get("lane_cycle_binding")
+        _require(
+            all(state.get(k) == managed[k] for k in ("task_ref", "lane_id", "worktree_path"))
+            and state.get("review_cycle_dispatch_id") == dispatch_id
+            and state.get("review_cycle_subject_branch") == row["subject_branch"]
+            and state.get("review_cycle") == held.decision
+            and state.get("orchestrator_root") == str(held.primary),
+            "pass_identity_mismatch",
+            "native pass record of this reservation",
+        )
+        _require(
+            _terminal_pass_terminal_at(state) is not None,
+            "stranded_pass_live",
+            "absent or terminal native pass record",
+        )
+        _require(
+            isinstance(binding, dict)
+            and binding.get("v") == 1
+            and type(binding.get("row_id")) is int
+            and type(binding.get("cycle_epoch")) is int
+            and all(binding.get(k) == managed[k] for k in ("task_ref", "lane_id", "worktree_path"))
+            and binding.get("branch") == source["branch"],
+            "lane_cycle_unavailable",
+            "native first-publication row/cycle binding",
+        )
+        row_ids.add(binding["row_id"])
+        epoch = binding["cycle_epoch"]
+        pass_evidence = dict(state="terminal", status=state["status"], sha256=pass_sha, lane_cycle_binding=binding)
+    _require(len(row_ids) == 1, "stranded_lane_identity_unproven", "one native issuing registry row id")
+    row_id = row_ids.pop()
+    lane, fence = _lane(held.runtime, row_id), None
+    if lane is None:
+        task = ratchet.task_record(managed["task_ref"])
+        archived = task is not None and task.get("source") == "archive"
+        lane = ratchet.archived_lane_row(managed["task_ref"], managed["lane_id"]) if archived else None
+        _require(
+            lane is not None,
+            "stranded_lane_unavailable",
+            "issuing registry row, or the archived task's archived lane snapshot",
+        )
+    else:
+        fence = dict(row_id=row_id, **{k: lane.get(k) for k in ("task_ref", "lane_id", "branch", "worktree_path",
+                                                               "cycle_epoch")})
+    _require(
+        lane.get("id") == row_id
+        and all(lane.get(k) == managed[k] for k in ("task_ref", "lane_id", "worktree_path"))
+        and lane.get("branch") == source["branch"],
+        "stranded_lane_identity_mismatch",
+        "issuing registry row of the managed lane",
+    )
+    _require(
+        lane.get("status") in TERMINAL_LANE_STATUSES
+        and type(lane.get("cycle_epoch")) is int
+        and (epoch is None or lane["cycle_epoch"] >= epoch),
+        "stranded_lane_live",
+        "issuing lane terminal at or after the pass binding epoch",
+    )
+    # A started transport dominates infrastructure forgiveness: the native
+    # charged settlement of a non-verdict outcome (never INFRA_STOP, no refund).
+    completion = _expected_completion("transport_failure")
+    if row.get("completion") is not None:
+        _require(
+            row["completion"] == completion and row.get("outcome_class") == "verdict",
+            "existing_settlement",
+            "pending reservation or its own charged stranded settlement",
+        )
+    proof = dict(
+        schema=_STRANDED_SCHEMA,
+        dispatch_id=dispatch_id,
+        charged_subject=row["subject_branch"],
+        native_round=row["round"],
+        kind=row["kind"],
+        issued_sequence=row.get("issued_sequence"),
+        managed_identity=managed,
+        source=source,
+        integration_ref="refs/heads/main",
+        receipt_sha256=held.receipt_sha,
+        transfer_sha256=_digest(receipt["token"].encode()),
+        pass_evidence=pass_evidence,
+        issuing_lane={k: lane.get(k) for k in _ISSUING_LANE},
+        settlement_completion=completion,
+        outcome_class="verdict",
+    )
+    return SimpleNamespace(proof=proof, receipt=receipt, lane=lane, fence=fence, pass_path=pass_path,
+                           state_dir=held.runtime.state_dir, receipt_path=held.path)
+
+
+def _stranded_event(repo: Path, dispatch_id: str) -> dict | None:
+    path = _stranded_path(repo, dispatch_id)
+    if not path.exists() and not path.is_symlink():
+        return None
+    record, _ = _read(path, cycle.authority(repo))
+    _require(
+        record.get("schema") == _STRANDED_SCHEMA
+        and record.get("dispatch_id") == dispatch_id
+        and record.get("observation_sha256") == _digest(_encoded(record.get("observation"))),
+        "stranded_settlement_integrity",
+        "immutable stranded reservation settlement intent",
+    )
+    return record
+
+
+def _stranded_recover(request: dict, ledger: ReviewCycleLedger, repo: Path) -> LedgerDecision:
+    """Preview, or settle once under the terminal-recovery locks and epoch fence (DATA-05).
+
+    A later completion for the same dispatch meets ReviewCycleLedger.settle's
+    completion fence and is refused with ledger bytes unchanged (RES-10).
+    """
+    dispatch_id = request["dispatch_id"]
+    receipt_path = cycle.authority(repo) / "review_cycle_dispatch" / (_digest(dispatch_id.encode()) + ".json")
+    if request["operation"] == "stranded_preview":
+        raw = ledger.path.read_bytes()
+        with _dispatch_lock(receipt_path):
+            observed = _stranded(repo, ledger._decode(raw), dispatch_id)
+        _require(ledger.path.read_bytes() == raw, "stale_ledger", "unchanged canonical ledger")
+        return LedgerDecision(
+            "preview",
+            "",
+            dict(
+                expected_ledger_sha256=_digest(raw),
+                expected_observation_sha256=_digest(_encoded(observed.proof)),
+                observation=observed.proof,
+                native_admission=False,
+            ),
+        )
+    for field in ("expected_ledger_sha256", "expected_observation_sha256"):
+        _require(isinstance(request.get(field), str) and _SHA.fullmatch(request[field]), "invalid_protocol", field)
+    from .offload_pass_recovery import EvidenceHold as NativeHold
+    from .terminal_history_repair import _epoch_fence, _lane_publication, _pass_publication
+
+    with ExitStack() as locks:
+
+        def apply(data):
+            locks.enter_context(_dispatch_lock(receipt_path))
+            hint = _stranded(repo, data, dispatch_id)
+            managed = hint.proof["managed_identity"]
+            locks.enter_context(_lane_publication(hint.state_dir, managed["task_ref"], managed["lane_id"]))
+            locks.enter_context(_pass_publication(hint.pass_path))
+            if hint.fence is not None:
+                locks.enter_context(_epoch_fence(repo, SimpleNamespace(lane=hint.fence)))
+            observed = _stranded(repo, data, dispatch_id)
+            digest = _digest(_encoded(observed.proof))
+            record = _stranded_event(repo, dispatch_id)
+            row = data["rows"][dispatch_id]
+            pending = row.get("completion") is None
+            if record is not None:
+                _require(
+                    record["observation_sha256"] == digest == request["expected_observation_sha256"]
+                    and record.get("ledger_sha256_before") == request["expected_ledger_sha256"],
+                    "stranded_settlement_conflict",
+                    "same native death evidence and intent CAS",
+                )
+                if pending:
+                    _require(
+                        _digest(ledger.path.read_bytes()) == record["ledger_sha256_before"],
+                        "stale_ledger",
+                        "uncommitted stranded intent's unchanged canonical ledger",
+                    )
+            else:
+                _require(
+                    _digest(ledger.path.read_bytes()) == request["expected_ledger_sha256"],
+                    "stale_ledger",
+                    "canonical ledger bytes from preview",
+                )
+                _require(digest == request["expected_observation_sha256"], "stale_observation",
+                         "native death evidence from preview")
+                _require(pending, "existing_settlement", "pending reservation")
+                record = dict(
+                    schema=_STRANDED_SCHEMA,
+                    dispatch_id=dispatch_id,
+                    observation=observed.proof,
+                    observation_sha256=digest,
+                    ledger_sha256_before=request["expected_ledger_sha256"],
+                    native_admission=False,
+                )
+                destination = _stranded_path(repo, dispatch_id)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                cycle._save(destination, record)
+            if pending:
+                result = _SettlementInTransaction(ledger, data).settle(
+                    dispatch_id, row["subject_branch"], row["kind"], observed.proof["settlement_completion"]["outcome"]
+                )
+                _require(result.status == "settled", "native_settlement_refused",
+                         "existing charged native settlement transition")
+            decision = LedgerDecision(
+                "stranded_settled" if pending else "already_settled",
+                "",
+                dict(
+                    stranded_path=str(_stranded_path(repo, dispatch_id)),
+                    observation_sha256=digest,
+                    charged_subject=row["subject_branch"],
+                    native_round=row["round"],
+                    native_admission=False,
+                ),
+            )
+            if not pending:
+                raise _Unchanged(decision)  # Preserve settled ledger bytes exactly.
+            return decision
+
+        try:
+            return ledger._transaction(apply)
+        except NativeHold as exc:
+            raise EvidenceHold(exc.reason, getattr(exc, "needed", None) or "native publication/cycle fence") from exc
+
+
 def recover(request: dict, *, repo: Path) -> LedgerDecision:
     """Bounded local preview or CAS apply; no transport, model or admission."""
     try:
         operation, dispatch_id = request.get("operation"), request.get("dispatch_id")
         expected = {"operation", "dispatch_id"}
         source_authority = operation in {"source_preview", "source_apply"}
-        if operation in {"terminal_apply", "source_apply"}:
+        if operation in {"terminal_apply", "source_apply", "stranded_apply"}:
             expected |= {"expected_ledger_sha256", "expected_observation_sha256"}
         _require(
-            operation in {"terminal_preview", "terminal_apply", "source_preview", "source_apply"}
+            operation
+            in {"terminal_preview", "terminal_apply", "source_preview", "source_apply", "stranded_preview",
+                "stranded_apply"}
             and set(request) == expected
             and isinstance(dispatch_id, str)
             and bool(dispatch_id)
@@ -824,6 +1111,8 @@ def recover(request: dict, *, repo: Path) -> LedgerDecision:
             "dispatch locator and exact CAS digests only",
         )
         ledger = _ledger(repo)
+        if operation in {"stranded_preview", "stranded_apply"}:
+            return _stranded_recover(request, ledger, repo)
         if operation in {"terminal_preview", "source_preview"}:
             raw = ledger.path.read_bytes()
             with _dispatch_lock(
@@ -979,26 +1268,3 @@ def validated_record(repo: Path, receipt: dict, data: dict | None = None) -> dic
     )
     return record
 
-
-def releases(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path) -> bool:
-    """Recovered scope participates only in the existing resource/landing predicates.
-
-    The charged identity remains untouched. The independently authenticated
-    producer's resource subject can differ from the old retained charge; it
-    cannot mint an approval or move accounting to that source branch.
-    """
-    record = validated_record(repo, receipt)
-    if record is None or record["observation"]["execution"] != "actual":
-        return False
-    original = record["observation"]["source_scope"]
-    if record["observation"].get("schema") == _SOURCE_SCHEMA:
-        # Own corrected history remains charged, but is no foreign resource
-        # holder. The full producer chain was just reopened by validated_record.
-        if original == proof and cycle._authorized_roots(repo, orchestrator_root, proof) is not None:
-            return True
-    view = {**receipt, "source_task_subject": original}
-    return cycle._independent_baseline_source(
-        repo, proof, view, orchestrator_root, source_subject=original["subject_branch"]
-    ) or cycle._terminal_producer_source(
-        repo, proof, view, orchestrator_root, source_subject=original["subject_branch"]
-    )

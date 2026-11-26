@@ -26,8 +26,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import resolver
 import interpreter_skew
@@ -108,6 +111,56 @@ def _probe_timeout_seconds() -> float:
 _DASHBOARD_FRESH_SECONDS = 24 * 60 * 60
 
 
+@dataclass(frozen=True)
+class DoctorTaskResolution:
+    status: Literal["ambiguous"]
+    candidates: list[dict[str, object]]
+    guidance: str
+
+
+@dataclass(frozen=True)
+class DoctorMcpProbe(DoctorMcp):
+    task_resolution: DoctorTaskResolution | None = None
+
+
+def _handoff_task_ambiguity(payload: dict[str, Any]) -> DoctorTaskResolution | None:
+    """Recognize the state resolver's structured ambiguity error."""
+    if payload.get("ok") is not False or payload.get("tool") != "get_handoff_state":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    # The state resolver's legacy ambiguity reply has no machine-readable kind.
+    if any(key in payload or key in data for key in ("error_kind", "error_code")):
+        return None
+
+    error = data.get("error")
+    candidates = data.get("candidates")
+    guidance = data.get("resolution")
+    if (
+        not isinstance(error, str)
+        or error.strip().partition(".")[0] not in (
+            "Ambiguous active task",
+            "Ambiguous active task for workspace path",
+            "Multiple active tasks",
+        )
+        or not isinstance(guidance, str)
+        or not guidance.strip()
+        or not isinstance(candidates, list)
+    ):
+        return None
+
+    refs: set[str] = set()
+    for candidate in candidates:
+        ref = candidate.get("task_ref") if isinstance(candidate, dict) else None
+        if not isinstance(ref, str) or not ref.strip():
+            return None
+        refs.add(ref.strip())
+    if len(refs) < 2:
+        return None
+    return DoctorTaskResolution(status="ambiguous", candidates=candidates, guidance=guidance)
+
+
 def _probe_env(repo: Path) -> tuple[DoctorEnv, list[ReceiptWarning]]:
     warnings: list[ReceiptWarning] = []
     try:
@@ -186,12 +239,13 @@ def _probe_with_retry(
     field: str,
     latency_key: str,
     latencies: dict[str, float],
-) -> tuple[str, ReceiptWarning | None]:
+    resolve_error: Callable[[dict[str, Any]], DoctorTaskResolution | None] | None = None,
+) -> tuple[str, ReceiptWarning | None, DoctorTaskResolution | None]:
     """Shared bounded-retry probe shape.
 
     Used by both the handoff and orchestrator probes so the tri-state
-    surface stays in one place. Returns ``(status, last_warning)`` where
-    ``status`` is one of ``"reachable"`` / ``"warming"`` / ``"unreachable"``.
+    surface stays in one place. Returns reachability, a probe warning,
+    and any task resolution reported by a recognized response.
     Records the most recent attempt's wall-clock under
     ``latencies[latency_key]`` (back-compat with the original single-value
     latency shape; intentionally no full attempt list).
@@ -209,7 +263,7 @@ def _probe_with_retry(
             field=field,
         )
         latencies[latency_key] = round((time.monotonic() - started) * 1000.0, 1)
-        return "unreachable", warning
+        return "unreachable", warning, None
 
     last_warning: ReceiptWarning | None = None
     for attempt_index in range(len(_PROBE_BACKOFF_SLEEPS) + 1):
@@ -221,22 +275,22 @@ def _probe_with_retry(
             field=field,
         )
         latencies[latency_key] = round((time.monotonic() - started) * 1000.0, 1)
-        # Only an ok=true dict counts as reachable; ok=false must stay in the
-        # retry loop and surface last_warning as unreachable [OBS-08][AGT-10].
-        if (
-            payload is not None
-            and isinstance(payload, dict)
-            and payload.get("ok") is True
-        ):
-            return ("reachable" if attempt_index == 0 else "warming"), None
+        if isinstance(payload, dict):
+            status = "reachable" if attempt_index == 0 else "warming"
+            if payload.get("ok") is True:
+                return status, None, None
+            if resolve_error is not None:
+                task_resolution = resolve_error(payload)
+                if task_resolution is not None:
+                    return status, None, task_resolution
         last_warning = warning
         if attempt_index < len(_PROBE_BACKOFF_SLEEPS):
             time.sleep(_PROBE_BACKOFF_SLEEPS[attempt_index])
 
-    return "unreachable", last_warning
+    return "unreachable", last_warning, None
 
 
-def _probe_mcp(repo: Path) -> tuple[DoctorMcp, list[ReceiptWarning]]:
+def _probe_mcp(repo: Path) -> tuple[DoctorMcpProbe, list[ReceiptWarning]]:
     """Bounded-retry probes with tri-state result.
 
     Runs two independent bounded-retry probes:
@@ -254,6 +308,7 @@ def _probe_mcp(repo: Path) -> tuple[DoctorMcp, list[ReceiptWarning]]:
     """
     warnings: list[ReceiptWarning] = []
     latencies: dict[str, float] = {}
+    task_resolution = None
 
     try:
         handoff_binary = _common.mcp_handoff_bin()
@@ -270,19 +325,20 @@ def _probe_mcp(repo: Path) -> tuple[DoctorMcp, list[ReceiptWarning]]:
         )
         latencies["handoff"] = 0.0
     else:
-        mcp_status, handoff_warning = _probe_with_retry(
+        mcp_status, handoff_warning, task_resolution = _probe_with_retry(
             repo,
             binary=handoff_binary,
-            runner=_common.run_handoff_json,
+            runner=partial(_common.run_handoff_json, allow_command_error=True),
             argv=["state", "--sections", "identity", "--detail", "summary"],
             field="mcp.handoff",
             latency_key="handoff",
             latencies=latencies,
+            resolve_error=_handoff_task_ambiguity,
         )
     if handoff_warning is not None:
         warnings.append(handoff_warning)
 
-    orchestrator_status, orchestrator_warning = _probe_with_retry(
+    orchestrator_status, orchestrator_warning, _ = _probe_with_retry(
         repo,
         binary=_common.mcp_orchestrator_bin(),
         runner=_common.run_orchestrator_json,
@@ -295,12 +351,13 @@ def _probe_mcp(repo: Path) -> tuple[DoctorMcp, list[ReceiptWarning]]:
         warnings.append(orchestrator_warning)
 
     return (
-        DoctorMcp(
+        DoctorMcpProbe(
             handoff_reachable=mcp_status in ("reachable", "warming"),
             orchestrator_reachable=orchestrator_status in ("reachable", "warming"),
             latencies_ms=latencies,
             mcp_status=mcp_status,
             orchestrator_status=orchestrator_status,
+            task_resolution=task_resolution,
         ),
         warnings,
     )
@@ -906,19 +963,25 @@ def _suggest_next(branch: DoctorBranch, mcp: DoctorMcp) -> NextCommand:
     Priority order:
 
     1. Handoff outage — lifecycle gates need it, so this dominates.
-    2. Handoff cold-start — the probe succeeded on retry, so the right
+    2. Ambiguous handoff task — select an active task explicitly.
+    3. Handoff cold-start — the probe succeeded on retry, so the right
        advice is "wait a moment, then re-run `make doctor`" rather than
        restarting a healthy server.
-    3. Orchestrator outage — daemon lifecycle is degraded; flag it before
+    4. Orchestrator outage — daemon lifecycle is degraded; flag it before
        the operator wastes a cycle.
-    4. Orchestrator cold-start — informational; tell the operator it is
+    5. Orchestrator cold-start — informational; tell the operator it is
        warming so they can re-run if they need a green orchestrator gate.
-    5. Branch/dirty cues.
+    6. Branch/dirty cues.
     """
     if mcp.mcp_status == "unreachable":
         return NextCommand(
             command="check MCP_WORKBAY_HANDOFF_BIN; restart workbay-handoff-mcp",
             reason="handoff MCP unreachable; lifecycle gates need it",
+        )
+    if isinstance(mcp, DoctorMcpProbe) and mcp.task_resolution is not None:
+        return NextCommand(
+            command="WORKBAY_HANDOFF_ACTIVE_TASK='<task_ref>' make doctor",
+            reason="multiple active handoff tasks match this workspace",
         )
     if mcp.mcp_status == "warming":
         return NextCommand(
@@ -1733,12 +1796,17 @@ def run(argv: list[str]) -> int:
                 f"indexed={(codemap_freshness.indexed_sha or '')[:12]} "
                 f"({detail})"
             )
+        task_resolution_summary = (
+            "task_resolution=ambiguous "
+            if isinstance(mcp, DoctorMcpProbe) and mcp.task_resolution is not None
+            else ""
+        )
         sys.stderr.write(
             f"doctor: branch={branch.name or '-'} head={(branch.head or '')[:12]} "
             f"dirty={branch.dirty} mcp={mcp.mcp_status} "
             f"orchestrator={mcp.orchestrator_status} "
             f"mcp.handoff={mcp.handoff_reachable} "
-            f"dashboard.exists={dashboard.exists}\n"
+            f"{task_resolution_summary}dashboard.exists={dashboard.exists}\n"
             f"{baseline_line}\n"
             f"{maint_worktree_collision_line}\n"
             f"{venv_line}\n"

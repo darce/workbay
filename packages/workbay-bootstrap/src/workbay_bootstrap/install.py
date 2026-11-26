@@ -105,6 +105,9 @@ CLONE_SUBDIR = (RUNTIME_ROOT_DIRNAME, "remote")
 # one derivation site instead of each hardcoding the literal.
 CLONE_RELPATH = "/".join(CLONE_SUBDIR)
 
+# Legacy plan and receipt callers use "local_ok" for an implicit default.
+_EXPLICIT_LOCAL_OK = "explicit_local_ok"
+
 
 def _build_install_manifest(
     *,
@@ -135,10 +138,7 @@ def _build_install_manifest(
     sync may prune from the surface files; everything else is treated
     as third-party and left untouched.
 
-    ``execution_mode`` is written only when ``"remote_only"`` so default
-    git_overlay manifests stay byte-identical (schema defaults cover absence).
-    ``embeddings_mode`` is written only when not ``"unspecified"`` for the
-    same byte-compat reason (``verified`` / ``disabled`` are explicit).
+    Omitted policy choices are inherited by the writer under the ledger lock.
     """
     manifest: dict[str, object] = {"schema_version": SCHEMA_VERSION}
     if source_kind == "package":
@@ -176,6 +176,8 @@ def _build_install_manifest(
         manifest["plugin_overrides_path"] = plugin_overrides_path
     if execution_mode == "remote_only":
         manifest["execution_mode"] = "remote_only"
+    elif execution_mode == _EXPLICIT_LOCAL_OK:
+        manifest["execution_mode"] = "local_ok"
     if embeddings_mode != "unspecified":
         manifest["embeddings_mode"] = embeddings_mode
     return manifest
@@ -240,12 +242,19 @@ _MANIFEST_REBUILT_KEYS = frozenset(
         "configs",
         "mcp_servers",
         "plugin_overrides_path",
-        "execution_mode",
-        "embeddings_mode",
     }
 )
 _EMBEDDINGS_OPERATOR_POLICY_KEY = "embeddings_operator_policy"
 _EMBEDDINGS_INFERENCE_RECEIPT_KEY = "embeddings_inference_receipt"
+_LEDGER_POLICY_MODES = {
+    "execution_mode": ("local_ok", "remote_only"),
+    "embeddings_mode": ("unspecified", "verified", "disabled"),
+}
+LEDGER_POLICY_KEYS = _LEDGER_POLICY_MODES.keys() | {
+    _EMBEDDINGS_OPERATOR_POLICY_KEY,
+    "remote_exec_mode",
+    "codemap_mode",
+}
 
 
 def _validate_embeddings_operator_policy(value: object) -> object:
@@ -373,6 +382,8 @@ def _preserve_existing_manifest_keys(
             continue
         if key in {_EMBEDDINGS_OPERATOR_POLICY_KEY, _EMBEDDINGS_INFERENCE_RECEIPT_KEY}:
             continue
+        if key in _LEDGER_POLICY_MODES and value not in _LEDGER_POLICY_MODES[key]:
+            continue  # Keep the reader's fallback for invalid legacy modes.
         manifest[key] = value
 
 
@@ -2136,8 +2147,21 @@ def _gitonly_tool_embeddings_mode(target: Path, embeddings_mode: str) -> str:
         return embeddings_mode
     if _persisted_embeddings_opted_out(target):
         return "disabled"
-    if _load_existing_manifest_str(target, "embeddings_mode") == "verified":
-        return "verified"
+    recorded_mode = _load_existing_manifest_str(target, "embeddings_mode")
+    if recorded_mode == "verified":
+        return recorded_mode
+    if recorded_mode == "disabled":
+        # A disabled receipt is history; a current operator choice (already
+        # known not to be off above) overrides it, matching
+        # _finish_inherited_install_embeddings.
+        from workbay_protocol.embedding_policy import load_embeddings_policy
+
+        try:
+            policy_status = load_embeddings_policy(target).status
+        except Exception:  # noqa: BLE001 - policy uncertainty must not opt in
+            return recorded_mode
+        if policy_status != "ok":
+            return recorded_mode
     from workbay_bootstrap.gitonly_closure import default_uv_tools_root
 
     receipt_path = default_uv_tools_root() / "mcp-workbay-handoff" / "uv-receipt.toml"
@@ -4151,17 +4175,50 @@ def _finish_install_embeddings(
         print(line, file=sys.stderr)
 
 
+def _finish_inherited_install_embeddings(target: Path, *, recorded_mode: object, prior_opt_out: bool) -> None:
+    """Apply durable operator policy before falling back to install history."""
+    from workbay_protocol.embedding_policy import load_embeddings_policy
+
+    from workbay_bootstrap.embedding_provision import (
+        _bootstrap_writer_lock,
+        _project_embedding_env_from_policy,
+        set_embeddings_gate,
+    )
+
+    with _bootstrap_writer_lock(target):
+        policy = load_embeddings_policy(target)
+        if policy.status == "ok" and policy.embeddings_policy == "off":
+            _project_embedding_env_from_policy(target, policy)
+            return
+        if (prior_opt_out and policy.status != "ok") or _persisted_embeddings_opted_out(target):
+            set_embeddings_gate(target, enabled=False)
+            return
+        # Historical verification never triggers a new verification. A
+        # current operator policy also takes precedence over a disabled receipt.
+        if recorded_mode == "verified":
+            return
+        if recorded_mode == "disabled":
+            if policy.status != "ok":
+                set_embeddings_gate(target, enabled=False)
+            return
+
+    _finish_install_embeddings(target, embeddings_mode="unspecified", no_embeddings=False)
+
+
 def _clear_verified_embeddings_mode(target: Path) -> None:
     """Drop an unproven verified receipt while preserving the rest of the ledger."""
-    ledger_path = target / BOOTSTRAP_MANIFEST_NAME
-    try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return
-    if not isinstance(ledger, dict) or ledger.get("embeddings_mode") != "verified":
-        return
-    ledger.pop("embeddings_mode", None)
-    _write_install_manifest(target, ledger)
+    from workbay_bootstrap.embedding_provision import _bootstrap_writer_lock
+
+    with _bootstrap_writer_lock(target):
+        ledger_path = target / BOOTSTRAP_MANIFEST_NAME
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(ledger, dict) or ledger.get("embeddings_mode") != "verified":
+            return
+        ledger.pop("embeddings_mode")
+        _persist_install_manifest_bytes(target, ledger)
 
 
 def _preflight_package_source(
@@ -4224,7 +4281,7 @@ def install(
     install_grok_ensure_agent_surfaces_hook: bool = False,
     no_embeddings: bool = False,
     allow_member_skew: bool = False,
-    execution_mode: str = "local_ok",
+    execution_mode: str = "inherit",
     embeddings_mode: str = "unspecified",
     force_reuse_state: bool = False,
 ) -> dict[str, object]:
@@ -4284,16 +4341,12 @@ def install(
             self-heal ``ensure-agent-surfaces`` SessionStart hook for the Grok
             harness. Off by default.
         execution_mode: Offload policy to record. ``"remote_only"`` probes the
-            remote gate before any materialization and persists that policy in
-            the ledger; ``"local_ok"`` (default) omits the field for
-            byte-compat with existing manifests.
+            remote gate before materialization, ``"local_ok"`` allows local
+            execution, and ``"inherit"`` (default) keeps the recorded choice.
         embeddings_mode: Semantic-embeddings capability to record.
-            ``"verified"`` (``--with-embeddings``) hard-verifies the
-            [embeddings] extra and digest pin, then provisions; ``"disabled"``
-            (``--no-embeddings``) opts out; ``"unspecified"`` (default) omits
-            the field unless provisioned artifacts digest-verify at install,
-            in which case the ledger records ``verified`` so semantic features
-            do not read silence as "unspecified".
+            ``"verified"`` hard-verifies the [embeddings] extra and digest pin,
+            ``"disabled"`` opts out, and ``"unspecified"`` (default) inherits the
+            recorded mode or uses best-effort provisioning on first install.
         force_reuse_state: Pass ``--force-reuse-state`` to init-state only when
             the operator explicitly opts in to reusing an unmanifested state DB.
 
@@ -4340,16 +4393,23 @@ def install(
                 install_vscode_ensure_agent_surfaces_hook=install_vscode_ensure_agent_surfaces_hook,
                 install_grok_ensure_agent_surfaces_hook=install_grok_ensure_agent_surfaces_hook,
                 allow_member_skew=allow_member_skew,
-                execution_mode=execution_mode,
+                execution_mode=_EXPLICIT_LOCAL_OK if execution_mode == "local_ok" else execution_mode,
                 embeddings_mode=embeddings_mode,
                 force_reuse_state=force_reuse_state,
             )
         )
-        _finish_install_embeddings(
-            target,
-            embeddings_mode=embeddings_mode,
-            no_embeddings=no_embeddings or opt_out,
-        )
+        if embeddings_mode != "unspecified" or no_embeddings:
+            _finish_install_embeddings(
+                target,
+                embeddings_mode=embeddings_mode,
+                no_embeddings=no_embeddings,
+            )
+        else:
+            _finish_inherited_install_embeddings(
+                target,
+                recorded_mode=manifest.get("embeddings_mode"),
+                prior_opt_out=opt_out,
+            )
         return manifest
     finally:
         # Policy consent and abort snapshots have their own legacy writers.

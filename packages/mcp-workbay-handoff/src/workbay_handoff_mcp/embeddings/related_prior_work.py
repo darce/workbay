@@ -19,15 +19,28 @@ from "store empty" from "incompatible model_id".
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import heapq
 import logging
+import math
+import os
 import sqlite3
-from collections.abc import Collection
+import threading
+import time
+from collections.abc import Collection, Iterator
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
 
-from ..lanes_recording import is_reclaim_candidate_decision_id
+from .scan import (
+    check_cancelled,
+    concept_rows_exist,
+    iter_concept_vector_chunks,
+    reclaim_exclusion_sql,
+    score_chunk,
+)
 from .store import (
     SupportsEmbed,
     concept_embedding_coverage,
@@ -77,7 +90,79 @@ RelatedPriorWorkStatus = Literal[
     "provider_unavailable",
     "model_mismatch",
     "store_empty",
+    "busy",
 ]
+
+# Rows per fetchmany chunk of the bounded scan: peak resident memory is one
+# chunk (rows + an (n, dim) float32 matrix) plus the top-k, never the store.
+RELATED_PRIOR_WORK_SCAN_CHUNK_ROWS: int = 1024
+
+# Single-flight ([RES-04], [CAL-02]): one prior-work query scans at a time per
+# process; later callers queue (same result shape, same status vocabulary)
+# for at most this long. Only exhausting the wait degrades, to the typed
+# status "busy" with note RELATED_PRIOR_WORK_BUSY_NOTE.
+DEFAULT_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS: float = 30.0
+ENV_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS = "WORKBAY_HANDOFF_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS"
+RELATED_PRIOR_WORK_BUSY_NOTE = "single_flight_wait_exhausted"
+# Cancel-token poll interval while queued.
+_QUEUE_POLL_SECONDS = 0.05
+
+_SINGLE_FLIGHT = threading.Lock()
+
+# Cancel token of the request this thread is serving (set by the MCP tool
+# bridge in api.py; ``None`` for in-process callers). A ContextVar so it
+# reaches find_related_prior_work_public through core's pass-through without
+# widening every intermediate signature.
+_ACTIVE_CANCEL: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "related_prior_work_cancel", default=None
+)
+
+
+@contextlib.contextmanager
+def cancellation_scope(cancel: threading.Event | None) -> Iterator[None]:
+    """Make ``cancel`` the token checked by prior-work queries in this context."""
+    token = _ACTIVE_CANCEL.set(cancel)
+    try:
+        yield
+    finally:
+        _ACTIVE_CANCEL.reset(token)
+
+
+def resolve_queue_timeout_seconds() -> float:
+    """Bounded single-flight wait, rejecting unsafe environment values."""
+    raw = os.environ.get(ENV_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS)
+    if raw is None:
+        return DEFAULT_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{ENV_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS} must be a finite positive number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"{ENV_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS} must be a finite positive number, got {raw!r}"
+        )
+    return value
+
+
+def _acquire_single_flight(timeout_seconds: float, cancel: threading.Event | None) -> bool:
+    """Queue for the scan slot; ``False`` once the bounded wait is exhausted.
+
+    Raises :class:`ScanCancelled` if the caller's token is set while queued.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        check_cancelled(cancel)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        wait = remaining if cancel is None else min(remaining, _QUEUE_POLL_SECONDS)
+        if _SINGLE_FLIGHT.acquire(timeout=wait):
+            if cancel is not None and cancel.is_set():
+                _SINGLE_FLIGHT.release()
+                check_cancelled(cancel)
+            return True
 
 
 @dataclass(frozen=True)
@@ -240,15 +325,9 @@ def _resolve_snippet(
     return text
 
 
-def _compaction_residual_oversized(conn: sqlite3.Connection, compaction_id: str) -> bool:
-    row = conn.execute(
-        "SELECT length(prose_residual) FROM session_compactions WHERE compaction_id = ?",
-        (compaction_id,),
-    ).fetchone()
-    # BR-I7-01 / CARD-05: unproven length is oversized — do not rank.
-    if row is None or row[0] is None:
-        return True
-    return int(row[0]) > COMPACTION_RESIDUAL_RANK_MAX_CHARS
+def _rank_key(hit: tuple[float, str, str, str, str]) -> tuple[float, str, str]:
+    """Result order: score descending, then entity_kind, then entity_id."""
+    return (-hit[0], hit[1], hit[2])
 
 
 def _include_token(value: object) -> str:
@@ -285,7 +364,9 @@ def _rank_against_store(
     include_task_refs: frozenset[str] | None = None,
     include_plan_paths: frozenset[str] | None = None,
     include_statuses: frozenset[str] | None = None,
+    cancel: threading.Event | None = None,
 ) -> RelatedPriorWorkResult:
+    check_cancelled(cancel)
     total = _store_row_count(conn)
     if total == 0:
         return _empty("store_empty", min_score=min_score, query_mode=query_mode, query_model_id=model_id)
@@ -317,26 +398,21 @@ def _rank_against_store(
     anchor = anchor / norm
 
     # Space identity (EMB-01 / EMB-05): never silently rank across model_id geometries.
-    model_match_count = 0
-    other_model_count = 0
-    scored: list[tuple[float, str, str, str, str]] = []  # score, kind, eid, task_ref, model_id
-
+    # Every predicate is SQL; the scan returns only same-model rows that
+    # survive the reclaim exclusion, the caller's exclusions and the include
+    # filters, chunk by chunk ([RES-04]). Foreign-model rows are only ever
+    # probed with EXISTS, never fetched.
     needs_join = include_plan_paths is not None or include_statuses is not None
-    sql = (
-        "SELECT c.entity_kind, c.entity_id, c.task_ref, c.vector, c.model_id, c.text_hash, c.dim, d.decision "
-        "FROM concept_embeddings c LEFT JOIN decisions d "
-        "ON c.entity_kind IN ('decision.title', 'decision.rationale') "
-        "AND d.id = c.entity_id AND d.task_ref = c.task_ref"
-    )
-    params: list[object] = []
+    joins_sql = ""
     if needs_join:
         # Live handoff_state wins via COALESCE. Join archives on task_ref
         # alone so a restored live row with NULL task_plan_path can still
         # fall back to $.active.task_plan_path (BR-I8-01 / GRPH-36).
-        sql += (
-            " LEFT JOIN handoff_state h ON h.task_ref = c.task_ref LEFT JOIN task_archives a ON a.task_ref = c.task_ref"
+        joins_sql = (
+            "LEFT JOIN handoff_state h ON h.task_ref = c.task_ref LEFT JOIN task_archives a ON a.task_ref = c.task_ref"
         )
     where: list[str] = []
+    params: list[object] = []
     if include_task_refs is not None:
         placeholders = ",".join("?" for _ in include_task_refs)
         where.append(f"c.task_ref IN ({placeholders})")
@@ -351,64 +427,75 @@ def _rank_against_store(
         placeholders = ",".join("?" for _ in include_statuses)
         where.append(f"COALESCE(h.status, json_extract(a.snapshot_json, '$.active.status')) IN ({placeholders})")
         params.extend(sorted(include_statuses))
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    exclusions: list[str] = []
+    exclusion_params: list[object] = []
+    if exclude_entity_ids:
+        exclusions.append("c.entity_id NOT IN (" + ",".join("?" for _ in exclude_entity_ids) + ")")
+        exclusion_params.extend(sorted(exclude_entity_ids))
+    if exclude_task_ref is not None:
+        exclusions.append("c.task_ref != ?")
+        exclusion_params.append(exclude_task_ref)
 
-    rows = conn.execute(sql, params).fetchall()
-    if not rows and where:
-        return _empty(
-            "no_results_above_threshold",
-            min_score=min_score,
-            query_mode=query_mode,
-            query_model_id=model_id,
-            note="no_candidates_after_include_filters",
-        )
-    intern_keys = [(str(row[5]), str(row[4])) for row in rows if not bytes(row[3] or b"")]
-    owned_cache = prefetch_owned_vector_blobs(conn, intern_keys)
-    for row in rows:
-        if row[7] is not None and is_reclaim_candidate_decision_id(str(row[7])):
+    # Same-model rows are counted before the residual skip so an oversized
+    # compaction.prose_residual is not reported as model_mismatch
+    # (BR-MEM2-01 / CARD-05).
+    model_match_count = 0
+    any_scored = False
+    any_above = False
+    keep = max(0, limit)
+    top: list[tuple[float, str, str, str, str]] = []  # score, kind, eid, task_ref, model_id
+    for chunk in iter_concept_vector_chunks(
+        conn,
+        model_id=model_id,
+        dim=int(anchor.shape[0]),
+        where_sql=[*where, *exclusions],
+        params=[*params, *exclusion_params],
+        joins_sql=joins_sql,
+        chunk=RELATED_PRIOR_WORK_SCAN_CHUNK_ROWS,
+        cancel=cancel,
+        residual_max_chars=COMPACTION_RESIDUAL_RANK_MAX_CHARS,
+        decode=lambda blob, stored_dim: deserialize_vector(blob, dim=_stored_vector_dim(stored_dim)),
+    ):
+        model_match_count += chunk.rows_seen
+        if not chunk.keys:
             continue
-        entity_kind = str(row[0])
-        entity_id = str(row[1])
-        row_task_ref = str(row[2])
-        row_model_id = str(row[4])
-
-        if entity_id in exclude_entity_ids:
+        any_scored = True
+        candidates = [
+            (score, *key)
+            for score, key in zip(score_chunk(chunk.matrix, anchor), chunk.keys, strict=True)
+            if score >= min_score
+        ]
+        if not candidates:
             continue
-        if exclude_task_ref is not None and row_task_ref == exclude_task_ref:
-            continue
-
-        if row_model_id != model_id:
-            other_model_count += 1
-            continue
-
-        # Count same-model rows before residual skip so an oversized
-        # compaction.prose_residual is not reported as model_mismatch
-        # (BR-MEM2-01 / CARD-05).
-        model_match_count += 1
-        if entity_kind == _COMPACTION_RESIDUAL_KIND and _compaction_residual_oversized(conn, entity_id):
-            continue
-        blob = resolve_vector_blob(conn, row[3], str(row[5]), row_model_id, owned_cache=owned_cache)
-        if not blob:
-            continue
-        vec = deserialize_vector(blob, dim=_stored_vector_dim(row[6]))
-        if vec.shape[0] != anchor.shape[0]:
-            continue
-        score = float(np.dot(anchor, vec))
-        scored.append((score, entity_kind, entity_id, row_task_ref, row_model_id))
+        any_above = True
+        # Bounded top-k: O(limit + chunk) entries, same (-score, kind, id) order.
+        top = heapq.nsmallest(keep, [*top, *candidates], key=_rank_key)
 
     if model_match_count == 0:
-        if other_model_count > 0 or total > 0:
-            # Store has rows but none share the query model_id (or all were excluded
-            # and only foreign-model rows remain visible as mismatch evidence).
-            if other_model_count > 0:
-                return _empty(
-                    "model_mismatch",
-                    min_score=min_score,
-                    query_mode=query_mode,
-                    query_model_id=model_id,
-                    note="no_candidates_share_query_model_id",
-                )
+        if where and not concept_rows_exist(conn, predicates=where, params=params, joins_sql=joins_sql, cancel=cancel):
+            return _empty(
+                "no_results_above_threshold",
+                min_score=min_score,
+                query_mode=query_mode,
+                query_model_id=model_id,
+                note="no_candidates_after_include_filters",
+            )
+        # Store has rows but none share the query model_id: foreign-model rows
+        # that survive the same filters are the mismatch evidence.
+        if concept_rows_exist(
+            conn,
+            predicates=["c.model_id != ?", reclaim_exclusion_sql(conn), *where, *exclusions],
+            params=[model_id, *params, *exclusion_params],
+            joins_sql=joins_sql,
+            cancel=cancel,
+        ):
+            return _empty(
+                "model_mismatch",
+                min_score=min_score,
+                query_mode=query_mode,
+                query_model_id=model_id,
+                note="no_candidates_share_query_model_id",
+            )
         # Everything was self/task-excluded; treat as empty-of-peers, not mismatch.
         return _empty(
             "no_results_above_threshold",
@@ -418,18 +505,16 @@ def _rank_against_store(
             note="no_candidates_after_exclusions",
         )
 
-    above = [s for s in scored if s[0] >= min_score]
-    if not above:
+    if not any_above:
         return _empty(
             "no_results_above_threshold",
             min_score=min_score,
             query_mode=query_mode,
             query_model_id=model_id,
-            note="no_candidates_after_exclusions" if not scored else None,
+            note="no_candidates_after_exclusions" if not any_scored else None,
         )
 
-    above.sort(key=lambda t: (-t[0], t[1], t[2]))
-    top = above[: max(0, limit)]
+    check_cancelled(cancel)
     hits: list[RelatedPriorWorkHit] = []
     for score, entity_kind, entity_id, row_task_ref, row_model_id in top:
         snippet = _resolve_snippet(conn, entity_kind, entity_id, row_task_ref)
@@ -464,6 +549,7 @@ def _find_related_prior_work(
     limit: int = DEFAULT_RELATED_PRIOR_WORK_LIMIT,
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
+    cancel: threading.Event | None = None,
 ) -> RelatedPriorWorkResult:
     """Return prior concept rows that resemble the query (advisory context only).
 
@@ -502,6 +588,10 @@ def _find_related_prior_work(
     provider:
         Embedding provider for free-text mode. Ignored for ``finding_id`` mode.
         Tests inject a stub; production may pass ``None`` to resolve from env.
+    cancel:
+        Optional token. Once set, the scan stops at its next chunk boundary
+        and raises :class:`~workbay_handoff_mcp.embeddings.scan.ScanCancelled`
+        (the caller has abandoned the request; nothing is returned).
 
     Returns
     -------
@@ -516,6 +606,9 @@ def _find_related_prior_work(
       returns ``model_mismatch`` when the store has vectors but none share the
       query's model identity.
     * Self-exclusion: a ``finding_id`` query never returns that finding.
+    * Bounded: rows are scanned in chunks of
+      :data:`RELATED_PRIOR_WORK_SCAN_CHUNK_ROWS` with every filter in SQL and a
+      top-``limit`` heap, so resident memory is O(chunk + limit), not O(store).
     """
     has_text = text is not None and str(text).strip() != ""
     has_finding = finding_id is not None and str(finding_id).strip() != ""
@@ -562,6 +655,7 @@ def _find_related_prior_work(
             include_task_refs=inc_tasks,
             include_plan_paths=inc_plans,
             include_statuses=inc_statuses,
+            cancel=cancel,
         )
 
     # Free-text mode — provider required.
@@ -580,6 +674,7 @@ def _find_related_prior_work(
 
     from .provider import EmbeddingArtifactError
 
+    check_cancelled(cancel)
     try:
         vectors = prov.embed([str(text).strip()])
     except EmbeddingArtifactError as exc:
@@ -615,6 +710,7 @@ def _find_related_prior_work(
         include_task_refs=inc_tasks,
         include_plan_paths=inc_plans,
         include_statuses=inc_statuses,
+        cancel=cancel,
     )
 
 
@@ -630,12 +726,15 @@ def find_related_prior_work(
     limit: int = DEFAULT_RELATED_PRIOR_WORK_LIMIT,
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
+    cancel: threading.Event | None = None,
 ) -> RelatedPriorWorkResult:
     """Retrieve advisory prior art and report source-derived global coverage.
 
     Coverage scope is all source concepts, regardless of result membership
     filters. A successful ranking may still have pending coverage. Provider
-    absence or missing query model identity yields unknown coverage.
+    absence or missing query model identity yields unknown coverage. The
+    census is streamed in pages, like the ranking scan. ``cancel`` stops
+    either between chunks (:class:`~workbay_handoff_mcp.embeddings.scan.ScanCancelled`).
     """
     result = _find_related_prior_work(
         conn,
@@ -648,8 +747,39 @@ def find_related_prior_work(
         limit=limit,
         min_score=min_score,
         provider=provider,
+        cancel=cancel,
     )
-    return replace(result, coverage=concept_embedding_coverage(conn, result.query_model_id))
+    return replace(result, coverage=concept_embedding_coverage(conn, result.query_model_id, cancel=cancel))
+
+
+def _busy_payload(
+    *,
+    text: str | None,
+    finding_id: str | None,
+    min_score: float,
+) -> dict[str, Any]:
+    """Typed degrade when the bounded single-flight wait is exhausted.
+
+    Nothing was ranked or counted, so coverage is ``unknown`` (not a claim).
+    """
+    has_text = text is not None and str(text).strip() != ""
+    has_finding = finding_id is not None and str(finding_id).strip() != ""
+    result = RelatedPriorWorkResult(
+        status="busy",
+        results=(),
+        min_score=min_score,
+        query_mode="finding_id" if has_finding else "text" if has_text else None,
+        note=RELATED_PRIOR_WORK_BUSY_NOTE,
+        coverage={
+            "status": "unknown",
+            "model_id": None,
+            "total": None,
+            "current": None,
+            "pending": None,
+            "scope": "all_source_concepts",
+        },
+    )
+    return result.as_dict()
 
 
 def find_related_prior_work_public(
@@ -663,32 +793,52 @@ def find_related_prior_work_public(
     limit: int = DEFAULT_RELATED_PRIOR_WORK_LIMIT,
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Package-level entry: open the handoff DB and return a JSON-friendly dict.
 
     Keyword-only. See :func:`find_related_prior_work` for semantics. Public
     callers receive ``empty_membership_filter`` for an explicitly empty include
     collection so it cannot be confused with exclusions removing candidates.
+
+    Single-flight ([RES-04], [CAL-02]): embed + rank + coverage run under one
+    process-wide lock, so N concurrent callers hold one scan working set, not
+    N. A second caller is queued, not refused: it waits, then gets the same
+    ranking. The wait is bounded by :func:`resolve_queue_timeout_seconds`
+    (``WORKBAY_HANDOFF_RELATED_PRIOR_WORK_QUEUE_TIMEOUT_SECONDS``, default
+    30 s); only exhausting it degrades, to the typed status ``busy`` with note
+    ``single_flight_wait_exhausted`` and ``unknown`` coverage.
+
+    ``cancel`` (default: the token installed by :func:`cancellation_scope`)
+    is checked while queued and between scan chunks; once set the call raises
+    :class:`~workbay_handoff_mcp.embeddings.scan.ScanCancelled`.
     """
     from workbay_handoff_mcp.shared_schema import _get_db_connection
 
-    with _get_db_connection() as conn:
-        result = find_related_prior_work(
-            conn,
-            text=text,
-            finding_id=finding_id,
-            task_ref=task_ref,
-            include_task_refs=include_task_refs,
-            include_plan_paths=include_plan_paths,
-            include_statuses=include_statuses,
-            limit=limit,
-            min_score=min_score,
-            provider=provider,
-        )
-    payload = result.as_dict()
-    if result.note == "no_candidates_after_exclusions" and any(
-        (normalized := _normalize_include(value)) is not None and not normalized
-        for value in (include_task_refs, include_plan_paths, include_statuses)
-    ):
-        payload["note"] = "empty_membership_filter"
-    return payload
+    token = cancel if cancel is not None else _ACTIVE_CANCEL.get()
+    if not _acquire_single_flight(resolve_queue_timeout_seconds(), token):
+        return _busy_payload(text=text, finding_id=finding_id, min_score=min_score)
+    try:
+        with _get_db_connection() as conn:
+            result = find_related_prior_work(
+                conn,
+                text=text,
+                finding_id=finding_id,
+                task_ref=task_ref,
+                include_task_refs=include_task_refs,
+                include_plan_paths=include_plan_paths,
+                include_statuses=include_statuses,
+                limit=limit,
+                min_score=min_score,
+                provider=provider,
+                cancel=token,
+            )
+        payload = result.as_dict()
+        if result.note == "no_candidates_after_exclusions" and any(
+            (normalized := _normalize_include(value)) is not None and not normalized
+            for value in (include_task_refs, include_plan_paths, include_statuses)
+        ):
+            payload["note"] = "empty_membership_filter"
+        return payload
+    finally:
+        _SINGLE_FLIGHT.release()

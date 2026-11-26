@@ -14,7 +14,7 @@ _MAX_PAGE_SIZE = 50
 _CURSOR = re.compile(r"v1\.([0-9a-f]{64})\.([1-9][0-9]{0,18})")
 _ACTIONS = {
     "unknown": "Inspect the retained holder and its recorded evidence in a reconciliation preview.",
-    "overlap": "Review the reported scope overlap with this holder before proceeding.",
+    "overlap": "Land, discard (lane_discarded_<task>_<lane>_<tip40>) or wait for the holder's unlanded commits on overlap_paths.",
     "missing_incoming_scope": "Provide the incoming task's authorized scope and rerun subject resolution.",
     "evidence_unavailable": "Check access to the recorded holder evidence and rerun subject resolution.",
 }
@@ -24,6 +24,10 @@ _CODE_ALIASES = {
     "holder_evidence_unavailable": "evidence_unavailable",
     "holder_custody_unavailable": "evidence_unavailable",
     "review_cycle_holder_release_ledger_unavailable": "evidence_unavailable",
+    # review_cycle_holds.holder_blocks reasons.
+    "paths_overlap": "overlap",
+    "holder_tip_unreadable": "evidence_unavailable",
+    "integration_unreadable": "evidence_unavailable",
 }
 
 

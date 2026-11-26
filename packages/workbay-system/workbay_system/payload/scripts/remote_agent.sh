@@ -416,7 +416,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.47
+_BOUNDARY_RUNTIME_VERSION=0.3.48
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -9498,7 +9498,8 @@ CLEANUP_EOF
     # Single-source admission for pre-dispatch and the in-run recheck.
     # Placeholders contain validated numeric options; MAX_LANES may be empty.
     read -r -d '' _admission_tpl <<'ADMISSION_EOF' || true
-pids_root="${WORKBAY_REMOTE_GATE_PIDS_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice}"
+admission_uid=$(id -u)
+pids_root="${WORKBAY_REMOTE_GATE_PIDS_ROOT:-/sys/fs/cgroup/user.slice/user-$admission_uid.slice}"
 _read_uint() {
     awk 'NR == 1 && NF == 1 && $1 ~ /^[0-9]+$/ {v=$1; ok=1}
          END {if (ok && NR == 1) print v; else exit 1}' "$1" 2>/dev/null
@@ -9730,7 +9731,7 @@ _admission_top_scopes() {
 _admission_unmeasured() {
     _au_metric=cpu
     case "$1" in vm_memory|vm_memory_psi) _au_metric=memory ;; esac
-    echo "remote_agent: vm_admission_unmeasured gauge=$1 top_scopes=$(_admission_top_scopes "$_au_metric")" >&2
+    echo "remote_agent: vm_admission_unmeasured gauge=$1${2:+ $2} top_scopes=$(_admission_top_scopes "$_au_metric")" >&2
     exit 75
 }
 _admission_saturated() {
@@ -9739,6 +9740,96 @@ _admission_saturated() {
     # Keep the decision, gauge details, and consuming scopes in one event.
     echo "remote_agent: vm_measured_saturation gauge=$1 $2 — deferring lane top_scopes=$(_admission_top_scopes "$_as_metric")" >&2
     exit 75
+}
+# CPU admission reads pressure in a scope the lane alone occupies. Shared
+# ancestors count a quota-capped sibling's cpu.max throttling as stall, and so
+# does host-wide /proc/pressure/cpu (measured on the VM, MEAS-17).
+# Every admission is a first dispatch: both the pre-dispatch probe and the
+# in-run recheck run before the lane's scope exists, and the lane launches in a
+# fresh scope. A cgroup that already holds LANE_UNIT's name is a straggler, so
+# its pressure says nothing about the incoming lane and is never read here.
+_cpu_cgroup_dir() {
+    # Map a systemd ControlGroup path into the measured hierarchy.
+    case "$1" in
+        "/user.slice/user-$admission_uid.slice/"*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *//*|*/./*|*/../*|*/.|*/..|*[!A-Za-z0-9:_.@/\\-]*) return 1 ;;
+    esac
+    printf '%s\n' "$pids_root${1#/user.slice/user-$admission_uid.slice}"
+}
+_cpu_quota_free() {
+    # 0: no cgroup below $1 has its own cpu.max quota; 1: one does; 2: unknown.
+    [ -r "$1" ] && [ -x "$1" ] || return 2
+    _cqf_files=$(find "$1" -mindepth 2 -maxdepth 8 -type f -name cpu.max -print 2>/dev/null) || return 2
+    [ -n "$_cqf_files" ] || return 0
+    while IFS= read -r _cqf_file; do
+        _cqf_quota=''
+        read -r _cqf_quota _cqf_period 2>/dev/null < "$_cqf_file" || [ -n "$_cqf_quota" ] || return 2
+        [ "$_cqf_quota" = max ] || return 1
+    done <<< "$_cqf_files"
+    return 0
+}
+_cpu_lane_probe() {
+    # First dispatch has no lane cgroup yet. Launch a lane-exclusive probe the
+    # way the lane is launched (systemd-run --user --scope, nice 10) but with
+    # no CPUQuota of its own. One CPU-bound thread reports, from its own
+    # cpu.pressure total, the share of a 1s window it spent waiting for CPU.
+    [ -n "$_cpu_tw" ] || return 1
+    command -v systemd-run >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || return 1
+    _clp_out=$(timeout -k 2 10 systemd-run --quiet --user --scope --collect \
+        --unit "workbay-cpu-probe-$$-$RANDOM.scope" --description=workbay-cpu-admission-probe -p RuntimeMaxSec=10 \
+        nice -n 10 python3 -c '
+import sys
+import time
+
+root, uid = sys.argv[1], sys.argv[2]
+prefix = "/user.slice/user-" + uid + ".slice"
+own = [line[3:].strip() for line in open("/proc/self/cgroup") if line.startswith("0::")]
+if len(own) != 1 or not own[0].startswith(prefix + "/"):
+    sys.exit(1)
+path = root + own[0][len(prefix):] + "/cpu.pressure"
+
+
+def stalled_usec():
+    with open(path) as stream:
+        some = [line for line in stream if line.startswith("some ")]
+    return int(some[0].rsplit("total=", 1)[1])
+
+
+before, start = stalled_usec(), time.monotonic()
+while time.monotonic() - start < 1:
+    pass
+after, end = stalled_usec(), time.monotonic()
+print("%.2f %s" % ((after - before) / ((end - start) * 1e4), own[0]))
+' "$pids_root" "$admission_uid" </dev/null 2>/dev/null) || return 1
+    [[ "$_clp_out" =~ ^([0-9]+[.][0-9]+)\ (/[^[:space:]]+)$ ]] || return 1
+    _clp_pct=${BASH_REMATCH[1]}
+    _clp_dir=$(_cpu_cgroup_dir "${BASH_REMATCH[2]}") || return 1
+    cpu_psi_sampled=$_clp_pct
+    cpu_psi_scope=$_clp_dir
+    cpu_psi_source="lane_probe window_s=1"
+}
+_cpu_first_dispatch_scope() {
+    _cpu_launch_slice="$cpu_psi_service/app.slice"
+    _cpu_lane_probe && return 0
+    # Without a probe, a launch slice no capped cgroup shares is the closest
+    # lane scope. Otherwise only the aggregate remains; say so in the event.
+    _cpu_launch_state=absent
+    if [ -d "$_cpu_launch_slice" ]; then
+        _cpu_quota_rc=0
+        _cpu_quota_free "$_cpu_launch_slice" || _cpu_quota_rc=$?
+        case "$_cpu_quota_rc" in
+            0) cpu_psi_scope=$_cpu_launch_slice
+               cpu_psi_source="launch_slice fallback=lane_probe_unavailable"
+               return 0 ;;
+            1) _cpu_launch_state=quota_shared ;;
+            *) _cpu_launch_state=unreadable ;;
+        esac
+    fi
+    cpu_psi_scope=$pids_root
+    cpu_psi_source="aggregate fallback=lane_probe_unavailable launch_slice=$_cpu_launch_state"
 }
 avail_mb=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "$avail_mb" -gt 0 ] && [ "$avail_mb" -lt __MEM_FLOOR_MB__ ]; then
@@ -9777,13 +9868,34 @@ if [ -d "$pids_root" ]; then
         _admission_saturated vm_memory "anon=$anon lane=$lane_anon max=$memory_max headroom_pct=__HEADROOM_PCT__"
     fi
     mem_psi=$(_read_psi "$pids_root/memory.pressure") || _admission_unmeasured vm_memory_psi
-    cpu_psi=$(_read_psi "$pids_root/cpu.pressure") || _admission_unmeasured vm_cpu_psi
+    # The incoming lane has no cgroup yet at any admission site; measure it as
+    # a first dispatch. An unreadable user manager hides the probe and launch
+    # slice alike, so it defers.
+    cpu_psi_service="$pids_root/user@$admission_uid.service"
+    cpu_psi_scope=''
+    cpu_psi_source=''
+    cpu_psi_sampled=''
+    _cpu_tw=''; command -v timeout >/dev/null 2>&1 && _cpu_tw='timeout -k 1 5'
+    if [ -d "$cpu_psi_service" ] && { [ ! -r "$cpu_psi_service" ] || [ ! -x "$cpu_psi_service" ]; }; then
+        _admission_unmeasured vm_cpu_psi "scope=$cpu_psi_service measurement=first_dispatch reason=cgroup_unreadable"
+    fi
+    _cpu_first_dispatch_scope
+    cpu_psi_details="scope=$cpu_psi_scope measurement=$cpu_psi_source"
+    if [ -n "$cpu_psi_sampled" ]; then
+        cpu_psi=$cpu_psi_sampled
+        cpu_psi_gauge="some_pct=$cpu_psi"
+    else
+        cpu_psi=$(_read_psi "$cpu_psi_scope/cpu.pressure") ||
+            _admission_unmeasured vm_cpu_psi "$cpu_psi_details reason=cpu_psi_unreadable"
+        cpu_psi_gauge="avg60=$cpu_psi"
+    fi
     if awk -v p="$mem_psi" 'BEGIN {exit !(p>__MEM_PSI_MAX__)}'; then
         _admission_saturated vm_memory_psi "avg60=$mem_psi max=__MEM_PSI_MAX__"
     fi
     if awk -v p="$cpu_psi" 'BEGIN {exit !(p>__CPU_PSI_MAX__)}'; then
-        _admission_saturated vm_cpu_psi "avg60=$cpu_psi max=__CPU_PSI_MAX__"
+        _admission_saturated vm_cpu_psi "$cpu_psi_gauge max=__CPU_PSI_MAX__ $cpu_psi_details"
     fi
+    echo "remote_agent: vm_admission_measurement gauge=vm_cpu_psi $cpu_psi_gauge max=__CPU_PSI_MAX__ $cpu_psi_details" >&2
 fi
 # Probe the nearest existing parent on first dispatch, before the agent root is
 # created. It lives on the same filesystem that will hold the new directory.

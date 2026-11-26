@@ -9,6 +9,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from .concept_embed_hook import embed_concept_on_write
+from .lane_landing_proof import LandingProbe
 from .lifecycle_resource_producer import ProducerBinding, prepare_binding, replay_receipt, stage_change
 from .orientation_reads import orientation_read_boundary_active, record_orientation_read
 from .projection_event_dedupe import (
@@ -122,6 +123,9 @@ def set_handoff_state(
     # Resolve actor/git context outside the write lock, then re-read the task and
     # archive rows under BEGIN IMMEDIATE. This keeps external resolution out of
     # SQLite's RESERVED window while making the create fence atomic with INSERT.
+    from .core import MAX_OPTIMISTIC_REVISION_ATTEMPTS  # noqa: PLC0415
+    from .lane_landing_proof import LANDING_PROBE_STALE, probe_task_landing  # noqa: PLC0415
+
     with _get_db_connection() as conn:
         task_row = _get_handoff_row_for_task(conn, task_ref)
         resolved_ctx = _resolve_write_actor(
@@ -136,30 +140,48 @@ def set_handoff_state(
         target_branch if target_branch is not None else (task_row["target_branch"] if task_row is not None else None),
         source_worktree,
     )
-    with _get_db_connection(begin_immediate=True) as conn:
-        producer_binding = _fence_producer_binding(
-            conn,
-            task_ref=task_ref,
-            target_branch=target_branch,
-            target_worktree_path=target_worktree_path,
-            prepared_target=prepared_target,
-            binding=producer_binding,
-        )
-        result = _set_handoff_state_with_conn(
-            conn,
-            task_ref=task_ref,
-            objective=objective,
-            focus=focus,
-            status=status,
-            expected_revision=expected_revision,
-            actor=actor,
-            target_branch=target_branch,
-            target_worktree_path=target_worktree_path,
-            task_plan_path=task_plan_path,
-            event_id=event_id,
-            resolved_ctx=resolved_ctx,
-            producer_binding=producer_binding,
-        )
+    # A done is fenced on the lane roster the landing probe observed (Git, so
+    # before the lock). When the roster moves before BEGIN IMMEDIATE the locked
+    # write refuses landing_probe_stale without writing; re-probe here and
+    # retry, bounded like the optimistic revision loop [CON-21][GRPH-27].
+    for attempt in range(MAX_OPTIMISTIC_REVISION_ATTEMPTS):
+        landing_probe = None
+        if status == "done" and task_row is not None and str(task_row["status"]) != "done":
+            with _get_db_connection() as conn:
+                landing_probe = probe_task_landing(conn, str(task_row["task_ref"]))
+        with _get_db_connection(begin_immediate=True) as conn:
+            fenced_binding = _fence_producer_binding(
+                conn,
+                task_ref=task_ref,
+                target_branch=target_branch,
+                target_worktree_path=target_worktree_path,
+                prepared_target=prepared_target,
+                binding=producer_binding,
+            )
+            result = _set_handoff_state_with_conn(
+                conn,
+                task_ref=task_ref,
+                objective=objective,
+                focus=focus,
+                status=status,
+                expected_revision=expected_revision,
+                actor=actor,
+                target_branch=target_branch,
+                target_worktree_path=target_worktree_path,
+                task_plan_path=task_plan_path,
+                event_id=event_id,
+                resolved_ctx=resolved_ctx,
+                producer_binding=fenced_binding,
+                landing_probe=landing_probe,
+            )
+        data = result.get("data") if isinstance(result, dict) else None
+        if not (
+            result.get("ok") is False
+            and isinstance(data, dict)
+            and data.get("error_kind") == LANDING_PROBE_STALE
+            and attempt < MAX_OPTIMISTIC_REVISION_ATTEMPTS - 1
+        ):
+            break
     if result.get("ok"):
         from .current_task_rendering import (  # noqa: PLC0415
             _write_per_task_projection,
@@ -269,6 +291,7 @@ def _set_handoff_state_with_conn(
     target_context_warnings: list[str] | None = None,
     precomputed_target_worktree_path: str | None = None,
     producer_binding: ProducerBinding | None = None,
+    landing_probe: LandingProbe | None = None,
 ) -> dict:
     if resolved_ctx is None:
         task_row = _get_handoff_row_for_task(conn, task_ref)
@@ -303,6 +326,7 @@ def _set_handoff_state_with_conn(
             target_context_warnings=target_context_warnings,
             precomputed_target_worktree_path=precomputed_target_worktree_path,
             producer_binding=producer_binding,
+            landing_probe=landing_probe,
         )
     except BaseException:
         conn.execute("ROLLBACK TO native_handoff_mutation")
@@ -329,6 +353,7 @@ def _mutate_handoff_state_with_conn(
     target_context_warnings: list[str] | None = None,
     precomputed_target_worktree_path: str | None = None,
     producer_binding: ProducerBinding | None = None,
+    landing_probe: LandingProbe | None = None,
 ) -> dict:
     _tool = "set_handoff_state"
     if status is not None and status not in HANDOFF_ACTIVE_STATUSES:
@@ -621,6 +646,34 @@ def _mutate_handoff_state_with_conn(
                 "current_revision": int(task_row["revision"]),
             },
         )
+    if resolved_status == "done" and str(task_row["status"]) != "done":
+        # A task is not done while a lane holds an unlanded tip [GRPH-14].
+        # SQL only under the lock: a missing or stale pre-lock probe is a typed,
+        # retryable refusal, never a Git re-probe under RESERVED [CON-21][GRPH-27].
+        from .lane_landing_proof import (  # noqa: PLC0415
+            StaleLandingProbe,
+            fenced_unlanded,
+            landing_probe_stale_refusal,
+            unlanded_lanes_refusal,
+        )
+
+        unlanded = fenced_unlanded(conn, task_ref, landing_probe)
+        if isinstance(unlanded, StaleLandingProbe):
+            clear_projection_event_claim(conn, event_id)
+            return _envelope(
+                ok=False,
+                tool=_tool,
+                task_ref=task_ref,
+                data=landing_probe_stale_refusal(_tool, task_ref),
+            )
+        if unlanded:
+            clear_projection_event_claim(conn, event_id)
+            return _envelope(
+                ok=False,
+                tool=_tool,
+                task_ref=task_ref,
+                data=unlanded_lanes_refusal(_tool, task_ref, unlanded),
+            )
 
     def update_state(connection):
         updated = connection.execute(

@@ -1040,40 +1040,6 @@ class ReviewCycleLedger:
             return LedgerDecision("settled", "unjudged_incomplete", copy.deepcopy(row))
         return self._transaction(operation)
 
-    def _append_holder_release(
-        self, *, dispatch_ids: list[str], receipt_sha256s: dict[str, str],
-        operator_decision_id: int, authenticate: Callable,
-    ) -> LedgerDecision:
-        """Append one host-authenticated release under the ledger's single writer.
-
-        ``authenticate(data)`` reopens operator and producer evidence while this
-        transaction and its receipt locks are held. No receipt, charged row,
-        issuance counter, or subject record is altered.
-        """
-        if (not isinstance(dispatch_ids, list) or not dispatch_ids
-                or not all(isinstance(item, str) and item for item in dispatch_ids)
-                or len(dispatch_ids) != len(set(dispatch_ids))
-                or not isinstance(receipt_sha256s, dict) or set(receipt_sha256s) != set(dispatch_ids)
-                or not all(isinstance(value, str) and _SHA256.fullmatch(value) for value in receipt_sha256s.values())
-                or type(operator_decision_id) is not int or operator_decision_id <= 0):
-            return LedgerDecision("ledger_hold", "holder_release_invalid_request")
-
-        def operation(data):
-            if any(set(event["dispatch_ids"]).intersection(dispatch_ids) for event in data.get("holder_releases", [])):
-                raise _Unchanged(LedgerDecision("ledger_hold", "holder_release_already_recorded"))
-            observations = authenticate(data)
-            data["sequence"] += 1
-            event = dict(schema=HOLDER_RELEASE_SCHEMA, dispatch_ids=sorted(dispatch_ids),
-                         receipt_sha256s=copy.deepcopy(receipt_sha256s),
-                         operator_decision_id=operator_decision_id, preconditions=copy.deepcopy(observations),
-                         recorded_sequence=data["sequence"])
-            if not _valid_holder_release(event, data):
-                raise _Hold("holder_release_observation_invalid")
-            data.setdefault("holder_releases", []).append(event)
-            return LedgerDecision("released", "", copy.deepcopy(event))
-
-        return self._transaction(operation, project_corrections=False)
-
     def append_outcome_correction(
         self, *, dispatch_id: str, expected_ledger_sha256: str, expected_observation_sha256: str, authenticate: Callable
     ) -> LedgerDecision:

@@ -5,6 +5,9 @@ Scan is read-only. Apply requires a valid matching owner release, holds unknown
 activity, archives bounded evidence, and renames before deleting. An opt-in unit
 lease may mark a release after verified termination and grace; it never deletes.
 Producers use allocate; owners mark legacy dirs with allocate --adopt.
+Custody gate: a lane job whose own source repo holds a commit is never released,
+lease-marked or reclaimed until CUSTODY.json names a bundle or repo outside every
+job dir in which `git cat-file -e <sha>^{commit}` succeeds; otherwise it holds.
 """
 
 from __future__ import annotations
@@ -75,6 +78,19 @@ RECOVER_BACKOFF_SECONDS = 6 * 3600
 EVIDENCE_TEMP = re.compile(r"\.workbay-.+-[0-9]{8}-[a-z0-9_]{8}\.tgz\Z")
 EVIDENCE_TEMP_STALE_SECONDS = 50 * 60
 UNIT_QUERY_TIMEOUT_SECONDS = 10
+# Lane-kit producer files: their presence makes the job's source repo commits
+# candidates whose only copy may be this VM dir (custody gate, P1).
+CUSTODY_MARKERS = ("LANE.json", "CUSTODY.json", "out/candidate.json", "out/receipt.json")
+CUSTODY_GIT_TIMEOUT_SECONDS = 120
+# Digest-bound bundle verifications (location identity, sha256, commits) within this
+# process; apply rechecks reuse them. A directory store has no digest: it is fetched
+# afresh on every check, the final pre-rename recheck included (REF-09, CON-11).
+_CUSTODY_VERIFIED = set()
+# Repository variables that would redirect a custody probe away from the git dir it names.
+CUSTODY_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_NAMESPACE")
+# A partial (promisor) clone reads missing objects from its remote, usually the job repo.
+CUSTODY_PARTIAL_CONFIG = r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$"
 # Keys of every counts object (scan, status, last-run). A status scan that reaches
 # its deadline also counts "unclassified" (never reclaimable), present only when
 # nonzero; apply scans without a deadline and never writes it.
@@ -279,6 +295,9 @@ def release(directory, owner, reason, evidence_copied_to=None):
         raise Refusal("owner_mismatch", "--owner differs from RETENTION.json owner")
     if not reason.strip():
         raise Refusal("reason_missing", "release reason must not be empty")
+    custody = custody_status(directory, directory.parent, retention)
+    if custody["state"] not in {"verified", "not_required"}:
+        raise Refusal(custody["reason"], json.dumps(custody, sort_keys=True))
     data = dict(
         schema=1,
         owner=owner,
@@ -1161,6 +1180,219 @@ def lender_details(directory, root, retention, row, census, deadline, explain):
         row["blocking_borrowers"].append({key: borrower[key] for key in ("basename", "verdict", "reason")})
 
 
+class CustodyUnknown(ValueError):
+    """A custody fact could not be read; the gate holds (never a proof of custody)."""
+
+
+def _custody_git(arguments, deadline=None, stdin=None):
+    timeout = CUSTODY_GIT_TIMEOUT_SECONDS
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise ScanDeadline
+    env = {key: value for key, value in os.environ.items() if key not in CUSTODY_GIT_ENV_DROP}
+    try:
+        return subprocess.run(["git", *arguments], capture_output=True, text=True, timeout=timeout, check=False,
+                              input=stdin, env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+                                                "GIT_NO_LAZY_FETCH": "1"})
+    except subprocess.TimeoutExpired:
+        if deadline is not None and timeout < CUSTODY_GIT_TIMEOUT_SECONDS:
+            raise ScanDeadline from None
+        raise CustodyUnknown("git_timeout") from None
+    except OSError as exc:
+        raise CustodyUnknown("git_unavailable") from exc
+
+
+def _json_object(path):
+    try:
+        value = json.loads(read_regular(path))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _commit_name(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) else None
+
+
+def _own_git_dir(slot):
+    """The slot's own object store: a real .git dir or a bare repo; links and gitfiles live elsewhere."""
+    if slot.is_symlink() or not slot.is_dir():
+        return None
+    dot_git = slot / ".git"
+    if dot_git.is_dir() and not dot_git.is_symlink():
+        return dot_git
+    if not os.path.lexists(dot_git) and (slot / "HEAD").is_file() and (slot / "objects").is_dir():
+        return slot
+    return None
+
+
+def custody_candidates(directory, deadline=None):
+    """Every commit a lane job dir may hold alone: every ref peeled to a commit (branches,
+    tags, remote-tracking and any other namespace), HEAD and declared candidates.
+
+    Commits that are ancestors of the receipt's recorded base came from the host
+    and need no custody. Non-lane dirs (no producer marker) keep owner-release rules.
+    """
+    if not any(os.path.lexists(directory / marker) for marker in CUSTODY_MARKERS):
+        return []
+    receipt = _json_object(directory / "out/receipt.json")
+    declared = {_commit_name(_json_object(directory / "out/candidate.json").get("commit")),
+                _commit_name(receipt.get("candidate_commit"))} - {None}
+    base = _commit_name(receipt.get("base"))
+    candidates = set()
+    for name in SOURCE_PATHS:
+        git_dir = _own_git_dir(directory / name)
+        if git_dir is None:
+            continue
+        prefix = [f"--git-dir={git_dir}"]
+        refs = _custody_git([*prefix, "for-each-ref", "--format=%(objectname)"], deadline)
+        if refs.returncode != 0:
+            raise CustodyUnknown("source_refs_unreadable")
+        commits = set()
+        if refs.stdout.split():
+            # Peel every ref (annotated tags included); refs naming trees or blobs hold no commit.
+            peeled = _custody_git([*prefix, "cat-file", "--batch-check=%(objectname) %(objecttype)"], deadline,
+                                  stdin="".join(f"{oid}^{{commit}}\n" for oid in sorted(set(refs.stdout.split()))))
+            if peeled.returncode != 0:
+                raise CustodyUnknown("source_refs_unreadable")
+            commits.update(line.split()[0] for line in peeled.stdout.splitlines() if line.endswith(" commit"))
+        head = _custody_git([*prefix, "rev-parse", "-q", "--verify", "HEAD^{commit}"], deadline)
+        commits.update(head.stdout.split() if head.returncode == 0 else ())
+        for sha in declared:
+            if _custody_git([*prefix, "cat-file", "-e", f"{sha}^{{commit}}"], deadline).returncode == 0:
+                commits.add(sha)
+        for sha in commits:
+            if base and _custody_git([*prefix, "merge-base", "--is-ancestor", sha, base], deadline).returncode == 0:
+                continue
+            candidates.add(sha)
+    return sorted(candidates)
+
+
+def custody_location_forbidden(location, directory, root):
+    """A store inside this job dir, any VM job dir or a tombstone dies with a reclaim."""
+    job = Path(os.path.realpath(directory))
+    if inside(location, job):
+        return True
+    for jobs_root in {Path(os.path.realpath(root)), job.parent}:
+        if location != jobs_root and inside(location, jobs_root):
+            first = location.relative_to(jobs_root).parts[0]
+            if JOB_NAME.fullmatch(first) or first.startswith(".reclaiming-"):
+                return True
+    return False
+
+
+def custody_store_refusal(git_dir, directory, root, deadline=None):
+    """Why a directory store is not storage of its own, or None.
+
+    The fresh fetch reads through whatever the store reads; every object it serves
+    must therefore live in the store itself, outside every job dir and tombstone.
+    """
+    objects = git_dir / "objects"
+    if not (git_dir / "HEAD").is_file() or not objects.is_dir():
+        return "custody_store_invalid"
+    for path in (git_dir, objects, *(objects.iterdir()), *(objects / "pack").glob("*")):
+        if custody_location_forbidden(Path(os.path.realpath(path)), directory, root):
+            return "custody_inside_job_dir"
+    if any(os.path.lexists(path) for path in (objects / "info/alternates", objects / "info/http-alternates",
+                                               git_dir / "commondir")):
+        return "custody_store_borrows_objects"
+    if any((objects / "pack").glob("*.promisor")):
+        return "custody_store_partial"
+    if (git_dir / "config").exists():
+        partial = _custody_git(["config", "--file", str(git_dir / "config"), "--includes", "--get-regexp",
+                                CUSTODY_PARTIAL_CONFIG], deadline)
+        if partial.returncode == 0:
+            return "custody_store_partial"
+        if partial.returncode != 1:
+            raise CustodyUnknown("custody_store_config_unreadable")
+    return None
+
+
+def custody_verified(directory, root, retention, candidates, deadline=None):
+    """Return (True, None) only when a fresh repo, fetched from the claimed independent store,
+    holds every candidate's commit and its whole object closure."""
+    try:
+        claim = manifest(directory / "CUSTODY.json")
+    except FileNotFoundError:
+        return False, "custody_claim_missing"
+    except (OSError, ValueError):
+        return False, "custody_claim_invalid"
+    store = claim.get("bundle")
+    if claim.get("schema") != 1 or claim["owner"] != retention["owner"] or not isinstance(store, str) \
+            or not os.path.isabs(store):
+        return False, "custody_claim_invalid"
+    location = Path(os.path.realpath(store))
+    if custody_location_forbidden(location, directory, root):
+        return False, "custody_inside_job_dir"
+    try:
+        info = location.stat()
+    except OSError:
+        return False, "custody_store_missing"
+    key = None
+    if stat.S_ISDIR(info.st_mode):
+        dot_git = location / ".git"
+        source = Path(os.path.realpath(dot_git)) if os.path.lexists(dot_git) else location
+        refusal = custody_store_refusal(source, directory, root, deadline)
+        if refusal:
+            return False, refusal
+        unfetchable = "custody_store_unfetchable"
+    elif stat.S_ISREG(info.st_mode):
+        key = (str(location), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+               claim.get("bundle_sha256"), tuple(candidates))
+        if key in _CUSTODY_VERIFIED:
+            return True, None
+        digest = hashlib.sha256()
+        with location.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != claim.get("bundle_sha256"):
+            return False, "custody_bundle_digest_mismatch"
+        source, unfetchable = location, "custody_bundle_unfetchable"
+    else:
+        return False, "custody_store_invalid"
+    with tempfile.TemporaryDirectory(prefix="workbay-custody-") as scratch:
+        if _custody_git(["init", "-q", "--bare", scratch], deadline).returncode != 0:
+            raise CustodyUnknown("custody_scratch_failed")
+        if _custody_git([f"--git-dir={scratch}", "fetch", "-q", "--no-write-fetch-head", str(source),
+                         "+refs/*:refs/*"], deadline).returncode != 0:
+            return False, unfetchable
+        for sha in candidates:
+            if _custody_git([f"--git-dir={scratch}", "cat-file", "-e", f"{sha}^{{commit}}"],
+                            deadline).returncode != 0:
+                return False, "custody_commit_absent"
+            if _custody_git([f"--git-dir={scratch}", "rev-list", "--objects", "--quiet", sha],
+                            deadline).returncode != 0:
+                return False, "custody_content_absent"
+    if key is not None:
+        _CUSTODY_VERIFIED.add(key)
+    return True, None
+
+
+def custody_status(directory, root, retention, deadline=None):
+    """Structured custody verdict; anything but verified/not_required holds release and reclaim."""
+    candidates = []
+    try:
+        candidates = custody_candidates(directory, deadline)
+        if not candidates:
+            return {"state": "not_required", "reason": "custody_not_required", "candidates": []}
+        ok, detail = custody_verified(directory, root, retention, candidates, deadline)
+    except CustodyUnknown as exc:
+        ok, detail = False, str(exc)
+    except OSError:
+        ok, detail = False, "custody_check_failed"
+    if ok:
+        return {"state": "verified", "reason": "custody_verified", "candidates": candidates}
+    status = {"state": "unverified", "reason": "custody_unverified", "detail": detail, "candidates": candidates}
+    error = _json_object(directory / "out/receipt.json").get("candidate_custody_error")
+    if isinstance(error, str) and error:
+        # The VM copy is the quarantine: typed, held, never moved or deleted (P3).
+        status.update(state="quarantine", reason="custody_quarantine",
+                      classification="owned_paths_violation" if "scope:" in error else "candidate_custody_error",
+                      candidate_custody_error=error[:DEPENDENCY_ERROR_TEXT_CAP])
+    return status
+
+
 def classify(directory, root, read_only=False, deadline=None, dependency_census=None, sandbox_root=None,
              lease_released=None, explain_borrowers=True):
     row = {"basename": directory.name, "path": str(directory), "lends_to": []}
@@ -1192,6 +1424,17 @@ def classify(directory, root, read_only=False, deadline=None, dependency_census=
         if lease_released is not None and not read_only:
             clear_lease_stamp(directory)
         return verdict(*hold)
+    # Custody before any lease publication or reclaimable verdict (P1). Without a
+    # release, or a lease this pass may publish, the job holds without git probes.
+    if os.path.lexists(directory / "RELEASE.json") or (row["leased"] and lease_released is not None
+                                                        and not read_only):
+        try:
+            custody = custody_status(directory, root, retention, deadline)
+        except ScanDeadline:
+            return verdict("unclassified", "scan_deadline")
+        if custody["state"] not in {"verified", "not_required"}:
+            row["custody"] = custody
+            return verdict(*hold) if hold else verdict("hold_not_released", custody["reason"])
     # Finish activity's unit observation before the lease's final verification
     # and publication. Locks/cwds still hold deletion even when a lease marks.
     auto_released = (observe_lease(directory, retention, lease_released)

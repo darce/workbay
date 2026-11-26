@@ -51,6 +51,7 @@ from workbay_bootstrap.install import (
     GENERATOR_SCRIPT,
     GENERATOR_SKILLS_SOURCE,
     GROK_PLUGIN_DEST,
+    LEDGER_POLICY_KEYS,
     PLUGIN_GENERATED_ROOT,
     PLUGIN_MARKETPLACE_NAME,
     PLUGIN_NAME,
@@ -2111,7 +2112,7 @@ def _doctor_gitonly_mcp_tool_sources(
 
 
 def _doctor_ledger_baseline(target: Path) -> list[Finding]:
-    """Advisory host-field inventory, only for index/HEAD ledger members."""
+    """Compare policy to HEAD and inventory host fields in tracked ledgers."""
     from workbay_protocol.bootstrap_ledger_view import split_ledger
 
     try:
@@ -2119,11 +2120,11 @@ def _doctor_ledger_baseline(target: Path) -> list[Finding]:
             ["git", "ls-files", "--error-unmatch", "--", BOOTSTRAP_MANIFEST_NAME],
             cwd=target, capture_output=True, check=False, timeout=30,
         ).returncode == 0
-        in_head = subprocess.run(
-            ["git", "cat-file", "-e", f"HEAD:{BOOTSTRAP_MANIFEST_NAME}"],
+        committed = subprocess.run(
+            ["git", "show", f"HEAD:{BOOTSTRAP_MANIFEST_NAME}"],
             cwd=target, capture_output=True, check=False, timeout=30,
-        ).returncode == 0
-        if not indexed and not in_head:
+        )
+        if not indexed and committed.returncode != 0:
             return []
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -2133,16 +2134,41 @@ def _doctor_ledger_baseline(target: Path) -> list[Finding]:
         return []  # The ordinary manifest facet reports unreadable ledgers.
     if not isinstance(manifest, dict):
         return []
-    baseline, _host = split_ledger(manifest)
-    keys = sorted(key for key, value in manifest.items() if key not in baseline or baseline[key] != value)
-    if not keys:
-        return []
-    return [{
-        "kind": "ledger_host_facts_in_tracked",
-        "path": BOOTSTRAP_MANIFEST_NAME,
-        "severity": "info",
-        "detail": f"host facts in tracked ledger: {', '.join(keys)}; installs also record these in .workbay/host-receipt.json; tracked removal follows reader migration",
-    }]
+    findings: list[Finding] = []
+    if committed.returncode == 0:
+        try:
+            baseline = json.loads(committed.stdout)
+        except (ValueError, UnicodeDecodeError):
+            baseline = None
+        if not isinstance(baseline, dict):
+            findings.append({
+                "kind": "ledger_policy_baseline_invalid",
+                "path": BOOTSTRAP_MANIFEST_NAME,
+                "severity": "error",
+                "detail": "Cannot check policy drift against an invalid committed ledger at HEAD.",
+            })
+        else:
+            missing = object()
+            keys = sorted(
+                key for key in LEDGER_POLICY_KEYS if baseline.get(key, missing) != manifest.get(key, missing)
+            )
+            if keys:
+                findings.append({
+                    "kind": "ledger_policy_drift",
+                    "path": BOOTSTRAP_MANIFEST_NAME,
+                    "severity": "error",
+                    "detail": f"Policy drift from committed HEAD: {', '.join(keys)}",
+                })
+    tracked, _host = split_ledger(manifest)
+    keys = sorted(key for key, value in manifest.items() if key not in tracked or tracked[key] != value)
+    if keys:
+        findings.append({
+            "kind": "ledger_host_facts_in_tracked",
+            "path": BOOTSTRAP_MANIFEST_NAME,
+            "severity": "info",
+            "detail": f"host facts in tracked ledger: {', '.join(keys)}; installs also record these in .workbay/host-receipt.json; tracked removal follows reader migration",
+        })
+    return findings
 
 
 def doctor(
@@ -5363,19 +5389,7 @@ def update(
     # local_ok (the rebuilt manifest would omit the field). remote_only also
     # re-probes the gate inside install(); dropping the policy is repair
     # --no-remote, never an update side effect.
-    execution_mode = str(manifest.get("execution_mode") or "local_ok")
-    # Same preservation for embeddings capability: update must not drop a
-    # verified/disabled ledger back to unspecified (key omitted).
-    embeddings_mode = str(manifest.get("embeddings_mode") or "unspecified")
-    if embeddings_mode == "verified":
-        # update has no explicit --with-embeddings consent flag. A historical
-        # verified receipt must not override a later durable operator opt-out
-        # (or unreadable opt-out state) when the tools are reinstalled.
-        from workbay_bootstrap.install import _persisted_embeddings_opted_out
-
-        if _persisted_embeddings_opted_out(target):
-            embeddings_mode = "unspecified"
-
+    execution_mode = str(manifest.get("execution_mode") or "inherit")
     if source_kind == "package":
         gitonly_url, gitonly_ref = _persisted_gitonly_closure_pin(manifest)
         result = install(
@@ -5392,7 +5406,6 @@ def update(
             allow_member_skew=allow_member_skew,
             profile=profile,
             execution_mode=execution_mode,
-            embeddings_mode=embeddings_mode,
             **hook_kwargs,
         )
     elif source_kind == "worktree":
@@ -5407,7 +5420,6 @@ def update(
             allow_member_skew=allow_member_skew,
             profile=profile,
             execution_mode=execution_mode,
-            embeddings_mode=embeddings_mode,
             **hook_kwargs,
         )
     else:
@@ -5429,7 +5441,6 @@ def update(
             allow_member_skew=allow_member_skew,
             profile=profile,
             execution_mode=execution_mode,
-            embeddings_mode=embeddings_mode,
             **hook_kwargs,
         )
 

@@ -1,0 +1,10 @@
+{
+  "jar": "~/.local/share/tlaplus/tla2tools.jar",
+  "java_opts": [
+    "-Xmx512m",
+    "-XX:+UseParallelGC"
+  ],
+  "note": "Pinned tla2tools.jar for make tla-check (scripts/check_tla.py). A jar whose sha256 differs is refused (exit 3) before TLC runs; a missing jar or java is tlc_unavailable (exit 2), never PASS. -Xmx512m bounds TLC on the shared VM slice.",
+  "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88",
+  "tla2tools_version": "host-provisioned tla2tools.jar (sha256 above; all 21 docs/specs/tla verdicts matched on host 2026-11-25T08:37Z)"
+}

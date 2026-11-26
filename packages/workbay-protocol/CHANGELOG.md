@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.25] — 2026-11-26
+
+### Changed
+- Advance the protocol package version for the WorkBay v0.1.102 Git release.
+
 ## [0.3.24] — 2026-11-23
 
 ### Changed

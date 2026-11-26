@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.43] — 2026-11-26
+
+### Changed
+- Refresh the protocol and system dependency floors for WorkBay v0.1.102 and align bootstrap install and profile handling with the v0.1.102 runtime.
+
 ## [0.4.42] — 2026-11-23
 
 ### Changed

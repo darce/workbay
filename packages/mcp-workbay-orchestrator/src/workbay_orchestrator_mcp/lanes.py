@@ -3209,6 +3209,19 @@ def _upsert_routing_caller(
     return caller
 
 
+def _lane_terminal_response(row: Mapping[str, object], **extra: object) -> dict:
+    """The one ``lane_terminal`` refusal (finding 26118): a terminal row is not rewritten."""
+    return _json_response(
+        {
+            "ok": False,
+            "error": "Terminal lanes require an explicit reopen_reason before changing status.",
+            "error_kind": "lane_terminal",
+            "lane": dict(row),
+            **extra,
+        }
+    )
+
+
 def _routing_upsert_rejection(*, values: dict[str, object], row: dict[str, object]) -> dict | None:
     """Preflight open_lane's rejection conditions before either route store changes.
 
@@ -3241,14 +3254,7 @@ def _routing_upsert_rejection(*, values: dict[str, object], row: dict[str, objec
             }
         )
     if status_changed and (row["status"] in TERMINAL_LANE_STATUSES or row.get("landing_commit_sha") is not None):
-        return _json_response(
-            {
-                "ok": False,
-                "error": "Terminal lanes require an explicit reopen_reason before changing status.",
-                "error_kind": "lane_terminal",
-                "lane": row,
-            }
-        )
+        return _lane_terminal_response(row)
     if status not in OPENABLE_LANE_STATUSES and status_changed:
         return _json_response(
             {
@@ -4855,6 +4861,221 @@ def close_worktree_lane(
     return result
 
 
+_REOPEN_GIT_TIMEOUT_S = 60
+
+
+def _reopen_git(root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_REOPEN_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def reopen_worktree_lane(
+    *,
+    lane_id: str | None,
+    task_ref: str | None,
+    expected_tip: str | None,
+    worktree_path: str | None = None,
+) -> dict:
+    """Reopen a terminal lane from its retained branch, restoring its worktree.
+
+    A merged, ``closed_stale`` or landing-stamped row refuses ``lane_terminal``
+    before any Git, and again under the writer lock (``refuse_landed``): reopen
+    never erases a landed outcome (GDN-GATE-T163 R2). Otherwise refuses,
+    writing nothing, unless the lane is terminal, ``refs/heads/<branch>``
+    resolves (``branch_ref_missing``) to exactly ``expected_tip``
+    (``tip_mismatch``), that tip is not already on the integration ref
+    (``tip_already_landed`` / ``integration_ref_unresolved``) and the worktree
+    path is free (``worktree_path_occupied``). Then ``git worktree add`` and the
+    row CAS ``open_lane(status=active, expected_status=<terminal>,
+    reopen_reason='lane_reopened:<tip40>')``; a failed CAS removes the worktree
+    it just added, so nothing is half-applied [FLOW-14]. A done task moves back
+    to ``in_progress`` and ``lane_reopened_<task>_<lane>_<tip40>`` is recorded.
+    The row is the commit point: a retry of a reopen whose row already moved
+    resumes the task flip and decision rather than refusing.
+    """
+    from workbay_handoff_mcp import core as handoff_core  # noqa: PLC0415
+    from workbay_handoff_mcp.lane_landing_proof import (  # noqa: PLC0415
+        read_branch_tip,
+        reopen_decision_id,
+        tip_is_landed,
+    )
+    from workbay_handoff_mcp.lanes_api import open_lane  # noqa: PLC0415
+    from workbay_handoff_mcp.lanes_recording import lane_reopen_forbidden  # noqa: PLC0415
+    from workbay_handoff_mcp.runtime import get_runtime_config  # noqa: PLC0415
+
+    def refuse(error_kind: str, error: str, **extra: object) -> dict:
+        return _json_response({"ok": False, "error_kind": error_kind, "error": error, **extra})
+
+    normalized_lane_id = _normalize_optional_text(lane_id)
+    if normalized_lane_id is None:
+        return refuse("lane_id_required", "lane_id is required.")
+    tip = _normalize_optional_text(expected_tip)
+    if tip is None or re.fullmatch(r"[0-9a-f]{40}", tip) is None:
+        return refuse("expected_tip_invalid", "expected_tip must be the full 40-hex lowercase branch tip.")
+    with _get_db_connection() as conn:
+        resolved_task_ref = _resolve_task_ref(conn, task_ref)
+        row = conn.execute(
+            "SELECT * FROM worktree_lanes WHERE task_ref = ? AND lane_id = ?",
+            (resolved_task_ref, normalized_lane_id),
+        ).fetchone()
+        task_row = conn.execute(
+            "SELECT status, revision FROM handoff_state WHERE task_ref = ?", (resolved_task_ref,)
+        ).fetchone()
+        branch = None
+        if row is not None:
+            branch = (_normalize_optional_text(row["branch"]) or "").removeprefix("refs/heads/") or None
+    if row is None:
+        return refuse("lane_not_found", f"Lane '{normalized_lane_id}' not found for task '{resolved_task_ref}'.")
+    if lane_reopen_forbidden(row):
+        # GDN-GATE-T163 R2: a merged, closed_stale or landing-stamped row keeps
+        # its landed outcome; refuse before any Git or write [GRPH-14].
+        return _lane_terminal_response(_row_to_dict(row), lane_id=normalized_lane_id, task_ref=resolved_task_ref)
+    if task_row is None:
+        return refuse("task_not_live", f"Task '{resolved_task_ref}' has no live row; restore it first.")
+    path = _normalize_optional_text(worktree_path) or _normalize_optional_text(row["worktree_path"])
+    if path is None or not os.path.isabs(path):
+        return refuse("worktree_path_invalid", "worktree_path must be an absolute path.")
+    if branch is None or branch.startswith("-"):
+        return refuse("branch_ref_missing", f"Lane '{normalized_lane_id}' records no usable branch.")
+    root = Path(get_runtime_config().git_workspace_root)
+    decision_id = reopen_decision_id(resolved_task_ref, normalized_lane_id, tip)
+    event = {
+        "kind": "lane_reopened",
+        "tip": tip,
+        "branch": branch,
+        "worktree_path": path,
+        "decision_id": decision_id,
+    }
+    identity = {"lane_id": normalized_lane_id, "task_ref": resolved_task_ref, "branch": branch, "expected_tip": tip}
+
+    def worktree_head() -> str | None:
+        head = _reopen_git(Path(path), "rev-parse", "--verify", "HEAD")
+        name = _reopen_git(Path(path), "symbolic-ref", "--short", "HEAD")
+        if head is None or name is None or head.returncode != 0 or name.returncode != 0:
+            return None
+        return head.stdout.strip() if name.stdout.strip() == branch else None
+
+    resumed = row["status"] not in TERMINAL_LANE_STATUSES
+    if resumed and not (
+        row["status"] == "active"
+        and _normalize_optional_text(row["worktree_path"]) == path
+        and f"lane_reopened:{tip}" in str(row["notes"] or "")
+        and worktree_head() == tip
+    ):
+        return refuse("lane_not_terminal", f"Lane '{normalized_lane_id}' is {row['status']}, not terminal.", **identity)
+    if not resumed:
+        state, live = read_branch_tip(root, branch)
+        if state == "missing":
+            return refuse("branch_ref_missing", f"refs/heads/{branch} does not resolve.", **identity)
+        if state != "present" or live is None:
+            return refuse("branch_ref_unreadable", f"refs/heads/{branch} could not be read.", **identity)
+        if live != tip:
+            return refuse("tip_mismatch", f"refs/heads/{branch} is {live}, not {tip}.", branch_tip_sha=live, **identity)
+        with _get_db_connection() as conn:
+            landed = tip_is_landed(conn, resolved_task_ref, branch, tip)
+        if landed is True:
+            return refuse(
+                "tip_already_landed", f"{tip} is already on the integration ref; nothing to reopen.", **identity
+            )
+        if landed is None:
+            return refuse("integration_ref_unresolved", "Integration ancestry of the tip is unknown.", **identity)
+        if os.path.lexists(path):
+            return refuse("worktree_path_occupied", f"{path} already exists.", worktree_path=path, **identity)
+        added = _reopen_git(root, "worktree", "add", path, branch)
+        if added is None or added.returncode != 0:
+            return refuse(
+                "worktree_add_failed",
+                (added.stderr.strip() if added is not None else "git worktree add did not run")[:500],
+                worktree_path=path,
+                **identity,
+            )
+
+        def rollback() -> bool:
+            # Only the worktree this call just added, still clean at the tip.
+            if worktree_head() != tip:
+                return False
+            removed = _reopen_git(root, "worktree", "remove", path)
+            return removed is not None and removed.returncode == 0
+
+        try:
+            opened = _adapt_lane_envelope(
+                open_lane(
+                    task_ref=resolved_task_ref,
+                    lane_id=normalized_lane_id,
+                    worktree_path=path,
+                    branch=str(row["branch"]),
+                    status="active",
+                    expected_status=str(row["status"]),
+                    reopen_reason=f"lane_reopened:{tip}",
+                    refuse_landed=True,
+                )
+            )
+        except BaseException:
+            rollback()
+            raise
+        parsed = json.loads(opened) if isinstance(opened, str) else opened
+        if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+            failure = dict(parsed) if isinstance(parsed, dict) else {"ok": False, "error": str(parsed)}
+            failure["worktree_rolled_back"] = rollback()
+            failure.setdefault("error_kind", "lane_reopen_conflict")
+            return _json_response(failure)
+
+    task_status = str(task_row["status"])
+    if task_status == "done":
+        flipped = handoff_core.set_handoff_state(
+            task_ref=resolved_task_ref, status="in_progress", expected_revision=int(task_row["revision"])
+        )
+        if not flipped.get("ok"):
+            return refuse(
+                "task_reopen_failed",
+                str((flipped.get("data") or {}).get("error") or "task status flip failed"),
+                lane_reopened=True,
+                event=event,
+                **identity,
+            )
+        task_status = "in_progress"
+    recorded = handoff_core.record_decision(
+        session=resolved_task_ref,
+        task_ref=resolved_task_ref,
+        decision=decision_id,
+        rationale=f"lane {normalized_lane_id} reopened from retained branch {branch} at {tip} into {path}",
+    )
+    if not recorded.get("ok"):
+        return refuse(
+            "reopen_decision_failed",
+            str((recorded.get("data") or {}).get("error") or "decision record failed"),
+            lane_reopened=True,
+            task_status=task_status,
+            event=event,
+            **identity,
+        )
+    with _get_db_connection() as conn:
+        lane = conn.execute(
+            "SELECT * FROM worktree_lanes WHERE task_ref = ? AND lane_id = ?",
+            (resolved_task_ref, normalized_lane_id),
+        ).fetchone()
+    return _json_response(
+        {
+            "ok": True,
+            "outcome": "lane_reopened",
+            "resumed": resumed,
+            "lane": _row_to_dict(lane) if lane is not None else None,
+            "task_status": task_status,
+            "event": event,
+            **identity,
+        }
+    )
+
+
 def _backfill_close_vm_merged_markers(*, repo: Path | None, focus_branch: str | None = None) -> dict[str, object]:
     """Drain a bounded marker backlog even when this close was not on main."""
     try:
@@ -6157,8 +6378,8 @@ def manage_worktree_lane(
     allow_main: bool = False,
     event_id: str | None = None,
 ) -> dict:
-    """Discriminated wrapper for worktree lane upsert, close, list, retire, land, and supersede operations."""
-    valid_operations = {"close", "list", "update_routing", "upsert", "retire", "land", "supersede"}
+    """Discriminated wrapper for worktree lane upsert, close, list, retire, land, supersede and reopen operations."""
+    valid_operations = {"close", "list", "update_routing", "upsert", "retire", "land", "supersede", "reopen"}
     if operation not in valid_operations:
         return _json_response(
             {"ok": False, "error": f"Invalid operation. Valid: {', '.join(sorted(valid_operations))}"}
@@ -6217,6 +6438,13 @@ def manage_worktree_lane(
             landing_commit_sha=landing_commit_sha,
             branch_tip_sha=branch_tip_sha,
             **({"event_id": event_id} if event_id is not None else {}),
+        )
+    if operation == "reopen":
+        return reopen_worktree_lane(
+            lane_id=lane_id,
+            task_ref=task_ref,
+            expected_tip=expected_tip,
+            worktree_path=worktree_path,
         )
     if operation == "retire":
         return _retire_worktree_lane(

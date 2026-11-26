@@ -565,6 +565,29 @@ def task_record(task_ref: str) -> dict | None:
     return {"task_ref": task_ref, **{key: active.get(key) for key in fields}, "source": "archive"}
 
 
+def archived_lane_row(task_ref: str, lane_id: str) -> dict | None:
+    """The lane registration in the same newest ``task_archives`` snapshot ``task_record`` reads.
+
+    ``None`` when the task has no archive, the snapshot is unreadable or it
+    does not record exactly one row for the lane.
+    """
+    from workbay_handoff_mcp.shared_schema import _get_db_connection
+
+    with _get_db_connection() as conn:
+        archived = conn.execute(
+            "SELECT snapshot_json FROM task_archives WHERE task_ref = ? ORDER BY archived_at DESC LIMIT 1",
+            (task_ref,),
+        ).fetchone()
+    try:
+        snapshot = json.loads(archived["snapshot_json"]) if archived is not None else None
+    except (TypeError, ValueError):
+        return None
+    rows = snapshot.get("worktree_lanes") if isinstance(snapshot, dict) else None
+    matches = [row for row in rows if isinstance(row, dict) and row.get("task_ref") == task_ref
+               and row.get("lane_id") == lane_id] if isinstance(rows, list) else []
+    return matches[0] if len(matches) == 1 else None
+
+
 def _manifest_lane(orchestrator_root: Path, task_ref: str, lane_id: str) -> tuple[dict, dict] | None:
     if "/" in task_ref or task_ref.startswith("."):
         return None
@@ -687,19 +710,33 @@ def _scope_record(repo: Path, binding: dict) -> dict | None:
 
     try:
         record, _ = _read(_scope_path(repo, binding), authority(repo), private_mode=True)
-        scopes = record["authorized_scopes"]
-        if (
-            record.get("schema") != _SCOPE_SCHEMA
-            or record["original"] != binding
-            or not scopes
-            or scopes[0] != binding["owned_paths"]
-            or any(_owned_roots(scope) != scope for scope in scopes)
-            or any(not set(left) < set(right) for left, right in zip(scopes, scopes[1:]))
-        ):
-            return None
-        return record
+        return record if _monotonic_scopes(record, binding) is not None else None
     except (EvidenceHold, OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def _monotonic_scopes(record: object, binding: dict) -> list[list[str]] | None:
+    """The authorization history of a protected scope record, if it is monotonic widening.
+
+    The caller supplies the record read from private producer custody, which
+    only the registry producer's public upsert (``_publish_scope``) writes.
+    Its first entry is the immutable original binding's roots and each later
+    entry a strict superset of its predecessor. A shrink, gap, replacement,
+    non-canonical entry or another binding's record is unauthenticated
+    (``None``). SECD-01, SECD-05, SECD-07 (Security Engineering).
+    """
+    if not isinstance(record, dict) or record.get("schema") != _SCOPE_SCHEMA or record.get("original") != binding:
+        return None
+    scopes = record.get("authorized_scopes")
+    if (
+        not isinstance(scopes, list)
+        or not scopes
+        or scopes[0] != binding.get("owned_paths")
+        or any(not isinstance(scope, list) or _owned_roots(scope) != scope for scope in scopes)
+        or any(not set(left) < set(right) for left, right in zip(scopes, scopes[1:]))
+    ):
+        return None
+    return scopes
 
 
 def _publish_scope(repo: Path, binding: dict, worktree_path: str, roots: list[str]) -> bool:
@@ -1044,6 +1081,9 @@ def _landed_source_time_scope(repo: Path, private: Path, binding: dict, lane: di
     The protected producer record fixes the original scope and baseline. The
     manifest and native lane can corroborate that identity, but cannot supply
     it. The original base remains usable after integration absorbs the delta.
+    A scope widened through the public upsert keeps this proof only as an
+    authenticated monotonic history, and the manifest must name exactly its
+    latest authorization; a manifest edit alone authorizes nothing.
     """
     from .review_cycle_reconciliation import _read
 
@@ -1051,10 +1091,10 @@ def _landed_source_time_scope(repo: Path, private: Path, binding: dict, lane: di
         return False
     record, _ = _read(_scope_path(repo, binding), private, private_mode=True)
     roots = _owned_roots(binding.get("owned_paths"))
+    scopes = _monotonic_scopes(record, binding)
     if (
-        roots is None or binding["owned_paths"] != roots
-        or record.get("schema") != _SCOPE_SCHEMA or record.get("original") != binding
-        or record.get("authorized_scopes") != [roots] or _owned_roots(member.get("owned_paths")) != roots
+        roots is None or binding["owned_paths"] != roots or scopes is None
+        or _owned_roots(member.get("owned_paths")) != scopes[-1]
         or not _same_worktree(record.get("worktree_path"), lane.get("worktree_path"))
     ):
         return False
@@ -1647,7 +1687,20 @@ def _exclude_unreadable_foreign_pass(
     raise refusal from exc
 
 
-def load_context(
+def load_context(repo: Path, state_dir: Path, **kwargs) -> ReviewContext | None:
+    """:func:`_load_context` with each repository's authority directory resolved once per scan.
+
+    Every prior pass is authenticated on each call; without the memo each check
+    re-ran ``git rev-parse --git-common-dir`` (O(N^2) processes over N
+    sequential prepares on a large canonical history).
+    """
+    from .review_cycle_dispatch import authority_memo
+
+    with authority_memo():
+        return _load_context(repo, state_dir, **kwargs)
+
+
+def _load_context(
     repo: Path,
     state_dir: Path,
     *,

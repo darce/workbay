@@ -1425,12 +1425,21 @@ def _snapshot_retained_attempt(
     files = probe["files"]
     try:
         record_path = destination / "snapshot-record.json"
-        if record_path.exists():
-            record = json.loads(record_path.read_text())
-            record["result"] = _result_from_json(destination / "result.json") or _result_from_json(
-                destination / "final-message.txt"
-            )
+        record = _valid_snapshot_record(record_path, nonce, destination)
+        if record is not None:
+            # The record is the published truth: a missing or torn final-message.txt is
+            # re-derived from it, and staging residue from a killed write is swept.
+            _sweep_snapshot_temporaries(destination)
+            recorded = record.get("final_message")
+            final_path = destination / "final-message.txt"
+            if isinstance(recorded, str) and (
+                not final_path.exists() or final_path.read_bytes() != recorded.encode("utf-8")
+            ):
+                _atomic_write_bytes(final_path, recorded.encode("utf-8"))
+            record["result"] = _result_from_json(destination / "result.json") or _result_from_json(final_path)
             return record
+        # Absent, torn, empty, non-object or foreign record: rebuild from the
+        # retained files below (RES-19 keeps the first snapshot) and republish.
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             staging = Path(tempfile.mkdtemp(prefix=".rescue-", dir=destination.parent))
@@ -1440,6 +1449,7 @@ def _snapshot_retained_attempt(
                 staging.rename(destination)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
+        _sweep_snapshot_temporaries(destination)
         # RES-19: replay uses the first snapshot; no live/newer output is overwritten.
         final = (destination / "result.json").read_text() if (destination / "result.json").exists() else ""
         parsed = _result_from_json(destination / "result.json")
@@ -1450,8 +1460,9 @@ def _snapshot_retained_attempt(
                     if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                         final = item["text"]
         final_path = destination / "final-message.txt"
-        if not final_path.exists():
-            final_path.write_text(final, encoding="utf-8")
+        # Derived from the retained files, so a missing or torn copy is rewritten.
+        if not final_path.exists() or final_path.read_bytes() != final.encode("utf-8"):
+            _atomic_write_bytes(final_path, final.encode("utf-8"))
         if parsed is None and final.strip():
             parsed = _result_from_json(final_path)
         inventory_path = destination / "untracked.txt"
@@ -1481,10 +1492,57 @@ def _snapshot_retained_attempt(
             "prior_attempt_remainder": str(remainder) if remainder.exists() else None,
             "remainder_bytes": remainder_bytes,
         }
-        record_path.write_text(json.dumps({k: v for k, v in record.items() if k != "result"}), encoding="utf-8")
+        _atomic_write_bytes(record_path, json.dumps({k: v for k, v in record.items() if k != "result"}).encode("utf-8"))
         return record
     except (OSError, ValueError):
         return {**probe, "state": "salvage_unknown", "reason": "attempt_snapshot_failed"}
+
+
+_SNAPSHOT_RECORD_STATES = frozenset({"complete_unfetched", "partial", "nothing", "salvage_unknown"})
+# _atomic_write_bytes staging names for the two published snapshot files.
+_SNAPSHOT_TEMPORARY = re.compile(r"\.(snapshot-record\.json|final-message\.txt)\..+\.tmp\Z")
+
+
+def _sweep_snapshot_temporaries(destination: Path) -> None:
+    """Unlink staging files a killed atomic write left beside the snapshot (regular files only)."""
+    for entry in destination.iterdir():
+        if _SNAPSHOT_TEMPORARY.fullmatch(entry.name) and entry.is_file() and not entry.is_symlink():
+            entry.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Publish complete bytes or nothing: same-dir temp, fsync, os.replace, dir fsync."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _valid_snapshot_record(record_path: Path, nonce: str, destination: Path) -> dict[str, Any] | None:
+    """Trust only this nonce's complete record; anything else is rebuilt by the caller."""
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(record, dict)
+        or record.get("nonce") != nonce
+        or record.get("snapshot") != str(destination)
+        or record.get("state") not in _SNAPSHOT_RECORD_STATES
+    ):
+        return None
+    return record
 
 
 _PRIOR_FENCE_ATTEMPTS = 8

@@ -17,12 +17,9 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
-from functools import cache
-from itertools import chain
 from pathlib import Path
 from typing import Literal
 
@@ -332,8 +329,36 @@ def _receipt_ancestries(repo: Path, receipts: list[tuple[str, str]], target: str
         raise ValueError("review_cycle_subject_unresolvable") from exc
 
 
+_AUTHORITY_MEMO: ContextVar[dict | None] = ContextVar("review_cycle_authority_memo", default=None)
+
+
+@contextmanager
+def authority_memo():
+    """Resolve each repository's authority directory once inside one read-only scan.
+
+    A history scan (``review_ratchet.load_context``) authenticates every prior
+    pass; each check re-derived the same git common dir with a subprocess, so N
+    sequential prepares over N passes spawned O(N^2) git processes. The common
+    dir of a checkout cannot change during one scan; outside a scan nothing is
+    cached. PERF-06 (A Philosophy of Software Design, ch. 20).
+    """
+    token = _AUTHORITY_MEMO.set({}) if _AUTHORITY_MEMO.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _AUTHORITY_MEMO.reset(token)
+
+
 def authority(repo: Path) -> Path:
-    return Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "workbay"
+    memo = _AUTHORITY_MEMO.get()
+    key = str(repo)
+    if memo is not None and key in memo:
+        return memo[key]
+    value = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "workbay"
+    if memo is not None:
+        memo[key] = value
+    return value
 
 
 def absent_source_report(repo: Path) -> dict:
@@ -579,7 +604,19 @@ def _dispatch_subject(repo: Path, branch: str, *, registered, dispatch_id: str,
     return _require_resolved_subject(resolution), proof
 
 
+DISPATCH_RETRY = "dispatch_retry"
+_LEDGER_RETRY_ATTEMPTS = 3
+
+
+def _retry_decision(cause: str) -> LedgerDecision:
+    """The typed retryable dispatch outcome: contention is never a hold (S1, N4)."""
+    return LedgerDecision(DISPATCH_RETRY, TRANSFER_CONTENDED, dict(retryable=True, cause=cause))
+
+
 def _dispatch_refusal(repo: Path, error: Exception, kind: str) -> dict:
+    if isinstance(error, SubjectSnapshotContended) or str(error) == TRANSFER_CONTENDED:
+        cause = error.cause if isinstance(error, SubjectSnapshotContended) else "ledger_busy"
+        return {"decision": asdict(_retry_decision(cause))}
     detail = None
     if isinstance(error, (SubjectResolutionHeld, SubjectScopeUnauthenticated, SubjectAmbiguous)):
         detail = subject_resolution_details(repo, error, kind=kind)
@@ -642,6 +679,14 @@ def _reserve_resolved(repo: Path, *, dispatch_id: str, subject_branch: str, kind
             decision = LedgerDecision("ledger_hold", str(exc))
     else:
         decision = dispatch(request, repo=repo)
+        for attempt in range(1, _LEDGER_RETRY_ATTEMPTS):
+            if not (decision.status == "ledger_hold" and decision.reason == "ledger_busy"):
+                break
+            # Bounded retry with jitter; persistent contention is a typed retry.
+            time.sleep(secrets.randbelow(100) / 1000 * attempt)
+            decision = dispatch(request, repo=repo)
+        if decision.status == "ledger_hold" and decision.reason == "ledger_busy":
+            decision = _retry_decision("ledger_busy")
     receipt = {"decision": asdict(decision), "identity": dict(dispatch_id=dispatch_id,
                 subject_branch=subject_branch, kind=kind)}
     if decision.status != "reserved" or decision.reason == "replay":
@@ -2301,7 +2346,9 @@ def _preceding_subject(repo: Path, state_dir: Path, prior_pass: str, branch: str
                          and retained.holding[0].get("source_head") == identity.get("tip_sha")
                          and retained.holding[0].get("subject") == subject
                          and not retained.holding[0].get("missing_proof")
-                         and "holder_release_revalidation" not in retained.holding[0].get("predicates_tried", []))
+                         and "holder_release_revalidation" not in retained.holding[0].get("predicates_tried", [])
+                         # A git-derived hold (holder_blocks) is never discharged by a prior review.
+                         and retained.holding[0].get("blocks") not in (True, "unknown"))
         return SubjectResolution("continuation_proven", subject, retained.holding) if previous_only else retained
     if retained.holding and any(row.get("subject") != subject for row in retained.holding):
         named = _named_subject_holders(repo, orchestrator_root, list(retained.holding))
@@ -2461,11 +2508,6 @@ def _possible_issuers(config, source: str) -> list[dict]:
     return candidates
 
 
-def _issuer_description(row: dict) -> dict:
-    return dict(row_id=row["id"], task_ref=row["task_ref"], lane_id=row["lane_id"],
-                branch=row["branch"], status=row["status"])
-
-
 def _receipt_holder(repo: Path, receipt: dict, branch: str) -> _ReceiptHolder:
     """Only protected issuance stamps can identify a registration."""
     from .review_ratchet import _short_branch
@@ -2581,52 +2623,6 @@ def _historical_admission_subject(repo: Path, root: Path, task_ref: str, branch:
     return None
 
 
-def _confirmed_holder_rows(repo: Path, receipt: dict, subject: str, *, terminal: bool = False) -> dict[str, list[dict]] | None:
-    """Registry evidence used by a landing or resource predicate, joined at read time."""
-    from workbay_handoff_mcp.lanes_recording import CLOSEABLE_LANE_STATUSES
-
-    from .review_ratchet import _short_branch
-
-    registrations = {}
-    primary = authority(repo).parent.parent
-    for branch in {subject, receipt["source_branch"]}:
-        bound = _receipt_holder(primary, receipt, branch)
-        if bound.mismatch or (bound.lane is not None and _short_branch(bound.lane["branch"]) != _short_branch(branch)):
-            return None
-        rows = list(bound.competing)
-        if bound.lane is not None:
-            rows.insert(0, bound.lane)
-        elif branch == receipt["source_branch"]:
-            # An original subject stamp on a continuation still authenticates
-            # the subject. A landing from a replacement cannot prove the
-            # contribution of a possible issuer that moved off this branch.
-            if not receipt.get("source_task_subject") or any(_short_branch(row["branch"]) != _short_branch(branch) for row in rows):
-                return None
-        if terminal and any(row.get("status") not in CLOSEABLE_LANE_STATUSES for row in rows):
-            return None
-        registrations[branch] = rows
-    return registrations if any(registrations.values()) else None
-
-
-def _feature_target_landed(repo: Path, orchestrator_root: Path, task: dict, row: dict, *,
-                           subject: str, source: str, head: str, integration: str, landed: str) -> bool:
-    """Release a live feature task only when its entire owned work is preserved.
-
-    The source binding identifies the work unit; registry/manifest agreement,
-    typed landings and Git establish completion without finishing the task.
-    """
-    from .review_ratchet import _short_branch, task_subject_binding
-
-    binding = task_subject_binding(row)
-    if (_short_branch(task.get("target_branch")) != subject
-            or binding is None or binding.get("task_ref") != row["task_ref"]
-            or binding.get("subject_branch") != subject or binding.get("tip_sha") != head
-            or binding.get("base_sha") == head):
-        return False
-    return _feature_members_landed(repo, orchestrator_root, task, row, subject=subject, source=source,
-                                   head=head, integration=integration, landed=landed)
-
-
 def _feature_members_landed(repo: Path, orchestrator_root: Path, task: dict, row: dict, *,
                             subject: str, source: str, head: str, integration: str, landed: str) -> bool:
     """Check all of a live feature task's lanes, including its unfinished siblings."""
@@ -2686,71 +2682,6 @@ def _feature_members_landed(repo: Path, orchestrator_root: Path, task: dict, row
     return subject in names and source in names and _terminal_refs_landed(repo, names, landed)
 
 
-def _released(repo: Path, proof: dict, receipt: dict, *,
-              orchestrator_root: Path | None = None, authenticated_scope: bool = False,
-              admitted_original: bool = False) -> bool:
-    """Release a proven task from completed, landed ancestor work only.
-
-    A main-target maintenance parent may stay active for unrelated features.
-    Its original lane's typed merged identity, rechecked against Git, proves
-    that work unit landed; its status or a prose claim alone does not. A task
-    targeting the old feature needs the complete task's terminal ownership proof.
-    """
-    from .review_ratchet import _commit, _short_branch, _subject_is_ancestor, task_record
-    subject = receipt["identity"]["subject_branch"]
-    source_branch, head = receipt["source_branch"], receipt["source_head"]
-    if subject == proof["subject_branch"]:
-        return False
-    landed = _commit(repo, _local_branch_ref(proof["integration_branch"]))
-    if landed is None or not _subject_is_ancestor(repo, proof["base_sha"], landed):
-        return False
-    # New main-parent starts below integration use the full terminal/scope proof,
-    # never the older task-completion shortcut.
-    historical_baseline = (proof["base_sha"] == proof["tip_sha"] and proof["tip_sha"] != landed
-                           and _short_branch((task_record(proof["task_ref"]) or {}).get("target_branch")) == "main")
-    if historical_baseline and not admitted_original:
-        return False
-    if _ancestry(repo, head, landed) != "ancestor":
-        return False
-    by_branch = _confirmed_holder_rows(repo, receipt, subject)
-    if by_branch is None or not all(by_branch.values()):
-        return False
-    if any(row.get("branch") != name for name, rows in by_branch.items() for row in rows):
-        return False
-    for row in chain.from_iterable(by_branch.values()):
-        task = task_record(row["task_ref"]) or {}
-        if row["task_ref"] == proof["task_ref"] and _short_branch(task.get("target_branch")) != "main":
-            return False
-        status = task.get("status")
-        if status == "done" and authenticated_scope and not historical_baseline:
-            continue
-        if (status in {"in_progress", "done"} and task.get("source") == "live"
-                and _short_branch(task.get("target_branch")) not in {None, "main"}):
-            if not _feature_target_landed(repo, orchestrator_root or repo, task, row, subject=subject,
-                                           source=source_branch, head=head,
-                                           integration=proof["integration_branch"], landed=landed):
-                return False
-            continue
-        if (status not in {"in_progress", "done"}
-                or _short_branch(task.get("target_branch")) != "main"
-                or _short_branch(task.get("target_branch")) != proof["integration_branch"]
-                or row.get("status") != "merged"
-                or row.get("branch_tip_source") not in {"branch", "backfill"}):
-            return False
-        tip, landing = row.get("branch_tip_sha"), row.get("landing_commit_sha")
-        if any(not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha) for sha in (tip, landing)):
-            return False
-        if _commit(repo, tip) != tip or _commit(repo, landing) != landing:
-            return False
-        if historical_baseline and (row.get("branch") == source_branch and head != tip
-                                    or not _subject_is_ancestor(repo, landing, proof["base_sha"])):
-            return False
-        if not all(_subject_is_ancestor(repo, older, newer) for older, newer in (
-                (head, tip), (tip, landing), (landing, landed))):
-            return False
-    return True
-
-
 def _authorized_roots(repo: Path, orchestrator_root: Path, binding: dict) -> set[str] | None:
     """A subject's original roots plus its current producer authorization.
 
@@ -2766,103 +2697,6 @@ def _authorized_roots(repo: Path, orchestrator_root: Path, binding: dict) -> set
     return None if current is None else set(original) | set(current)
 
 
-def _repair_baseline(repo: Path, proof: dict, receipt: dict, directory: Path, recorded: dict,
-                     orchestrator_root: Path) -> bool:
-    """A landed subject's later repair source shared only integration history.
-
-    Receipts predating source_task_subject keep their subject, round and
-    charge. A repair dispatched from main after its subject's typed landing
-    gives a proven sibling no data. The repair's own branch, any head carrying
-    repair commits, and a sibling owning (originally or by later authorization)
-    a path that the subject's recorded repair heads still change all hold.
-    GRPH-32 (practice label); GRPH-09 (Graph Theory with Applications, ch. 8).
-    """
-    from workbay_handoff_mcp.lanes_api import resolve_lane_by_branch
-
-    from .review_ratchet import _commit, _short_branch, _subject_is_ancestor, task_record
-    subject, head = receipt["identity"]["subject_branch"], receipt["source_head"]
-    if (receipt.get("source_task_subject") is not None or proof["integration_branch"] != "main"
-            or proof["subject_branch"] in {subject, receipt["source_branch"]}):
-        return False
-    landed = _commit(repo, "refs/heads/main")
-    if landed is None or _ancestry(repo, head, landed) != "ancestor":
-        return False
-    if (proof["base_sha"] == proof["tip_sha"] and proof["tip_sha"] != landed
-            and _short_branch((task_record(proof["task_ref"]) or {}).get("target_branch")) == "main"):
-        return False  # a historical first source requires _landed_retained_source
-    response = resolve_lane_by_branch(subject)
-    if not response.get("ok"):
-        raise ValueError("review_cycle_registry_unavailable")
-    lanes = response["data"]["current"]
-    if not lanes:
-        return False
-    for row in lanes:
-        task = task_record(row["task_ref"]) or {}
-        tip, landing = row.get("branch_tip_sha"), row.get("landing_commit_sha")
-        if ((task.get("status") != "done" and (task.get("status") != "in_progress"
-                                               or _short_branch(task.get("target_branch")) != "main"))
-                or row.get("status") != "merged" or row.get("branch_tip_source") not in {"branch", "backfill"}
-                or any(not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha) for sha in (tip, landing))
-                or _commit(repo, tip) != tip or _commit(repo, landing) != landing
-                or not _subject_is_ancestor(repo, tip, landing) or not _subject_is_ancestor(repo, landing, head)):
-            return False
-    if subject not in recorded:
-        recorded[subject] = set()
-        for path in directory.glob("*.json"):
-            other = json.loads(path.read_text())
-            if other.get("source_branch") and other.get("source_head") and other["identity"]["subject_branch"] == subject:
-                try:
-                    base = _git(repo, "merge-base", landed, other["source_head"])
-                    changed = _git(repo, "diff", "--name-only", "--no-renames", base, other["source_head"], "--")
-                except subprocess.CalledProcessError as exc:
-                    if _ancestry(repo, other["source_head"], landed) == "absent":
-                        recorded.pop(subject, None)
-                        return False  # incomplete file coverage cannot release
-                    raise ValueError("review_cycle_subject_unresolvable") from exc
-                recorded[subject].update(changed.splitlines())
-    roots = _authorized_roots(repo, orchestrator_root, proof)
-    if roots is None:
-        return False
-    return not any(path == root or path.startswith(root + "/")
-                   for path in recorded[subject] for root in roots)
-
-
-def _independent_baseline_source(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path, *,
-                                 source_subject: str | None = None) -> bool:
-    """A shared starting commit is not an edge between independently owned work.
-
-    Only the host's source-time producer snapshot participates. Reconstructing
-    it from a later registration would let an unfinished legacy task shed its
-    history. Recheck the original binding and resource partition before
-    distinguishing two work units.
-    """
-    from .review_ratchet import _short_branch
-
-    original = receipt.get("source_task_subject")
-    if not isinstance(original, dict) or not isinstance(original.get("task_ref"), str):
-        return False
-    identity = ("task_ref", "lane_id", "subject_branch")
-    if (all(original.get(key) == proof.get(key) for key in identity)
-            or _short_branch(original.get("subject_branch"))
-            != _short_branch(source_subject or receipt["identity"]["subject_branch"])
-            or original.get("integration_branch") != "main" or proof["integration_branch"] != "main"
-            or original.get("base_sha") != receipt.get("source_head")
-            or original.get("tip_sha") != receipt.get("source_head")):
-        return False
-    if (source_subject is None
-            and _short_branch(receipt["source_branch"]) != _short_branch(receipt["identity"]["subject_branch"])):
-        # The charged subject stamp alone does not describe a distinct issuer.
-        return False
-    # Both sides' source-time and currently authorized resources participate.
-    # An expansion of either the older or the incoming subject must not create
-    # an overlap escape around an old receipt; either unauthenticated holds.
-    older = _authorized_roots(repo, orchestrator_root, original)
-    incoming = None if older is None else _authorized_roots(repo, orchestrator_root, proof)
-    if incoming is None:
-        return False
-    return _disjoint_roots(older, incoming)
-
-
 def _disjoint_roots(older: set[str], incoming: set[str]) -> bool:
     """A shared baseline is independent only across disjoint owned resources.
 
@@ -2873,107 +2707,23 @@ def _disjoint_roots(older: set[str], incoming: set[str]) -> bool:
                    for left in older for right in incoming)
 
 
-def _uncontributed_continuation_source(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path) -> bool:
-    """No inherited post-source work and no shared subject or continuation roots.
+#: landing_cleanup's landed rule: a merged or closed terminal row is landed work
+#: only with typed landing evidence that Git ancestry confirms. GRPH-14 (Building
+#: Knowledge Graphs, ch. 8); SECD-05 (Security Engineering): without it, the row holds.
+_LANDED_LANE_STATUSES = frozenset({"merged", "closed"})
 
-    Re-read the registry, Git and canonical scope on every use. Unreadable
-    evidence holds; a notes binding must name its own row and can only add held
-    roots, never authorize release by itself. Canon v0.26.2: SECD-03, Check
-    every access at the reference monitor; SECD-05, Fail-safe defaults
-    (Security Engineering); GRPH-09, Colour the conflict graph (Graph Theory
-    with Applications, ch. 8).
+
+def _landed_continuation_tip(repo: Path, head: str, rows: list[dict], landed: str, *,
+                             statuses: frozenset[str] = frozenset({"merged"})) -> str | None:
+    """A typed landed row must prove source head, tip, landing and main in order.
+
+    Continuations count merged rows only. The landed self-source predicate also
+    admits its done issuer's own closed row (``_LANDED_LANE_STATUSES``).
     """
-    from .review_ratchet import (
-        _owned_roots,
-        _scope_path,
-        _scope_record,
-        _short_branch,
-        task_subject_binding,
-    )
-
-    by_branch = _uncontributed_source_rows(repo, proof, receipt)
-    if by_branch is None:
-        return False
-    original, source = receipt["source_task_subject"], receipt["source_branch"]
-    source_name = _short_branch(source)
-    older = _owned_roots(original.get("owned_paths"))
-    if older is None:
-        return False
-    older = set(older)
-    if _scope_path(repo, original).exists():
-        record = _scope_record(repo, original)
-        if record is None:
-            return False
-        older |= set(record["authorized_scopes"][-1])
-    for row in by_branch[source]:
-        binding = task_subject_binding(row)
-        # _authorized_roots proves a binding genuine for its own task, not for this
-        # row; a transplanted genuine binding must hold (SECD-03, SECD-05).
-        if (binding is None or not isinstance(row.get("task_ref"), str) or not isinstance(row.get("lane_id"), str)
-                or binding.get("task_ref") != row.get("task_ref") or binding.get("lane_id") != row.get("lane_id")
-                or binding.get("subject_branch") != source_name or _short_branch(row.get("branch")) != source_name):
-            return False
-        roots = _authorized_roots(repo, orchestrator_root, binding)
-        if roots is None:
-            return False
-        older |= roots
-    incoming = _authorized_roots(repo, orchestrator_root, proof)
-    return incoming is not None and _disjoint_roots(older, incoming)
-
-
-def _uncontributed_source_rows(repo: Path, proof: dict, receipt: dict) -> dict[str, list[dict]] | None:
-    """Prove the incoming immutable source inherited no work after this receipt."""
-    from .review_ratchet import _commit, _short_branch, _subject_is_ancestor
-
-    original, head = receipt["source_task_subject"], receipt["source_head"]
-    subject, source = receipt["identity"]["subject_branch"], receipt["source_branch"]
-    tip = original.get("tip_sha")
-    if (_short_branch(source) == _short_branch(subject) or not isinstance(tip, str) or not re.fullmatch("[0-9a-f]{40}", tip)
-            or original.get("base_sha") != tip or original.get("changed_files", []) != []):
-        return None
-    integration = proof.get("integration_branch")
-    landed = _commit(repo, _local_branch_ref(integration)) if _short_branch(integration) else None
-    if (landed is None or _ancestry(repo, head, landed) != "ancestor"
-            or not _subject_is_ancestor(repo, proof["base_sha"], landed)
-            or not _subject_is_ancestor(repo, tip, head)):
-        return None
-    by_branch = _confirmed_holder_rows(repo, receipt, subject)
-    if by_branch is None or not by_branch[source]:
-        return None
-    tips = set()
-    for name, rows in by_branch.items():
-        for row in rows:
-            recorded_tip = row.get("branch_tip_sha")
-            if isinstance(recorded_tip, str) and re.fullmatch("[0-9a-f]{40}", recorded_tip):
-                if _commit(repo, recorded_tip) != recorded_tip:
-                    return None
-                tips.add(recorded_tip)
-        ref = _local_branch_ref(name)
-        ref_tip = _commit(repo, ref)
-        if ref_tip is None:
-            if _ref_exists(repo, ref):
-                return None
-        else:
-            tips.add(ref_tip)
-    for candidate in tips:
-        result = _subject_probe(repo, "merge-base", "--all", review_source_ref(repo), candidate)
-        if result.returncode == 1 and not result.stdout.strip():
-            continue
-        if result.returncode != 0:
-            if _ancestry(repo, candidate, review_source_ref(repo)) == "absent":
-                return None  # missing merge-base evidence cannot release
-            raise ValueError("review_cycle_subject_unresolvable")
-        if any(not _subject_is_ancestor(repo, base, head) for base in result.stdout.splitlines()):
-            return None
-    return by_branch
-
-
-def _landed_continuation_tip(repo: Path, head: str, rows: list[dict], landed: str) -> str | None:
-    """A typed merged row must prove source head, tip, landing and main in order."""
     from .review_ratchet import _commit, _subject_is_ancestor
 
     for row in rows:
-        if row.get("status") != "merged" or row.get("branch_tip_source") not in {"branch", "backfill"}:
+        if row.get("status") not in statuses or row.get("branch_tip_source") not in {"branch", "backfill"}:
             continue
         tip, landing = row.get("branch_tip_sha"), row.get("landing_commit_sha")
         if any(not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{40}", sha) for sha in (tip, landing)):
@@ -3030,245 +2780,6 @@ def _terminal_refs_landed(repo: Path, names: set[str], landed: str) -> bool:
     return True
 
 
-def _landed_continuation_files(repo: Path, subject: str, landed: str) -> set[str]:
-    """Re-read same-subject receipts and current landing evidence; missing evidence holds.
-
-    Canon v0.26.2: SECD-03, Check every access at the reference monitor;
-    SECD-05, Fail-safe defaults (Security Engineering).
-    """
-    from .review_ratchet import _commit, _short_branch
-
-    covered = set()
-    for path in (authority(repo) / "review_cycle_dispatch").glob("*.json"):
-        try:
-            other = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(other, dict) or not isinstance(other.get("identity"), dict):
-            continue
-        source, head = other.get("source_branch"), other.get("source_head")
-        if (other["identity"].get("subject_branch") != subject
-                or not isinstance(source, str) or not source or _short_branch(source) == _short_branch(subject)
-                or not isinstance(head, str) or not head or _commit(repo, head) is None):
-            continue
-        by_branch = _confirmed_holder_rows(repo, other, subject, terminal=True)
-        if by_branch is None:
-            continue
-        tip = _landed_continuation_tip(repo, head, by_branch[source], landed)
-        if tip is None or not _terminal_refs_landed(repo, {source}, landed):
-            continue
-        try:
-            changed = _git(repo, "diff", "--name-only", "--no-renames", head, tip, "--")
-        except subprocess.CalledProcessError as exc:
-            if _ancestry(repo, head, tip) == "absent":
-                continue  # missing file coverage grants no release
-            raise ValueError("review_cycle_subject_unresolvable") from exc
-        covered.update(changed.splitlines())
-    return covered
-
-
-def _terminal_producer_source(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path, *,
-                              source_subject: str | None = None, check_uncontributed: bool = True) -> bool:
-    """A terminal source, landed or uncontributed continuation can release.
-
-    An uncontributed continuation shares neither post-source history nor its
-    subject's or its own authenticated roots. Its notes binding can only add
-    held roots or hold; it cannot authorize release by itself.
-    Otherwise only registry status and Git establish terminality; notes,
-    labels, titles, manifests and caller text never do. Every current row
-    naming the producer's branches must be closed or merged, every surviving
-    ref landed, and its source-time resources disjoint from the incoming subject's
-    or each overlapping file changed by a typed landed continuation of the same subject.
-    A continuation of an older zero-ahead snapshot also needs a typed merged
-    source tip and landing covering its source head.
-    Missing or unreadable evidence holds; an operational error raises. Re-read
-    on every call, so a reopened row holds again.
-    SECD-03, SECD-05 (Security Engineering); DATA-14 (Designing Data-Intensive
-    Applications, ch. 11); GRPH-09 (Graph Theory with Applications, ch. 8).
-    """
-    from .review_ratchet import (
-        _commit,
-        _owned_roots,
-        _scope_path,
-        _scope_record,
-        _short_branch,
-        _subject_is_ancestor,
-        task_record,
-    )
-    original, head = receipt.get("source_task_subject"), receipt.get("source_head")
-    if (source_subject is None and proof["base_sha"] == proof["tip_sha"]
-            and proof["tip_sha"] != _commit(repo, "refs/heads/main")
-            and _short_branch((task_record(proof["task_ref"]) or {}).get("target_branch")) == "main"):
-        return _landed_retained_source(repo, proof, receipt, orchestrator_root)
-    if not isinstance(original, dict) or not isinstance(original.get("task_ref"), str) or not isinstance(head, str):
-        # Keep the existing exact-tip continuation proof; other unproven
-        # sources require full terminality and authenticated resource scopes.
-        return (_landed_unproven_source(repo, proof, receipt, orchestrator_root)
-                or _landed_retained_source(repo, proof, receipt, orchestrator_root))
-    # Only native terminal recovery supplies a separately authenticated source
-    # resource subject. The original receipt identity still owns every charge.
-    subject = source_subject or receipt["identity"]["subject_branch"]
-    if (original.get("subject_branch") != subject or subject == proof["subject_branch"]
-            or original.get("integration_branch") != "main" or proof["integration_branch"] != "main"):
-        return False
-    if check_uncontributed and _uncontributed_continuation_source(repo, proof, receipt, orchestrator_root):
-        return True
-    zero_ahead = original.get("base_sha") == head and original.get("tip_sha") == head
-    source = receipt["source_branch"]
-    distinct = _short_branch(source) != _short_branch(subject)
-    if not zero_ahead and (not distinct
-            or not isinstance(original.get("base_sha"), str)
-            or original.get("base_sha") != original.get("tip_sha")
-            or original.get("changed_files", []) != []):
-        return False
-    landed = _commit(repo, "refs/heads/main")
-    if (landed is None or not _subject_is_ancestor(repo, head, landed)
-            or not _subject_is_ancestor(repo, proof["base_sha"], landed)):
-        return False
-    by_branch = _confirmed_holder_rows(repo, receipt, subject, terminal=True)
-    if by_branch is None:
-        return False
-    if not zero_ahead or (not check_uncontributed and distinct):
-        if not all(by_branch.values()) or not _subject_is_ancestor(repo, original["base_sha"], landed):
-            return False
-        if _landed_continuation_tip(repo, head, by_branch[source], landed) is None:
-            return False
-    if not _terminal_refs_landed(repo, set(by_branch), landed):
-        return False
-    older = _owned_roots(original.get("owned_paths"))
-    if older is None:
-        return False
-    older = set(older)
-    if _scope_path(repo, original).exists():
-        record = _scope_record(repo, original)
-        if record is None:
-            return False
-        older |= set(record["authorized_scopes"][-1])
-    incoming = _authorized_roots(repo, orchestrator_root, proof)
-    if incoming is None:
-        return False
-    if _disjoint_roots(older, incoming):
-        return True
-    overlapping = {root for root in older if not _disjoint_roots({root}, incoming)}
-    # Exact changed-file membership cannot discharge a directory root.
-    # Canon v0.26.2: INT-17, Confine deliberate difficulty (The Design of
-    # Everyday Things, ch. 6): retain only overlap whose work has not landed.
-    return overlapping <= _landed_continuation_files(repo, subject, landed)
-
-
-def _landed_retained_source(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path) -> bool:
-    """Release a terminal, typed landed source across authenticated disjoint scopes.
-
-    A closed zero-ahead subject need never have merged. Its continuing source
-    must have landed, and every subject/source row must be terminal. For an
-    unstamped source, Git must verify the recorded integration ancestry, even
-    when the head predates that integration tip or the source is the subject.
-    Re-read all evidence on each call; missing scope or landing evidence holds.
-    Canon v0.26.2: SECD-03, Check every access at the reference monitor;
-    SECD-05, Fail-safe defaults (Security Engineering).
-    """
-    from .review_ratchet import _commit, _short_branch, _subject_is_ancestor, task_subject_binding
-
-    subject, source = receipt["identity"]["subject_branch"], receipt.get("source_branch")
-    head, original = receipt.get("source_head"), receipt.get("source_task_subject")
-    if (not isinstance(source, str) or not source
-            or proof["subject_branch"] in {_short_branch(subject), _short_branch(source)}
-            or proof["integration_branch"] != "main"
-            or not isinstance(head, str) or not re.fullmatch("[0-9a-f]{40}", head)):
-        return False
-    landed = _commit(repo, "refs/heads/main")
-    if (landed is None or _commit(repo, head) != head
-            or not _subject_is_ancestor(repo, proof["base_sha"], landed)):
-        return False
-    older = set()
-    if original is not None:
-        if (not isinstance(original, dict) or original.get("subject_branch") != subject
-                or original.get("integration_branch") != "main"
-                or original.get("base_sha") != original.get("tip_sha")
-                or original.get("changed_files", []) != []):
-            return False
-        roots = _authorized_roots(repo, orchestrator_root, original)
-        if roots is None or not _subject_is_ancestor(repo, original["tip_sha"], head):
-            return False
-        older.update(roots)
-    else:
-        unproven = receipt.get("source_task_subject_unproven")
-        integration = unproven.get("integration_sha") if isinstance(unproven, dict) else None
-        if (not isinstance(unproven, dict) or unproven.get("head_on_integration") is not True
-                or not isinstance(integration, str) or not re.fullmatch("[0-9a-f]{40}", integration)
-                or _commit(repo, integration) != integration
-                or not _subject_is_ancestor(repo, head, integration)
-                or not _subject_is_ancestor(repo, integration, landed)):
-            return False
-    by_branch = _confirmed_holder_rows(repo, receipt, subject, terminal=True)
-    if by_branch is None or not all(by_branch.values()):
-        return False
-    if (_landed_continuation_tip(repo, head, by_branch[source], landed) is None
-            or not _terminal_refs_landed(repo, {subject, source}, landed)):
-        return False
-    for name, rows in by_branch.items():
-        branch = _short_branch(name)
-        for row in rows:
-            binding = task_subject_binding(row)
-            if (binding is None or binding.get("task_ref") != row.get("task_ref")
-                    or binding.get("lane_id") != row.get("lane_id")
-                    or binding.get("subject_branch") != branch or _short_branch(row.get("branch")) != branch):
-                return False
-            roots = _authorized_roots(repo, orchestrator_root, binding)
-            if roots is None:
-                return False
-            older.update(roots)
-    incoming = _authorized_roots(repo, orchestrator_root, proof)
-    return incoming is not None and _disjoint_roots(older, incoming)
-
-
-def _landed_unproven_source(repo: Path, proof: dict, receipt: dict, orchestrator_root: Path) -> bool:
-    """A non-subject source minted unproven at the integration tip, since landed in full.
-
-    The source-time record says the source started at main's tip with no commits
-    of its own, so its whole contribution is ``source_head..tip`` of a typed merged
-    landing. The subject's own dispatch is not a continuation and stays with
-    ``_released``. Re-read the registry, Git and the incoming scope on every call; the
-    receipt alone never releases. Missing or malformed evidence holds; an
-    operational error raises. Canon v0.26.2: SECD-03, Check every access at the
-    reference monitor; SECD-05, Fail-safe defaults (Security Engineering).
-    """
-    from .review_ratchet import _commit, _short_branch, _subject_is_ancestor
-    unproven, head = receipt.get("source_task_subject_unproven"), receipt.get("source_head")
-    subject, source = receipt["identity"]["subject_branch"], receipt.get("source_branch")
-    if (receipt.get("source_task_subject") is not None or not isinstance(unproven, dict)
-            or unproven.get("head_on_integration") is not True or unproven.get("integration_sha") != head
-            or not isinstance(head, str) or not re.fullmatch("[0-9a-f]{40}", head)
-            or not isinstance(source, str) or not source or _short_branch(source) == _short_branch(subject)
-            or proof["subject_branch"] in {_short_branch(subject), _short_branch(source)}
-            or proof["integration_branch"] != "main"):
-        return False
-    landed = _commit(repo, "refs/heads/main")
-    if (_commit(repo, head) != head or landed is None
-            or not _subject_is_ancestor(repo, proof["base_sha"], landed)):
-        return False
-    by_branch = _confirmed_holder_rows(repo, receipt, subject, terminal=True)
-    if by_branch is None:
-        return False
-    tip = _landed_continuation_tip(repo, head, by_branch[source], landed)
-    if tip is None or not _terminal_refs_landed(repo, {subject, source}, landed):
-        return False
-    try:
-        changed = _git(repo, "diff", "--name-only", "--no-renames", head, tip, "--").splitlines()
-    except subprocess.CalledProcessError as exc:
-        if _ancestry(repo, head, tip) == "absent":
-            return False  # missing changed-file evidence cannot release
-        raise ValueError("review_cycle_subject_unresolvable") from exc
-    incoming = _authorized_roots(repo, orchestrator_root, proof)
-    if incoming is None:
-        return False
-    # An exact landed file is no longer an edge; a directory root over one still is.
-    # Canon v0.26.2: GRPH-09, Colour the conflict graph (Graph Theory with
-    # Applications, ch. 8); INT-17, Confine deliberate difficulty (The Design of
-    # Everyday Things, ch. 6): hold only where landed work cannot discharge it.
-    return all(root == path for root in incoming for path in changed if not _disjoint_roots({root}, {path}))
-
-
 @dataclass(frozen=True)
 class SubjectResolution:
     """The only terminal states of the subject-resolution machine.
@@ -3286,6 +2797,9 @@ class SubjectResolution:
     missing_proof: str | None = None
     error: ValueError | None = None
     holders: tuple[dict, ...] = ()
+    #: Typed refusal cause when held (HG01-F2): holder_blocks, subject_lineage_mismatch,
+    #: subject_lineage_ambiguous or subject_lineage_unreadable.
+    reason: str | None = None
 
 
 class HolderLedgerUnavailable(ValueError):
@@ -3322,18 +2836,6 @@ class SubjectScopeUnauthenticated(ValueError):
         self.next_action = "Run review_cycle_reconciliation preview for a named holder dispatch."
 
 
-class SubjectHolderTaskUnknown(SubjectScopeUnauthenticated):
-    """The holder's task is absent from both live state and archives."""
-
-    reason = "review_cycle_holder_task_unknown"
-
-    def __init__(self, row: dict, task_ref: str) -> None:
-        super().__init__(row)
-        self.task_ref = task_ref
-        self.missing_proof = "holder task record and its authenticated source scope"
-        self.next_action = f"Restore the holder task record {task_ref}, then retry the reconciliation preview."
-
-
 class SubjectResolutionHeld(ValueError):
     """A possible holder is not evidence that the incoming work continues it."""
 
@@ -3342,778 +2844,161 @@ class SubjectResolutionHeld(ValueError):
         self.holding = list(result.holding)
         self.holders = list(result.holders)
         self.subject = result.subject_branch
+        self.cause = result.reason
         self.missing_proof = result.missing_proof
         self.next_action = (f"Run review_cycle_reconciliation preview for dispatch_id {self.holders[0]['dispatch_id']}."
                             if self.holders else "Run review_cycle_reconciliation preview for a named holder dispatch.")
 
 
-def _scope_error(row: dict, receipt: dict, original: dict) -> SubjectScopeUnauthenticated:
-    error = SubjectScopeUnauthenticated(row)
-    error.task_ref = original.get("task_ref") or "unknown"
-    error.lane_id = original.get("lane_id") or "unknown"
-    error.dispatch_id = (receipt.get("identity") or {}).get("dispatch_id") or "unknown"
-    error.next_action = f"Re-upsert lane {error.lane_id} to authorize its manifest scope."
-    return error
+class SubjectSnapshotContended(ValueError):
+    """Registry, receipt or ledger contention while taking the hold snapshot.
 
-
-def _unauthenticated_holder_roots(repo: Path, root: Path, original: dict, row: dict, lane: dict | None) -> set[str] | None:
-    """A validated original/authorization and the untrusted manifest form a superset.
-
-    A bad or missing member proves nothing. The manifest claim can widen this
-    conservative set, never authorize a narrower scope or mint a source stamp.
+    Typed retry: it is never a hold and never a clear (CAL-02, CON-21).
     """
-    from .review_ratchet import (
-        _manifest_lane,
-        _owned_roots,
-        _same_worktree,
-        _scope_record,
-        _short_branch,
-        task_subject_binding,
-    )
-    initial = _owned_roots(original.get("owned_paths"))
-    record = _scope_record(repo, original) if initial is not None else None
-    lane_id, task_ref = original.get("lane_id"), original.get("task_ref")
-    located = _manifest_lane(root, task_ref, lane_id) if isinstance(task_ref, str) and isinstance(lane_id, str) else None
-    if record is None or located is None or lane is None:
-        return None
-    claimed = _owned_roots(located[1].get("owned_paths"))
-    if (claimed is None or task_subject_binding(lane) != original
-            or lane.get("task_ref") != task_ref or lane.get("lane_id") != lane_id
-            or _short_branch(lane.get("branch")) != row["source_branch"]
-            or _short_branch(located[1].get("branch")) != row["source_branch"]
-            or not _same_worktree(located[1].get("worktree_path"), lane.get("worktree_path"))):
-        return None
-    return set(initial) | set(record["authorized_scopes"][-1]) | set(claimed)
+
+    retryable = True
+
+    def __init__(self, cause: str = "snapshot_contended") -> None:
+        super().__init__(cause)
+        self.cause = cause
 
 
-def _holder_scope_binds(repo: Path, proof: dict, receipt: dict, row: dict, orchestrator_root: Path, *,
-                        scope_evidence: tuple[set[str] | None, dict | None] | None = None,
-                        authorized: Callable[[dict], set[str] | None] | None = None,
-                        protected_receipt: bool = False) -> bool:
-    """Evaluate the resource edge for both leaf and main-target admissions.
+def _borrowed_proof(repo: Path, branch: str, proof: dict, orchestrator_root: Path | None) -> bool:
+    """The proof names another registered lane's subject, not this incoming branch (#57).
 
-    Canon v0.26.2 GRPH-09 (Graph Theory with Applications, ch. 8) and
-    GRPH-14 (Building Knowledge Graphs, ch. 8 + Mental Models, ch. 8).
-    A continuation may claim both the charged subject's resources and
-    the distinct issuing lane's resources.
+    A leaf task shares one original binding across its lanes, so a second lane
+    row on the task (a replacement on the predecessor's worktree) is handed the
+    predecessor's binding. That binding is the predecessor's identity: holds
+    must never treat the predecessor as ``self``. Only an incoming branch the
+    registry binds to a different lane is affected; an unreadable registry
+    drops the identity (fail-safe: more holders are evaluated, never fewer).
     """
-    from .review_ratchet import _short_branch
-
-    original = receipt.get("source_task_subject")
-    subject, source = _short_branch(row["subject"]), _short_branch(row["source_branch"])
-    if (not isinstance(original, dict) or not isinstance(original.get("task_ref"), str)
-            or _short_branch(original.get("subject_branch")) != subject
-            or _short_branch(proof.get("subject_branch")) in {subject, source}
-            or (original.get("task_ref"), original.get("lane_id")) == (proof.get("task_ref"), proof.get("lane_id"))):
-        return True
-
-    def hold(code: str, reason: str, missing: str | None = None) -> bool:
-        # Overlap comes from authenticated roots on both sides, so it is also
-        # reportable for legacy receipts without native custody.
-        if protected_receipt or code == "overlap":
-            row.update(holder_code=code, reason=reason)
-            if missing is not None:
-                row["missing_proof"] = missing
-        return True
-
-    if (not original.get("integration_branch")
-            or _short_branch(original["integration_branch"]) != _short_branch(proof.get("integration_branch"))):
-        return hold("unknown", "holder_integration_unproven", "matching source integration")
-    def roots(binding: dict) -> set[str] | None:
-        return authorized(binding) if authorized is not None else _authorized_roots(repo, orchestrator_root, binding)
-
-    incoming = roots(proof)
-    if incoming is None:
-        return hold("missing_incoming_scope", "incoming_scope_unproven", "authenticated incoming owned scope")
-    older = scope_evidence[0] if source == subject and scope_evidence is not None else roots(original)
-    if source != subject:
-        # A disjoint scope cannot discharge work inherited after the receipt.
-        rows = _uncontributed_source_rows(repo, proof, receipt)
-        if rows is None:
-            return hold("unknown", "source_inheritance_unproven",
-                        "immutable source ancestry without an inherited contribution")
-        if older is None:
-            older = _terminal_charged_roots(repo, original, rows[row["subject"]])
-        if older is not None and not _disjoint_roots(older, incoming):
-            return hold("overlap", "charged_subject_scope_overlap")
-        issuers = rows[row["source_branch"]]
-        if any((lane["task_ref"], lane["lane_id"]) == (proof.get("task_ref"), proof.get("lane_id"))
-               for lane in issuers):
-            return True
-        issuer_scope = _retained_issuer_roots(repo, receipt, issuers, roots, protected_receipt)
-        if issuer_scope is None or older is None:
-            return hold("unknown", "source_time_scope_unproven",
-                        "authenticated source-time scope for the charged subject and issuing lane")
-        return not _disjoint_roots(issuer_scope, incoming) and hold("overlap", "source_issuer_scope_overlap")
-
-    if original["task_ref"] == proof["task_ref"] and not (
-            original.get("base_sha") == original.get("tip_sha") == receipt.get("source_head")):
-        return True
-    if older is None:
-        from .review_ratchet import task_record
-        try:
-            holder_task = task_record(original["task_ref"])
-        except (OSError, sqlite3.Error) as exc:
-            raise _scope_error(row, receipt, original) from exc
-        if holder_task is None:
-            error = SubjectHolderTaskUnknown(row, original["task_ref"])
-            error.lane_id = original.get("lane_id") or "unknown"
-            error.dispatch_id = (receipt.get("identity") or {}).get("dispatch_id") or "unknown"
-            raise error
-        try:
-            source_lane = (scope_evidence[1] if scope_evidence is not None
-                           else _receipt_holder(orchestrator_root, receipt, row["source_branch"]).lane)
-            superset = _unauthenticated_holder_roots(repo, orchestrator_root, original, row, source_lane)
-        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
-            superset = None
-        if superset is not None and _disjoint_roots(superset, incoming):
-            return False
-        hold("unknown", "source_time_scope_unproven",
-             "authenticated holder source-time scope authorization")
-        raise _scope_error(row, receipt, original)
-    return not _disjoint_roots(older, incoming) and hold("overlap", "source_issuer_scope_overlap")
-
-
-def _terminal_charged_roots(repo: Path, original: dict, lanes: list[dict]) -> set[str] | None:
-    """A terminal charged lane's protected original remains usable after close."""
-    from workbay_handoff_mcp.lanes_recording import CLOSEABLE_LANE_STATUSES
-
-    from .review_ratchet import _same_worktree, _scope_record
-
-    if any(lane.get("status") not in CLOSEABLE_LANE_STATUSES for lane in lanes):
-        return None
-    matching = [lane for lane in lanes if all(lane.get(key) == original.get(key) for key in ("task_ref", "lane_id"))]
-    record = _scope_record(repo, original) if len(matching) == 1 else None
-    if record is None or not _same_worktree(record.get("worktree_path"), matching[0].get("worktree_path")):
-        return None
-    return set(record["authorized_scopes"][-1])
-
-
-def _retained_issuer_roots(repo: Path, receipt: dict, lanes: list[dict],
-                           authorized: Callable[[dict], set[str] | None], protected_receipt: bool) -> set[str] | None:
-    """Join every possible issuer to protected scope at the receipt's source."""
-    from .review_ratchet import _owned_roots, _same_worktree, _scope_record, _short_branch, task_subject_binding
-
-    stamped = "source_issuer_scope" in receipt
-    stamp = receipt.get("source_issuer_scope")
-    source, head = _short_branch(receipt["source_branch"]), receipt["source_head"]
-    combined: set[str] = set()
-    for lane in lanes:
-        if not stamped:
-            # A legacy receipt can use a protected original pinned to this
-            # exact source. A later tip or a current manifest alone cannot fill
-            # in a missing source-time binding.
-            binding = task_subject_binding(lane)
-            if binding is None or binding.get("tip_sha") != head:
-                return None
-        else:
-            issuer = receipt.get("source_issuer")
-            if (not protected_receipt or not isinstance(stamp, dict)
-                    or not _matches_issuer_binding(issuer, lane["task_ref"], lane["lane_id"])
-                    or issuer["row_id"] != lane["id"]
-                    or (stamp.get("head"), stamp.get("tree")) != (head, receipt.get("source_tree"))):
-                return None
-            binding = stamp.get("binding")
-        if (not isinstance(binding, dict)
-                or any(binding.get(key) != lane[key] for key in ("task_ref", "lane_id"))
-                or _short_branch(binding.get("subject_branch")) != source
-                or _short_branch(binding.get("integration_branch"))
-                != _short_branch(receipt["source_task_subject"].get("integration_branch"))):
-            return None
-        record = _scope_record(repo, binding)
-        if record is None or not _same_worktree(record.get("worktree_path"), lane.get("worktree_path")):
-            return None
-        if stamped:
-            frozen = _owned_roots(stamp.get("owned_paths"))
-            tip = binding.get("tip_sha")
-            if (frozen is None or frozen not in record["authorized_scopes"] or not isinstance(tip, str)
-                    or _ancestry(repo, tip, head) != "ancestor"):
-                return None
-            combined.update(frozen)
-        current = authorized(binding)
-        if current is None:
-            return None
-        combined.update(current)
-    return combined or None
-
-
-def _historical_self_source_issuer(repo: Path, receipt: dict, original: dict, lane: dict) -> bool:
-    """Join the retained dispatch pass to its native source-time lane witness."""
     from workbay_handoff_mcp.config import RuntimeConfig
 
-    from .review_cycle_reconciliation import EvidenceHold, _host, _read
-    from .review_cycle_terminal_recovery import _ID, _historical_source_lane
+    from .review_cycle_holds import SnapshotContended, _registry
     from .review_ratchet import _short_branch
 
-    managed = receipt["managed_identity"]
-    pass_id = managed.get("pass_id")
-    if not isinstance(pass_id, str) or not _ID.fullmatch(pass_id):
+    name = _short_branch(branch)
+    if not name or name == _short_branch(proof.get("subject_branch")):
         return False
     try:
-        primary, _ = _host(repo)
-        runtime = RuntimeConfig.for_repo(primary)
-        state, _ = _read(runtime.state_dir / f"offload-pass-{pass_id}.json", runtime.state_dir)
-        binding, config = state.get("lane_cycle_binding"), state.get("completion_config")
-        identity, source = receipt["identity"], receipt["managed_source"]
-        if (not isinstance(binding, dict) or not isinstance(config, dict)
-                or state.get("orchestrator_root") != str(primary)
-                or state.get("review_cycle_dispatch_id") != identity["dispatch_id"]
-                or state.get("review_cycle_subject_branch") != identity["subject_branch"]
-                or state.get("review_cycle") != receipt["decision"]
-                or config.get("pass_id") != pass_id or config.get("start_head_ref") != source["head_sha"]
-                or any(binding.get(k) != state.get(k) or state.get(k) != managed.get(k)
-                       for k in ("task_ref", "lane_id", "worktree_path"))
-                or _short_branch(binding.get("branch")) != _short_branch(source["branch"])
-                or _short_branch(state.get("branch")) != _short_branch(source["branch"])
-                or binding.get("v") != 1 or type(binding.get("row_id")) is not int
-                or binding["row_id"] != lane.get("id") or type(lane.get("identity_seq")) is not int
-                or type(binding.get("cycle_epoch")) is not int or type(lane.get("cycle_epoch")) is not int
-                or binding["cycle_epoch"] > lane["cycle_epoch"]
-                or binding.get("source_base_sha") != original.get("base_sha")):
-            return False
-        _historical_source_lane(runtime, binding, source, lane)
+        lanes, _ = _registry(RuntimeConfig.for_repo(orchestrator_root or authority(repo).parent.parent).db_path)
+    except (SnapshotContended, OSError, sqlite3.Error):
         return True
-    except (EvidenceHold, OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error):
-        return False
+    rows = [row for row in lanes if _short_branch(row.get("branch")) == name and row.get("lane_kind") != "review"]
+    return bool(rows) and all((row.get("task_ref"), row.get("lane_id")) != (proof.get("task_ref"), proof.get("lane_id"))
+                              for row in rows)
 
 
-def _source_delta_disjoint(repo: Path, tip: str, base: str, incoming: set[str]) -> bool:
-    """The source's actual paths can collide even outside its authorized grant."""
-    integrated = _subject_probe(repo, "--no-replace-objects", "merge-base", "--all", base, tip)
-    bases = integrated.stdout.splitlines()
-    if integrated.returncode or integrated.stderr or len(bases) != 1:
-        return False
-    if bases[0] == tip:
-        return True
-    changed = _subject_probe(repo, "--no-replace-objects", "diff", "--name-only", "--no-renames",
-                             "--no-ext-diff", "--ignore-submodules=none", "-z", bases[0], tip, "--")
-    return not changed.returncode and not changed.stderr and _disjoint_roots(
-        set(changed.stdout.rstrip("\0").split("\0")) - {""}, incoming,
-    )
+def hold_incoming(repo: Path, branch: str, proof: dict | None, *, orchestrator_root: Path | None = None):
+    """The incoming side of ``holder_blocks``: identity, integration ref, tip and declared roots.
 
-
-def _legacy_self_source_nonconflicting(repo: Path, receipt: dict, proof: dict, owner: _ReceiptHolder,
-                                      authorized: Callable[[dict], set[str] | None],
-                                      authenticates_reservation: Callable[[], bool], *,
-                                      orchestrator_root: Path) -> bool | None:
-    """Evaluate a single incoming resource edge from the original managed issuance.
-
-    False holds a changed binding or a failed absent-source proof.
-    None leaves other cases to the existing holder predicates.
-    Canon v0.26.2 GRPH-14 (Building Knowledge Graphs, ch. 8 + Mental Models,
-    ch. 8) grounds the join from protected scope and reservation to the
-    first-publication pass and its native lane witness.
+    The incoming scope is the pinned binding's roots plus its current
+    authorized scope growth (``_authorized_roots``): growth onto a holder's
+    unlanded work holds (SECD-05). A proof that names another registered
+    lane's subject is not this incoming source's identity (#57): the incoming
+    is then evaluated as its own registered lane (declared roots).
     """
-    from .review_ratchet import _same_worktree, _scope_record, _short_branch, task_subject_binding
+    from .review_cycle_holds import Incoming
+    from .review_ratchet import _short_branch
 
-    original = receipt.get("source_task_subject")
-    managed = receipt.get("managed_identity")
-    branch, head, lane = _short_branch(receipt["source_branch"]), receipt["source_head"], owner.lane
-    if (receipt.get("state") != "transport_started" or receipt.get("settlement_owner") != "engine"
-            or "source_issuer" in receipt or "source_issuer_scope" in receipt
-            or "source_task_subject_unproven" in receipt
-            or not isinstance(original, dict) or not isinstance(managed, dict)
-            or lane is None or owner.mismatch or owner.owner_unproven or owner.competing
-            or branch is None or branch != _short_branch(receipt["identity"]["subject_branch"])
-            or branch != _short_branch(original.get("subject_branch"))
-            or _short_branch(lane.get("branch")) != branch or _short_branch(proof["subject_branch"]) == branch
-            or original.get("task_ref") == proof["task_ref"]
-            or original.get("tip_sha") != head
-            or original.get("integration_branch") != proof["integration_branch"]
-            or receipt.get("managed_source") != dict(branch=receipt["source_branch"], head_sha=head,
-                                                     head_tree=receipt.get("source_tree"))):
-        return None
-    historical = task_subject_binding(lane) != original
-    unproven = False if historical else None
-    record = _scope_record(repo, original)
-    if (record is None or not _same_worktree(record.get("worktree_path"), lane.get("worktree_path"))
-            or not _same_worktree(managed.get("worktree_path"), lane.get("worktree_path"))):
-        return unproven
-    incoming_record = _scope_record(repo, proof)
-    if incoming_record is None:
-        return unproven
-    incoming = authorized(proof)
-    holder_roots = set(record["authorized_scopes"][-1])
-    if incoming is None or not _disjoint_roots(holder_roots, incoming):
-        return unproven
-
-    # The original scope says nothing about later source commits. A shared
-    # commit after transport is safe here only in the incoming integration base.
-    base = original.get("base_sha")
-    if not isinstance(base, str) or not _HEX_OID.fullmatch(base) or _ancestry(repo, base, head) != "ancestor":
-        return unproven
-    ref = _local_branch_ref(receipt["source_branch"])
-    resolved = _subject_probe(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
-    if resolved.stderr or resolved.returncode not in {0, 1} or (resolved.returncode == 1 and _ref_exists(repo, ref)):
-        return unproven
-    tips = {resolved.stdout.strip() or None, lane.get("branch_tip_sha")} - {None}
-    for candidate in tips:
-        if not isinstance(candidate, str) or not _HEX_OID.fullmatch(candidate):
-            return unproven
-        if candidate == head:
-            continue
-        stored = _subject_probe(repo, "cat-file", "-t", candidate)
-        if stored.returncode or stored.stderr or stored.stdout.strip() != "commit":
-            return unproven
-        if _ancestry(repo, candidate, proof["base_sha"]) == "ancestor":
-            continue
-        shared = _subject_probe(repo, "merge-base", "--all", review_source_ref(repo), candidate)
-        if (shared.returncode or shared.stderr or not shared.stdout.strip()
-                or any(_ancestry(repo, commit, head) != "ancestor"
-                       and _ancestry(repo, commit, proof["base_sha"]) != "ancestor"
-                       for commit in shared.stdout.splitlines())):
-            return unproven
-        if not _source_delta_disjoint(repo, candidate, proof["base_sha"], incoming):
-            return unproven
-    if historical and not _historical_self_source_issuer(repo, receipt, original, lane):
-        return unproven
-    if not authenticates_reservation():
-        return unproven
-    if tips:
-        return True
-
-    from workbay_handoff_mcp.config import RuntimeConfig
-
-    from .review_cycle_reference_independence import (
-        holder_source_absent,
-        protected_index_visible,
-        proves_reference_independence,
-    )
-    from .review_cycle_terminal_source import terminal_source_witness
-
-    incoming_worktree = incoming_record.get("worktree_path")
-    holder_worktree = record.get("worktree_path")
-    if not isinstance(incoming_worktree, str) or not isinstance(holder_worktree, str):
-        return False
-    witness = terminal_source_witness(repo, RuntimeConfig.for_repo(orchestrator_root).db_path, receipt, owner, proof)
-    if witness.status == "unknown":
-        # Only missing close evidence permits the reference proof, which
-        # cannot account for a retained terminal tip.
-        if witness.reason != "terminal_close_evidence_missing":
-            return False
-        return proves_reference_independence(
-            repo, proof, incoming_worktree=incoming_worktree, incoming_roots=incoming,
-            holder_worktree=holder_worktree, holder_roots=holder_roots,
-            holder_branch=branch, holder_head=head, holder_tree=receipt["source_tree"], holder_recorded_tip=None,
-        )
-    try:
-        return (
-            witness.tip is not None
-            and _same_worktree(incoming_worktree, str(repo))
-            and protected_index_visible(repo, incoming)
-            and _source_delta_disjoint(repo, witness.tip, proof["base_sha"], incoming)
-            and holder_source_absent(repo, holder_worktree, branch, proof["base_sha"])
-        )
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return False
+    borrowed = isinstance(proof, dict) and _borrowed_proof(repo, branch, proof, orchestrator_root)
+    hold_proof = None if borrowed else proof
+    subject = hold_proof.get("subject_branch") if isinstance(hold_proof, dict) else None
+    name = _short_branch(branch) or _short_branch(subject) or ""
+    integration = (_short_branch(proof.get("integration_branch")) if isinstance(proof, dict) else None) or "main"
+    roots = None
+    if isinstance(hold_proof, dict) and isinstance(hold_proof.get("owned_paths"), list) and hold_proof["owned_paths"]:
+        roots = tuple(sorted({str(item).strip("/") for item in hold_proof["owned_paths"] if isinstance(item, str)}))
+    authorized = None
+    if isinstance(proof, dict):
+        try:
+            authorized = _authorized_roots(repo, orchestrator_root or repo, proof)
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
+            authorized = None
+    if not borrowed and roots is not None and authorized is not None:
+        roots = tuple(sorted(set(roots) | {str(item).strip("/") for item in authorized}))
+    # Accounting only (decision 48657): the authenticated base, authorized
+    # roots and subject let a distinct task shed settled upstream history, never a hold.
+    proof_base = proof.get("base_sha") if isinstance(proof, dict) and isinstance(proof.get("base_sha"), str) else None
+    proof_subject = _short_branch(proof.get("subject_branch")) if isinstance(proof, dict) else None
+    proof_roots = None
+    if proof_base is not None and authorized is not None:
+        proof_owned = ({str(item).strip("/") for item in proof.get("owned_paths") or () if isinstance(item, str)}
+                       if isinstance(proof, dict) else set())
+        proof_roots = tuple(sorted(authorized | proof_owned | {
+            str(item).strip("/") for item in proof.get("changed_files") or () if isinstance(item, str)}))
+    return Incoming(branch=name, task_ref=hold_proof.get("task_ref") if isinstance(hold_proof, dict) else None,
+                    lane_id=hold_proof.get("lane_id") if isinstance(hold_proof, dict) else None,
+                    subject_branch=_short_branch(subject), integration_branch=integration,
+                    tip_ref=review_source_ref(repo), owned_roots=roots, proof_base=proof_base,
+                    proof_roots=proof_roots, proof_subject=proof_subject)
 
 
-def _terminal_self_source_requirement(issuer: _ReceiptHolder, receipt: dict, proof: dict) -> str | None:
-    """Identify the landing requirement for a remaining completed feature holder."""
-    from .review_ratchet import _short_branch, task_record
-
-    branch = _short_branch(receipt["source_branch"])
-    if (issuer.lane is None or issuer.task_ref == proof["task_ref"]
-            or _short_branch(receipt["identity"]["subject_branch"]) != branch
-            or branch == _short_branch(proof["subject_branch"])):
-        return None
-    original = receipt.get("source_task_subject")
-    if original is None:
-        observed = receipt.get("source_task_subject_unproven")
-        if not isinstance(observed, dict) or observed.get("head_on_integration") is not False:
-            return None
-    elif not isinstance(original, dict) or original.get("tip_sha") != receipt.get("source_head"):
-        # A later source on a continuing branch has its own resource proofs.
-        return None
-    task = task_record(issuer.task_ref)
-    if task is None:
-        return "holder_task_unknown"
-    if task["status"] == "done" and _short_branch(task.get("target_branch")) == branch:
-        return "protected source-time identity and exact landed issuer"
-    return None
+def subject_hold_evaluation(repo: Path, branch: str, proof: dict | None = None, *,
+                            orchestrator_root: Path | None = None) -> dict:
+    """``subject_hold_diagnostics`` plus every decision (``evaluated``) and the own receipts (``own``)."""
+    sink: dict = {}
+    report = subject_hold_diagnostics(repo, branch, proof, orchestrator_root=orchestrator_root, evaluation=sink)
+    return {**report, **sink}
 
 
 def subject_hold_diagnostics(repo: Path, branch: str, proof: dict | None = None, *,
                              orchestrator_root: Path | None = None, metrics: bool = False,
-                             close_releases: list | None = None) -> dict:
-    """One decision table for retained subjects and their holding receipts.
+                             close_releases: list | None = None, evaluation: dict | None = None) -> dict:
+    """Every holder's git-derived decision for this incoming source.
 
-    Inspect direct-branch and ancestor receipts in the same walk. A direct
-    match cannot hide a different unproved holder. Authenticated native recovery
-    can discharge its receipt; otherwise only applicable holders are reported.
-    A stamp's presence is diagnostic here; release predicates authenticate it.
-
-    ``metrics`` adds the phase cost: ``subject_hold_ms``, ``receipts_scanned``
-    (receipts the walk classified) and ``receipts_skipped_cached`` (absent
-    heads answered by the absent-source cache without a per-receipt probe).
-    Canon v0.26.2: PERF-06, Measure, don't guess (A Philosophy of Software
-    Design, ch. 20).
+    ``holding`` lists the holders whose unlanded commits overlap the incoming
+    paths, or whose tip cannot be read (``blocks == "unknown"``, reason named).
+    ``evaluation`` (or :func:`subject_hold_evaluation`) receives every decision
+    as ``evaluated``, sorted by (task, lane, branch), and the own receipts. Stored
+    release, stranded and close-release records are never read here.
+    Canon v0.26.2: PERF-06, Measure, don't guess (A Philosophy of Software Design, ch. 20).
     """
+    from .review_cycle_holds import evaluate_holds
+
     started = time.perf_counter()
-    directory = authority(repo) / "review_cycle_dispatch"
-    holding, recorded, absent, scope_refusals = [], {}, [], []
-    report = dict(holding=holding, source_head_absent=absent)
-    candidates, released_direct = [], set()
-    landed_candidates = {}
-    admitted_original = False
-    from .lane_close_release import verified_close_release
-    from .review_cycle_reconciliation import EvidenceHold, HolderReleaseWalk, _read
-    from .review_ratchet import _short_branch, task_record
-
-    root = orchestrator_root or repo
-    branch_name = _short_branch(branch)
-
-    # Scope authorization can walk protected history after a legacy expansion.
-    # Reuse it for identical bindings within this admission only.
-    @cache
-    def roots_for(wire: str) -> set[str] | None:
-        return _authorized_roots(repo, root, json.loads(wire))
-
-    def authorized(binding: dict) -> set[str] | None:
-        return roots_for(json.dumps(binding, sort_keys=True))
-
-    @cache
-    def source_tree(head: str) -> str:
-        return _git(repo, "rev-parse", "--verify", head + "^{tree}")
-
-    holder_release_walk = HolderReleaseWalk(repo)
-    release_paths = set()
-    verified = {}
-    # Ledger membership survives missing or malformed receipts. Compare the
-    # bytes we will classify with the entire batch authenticated under lock.
-    for event in holder_release_walk.events:
-        members = {directory / (hashlib.sha256(item.encode()).hexdigest() + ".json"): item
-                   for item in event["dispatch_ids"]}
-        release_paths.update(members)
-        current = holder_release_walk.observations(event)
-        if current is not None:
-            batch = {}
-            for path, item in members.items():
-                try:
-                    receipt, digest = _read(path, directory.parent)
-                except EvidenceHold:
-                    break
-                if digest != event["receipt_sha256s"][item]:
-                    break
-                batch[path] = (receipt, digest)
-            else:
-                verified.update(batch)
-                continue
-        for path, dispatch_id in members.items():
-            observed = event["preconditions"][dispatch_id]
-            row = dict(receipt=path.name, dispatch_id=dispatch_id, subject=observed["subject_branch"],
-                       source_branch=observed["source_branch"], source_head=observed["source_head"],
-                       release_digest=event["receipt_sha256s"][dispatch_id],
-                       missing_proof="current batch release preconditions",
-                       has_source_task_subject=False, predicates_tried=["holder_release_revalidation"])
-            if dispatch_id in holder_release_walk.unproven_owners:
-                row.update(reason="holder_release_owner_unproven", missing_proof=ISSUANCE_OWNER_UNPROVEN,
-                           possible_issuers=holder_release_walk.unproven_owners[dispatch_id])
-            if _short_branch(row["source_branch"]) == branch_name:
-                holding.append(row)
-            else:
-                ancestry = _ancestry(repo, row["source_head"], review_source_ref(repo))
-                if ancestry == "ancestor":
-                    holding.append(row)
-                elif ancestry == "absent":
-                    absent.append({key: row[key] for key in ("receipt", "subject", "source_branch", "source_head")})
-    receipt_paths = set(directory.glob("*.json"))
-    holding.extend(holder_release_walk.missing_receipts(directory, receipt_paths | set(verified)))
-    ordinary = (path for path in sorted(receipt_paths) if path not in release_paths)
-    for path in chain(verified, ordinary):
-        if path in verified:
-            receipt, digest = verified[path]
-        else:
-            raw = path.read_bytes()
-            receipt, digest = json.loads(raw), hashlib.sha256(raw).hexdigest()
-        source_branch, head = receipt.get("source_branch"), receipt.get("source_head")
-        # A read-only analysis is never a source pass, so its receipt holds no subject.
-        if not source_branch or not head or (receipt.get("identity") or {}).get("kind") == "analysis":
-            continue
-        candidates.append((path, receipt, digest))
-        if _short_branch(source_branch) == branch_name:
-            # An original admission survives a later integration advance. Only
-            # a protected receipt joined to its reservation witnesses that start.
-            identity = receipt["identity"]
-            if (not admitted_original and proof is not None
-                    and _original_admission_matches(path, receipt, proof, holder_release_walk)):
-                try:
-                    admitted_original = _read(path, directory.parent)[1] == digest
-                except EvidenceHold:
-                    pass  # No authenticated original admission at this path.
-            from .review_cycle_terminal_recovery import _recovery_path, releases
-            dispatch_id = identity.get("dispatch_id")
-            recovery = _recovery_path(repo, dispatch_id) if isinstance(dispatch_id, str) else None
-            if (proof is not None and recovery is not None and (recovery.exists() or recovery.is_symlink())
-                    and releases(repo, proof, receipt, orchestrator_root or repo)):
-                released_direct.add(path)
-                continue  # authenticated correction cannot hide later holders
-            # Continue: another holder may still require an independent proof.
-    answers, cached = _receipt_ancestries(repo, [(digest, receipt["source_head"]) for _, receipt, digest in candidates
-                                                 if _short_branch(receipt["source_branch"]) != branch_name], review_source_ref(repo))
-    answers = iter(answers)
-
-    def measured() -> dict:
-        if metrics:
-            report.update(subject_hold_ms=round((time.perf_counter() - started) * 1000, 3),
-                          receipts_scanned=len(candidates), receipts_skipped_cached=cached)
-        return report
-
-    for path, receipt, receipt_sha256 in candidates:
-        if path in released_direct:
-            continue
-        source_branch, head = receipt["source_branch"], receipt["source_head"]
-        subject = receipt["identity"]["subject_branch"]
-        row = dict(receipt=path.name, subject=subject, source_branch=source_branch, source_head=head,
-                   has_source_task_subject=receipt.get("source_task_subject") is not None,
-                   predicates_tried=[])
-        original = receipt.get("source_task_subject")
-        if isinstance(original, dict) and _short_branch(original.get("subject_branch")) != _short_branch(subject):
-            # A stamp for another account cannot establish this holder's scope.
-            # Keep the receipt visible to reports and refuse at aggregation.
-            row["missing_proof"] = "source-time stamp matching the charged subject"
-        if _short_branch(source_branch) == branch_name:
-            row["predicates_tried"] = ["direct_match"]
-            if proof is not None and receipt.get("source_task_subject") is None:
-                if holder_release_walk.is_current(receipt, receipt_sha256,
-                                                  integration_branch=proof["integration_branch"]) is False:
-                    row["predicates_tried"] = ["holder_release_revalidation"]
-                    row["missing_proof"] = "matching integration branch and current release preconditions"
-            holding.append(row)
-            continue
-        ancestry = next(answers)
-        if ancestry == "absent":
-            absent.append({key: row[key] for key in ("receipt", "subject", "source_branch", "source_head")})
-        elif ancestry == "ancestor":
-            if proof is not None and original is None:
-                # An appended release is authority only while every original
-                # precondition and the operator decision still hold now.
-                current = holder_release_walk.is_current(receipt, receipt_sha256,
-                                                         integration_branch=proof["integration_branch"])
-                if current is True:
-                    continue
-                if current is False:
-                    row["predicates_tried"] = ["holder_release_revalidation"]
-                    row["missing_proof"] = "matching integration branch and current release preconditions"
-                    holding.append(row)
-                    continue
-            from .review_cycle_terminal_recovery import _recovery_path, releases
-            recovery = _recovery_path(repo, receipt["identity"]["dispatch_id"])
-            if recovery.exists() or recovery.is_symlink():
-                # Recovery intent alone never releases. Reopen its original
-                # producers and full charged settlement on every native use;
-                # UNKNOWN or incomplete recovery cannot fall through to a
-                # weaker historic task-completion release predicate.
-                if proof is not None and releases(repo, proof, receipt, orchestrator_root or repo):
-                    continue
-                row["predicates_tried"] = ["authenticated_native_terminal_recovery"]
-                holding.append(row)
-                continue
-            if "missing_proof" in row:
-                row["predicates_tried"] = ["source_subject_binding"]
-                holding.append(row)
-                continue
-            source_lane = None
-            distinct = _short_branch(source_branch) != _short_branch(subject)
-            if proof is not None:
-                owner = _receipt_holder(root, receipt, source_branch)
-                source_lane = owner.lane
-                close_release = verified_close_release(repo, path, receipt, receipt_sha256, proof, holder=owner)
-                if close_release is not None:
-                    if close_releases is not None:
-                        close_releases.append(close_release)
-                    continue
-                if (original is None and source_lane is not None and not owner.mismatch
-                        and holder_release_walk.terminal_issuer_releases(path, receipt, receipt_sha256, owner, proof)):
-                    continue
-                requirement = _terminal_self_source_requirement(owner, receipt, proof)
-                legacy_nonconflicting = None
-                if requirement != "holder_task_unknown":
-                    legacy_nonconflicting = _legacy_self_source_nonconflicting(
-                        repo, receipt, proof, owner, authorized,
-                        lambda: holder_release_walk.authenticates_source_reservation(path, receipt, receipt_sha256),
-                        orchestrator_root=root,
-                    )
-                    if legacy_nonconflicting is True:
-                        continue
-                if requirement or legacy_nonconflicting is False:
-                    # A generic disjoint-root or retry proof cannot replace
-                    # the issuer's protected original evidence.
-                    if (branch_name in {None, _short_branch(proof["subject_branch"])}
-                            and holder_release_walk.landed_self_source_releases(path, receipt, receipt_sha256, proof)):
-                        continue
-                    predicates = ["landed_self_source_releases"]
-                    if legacy_nonconflicting is False:
-                        predicates.insert(0, "_legacy_self_source_nonconflicting")
-                    row.update(holder_task=owner.task_ref, holder_lane=owner.lane_id, predicates_tried=predicates,
-                               missing_proof=requirement or "authenticated original issuer and disjoint source scope")
-                    holding.append(row)
-                    continue
-                # A stamp on the earlier subject says nothing about the source
-                # registration. Its resource predicates check the candidate set.
-                unresolved = owner.unresolved if not owner.owner_unproven else ()
-                if (original is None and owner.owner_unproven) or owner.mismatch or unresolved or (
-                        source_lane is not None and _short_branch(source_lane.get("branch")) != _short_branch(source_branch)):
-                    if (source_lane is not None and _short_branch(source_lane.get("branch")) == _short_branch(source_branch)
-                            and owner.terminal_retries()
-                            and _terminal_producer_source(repo, proof, receipt, root, check_uncontributed=False)):
-                        continue
-                    if (source_lane is not None and _short_branch(source_lane.get("branch")) == _short_branch(source_branch)
-                            and original is None and unresolved and all(r.get("status") == "merged" for r in unresolved)
-                            and _released(repo, proof, receipt, orchestrator_root=root, admitted_original=admitted_original)):
-                        continue
-                    row.update(dispatch_id=receipt["identity"]["dispatch_id"],
-                               missing_proof=(ISSUANCE_OWNER_UNPROVEN if owner.owner_unproven else
-                                              "registry row for the source-time holder" if owner.mismatch else
-                                              "unambiguous live registry ownership"),
-                               predicates_tried=["ancestor_lane_ownership"])
-                    if owner.owner_unproven:
-                        row["possible_issuers"] = [_issuer_description(r) for r in owner.competing]
-                    else:
-                        row["conflicting_owners"] = [(r["task_ref"], r["lane_id"]) for r in owner.competing]
-                    if owner.task_ref and owner.lane_id:
-                        row.update(holder_task=owner.task_ref, holder_lane=owner.lane_id)
-                    holding.append(row)
-                    continue
-                if (source_lane is not None and source_lane.get("status") == "merged" and not distinct
-                        and branch_name in {None, _short_branch(proof["subject_branch"])}):
-                    landed_candidates[path.name] = (path, receipt, receipt_sha256)
-            if (proof is not None and source_lane is not None and source_lane.get("status") != "closed"
-                    and isinstance(original, dict) and _short_branch(original.get("subject_branch")) == _short_branch(subject)
-                    and original.get("tip_sha") == head and original.get("base_sha") != head
-                    and not distinct and original.get("task_ref") != proof.get("task_ref")):
-                holder_task = original.get("task_ref")
-                task = task_record(holder_task) if isinstance(holder_task, str) else None
-                if (task is None or (task.get("source") == "live" and task.get("status") == "in_progress"
-                                     and _short_branch(task.get("target_branch")) not in {None, "main"})):
-                    if (task is not None and source_lane.get("task_ref") == holder_task
-                            and _released(repo, proof, receipt, orchestrator_root=orchestrator_root,
-                                          admitted_original=admitted_original)):
-                        continue
-                    row.update(holder_task=holder_task,
-                               missing_proof="holder_task_unknown" if task is None else
-                                             "terminal_lane_source_integration_ownership_proof_missing",
-                               predicates_tried=["_released"])
-                    holding.append(row)
-                    continue
-            protected_receipt = False
-            if proof is not None and holder_release_walk.has_reservation(receipt["identity"]):
-                try:
-                    dispatch_id = receipt["identity"]["dispatch_id"]
-                    expected = hashlib.sha256(dispatch_id.encode()).hexdigest() + ".json"
-                    protected_receipt = path.name == expected and _read(path, directory.parent)[1] == receipt_sha256
-                except EvidenceHold:
-                    pass
-                if distinct and isinstance(original, dict) and (
-                        not protected_receipt or receipt.get("source_tree") != source_tree(head)):
-                    row.update(holder_code="evidence_unavailable", reason="holder_custody_unavailable",
-                               missing_proof="protected native receipt with matching source commit and tree",
-                               predicates_tried=["native_receipt_membership"])
-                    holding.append(row)
-                    continue
-            if proof is None:
-                holding.append(row)
-                continue
-            older = authorized(original) if isinstance(original, dict) and not distinct else None
-            scope_refusal = None
-            try:
-                if not _holder_scope_binds(repo, proof, receipt, row, root,
-                                           scope_evidence=(older, source_lane), authorized=authorized,
-                                           protected_receipt=protected_receipt):
-                    continue
-                if (not distinct and isinstance(original, dict) and isinstance(original.get("task_ref"), str)
-                        and original["task_ref"] != proof.get("task_ref") and older is None):
-                    raise _scope_error(row, receipt, original)
-            except SubjectScopeUnauthenticated as exc:
-                scope_refusal = exc
-            if _terminal_producer_source(repo, proof, receipt, root, check_uncontributed=False):
-                continue
-            if scope_refusal is not None:
-                # Preserve direct-match and multi-subject precedence for this uncertainty.
-                scope_refusals.append(scope_refusal)
-            elif (not distinct or original is None) and (
-                    _released(repo, proof, receipt, orchestrator_root=orchestrator_root,
-                              authenticated_scope=older is not None, admitted_original=admitted_original)
-                    or _repair_baseline(repo, proof, receipt, directory, recorded, root)):
-                continue
-            if scope_refusal is None:
-                row["predicates_tried"] = (["_holder_scope_binds", "_terminal_producer_source"]
-                                           if protected_receipt and distinct and isinstance(original, dict) else
-                                           ["_independent_baseline_source", "_terminal_producer_source",
-                                            "_released", "_repair_baseline"])
-            holding.append(row)
-    # A later landing is an additional proof for a remaining holder. Preserve
-    # earlier releases and never revisit direct matches, recovery or ownership holds.
-    released = {row["receipt"] for row in holding if row["receipt"] in landed_candidates
-                and holder_release_walk.landed_self_source_releases(*landed_candidates[row["receipt"]], proof)}
-    if released:
-        holding[:] = [row for row in holding if row["receipt"] not in released]
-        scope_refusals = [error for error in scope_refusals if error.receipt not in released]
-    if scope_refusals:
-        if len({row["subject"] for row in holding}) > 1:
-            raise SubjectAmbiguous(holding)
-        raise scope_refusals[0]
-    return measured()
+    incoming = hold_incoming(repo, branch, proof, orchestrator_root=orchestrator_root)
+    own: list = []
+    lineage: list = []
+    decisions = evaluate_holds(repo, incoming, orchestrator_root=orchestrator_root, own=own, lineage=lineage)
+    if any(item.blocks == "retry" for item in decisions):
+        raise SubjectSnapshotContended()
+    rows = [item.as_row() for item in decisions]
+    holding = [row for row, item in zip(rows, decisions, strict=True) if item.holds]
+    report = dict(holding=holding, source_head_absent=[
+        {key: row[key] for key in ("receipt", "subject", "source_branch", "source_head")}
+        for row in rows if row["reason"] == "holder_tip_absent" and row.get("receipt")])
+    if evaluation is not None:
+        evaluation.update(evaluated=rows, own=own, lineage=lineage[0] if lineage else None)
+    if metrics:
+        report.update(subject_hold_ms=round((time.perf_counter() - started) * 1000, 3),
+                      receipts_scanned=sum(1 for row in rows if row.get("receipt")), receipts_skipped_cached=0)
+    return report
 
 
 def subject_hold_report(repo: Path, branch: str, proof: dict | None = None, *,
-                        orchestrator_root: Path | None = None, close_releases: list | None = None) -> list[dict]:
-    """Holding rows only: absent-head diagnostics must never bind a subject."""
-    holding = subject_hold_diagnostics(
-        repo, branch, proof, orchestrator_root=orchestrator_root, close_releases=close_releases,
-    )["holding"]
-    if len({row["subject"] for row in holding}) > 1 and any(row.get("missing_proof") == "holder_task_unknown" for row in holding):
-        raise SubjectAmbiguous(holding)
-    for row in holding:
-        if row.get("missing_proof") == "holder_task_unknown":
-            raise SubjectHolderTaskUnknown(row, row["holder_task"])
-    return holding
+                        orchestrator_root: Path | None = None, close_releases: list | None = None,
+                        evaluation: dict | None = None) -> list[dict]:
+    """Holding rows only (``evaluation`` receives every decision and the own receipts)."""
+    return subject_hold_diagnostics(repo, branch, proof, orchestrator_root=orchestrator_root,
+                                    evaluation=evaluation)["holding"]
 
 
 def _named_subject_holders(repo: Path, root: Path, rows: list[dict], error: ValueError | None = None) -> list[dict]:
-    """Names are diagnostics only; neither a registry label nor this read creates proof."""
+    """One named holder per hold row: dispatch, lane, tip and overlapping paths (S7)."""
     holders = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        dispatch_id, name = row.get("dispatch_id"), row.get("receipt")
-        task, lane_id = row.get("holder_task"), row.get("holder_lane")
-        competitors = set(row.get("conflicting_owners", []))
-        possible = row.get("possible_issuers")
-        source = row.get("source_branch")
-        expected_digest = row.get("release_digest")
-        receipt = None
-        # An ownership refusal already captured the identity and competitors
-        # together. Other holds can also originate before a registry lookup.
-        if (expected_digest or (possible is None and not (task and lane_id and dispatch_id))) and isinstance(name, str) and Path(name).name == name:
-            try:
-                raw = (authority(repo) / "review_cycle_dispatch" / name).read_bytes()
-                if expected_digest is None or hashlib.sha256(raw).hexdigest() == expected_digest:
-                    receipt = json.loads(raw)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass
-        if isinstance(receipt, dict):
-            dispatch_id = (receipt.get("identity") or {}).get("dispatch_id") or dispatch_id
-            snapshot = receipt.get("source_task_subject")
-            branch = source or (snapshot.get("subject_branch") if isinstance(snapshot, dict) else None)
-            try:
-                owner = _receipt_holder(root, receipt, branch)
-                task, lane_id = owner.task_ref, owner.lane_id
-                if owner.owner_unproven:
-                    possible = [_issuer_description(r) for r in owner.competing]
-                else:
-                    competitors.update((r["task_ref"], r["lane_id"]) for r in owner.competing)
-            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
-                pass
-        holder = dict(task_ref=task or getattr(error, "task_ref", None) or "unknown",
-                      lane_id=lane_id or getattr(error, "lane_id", None) or "unknown",
-                      dispatch_id=dispatch_id or getattr(error, "dispatch_id", None) or "unknown",
-                      receipt=name, source_branch=source, subject_branch=row.get("subject"))
-        if possible is not None:
-            holder.update(possible_issuers=possible, final_tip="unknown")
-        if competitors:
-            holder["competing_registrations"] = [dict(task_ref=task_ref, lane_id=registered_lane_id)
-                                                 for task_ref, registered_lane_id in sorted(competitors)]
+        holder = dict(task_ref=row.get("holder_task") or getattr(error, "task_ref", None) or "unknown",
+                      lane_id=row.get("holder_lane") or getattr(error, "lane_id", None) or "unknown",
+                      dispatch_id=row.get("dispatch_id") or getattr(error, "dispatch_id", None) or "unknown",
+                      receipt=row.get("receipt"), source_branch=row.get("source_branch"),
+                      subject_branch=row.get("subject"))
+        for key in ("holder_tip", "overlap_paths", "blocks"):
+            if key in row:
+                holder[key] = row[key]
         holders.append(holder)
     return holders
 
@@ -4121,37 +3006,62 @@ def _named_subject_holders(repo: Path, root: Path, rows: list[dict], error: Valu
 def retained_subject_resolution(repo: Path, branch: str, proof: dict | None = None, *,
                                 orchestrator_root: Path | None = None,
                                 close_releases: list | None = None) -> SubjectResolution:
-    """Classify the aggregate; a retained edge to a foreign subject never proves continuation."""
-    try:
-        holding = subject_hold_report(
-            repo, branch, proof, orchestrator_root=orchestrator_root,
-            **({"close_releases": close_releases} if close_releases is not None else {}),
-        )
-    except HolderLedgerUnavailable as exc:
-        return SubjectResolution("held_missing_proof", None, missing_proof=str(exc))
-    except (SubjectAmbiguous, SubjectScopeUnauthenticated) as exc:
-        holding = getattr(exc, "holding", [])
-        named = _named_subject_holders(repo, orchestrator_root or repo, holding, exc)
-        return SubjectResolution("held_missing_proof", getattr(exc, "subject", None), tuple(holding),
-                                 getattr(exc, "missing_proof", None), exc, tuple(named))
-    if not holding:
-        return SubjectResolution("independence_proven", proof["subject_branch"] if proof else branch)
-    matches = {row["subject"] for row in holding}
-    if len(matches) > 1:
-        error = SubjectAmbiguous(holding)
-        named = _named_subject_holders(repo, orchestrator_root or repo, holding, error)
-        return SubjectResolution("held_missing_proof", None, tuple(holding), error.missing_proof, error, tuple(named))
-    subject = next(iter(matches))
-    ownership_hold = next((row["missing_proof"] for row in holding if row.get("missing_proof")), None)
-    if not ownership_hold and subject == (proof["subject_branch"] if proof else branch):
-        # The only retained account is the incoming subject's own. Continuation
-        # and independence charge that same account, so no foreign history can
-        # be inherited; a hold here would refuse the work with no release.
-        return SubjectResolution("continuation_proven", subject, tuple(holding))
-    missing = ("incoming task-subject proof and authenticated source-time lineage" if proof is None else
-               "authenticated source-time task, scope and continuation proof")
-    named = _named_subject_holders(repo, orchestrator_root or repo, holding)
-    return SubjectResolution("held_missing_proof", subject, tuple(holding), ownership_hold or missing, holders=tuple(named))
+    """Holds from ``holder_blocks``; the charged account from git lineage.
+
+    1. Any holder whose unlanded commits overlap the incoming paths (or whose
+       answer is ``unknown``) holds: ``held_missing_proof``, reason holder_blocks.
+    2. Otherwise the round account follows ``review_cycle_holds.retained_subject_for``
+       (decision 48657, accounting only, computed in the same lock-free
+       snapshot): no lineage receipt charges the incoming subject
+       (``independence_proven``); the retained subject equal to the incoming
+       one, or any retained subject when the incoming has no task proof, is
+       charged (``continuation_proven``), so a new registry row cannot restart
+       at round one. An authenticated incoming subject that differs from its
+       lineage, ambiguous lineage and unreadable lineage are typed refusals.
+       Without a task proof, a registered lane of a distinct task is never
+       charged to a foreign subject (finding 31645): ``subject_lineage_mismatch``.
+    Contention raises :class:`SubjectSnapshotContended` (typed retry).
+    """
+    sink: dict = {}
+    holding = subject_hold_report(repo, branch, proof, orchestrator_root=orchestrator_root, evaluation=sink)
+    expected = proof["subject_branch"] if proof else branch
+    root = orchestrator_root or repo
+    if holding:
+        named = _named_subject_holders(repo, root, holding)
+        unknown = any(row.get("blocks") == "unknown" for row in holding)
+        missing = ("readable holder tip, integration ref and incoming scope" if unknown else
+                   "holder commits landed on integration, or disjoint from the incoming paths")
+        # A held result is never charged; it names the holders' common account
+        # (None when they charge several) for diagnostics and next actions.
+        held = {row.get("subject") for row in holding}
+        return SubjectResolution("held_missing_proof", held.pop() if len(held) == 1 else None, tuple(holding),
+                                 missing, holders=tuple(named), reason="holder_blocks")
+    lineage = sink.get("lineage")
+    if lineage is None or lineage.status == "unknown":
+        rows = tuple(lineage.receipts) if lineage is not None else ()
+        return SubjectResolution("held_missing_proof", None, rows, "readable incoming tip and receipt ancestry",
+                                 holders=tuple(_named_subject_holders(repo, root, list(rows))),
+                                 reason="subject_lineage_unreadable")
+    rows = tuple(lineage.receipts)
+    if lineage.status == "incoming":
+        return SubjectResolution("independence_proven", expected)
+    if lineage.status == "ambiguous":
+        error = SubjectAmbiguous(list(rows))
+        named = _named_subject_holders(repo, root, list(rows), error)
+        return SubjectResolution("held_missing_proof", None, rows, error.missing_proof, error, tuple(named),
+                                 reason="subject_lineage_ambiguous")
+    # Finding 31645: a registered incoming lane whose task differs from (or
+    # cannot be matched to) the retained receipts' task is not their continuation.
+    foreign_task = bool(lineage.incoming_tasks) and any(
+        task not in lineage.incoming_tasks for task in lineage.charged_tasks or (None,))
+    if lineage.subject == expected or (proof is None and not foreign_task):
+        # Charge the lineage account: a re-registered lane of the same task or
+        # an unregistered branch continues the subject its tip descends from.
+        return SubjectResolution("continuation_proven", lineage.subject, rows)
+    return SubjectResolution("held_missing_proof", None if (proof is None and foreign_task) else lineage.subject, rows,
+                             "authenticated source-time task, scope and continuation proof",
+                             holders=tuple(_named_subject_holders(repo, root, list(rows))),
+                             reason="subject_lineage_mismatch")
 
 
 def _require_resolved_subject(result: SubjectResolution) -> str:
@@ -4230,8 +3140,7 @@ def _source_task_subject_unproven(repo: Path, spec: dict, subject: str, *, regis
                                   integration: str | None = None) -> dict | None:
     """Source-time evidence only; this record alone never releases a retained receipt.
 
-    Together with a typed landing of its source, re-read on each call, it lets
-    ``_terminal_producer_source`` release through ``_landed_unproven_source``.
+    Audit only: holds are computed from git by ``review_cycle_holds.holder_blocks``.
 
     Use the same registry manifest/default integration as the proof producer.
     A missing integration ref stays unproven without preventing an otherwise

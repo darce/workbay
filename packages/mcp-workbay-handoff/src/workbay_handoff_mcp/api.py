@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import inspect
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -21,6 +23,8 @@ from pathlib import Path
 from subprocess import TimeoutExpired as SubprocessTimeoutExpired
 from typing import Annotated, Any, Callable, Literal, cast
 
+import anyio
+import anyio.to_thread
 from fastmcp import FastMCP
 from fastmcp.client import Client, PythonStdioTransport
 from fastmcp.tools import FunctionTool, ToolResult
@@ -2215,12 +2219,30 @@ def latest_branch_reclaim_candidate(
     return core.latest_branch_reclaim_candidate(lane_id=lane_id, task_ref=task_ref)
 
 
+def _related_prior_work_cancellation(cancel: threading.Event | None) -> contextlib.AbstractContextManager[None]:
+    """Install the MCP request's cancel token for the prior-work scan, if any.
+
+    The token crosses ``core.find_related_prior_work`` (a plain pass-through)
+    as a ContextVar. Without the embeddings extra there is no scan to cancel.
+    """
+    if cancel is None:
+        return contextlib.nullcontext()
+    try:
+        from .embeddings.related_prior_work import cancellation_scope
+    except ImportError:
+        return contextlib.nullcontext()
+    return cancellation_scope(cancel)
+
+
 def _related_prior_semantic_degrade_reason(
     *,
     embeddings_mode: str,
     status: object,
     note: object,
 ) -> str | None:
+    if status == "busy":
+        # Bounded single-flight wait exhausted: nothing ranked, typed note.
+        return note if isinstance(note, str) and note else "busy"
     if embeddings_mode != "verified" or status != "provider_unavailable":
         return None
     if isinstance(note, str) and note:
@@ -2262,6 +2284,7 @@ def find_related_prior_work(
     session: Annotated[
         str | None, Field(description="Optional caller session id for orientation-read telemetry.")
     ] = None,
+    _cancel: threading.Event | None = None,
 ) -> dict[str, object]:
     """Return prior findings/decisions that resemble the query (advisory context only).
 
@@ -2277,16 +2300,17 @@ def find_related_prior_work(
     """
     embeddings_mode = _compaction_module._embeddings_mode_from_ledger()
     try:
-        result = core.find_related_prior_work(
-            text=text,
-            finding_id=finding_id,
-            task_ref=task_ref,
-            include_task_refs=include_task_refs,
-            include_plan_paths=include_plan_paths,
-            include_statuses=include_statuses,
-            limit=limit,
-            min_score=min_score,
-        )
+        with _related_prior_work_cancellation(_cancel):
+            result = core.find_related_prior_work(
+                text=text,
+                finding_id=finding_id,
+                task_ref=task_ref,
+                include_task_refs=include_task_refs,
+                include_plan_paths=include_plan_paths,
+                include_statuses=include_statuses,
+                limit=limit,
+                min_score=min_score,
+            )
     except ValueError as exc:
         if "exactly one of" not in str(exc):
             raise
@@ -2323,6 +2347,14 @@ def find_related_prior_work(
         read_profile="find_related_prior_work",
     )
     return result
+
+
+# The cancel token is internal transport plumbing set by the MCP bridge
+# (_run_sync_tool_cancellable), never a client input: keep the published
+# signature, and therefore the tool's input schema, byte-identical.
+find_related_prior_work.__signature__ = inspect.signature(find_related_prior_work).replace(  # type: ignore[attr-defined]
+    parameters=[p for p in inspect.signature(find_related_prior_work).parameters.values() if p.name != "_cancel"]
+)
 
 
 def compaction(
@@ -5563,6 +5595,70 @@ class _UnknownArgumentFunctionTool(FunctionTool):
         return await super().run(arguments)
 
 
+# Sync read tools whose scan honours a cancel token. FastMCP runs a sync tool
+# with anyio.to_thread.run_sync(abandon_on_cancel=False), so a client's
+# notifications/cancelled left the worker scanning to completion and then
+# answering an already-answered request. These tools bridge the request's
+# cancellation into the worker ([CON-03]) without patching fastmcp/mcp.
+_CANCELLABLE_SYNC_TOOL_NAMES = frozenset({"find_related_prior_work"})
+
+# True only while _CancellableFunctionTool.run dispatches the call. Direct
+# calls of the published ``fn`` (tests, in-process callers) stay synchronous.
+_MCP_CANCEL_BRIDGE_ACTIVE: ContextVar[bool] = ContextVar("handoff_mcp_cancel_bridge_active", default=False)
+
+
+class _CancellableFunctionTool(FunctionTool):
+    """FunctionTool whose MCP dispatch lets a cancelled request abandon the worker."""
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        token = _MCP_CANCEL_BRIDGE_ACTIVE.set(True)
+        try:
+            return await super().run(arguments)
+        finally:
+            _MCP_CANCEL_BRIDGE_ACTIVE.reset(token)
+
+
+async def _run_sync_tool_cancellable(handler: Callable[..., Any], args: tuple, kwargs: dict) -> object:
+    """Run ``handler`` in a worker thread; on cancellation set its token and re-raise.
+
+    ``abandon_on_cancel=True`` lets the request finish cancelling at once
+    instead of waiting for the worker; the ``threading.Event`` passed as
+    ``_cancel`` then stops the worker at its next scan-chunk boundary, and its
+    late result is never delivered.
+    """
+    cancel = threading.Event()
+    try:
+        return await anyio.to_thread.run_sync(
+            functools.partial(handler, *args, _cancel=cancel, **kwargs),
+            abandon_on_cancel=True,
+        )
+    except BaseException:
+        # CancelledError (client cancel, server shutdown) or any other
+        # abandonment: tell the worker nobody is waiting, then re-raise.
+        cancel.set()
+        raise
+
+
+def _cancellable_sync_tool(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """Outermost wrapper of a cancellable sync tool (published with run_in_thread=False).
+
+    Called by _CancellableFunctionTool.run (inline, on the event loop) it
+    returns the coroutine that runs the whole sync wrapper chain in a worker
+    thread, which FastMCP awaits. Called directly it is the unchanged sync
+    chain. The published signature is the handler's, without ``_cancel``.
+    """
+    signature = inspect.signature(handler)
+
+    @functools.wraps(handler)
+    def _wrapped(*args: object, **kwargs: object) -> object:
+        if not _MCP_CANCEL_BRIDGE_ACTIVE.get():
+            return handler(*args, **kwargs)
+        return _run_sync_tool_cancellable(handler, args, kwargs)
+
+    _wrapped.__signature__ = signature  # type: ignore[attr-defined]
+    return _wrapped
+
+
 def _publishable_tool(
     entry: ToolEntry,
     roster: BootRoster,
@@ -5643,7 +5739,15 @@ def _publishable_tool(
         tool, content_carrier, convert_result=lambda result: published.convert_result(result)
     )
     function_tool_type = _UnknownArgumentFunctionTool if entry.name == "list_handoff_rows" else FunctionTool
-    published = function_tool_type.from_function(tool, name=entry.name, description=description)
+    if entry.name in _CANCELLABLE_SYNC_TOOL_NAMES and not inspect.iscoroutinefunction(tool):
+        # Inline dispatch hands the bridge coroutine to FastMCP, which awaits
+        # it; the sync chain itself still runs in a worker thread.
+        tool = _cancellable_sync_tool(tool)
+        published = _CancellableFunctionTool.from_function(
+            tool, name=entry.name, description=description, run_in_thread=False
+        )
+    else:
+        published = function_tool_type.from_function(tool, name=entry.name, description=description)
     if entry.name == "list_handoff_rows":
         published.parameters = {**published.parameters, "additionalProperties": True}
     return published
@@ -6160,19 +6264,25 @@ def _emit_semantic_reinjection_startup_probe() -> None:
 
 
 def _check_embedding_backfill_coverage(db_path: Path) -> dict[str, Any]:
-    """Report concept-embedding + anchor coverage (internal).
+    """Report source coverage for the pinned model and vector inventory.
 
-    Best-effort; never raises. A pre-v15 DB (no ``concept_embeddings`` table) or
-    an unused feature degrades to ``ok=True`` with a note and zero counts, so
-    `doctor` always exits cleanly. The counts let an operator confirm a backfill
-    actually populated the store before flipping the semantic flag on.
+    ``status`` is the coverage verdict, using the same census as lookup.
+    ``ok`` retains its informational probe meaning for existing consumers.
+    A legacy DB or unavailable census leaves coverage ``unknown`` with a note.
     """
     import sqlite3 as _sqlite3
 
-    block: dict[str, Any] = {"ok": True, "embedded_concepts": 0, "model_ids": [], "anchor_vectors": 0}
+    block: dict[str, Any] = {
+        "ok": True,
+        "status": "unknown",
+        "embedded_concepts": 0,
+        "model_ids": [],
+        "anchor_vectors": 0,
+    }
     try:
         # closing(): Connection.__exit__ only commits/rolls back; it does not close.
         with closing(connect_handoff_db(db_path, read_only=True)) as conn:
+            conn.execute("BEGIN")
             try:
                 block["embedded_concepts"] = int(conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0])
                 block["model_ids"] = [
@@ -6192,7 +6302,11 @@ def _check_embedding_backfill_coverage(db_path: Path) -> dict[str, Any]:
                 )
             except _sqlite3.OperationalError:
                 block["anchor_vectors"] = 0
-    except _sqlite3.Error as exc:  # noqa: BLE001 — diagnostic capture
+            from .embeddings.model_pin import MODEL_ID
+            from .embeddings.store import concept_embedding_coverage
+
+            block.update(concept_embedding_coverage(conn, MODEL_ID))
+    except (_sqlite3.Error, ImportError) as exc:
         block["note"] = f"coverage probe failed ({exc})"
     return block
 

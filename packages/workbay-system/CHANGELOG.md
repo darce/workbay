@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.45] — 2026-11-26
+
+### Changed
+- Add independent fresh-fetch custody verification in `workbay_vm_reclaim.py`, non-HEAD ref enumeration, and `scope_unknown` quarantine classification.
+- Enforce read-only maintenance across lifecycle dispatcher paths, harden the shell payload guard against unprovable writes, scope CPU straggler admission to the live sibling set, and handle non-dict doctor plain-MCP envelopes.
+- Refresh the protocol development dependency floor and align the shipped remote-agent boundary pin with the WorkBay v0.1.102 orchestrator (`0.3.48`).
+
 ## [0.4.44] — 2026-11-23
 
 ### Changed

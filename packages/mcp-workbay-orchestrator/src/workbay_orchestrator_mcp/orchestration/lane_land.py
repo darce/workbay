@@ -1100,6 +1100,22 @@ def _finish_cleanup_impl(
             intent = saved
             remote_status = "complete"
     if projection_pending:
+        # A branch that advanced after its landing merge keeps the lane open
+        # (the moved tip is unlanded, so the merged projection is refused);
+        # name that cause rather than a projection retry that cannot succeed
+        # until the new tip lands.
+        moved, moved_error = _ref_oid(
+            orchestrator_lanes, root, branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
+        )
+        if not moved_error and moved is not None and moved != identity["expected_tip"]:
+            return {
+                **_retire_release_fields(local_result),
+                "complete": False,
+                "detail": "tip_moved_after_landing",
+                "local_status": local_status,
+                "remote_status": remote_status,
+                "retire_outcome": "tip_moved_after_landing",
+            }
         return {
             **_retire_release_fields(local_result),
             "complete": False,
@@ -2225,6 +2241,11 @@ def _land_once(
             run_id=request_run_id,
             detail=integration_error or "task_integration_ref_unresolved",
         )
+    from workbay_handoff_mcp.lane_landing_proof import LandedIntegration, bind_landed_integration  # noqa: PLC0415
+
+    bind_landed_integration(
+        LandedIntegration(task_ref=task_value, ref=integration_value, root=root, manifest_root=manifest_root)
+    )
 
     try:
         policy = harness_protocol.load_landing_policy(root)
@@ -3610,17 +3631,24 @@ def land(
                 "skipped_budget": 0,
             }
 
-    result = _land_once(
-        task_ref,
-        lane_id,
-        expected_tip,
-        run_id=run_id,
-        integration_ref=integration_ref,
-        orchestrator_root=orchestrator_root,
-        manifest_root=manifest_root,
-        _cleanup_deadline=_cleanup_deadline,
-        landing_lock_wait_seconds=landing_lock_wait_seconds,
-    )
+    from workbay_handoff_mcp.lane_landing_proof import landed_integration_scope  # noqa: PLC0415
+
+    # Every landing proof this landing reaches (its own close, the drain's
+    # contained close through the offload close port) measures against the ref
+    # it merged into, re-registered by the one predicate (GDN03B-D1) [DATA-14];
+    # _land_once binds that ref once it has resolved it.
+    with landed_integration_scope():
+        result = _land_once(
+            task_ref,
+            lane_id,
+            expected_tip,
+            run_id=run_id,
+            integration_ref=integration_ref,
+            orchestrator_root=orchestrator_root,
+            manifest_root=manifest_root,
+            _cleanup_deadline=_cleanup_deadline,
+            landing_lock_wait_seconds=landing_lock_wait_seconds,
+        )
     if cleanup_drain is not None:
         result["cleanup_drain"] = cleanup_drain
     result.setdefault("predecessors_retired", [])
@@ -3648,17 +3676,28 @@ def land(
                 requested_ref=integration_ref,
                 manifest_root=manifest_root,
             )
-            prepared = lane_landing_drain.prepare_contained_predecessors(
-                root=root,
-                task_ref=task_ref,
-                lane_id=lane_id,
-                expected_tip=expected_tip,
-                integration_ref=str(resolved_integration or integration_ref or "main"),
-                landing_commit=str(result["landing_commit"]),
-                run_id=str(result.get("run_id") or run_id or ""),
-                manifest_root=manifest_root,
-                state_dir=get_runtime_config().state_dir,
+            from workbay_handoff_mcp.lane_landing_proof import (  # noqa: PLC0415
+                LandedIntegration,
+                landed_integration_scope,
             )
+
+            landed = (
+                LandedIntegration(task_ref=task_ref, ref=resolved_integration, root=root, manifest_root=manifest_root)
+                if _integration_error is None and resolved_integration is not None
+                else None
+            )
+            with landed_integration_scope(landed):
+                prepared = lane_landing_drain.prepare_contained_predecessors(
+                    root=root,
+                    task_ref=task_ref,
+                    lane_id=lane_id,
+                    expected_tip=expected_tip,
+                    integration_ref=str(resolved_integration or integration_ref or "main"),
+                    landing_commit=str(result["landing_commit"]),
+                    run_id=str(result.get("run_id") or run_id or ""),
+                    manifest_root=manifest_root,
+                    state_dir=get_runtime_config().state_dir,
+                )
             result["predecessors_retired"] = prepared.get("predecessors_retired", [])
             result["predecessors_kept"] = prepared.get("predecessors_kept", [])
             result["predecessor_cleanup_drain"] = prepared.get("cleanup_drain")

@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.100] — 2026-11-26
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.1.102 Git release.
+- Include Git-lineage holder proofs, native multi-sibling `MERGECLOSE` resolution, landing-ref close/done/archive/reap guards, and the `merged`-stays-terminal lane statechart invariant.
+- Include independent fresh-fetch VM custody verification, non-HEAD ref enumeration, `scope_unknown` quarantine classification, and the stdlib-only `candidate_custody.py` `export-and-claim` CLI.
+- Include native stranded review-cycle settlement, chunked single-flight embedding scans in handoff, and TLA+ lane/task/land-reap statechart specifications with a pinned `tla2tools` runner.
+
 ## [0.3.99] — 2026-11-23
 
 ### Changed

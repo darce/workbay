@@ -1230,8 +1230,12 @@ def _sql_cas_close_lane(
     A notes-only write against an already-closed row keeps ``updated_at`` so
     the terminal generation in a retry marker stays stable (REAP07RV-001).
     A recorded close authority in the row's notes is carried into the written
-    notes, so the close never drops the tip the owner authorized.
+    notes, so the close never drops the tip the owner authorized. A merged
+    row is never closed over (lane_terminal) [GRPH-14].
     """
+    if expected_status == "merged":
+        # lane_terminal: a merged row is never closed over (GDNCLOSE03A-CROSS-SESSION-MERGED).
+        return False
     notes, writable = _close_notes_keeping_authority(
         conn, task_ref=task_ref, lane_id=lane_id, expected_status=expected_status, notes=notes
     )
@@ -1241,7 +1245,7 @@ def _sql_cas_close_lane(
         "UPDATE worktree_lanes "
         "SET status = ?, notes = COALESCE(?, notes), "
         "updated_at = CASE WHEN status = 'closed' THEN updated_at ELSE datetime('now') END "
-        "WHERE task_ref = ? AND lane_id = ? AND status = ?"
+        "WHERE task_ref = ? AND lane_id = ? AND status = ? AND status <> 'merged'"
     )
     params: list[object] = ["closed", notes, task_ref, lane_id, expected_status]
     if expected_tip_sha:
@@ -3194,6 +3198,20 @@ def _classify_cross_session_row(
             ownership="unowned",
             cleanliness="clean",
             reason=f"status {status or 'unset'} is not reclaim-eligible",
+            age_seconds=age_seconds,
+        )
+    if status == "merged":
+        # A merged row is landed history: the reclaim's close would rewrite it
+        # to closed. Refuse before any probe or classification, as the
+        # lane_terminal refusal does for reopen (GDNCLOSE03A-CROSS-SESSION-MERGED) [GRPH-14].
+        return _cross_session_item(
+            lane_id=lane_id,
+            branch=branch,
+            verdict="keep:already_terminal",
+            preservation="unintegrated",
+            ownership="unowned",
+            cleanliness="clean",
+            reason="lane_terminal: merged row is never rewritten by a reclaim",
             age_seconds=age_seconds,
         )
     if not branch:

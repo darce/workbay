@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote
 from .coordination_declaration import ExecutionDomain, declaration_errors
 from .lane_notes import REGISTRY_CORRECTION_KEY, ReservedLaneNotesError, merge_lane_notes, notes_envelope
 from .lane_resource_producer import LaneResourceConflict, execute_lane_change, prepare_lane_binding, replay_receipt
+from .lane_status_edges import direct_lane_status_error
 from .shared_primitives import (
     CLOSEABLE_LANE_STATUSES,
     TERMINAL_LANE_STATUSES,
@@ -250,6 +251,71 @@ def repair_lane_receipt_identity(
         return LaneReceiptCASResult(cursor.rowcount == 1, "applied" if cursor.rowcount == 1 else "row_changed")
 
 
+def _merged_exit_refusal(tool: str, *, task_ref: str, lane_id: str, target: str) -> dict[str, Any]:
+    """``merged`` is terminal with no exit in ``child.lane_machine``; refuse, write nothing [GRPH-14].
+
+    Shaped like the orchestrator upsert's ``illegal_transition`` refusal so
+    callers read one contract. A ``merged`` re-close is not an exit and is not
+    refused here.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    return _envelope(
+        ok=False,
+        tool=tool,
+        entity="lane",
+        data={
+            "error": (
+                f"Lane '{lane_id}' is merged, a terminal status with no outgoing edge; "
+                f"{target!r} would erase the landed outcome."
+            ),
+            "error_kind": "illegal_transition",
+            # Callers that only need the lane terminal may treat this as done.
+            "already_terminal": True,
+            "terminal_status": "merged",
+            "receipt": {
+                "schema": "workbay/illegal-transition@1",
+                "task_ref": task_ref,
+                "lane_id": lane_id,
+                "from": "merged",
+                "to": target,
+                "chart_id": None,
+                "chart_version": None,
+                "enforced": True,
+                "caller": tool,
+                "reason": "merged_is_terminal",
+                "at": datetime.now(UTC).isoformat(),
+            },
+        },
+    )
+
+
+# A row whose landed outcome a reopen would erase: merged, stale-closed, or
+# carrying a landing commit. ``closed`` alone is not landed (gdnclose00 test_c_*).
+REOPEN_FORBIDDEN_LANE_STATUSES = frozenset({"merged", "closed_stale"})
+
+
+def lane_reopen_forbidden(row: Any) -> bool:
+    """True when ``row`` must stay where it is under a reopen (GDN-GATE-T163 R2, [GRPH-14])."""
+    if row is None:
+        return False
+    return row["status"] in REOPEN_FORBIDDEN_LANE_STATUSES or row["landing_commit_sha"] is not None
+
+
+def _lane_terminal_refusal(tool: str, row: Any) -> dict[str, Any]:
+    """The one ``lane_terminal`` refusal (finding 26118): a terminal row is not rewritten."""
+    return _envelope(
+        ok=False,
+        tool=tool,
+        data={
+            "error": "Terminal lanes require an explicit reopen_reason before changing status.",
+            "error_kind": "lane_terminal",
+            "lane": _row_to_dict(row),
+        },
+        entity="lane",
+    )
+
+
 def _lane_status_conflict(tool: str) -> dict[str, Any]:
     return _envelope(
         ok=False,
@@ -323,6 +389,7 @@ def open_lane(
     event_id: str | None = None,
     execution_domain: ExecutionDomain | None = None,
     coordination_owner_proof: dict | None = None,
+    refuse_landed: bool = False,
 ) -> dict[str, Any]:
     """Insert or update a worktree lane row (upsert).
 
@@ -341,7 +408,9 @@ def open_lane(
     [cs0166-r13-18]. Required path/branch and explicit status still overwrite.
 
     A terminal row may be reopened only with ``reopen_reason``; the reason is
-    appended to notes as part of the guarded upsert.
+    appended to notes as part of the guarded upsert. ``refuse_landed=True``
+    (the orchestrator reopen) withholds that override from a merged,
+    ``closed_stale`` or landing-stamped row: ``lane_terminal``, nothing written.
     """
     if status in {"validated", "gated"}:
         return _envelope(
@@ -502,6 +571,10 @@ def open_lane(
             existing_before_upsert is None or existing_before_upsert["status"] != expected_status
         ):
             return _lane_status_conflict("open_lane")
+        if refuse_landed and lane_reopen_forbidden(existing_before_upsert):
+            # Re-checked under the writer lock: a landing stamped after the
+            # caller's own pre-check still refuses, writing nothing [FLOW-14].
+            return _lane_terminal_refusal("open_lane", existing_before_upsert)
         if status in {"closed", "merged"} and (
             existing_before_upsert is None or existing_before_upsert["status"] != status
         ):
@@ -510,16 +583,7 @@ def open_lane(
                 or existing_before_upsert["landing_commit_sha"] is not None
             ):
                 if normalized_reopen_reason is None:
-                    return _envelope(
-                        ok=False,
-                        tool="open_lane",
-                        data={
-                            "error": "Terminal lanes require an explicit reopen_reason before changing status.",
-                            "error_kind": "lane_terminal",
-                            "lane": _row_to_dict(existing_before_upsert),
-                        },
-                        entity="lane",
-                    )
+                    return _lane_terminal_refusal("open_lane", existing_before_upsert)
             else:
                 return _envelope(
                     ok=False,
@@ -675,16 +739,7 @@ def open_lane(
                 and (row["notes"] or "").lower().startswith("released_no_work:")
             ):
                 return _lane_status_conflict("open_lane")
-            return _envelope(
-                ok=False,
-                tool="open_lane",
-                data={
-                    "error": "Terminal lanes require an explicit reopen_reason before changing status.",
-                    "error_kind": "lane_terminal",
-                    "lane": _row_to_dict(row),
-                },
-                entity="lane",
-            )
+            return _lane_terminal_refusal("open_lane", row)
         if declaration is not None and lifecycle_resource.get("knowledge") != "observed":
             conn.rollback()
             return _envelope(
@@ -938,6 +993,22 @@ def update_lane(
         current = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         if current is None:
             return _lane_status_conflict("update_lane")
+        if status is not None and current["status"] == "merged" and status != "merged":
+            # merged has no outgoing edge; a patch never erases the landed
+            # outcome (gdnclose03a writer audit, [GRPH-14]). Under the lock, so
+            # a row merged after a caller's snapshot also refuses.
+            return _lane_terminal_refusal("update_lane", current)
+        status_error = direct_lane_status_error(
+            task_ref=resolved_task_ref, lane_id=normalized_lane_id, source=current["status"], target=status
+        )
+        if status_error is not None:
+            if (
+                (expected_status is not None and current["status"] != expected_status)
+                or (expected_tip_supplied and current["branch_tip_sha"] != parsed_expected_tip)
+                or (expected_source_supplied and current["branch_tip_source"] != parsed_expected_source)
+            ):
+                return cas_conflict(current)
+            return _envelope(ok=False, tool="update_lane", data=status_error, entity="lane")
         error = transition_error(conn, current, status, _validation_permit, source_current=validation_fresh)
         if error:
             return _envelope(
@@ -1102,10 +1173,25 @@ def close_lane(
                 data={"error": f"Lane '{normalized_lane_id}' not found for task '{resolved_task_ref}'."},
                 entity="lane",
             )
+        if existing["status"] == "merged" and status != "merged":
+            return _merged_exit_refusal(
+                "close_lane", task_ref=resolved_task_ref, lane_id=normalized_lane_id, target=status
+            )
         from .validation_lane import policy_source_current
 
         validation_fresh = policy_source_current(conn, existing) if status == "merged" else False
         prepared_row = dict(existing)
+        # Landing proof runs Git, so it is observed here, before the writer
+        # lock, and fenced on the lane row under it ([CON-21]).
+        from .lane_landing_proof import lane_roster_fingerprint, unlanded_lane_tips
+
+        landing_fence = lane_roster_fingerprint(conn, resolved_task_ref, [normalized_lane_id])
+        unlanded = unlanded_lane_tips(
+            conn,
+            resolved_task_ref,
+            [normalized_lane_id],
+            extra_tips={normalized_lane_id: parsed_tip} if parsed_tip is not None else None,
+        )
     binding = prepare_lane_binding(existing["worktree_path"], existing["branch"])
     with _get_db_connection(begin_immediate=True) as conn:
         replay = _lane_replay(
@@ -1118,12 +1204,39 @@ def close_lane(
         current = _get_lane_row(conn, resolved_task_ref, normalized_lane_id)
         if current is None:
             return _lane_status_conflict("close_lane")
+        if current["status"] == "merged" and status != "merged":
+            return _merged_exit_refusal(
+                "close_lane", task_ref=resolved_task_ref, lane_id=normalized_lane_id, target=status
+            )
         error = transition_error(conn, current, status, source_current=validation_fresh)
         if error:
             return _envelope(
                 ok=False,
                 tool="close_lane",
                 data={"error": error, "error_kind": "native_validation_required"},
+                entity="lane",
+            )
+        if lane_roster_fingerprint(conn, resolved_task_ref, [normalized_lane_id]) != landing_fence:
+            return _lane_status_conflict("close_lane")
+        if unlanded:
+            tip_entry = unlanded[0]
+            return _envelope(
+                ok=False,
+                tool="close_lane",
+                data={
+                    "error": (
+                        f"Lane '{normalized_lane_id}' branch tip {tip_entry['tip'] or 'unknown'} is not on "
+                        f"{tip_entry['integration_ref']} ({tip_entry['reason']}); land it, or record "
+                        f"{tip_entry['discard_decision_expected'] or 'a lane_discarded_<task>_<lane>_<tip40> decision'}"
+                    ),
+                    "error_kind": "unlanded_branch_tip",
+                    "lane_id": normalized_lane_id,
+                    "branch": tip_entry["branch"],
+                    "branch_tip_sha": tip_entry["tip"],
+                    "integration_ref": tip_entry["integration_ref"],
+                    "reason": tip_entry["reason"],
+                    "discard_decision_expected": tip_entry["discard_decision_expected"],
+                },
                 entity="lane",
             )
         try:

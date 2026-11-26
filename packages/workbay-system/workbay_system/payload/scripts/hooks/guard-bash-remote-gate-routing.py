@@ -174,6 +174,53 @@ _INERT_MAKE_GOALS = frozenset({
     "offload-flock", "lane-reap", "plan-done", "slice-commit", "task-start", "vm-reap", "doctor",
 })
 
+# Shipped orientation and readiness commands. Their recipes also accept
+# arguments and Make variable overrides, so admission is limited to the
+# documented read-only forms. In particular, task-reap has an apply mode.
+# A goal belongs here only when its whole recipe, handler body and any child
+# dispatch included, is proven to write nothing; an unproven goal stays refused.
+# handoff-close-check and context are withdrawn (gate rel93g140): the first
+# dispatches a child close-check that runs the full maintenance cadence, and the
+# context handler replays the error and terminal-guard spools and reaps scratch.
+_READ_ONLY_MAKE_ARGS = MappingProxyType({
+    "compaction-status": {"TASK"},
+    "crap-report": {"COVERAGE", "PATHS", "INCLUDE_UNMEASURED"},
+    "review-ready": {"LIFECYCLE_ARGS"},
+    "status": {"LIFECYCLE_ARGS"},
+    "task-reap": {"LIFECYCLE_ARGS", "TASK", "REAP_ARGS"},
+    "tasks": {"LIFECYCLE_ARGS"},
+})
+_READ_ONLY_MAKE_VALUES = MappingProxyType({
+    "COVERAGE": r"[A-Za-z0-9_./-]+",
+    "PATHS": r"[A-Za-z0-9_./-]+(?: +[A-Za-z0-9_./-]+)*",
+    "INCLUDE_UNMEASURED": r"1?",
+    "TASK": r"[A-Za-z0-9][A-Za-z0-9_.-]*",
+    "LIFECYCLE_ARGS": r"(?:--json)?",
+    "REAP_ARGS": r"",
+})
+_READ_ONLY_MAKE_ENV = re.compile(
+    r"(?<![\w${])(?:LIFECYCLE(?:_ARGS|_PYTHON|_RUNNER)?|REAP_ARGS|TASK|"
+    r"WORKBAY_HANDOFF_COMPACTION_OP_CLI|WORKSPACE_PYTHON|COVERAGE|PATHS|ONE_PATH|"
+    r"THRESHOLD|TOP|JSON_OUT|MD_OUT|INCLUDE_UNMEASURED|INCLUDE_TESTS|ALLOW_EMPTY|SCAN_ALL_PATHS)(?!\w)"
+)
+_READ_ONLY_MAKE_EXPORT = re.compile(
+    rf"(?:^|[;&|\n])\s*(?:export|declare|typeset|readonly|local)\s+[^;&|\n]*{_READ_ONLY_MAKE_ENV.pattern}"
+)
+# A read-only make admission proves one make call, not the shell invocation
+# around it. It holds only when every executable segment of the invocation is
+# itself proven read-only: another read-only make call, or one of these
+# commands, which read or print but never write a file or run a program named
+# in their arguments. Output may go only to the inherited descriptors or
+# /dev/null, and no prefix assignment, loop variable or writing launcher may
+# change what a later segment runs.
+_READ_ONLY_COMPANIONS = frozenset(
+    {"[", "cat", "cd", "echo", "false", "grep", "head", "jq", "ls", "pwd", "tail", "test", "true", "wc"}
+)
+_GIT_READ_ONLY_SUBCOMMANDS = frozenset({"blame", "diff", "log", "ls-files", "rev-parse", "show", "status"})
+_GIT_WRITING_OPTIONS = ("--output", "--ext-diff", "--textconv", "-O", "--open-files-in-pager")
+# nohup may create nohup.out, and uv run may sync or create an environment.
+_WRITING_LAUNCHERS = frozenset({"nohup", "uv", "uvx"})
+
 # Drift-scan exemptions: operator flows with their own preflight, and a help
 # listing whose echoed text names pytest but whose recipe runs nothing.
 _EXEMPT_TARGETS = MappingProxyType(
@@ -501,7 +548,10 @@ def _is_remote_gate_context(root: Path) -> bool:
 class _Segment:
     """One simple command: shlex text, verbatim source, heredocs and substitutions."""
 
-    __slots__ = ("bodies", "from_prior", "make_stdin_unprovable", "opaque", "raw", "substitutions", "text", "upstream")
+    __slots__ = (
+        "bodies", "from_prior", "make_stdin_unprovable", "opaque", "raw", "read_only_make", "substitutions", "text",
+        "upstream",
+    )
 
     def __init__(self) -> None:
         self.text: list[str] = []
@@ -516,6 +566,8 @@ class _Segment:
         self.make_stdin_unprovable = False
         # Set on the stand-in for a stdin that is the earlier text itself; see _PRIOR_STDIN.
         self.from_prior = False
+        # Set when this segment's own make call has only read-only goals with documented arguments.
+        self.read_only_make = False
 
     def add(self, text: str, raw: str | None = None) -> None:
         self.text.append(text)
@@ -1159,6 +1211,9 @@ class _MakeArgv:
         self.goals: list[str] = []
         self.directories: list[str] = []
         self.makefiles: list[str] = []
+        self.assignments: list[str] = []
+        self.environment_overrides = False
+        self.touch = False
         self.eval = False
         self.source_env = False
         self.dry_run = False
@@ -1231,6 +1286,7 @@ class _MakeArgv:
                         self.unparsed = word
                         return
             elif _ASSIGNMENT.fullmatch(word):
+                self.assignments.append(word)
                 self.source_env = self.source_env or word.partition("=")[0].rstrip("+") in {"MAKEFILES", "MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS"}
             else:
                 self.goals.append(word)
@@ -1243,6 +1299,24 @@ class _MakeArgv:
                     self.eval = True
                 elif option in {"-n", "--just-print", "--dry-run", "--recon"}:
                     self.dry_run = True
+                elif option in {"-e", "--environment-overrides"}:
+                    self.environment_overrides = True
+                elif option in {"-t", "--touch"}:
+                    self.touch = True
+
+
+def _make_goal_allowed(goal: str, argv: _MakeArgv) -> bool:
+    if goal in _INERT_MAKE_GOALS:
+        return True
+    allowed = _READ_ONLY_MAKE_ARGS.get(goal)
+    # -t touches targets in place of running their recipes, so a read-only goal no longer reads only.
+    if allowed is None or argv.environment_overrides or argv.touch:
+        return False
+    for assignment in argv.assignments:
+        name, _, value = assignment.partition("=")
+        if name not in allowed or not re.fullmatch(_READ_ONLY_MAKE_VALUES[name], value):
+            return False
+    return True
 
 
 def _package_is_inert(command: list[str]) -> bool:
@@ -1655,6 +1729,7 @@ def _make_words(command: str, *, include_default_make: bool, deny_unlisted_make:
                 if found is None and (_may_expand(goal) or _may_glob(goal)):
                     found = (goal, "test-files")
                 elif not argv.dry_run and (
+                    # Read-only goals need the structural, invocation-wide proof; raw text has neither.
                     goal in _TEST_TARGETS or (deny_unlisted_make and goal not in _INERT_MAKE_GOALS)
                 ):
                     # The test table chooses message wording, never permission.
@@ -1782,6 +1857,10 @@ class _Scan:
         self.prior = _PriorText()
         self.written_aliases: set[int] = set()
         self.file_production = _FileProduction()
+        # The via of each make call admitted only by the read-only table, and every segment the scan
+        # classified, nested scripts included. The invocation-wide read-only check reads both at the end.
+        self.read_only_admissions: list[str | None] = []
+        self.segments: list[tuple[_Segment, _RedirectCommand | None]] = []
 
     @property
     def prior_text(self) -> str:
@@ -2520,6 +2599,8 @@ def _classify_shell_text(
         (reason, target, nested_via or via, word) for reason, target, nested_via, word in nested.findings
     )
     scan.parse_errors.extend(nested.parse_errors)
+    scan.read_only_admissions.extend(nested.read_only_admissions)
+    scan.segments.extend(nested.segments)
     if nested.text_executor_unbypassed:
         _mark_text_executor(scan, via)
     elif nested.text_executor:
@@ -2535,7 +2616,8 @@ def _classify_shell_text(
 
 
 def _classify_make_call(
-    segment: _Segment, command: list[str], stdin_args: bool, clean: bool, via: str | None, scan: _Scan
+    segment: _Segment, command: list[str], stdin_args: bool, clean: bool, via: str | None, scan: _Scan,
+    *, prefix: tuple[str, ...] = (),
 ) -> bool:
     """Deny every make call unless one parse proves its explicit goals inert."""
     argv = _MakeArgv(command)
@@ -2578,10 +2660,85 @@ def _classify_make_call(
         return True
     if not argv.goals:
         return refuse("make_goal_missing", "make")
-    blocked = [goal for goal in argv.goals if goal not in _INERT_MAKE_GOALS]
+    if any(goal in _READ_ONLY_MAKE_ARGS for goal in argv.goals) and (
+        _READ_ONLY_MAKE_ENV.search(" ".join(prefix)) or scan.prior.matches(_READ_ONLY_MAKE_EXPORT)
+    ):
+        return refuse("make_makefile_unprovable", "make")
+    blocked = [goal for goal in argv.goals if not _make_goal_allowed(goal, argv)]
     for goal in blocked:
         refuse("make_goal_not_allowlisted", goal)
+    if not blocked and any(goal not in _INERT_MAKE_GOALS for goal in argv.goals):
+        # Only the read-only table admitted this call; _read_only_invocation_word must prove the rest.
+        scan.read_only_admissions.append(via)
+    segment.read_only_make = not blocked and all(goal in _READ_ONLY_MAKE_ARGS for goal in argv.goals)
     return True
+
+
+def _git_reads_only(command: list[str]) -> bool:
+    index = 1
+    while index < len(command):
+        token = command[index]
+        if token == "-C":
+            index += 2
+        elif token in {"--no-pager", "-P", "--no-optional-locks"}:
+            index += 1
+        else:
+            break
+    if index >= len(command) or command[index] not in _GIT_READ_ONLY_SUBCOMMANDS:
+        return False
+    return not any(token.startswith(_GIT_WRITING_OPTIONS) for token in command[index + 1 :])
+
+
+def _read_only_segment_word(segment: _Segment, entry: _RedirectCommand | None) -> str | None:
+    """Return None when the segment is proven read-only, else a word that names it."""
+    if entry is None or entry.malformed:
+        return "".join(segment.raw).strip()[:64] or "shell syntax"
+    if segment.opaque:
+        return "$(...)"
+    records = [*entry.redirects, *(record for group in entry.groups for record in group.redirects)]
+    for _fd, operator, target in records:
+        duplicate = operator in {">&", "<&"} and (target.isdigit() or target == "-")
+        writes = operator in _PRODUCING_OPERATORS or (operator in {">&", "<&"} and not duplicate)
+        if writes and _canonical_path(target) != "/dev/null":
+            return target.replace(_SUBSTITUTION, "$(...)").strip() or operator
+    if entry.argv[:1] in (["for"], ["select"]):
+        # A loop header binds a variable that a later segment's program may read.
+        return entry.argv[0]
+    try:
+        tokens = _strip_shell_group_tokens(entry.argv)
+        command, assignments, understood, stdin_args = _strip_prefixes(tokens)
+    except ValueError:
+        return "env -S"
+    if assignments:
+        return next(iter(assignments))
+    if not command:
+        return None
+    suffix = len(command) <= len(tokens) and tokens[len(tokens) - len(command) :] == command
+    launchers = tokens[: len(tokens) - len(command)] if suffix else tokens
+    launcher = next(
+        (word for item in launchers for word in item.split() if _basename(word) in _WRITING_LAUNCHERS), None
+    )
+    if launcher is not None:
+        return launcher
+    if not understood or stdin_args:
+        return command[0]
+    if _is_make_word(command):
+        return None if segment.read_only_make else command[0]
+    name = command[0]
+    if name in _READ_ONLY_COMPANIONS:
+        return None
+    if name == "git" and _git_reads_only(command):
+        return None
+    return name.replace(_SUBSTITUTION, "$(...)")
+
+
+def _read_only_invocation_word(scan: _Scan) -> str | None:
+    """The first segment of the invocation that is not proven read-only."""
+    for segment, entry in scan.segments:
+        word = _read_only_segment_word(segment, entry)
+        if word is not None:
+            return word
+    return None
 
 
 def _classify_segment(
@@ -2631,7 +2788,7 @@ def _classify_segment(
             if _MAKE_SOURCE_ENV.search(" ".join(assignments)) is not None:
                 scan.findings.append(("make_makefile_unprovable", "test-files", via, "make"))
                 return
-            if _classify_make_call(segment, command, stdin_args, clean, via, scan):
+            if _classify_make_call(segment, command, stdin_args, clean, via, scan, prefix=tuple(assignments)):
                 return
         elif _is_proven_inert(command, stdin_args, clean, scan):
             return
@@ -2662,7 +2819,10 @@ def _classify_segment(
             if _MAKE_SOURCE_ENV.search(" ".join([*assignments, *make_command[:index]])) is not None:
                 scan.findings.append(("make_makefile_unprovable", "test-files", via, "make"))
             else:
-                _classify_make_call(segment, make_command[index:], stdin_args, make_clean, via, scan)
+                _classify_make_call(
+                    segment, make_command[index:], stdin_args, make_clean, via, scan,
+                    prefix=(*assignments, *make_command[:index]),
+                )
     _record_unknown(
         scan, text, via, include_default_make=include_default_make, deny_unlisted_make=deny_unlisted_make,
         after_prior=runs_earlier_text or _reads_prior(segment),
@@ -2685,6 +2845,7 @@ def _scan_segments(
     _compound_redirects(entries)
     has_reader = any(_has_shell_reader(entry) for entry in entries)
     persistent: dict[int, _FdSource] = dict(inherited_fds or {})
+    scan.segments.extend(zip(segments, entries))
     outer_prior = scan.prior.mark()
     outer_words = scan.produced_words.copy()
     outer_names = _Names(scan.produced_names)
@@ -2961,6 +3122,11 @@ def _scan_command(
         if word is not None:
             via = None if scan.text_executor_unbypassed else scan.text_executor_via
             scan.findings.append((_UNPARSED_SHAPE, "test-files", via, word))
+    if parent is None and scan.read_only_admissions:
+        companion = _read_only_invocation_word(scan)
+        if companion is not None:
+            via = None if None in scan.read_only_admissions else scan.read_only_admissions[0]
+            scan.findings.append(("make_companion_unproven", "test-files", via, companion))
     return scan
 
 
@@ -2989,6 +3155,8 @@ def _blocked_message(targets: set[str]) -> str:
         "Enforced: pytest, py.test, run_named_tests.py; make is deny-by-default.\n"
         "Not inspected: JS runners, unittest, tox, nox, hatch, and scripts invoked by path.\n\n"
         f"Allowlisted make goals: {', '.join(sorted(_INERT_MAKE_GOALS))}.\n\n"
+        f"Read-only make goals (documented read-only arguments, every other command read-only): "
+        f"{', '.join(sorted(_READ_ONLY_MAKE_ARGS))}.\n\n"
         "WorkBay monorepo only (from its root, with a configured remote gate):\n"
         f'  make check-remote TARGETS="{refused_targets}"\n'
         '  WORKBAY_REMOTE_GATE_ENV="WORKBAY_TEST_FILES=<files>" '
@@ -3012,6 +3180,10 @@ _REFUSAL_REASONS = (
     ("make_makefile_unprovable", "makefile source or parse-time text is unprovable"),
     ("make_goal_missing", "make requires an explicit inert goal; the default goal may run tests"),
     ("make_goal_not_allowlisted", "make goal is not in the hook's fixed inert-goal allowlist"),
+    (
+        "make_companion_unproven",
+        "a read-only make goal shares its shell invocation with a command the hook cannot prove read-only",
+    ),
     ("unparseable", "command could not be parsed"),
     (_UNPARSED_SHAPE, "the hook could not prove this command shape is not a host test run"),
 )
@@ -3046,9 +3218,16 @@ def _refusal_message(findings: list[_Finding]) -> str:
                         "test_make_allowlist_and_dry_run_controls allowance control. "
                         "Route test runs through make check-remote.\n"
                     )
+                elif reason == "make_companion_unproven":
+                    admission = (
+                        "A read-only make goal is admitted only when every command in the same invocation is "
+                        "itself read-only: another read-only make goal, a read-only git query, or "
+                        f"{', '.join(sorted(_READ_ONLY_COMPANIONS))}, with no prefix assignment and output only to "
+                        "the terminal or /dev/null. Run the read-only goal in its own tool call.\n"
+                    )
                 return (
                     f"BLOCKED ({reason}): {prefix}; refused word '{word}'. {admission}"
-                    f"Use an explicit allowlisted goal ({', '.join(sorted(_INERT_MAKE_GOALS))}) or the audited override.\n\n"
+                    "Use an explicit allowlisted goal from the lists below or the audited override.\n\n"
                     f"{_blocked_message(targets)}"
                 )
             return (

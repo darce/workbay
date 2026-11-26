@@ -10,12 +10,13 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from enum import Enum
@@ -37,6 +38,15 @@ from .enums import LIVE_LANE_STATUSES, TERMINAL_LANE_STATUSES, HandoffStatus
 from .git_merge import branch_is_merged
 from .lane_close_evidence import OPENINGS as _PRIVATE_CLOSE_OPENINGS_TABLE
 from .lane_close_evidence import TABLE as _PRIVATE_CLOSE_EVIDENCE_TABLE
+from .lane_landing_proof import (
+    LANDING_PROBE_STALE,
+    StaleLandingProbe,
+    fenced_unlanded,
+    landing_probe_stale_refusal,
+    probe_task_landing,
+    unlanded_lane_tips,
+    unlanded_lanes_refusal,
+)
 from .lifecycle_resource_producer import ProducerBinding, _git, prepare_binding, stage_change
 from .review_findings_support import _validate_impact_origin
 from .runtime import get_runtime_config
@@ -2977,6 +2987,7 @@ def task_completion_hold_reason(
     task_updated_at: str | None = None,
     supersession_receipt: str | None = None,
     supersession_tip: str | None = None,
+    reap_final_source_proven: bool = False,
 ) -> str | None:
     """Return a conservative hold before automatic or explicit completion.
 
@@ -3016,6 +3027,13 @@ def task_completion_hold_reason(
             if not worktree:
                 return "integration worktree unknown"
         else:
+            # Reap qualification already proved the final source with the Git
+            # roster read regardless of any stored path (_final_source_hold).
+            # That replaces the path only where BASE never demanded one: the
+            # stored spelling names no local or remote-tracking branch. A
+            # resolvable live target keeps the stored-path hold below.
+            if reap_final_source_proven and not explicit_completion and _branch_ref_resolves(branch) is False:
+                return None
             # Qualified cleanup after a deleted branch still uses the existing
             # task/receipt/time-bound proof. Missing path alone is never proof.
             if not explicit_completion and _branch_ref_resolves(branch) is False:
@@ -3103,7 +3121,7 @@ def task_completion_hold_reason(
     except (ImportError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         return "target probe unavailable"
 
-    if status != "done" and not explicit_completion:
+    if status != "done" and not explicit_completion and not reap_final_source_proven:
         proof = _deleted_branch_merge_proof(
             branch,
             task_ref,
@@ -3113,6 +3131,446 @@ def task_completion_hold_reason(
         )
         if proof is not True:
             return "active source has no task-bound landing proof"
+    return None
+
+
+# Reap qualification: typed final-source proof. A row closes as done only
+# when its final source identity is proven and contained in integration.
+# Anything else holds with one of these codes naming the missing proof.
+_REAP_HOLD_CODES = frozenset(
+    {
+        "abandonment_unproven",
+        "landing_unproven",
+        "custody_unproven",
+        "generation_unproven",
+        "lane_live",
+        "integration_unreadable",
+        "source_unreadable",
+    }
+)
+
+
+def _reap_hold(code: str, detail: str) -> str:
+    return f"{code}: {detail}"
+
+
+def _reap_reason_code(reason: str) -> str | None:
+    code = reason.split(":", 1)[0]
+    if code in _REAP_HOLD_CODES:
+        return code
+    if reason == "branch missing with no merge proof":
+        return "abandonment_unproven"
+    if reason.startswith("branch missing with degraded merge proof") or reason in {
+        "insufficient signals to classify safely",
+        "main-target maintenance/planning row",
+    }:
+        # A subject or task-prefixed commit on main is never final-source proof.
+        return "landing_unproven"
+    return None
+
+
+def _reap_git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _reap_no_repository(root: Path) -> bool:
+    """True only when Git positively reports that ``root`` is in no repository.
+
+    A workspace outside any repository has no refs and no worktree roster to
+    read; every other read failure stays unknown and holds.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-dir"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"},
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 128 and b"not a git repository" in proc.stderr
+
+
+def _reap_contained(root: Path, sha: str, integration_sha: str) -> bool | None:
+    """Git ancestry of ``sha`` in the resolved integration commit; ``None`` when unreadable."""
+    if _HEX40.fullmatch(sha or "") is None:
+        return None
+    proc = _reap_git(root, "merge-base", "--is-ancestor", sha, integration_sha)
+    if proc is None or proc.returncode not in (0, 1):
+        return None
+    return proc.returncode == 0
+
+
+def _source_branch_names(target_branch: str) -> set[str]:
+    """Every branch name a stored target spelling can denote (superset, fail-safe)."""
+    names = {target_branch}
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if target_branch.startswith(prefix) and len(target_branch) > len(prefix):
+            names.add(target_branch[len(prefix) :])
+    return names
+
+
+def _stored_branch_ref_resolves(target_branch: str) -> bool | None:
+    """Whether any branch a stored target spelling denotes resolves; ``None`` on a Git failure.
+
+    A live ``refs/heads/<b>`` or ``origin/<b>`` spelling must not read as a
+    deleted branch (abandonment) only because the probe prefixes it again.
+    """
+    unknown = False
+    for name in sorted(_source_branch_names(target_branch)):
+        resolved = _branch_ref_resolves(name)
+        if resolved:
+            return True
+        unknown = unknown or resolved is None
+    return None if unknown else False
+
+
+def _worktree_roster(root: Path) -> list[tuple[str, str | None]] | None:
+    """``(path, branch ref)`` for every registered worktree, decoded losslessly."""
+    proc = _reap_git(root, "worktree", "list", "--porcelain", "-z")
+    if proc is None or proc.returncode != 0:
+        return None
+    entries: list[tuple[str, str | None]] = []
+    path: str | None = None
+    ref: str | None = None
+    for field in proc.stdout.split(b"\0"):
+        if not field:
+            if path is not None:
+                entries.append((path, ref))
+            path, ref = None, None
+            continue
+        text = os.fsdecode(field)
+        if text.startswith("worktree "):
+            path = text[len("worktree ") :]
+        elif text.startswith("branch "):
+            ref = text[len("branch ") :]
+    if path is not None:
+        entries.append((path, ref))
+    return entries
+
+
+def _lane_final_receipt(
+    lanes: Sequence[Mapping[str, object]],
+    names: set[str],
+    root: Path,
+    integration_ref: str,
+    *,
+    expected_tip: str | None = None,
+) -> tuple[bool, str]:
+    """Deleted-source proof from the current-generation terminal lane record.
+
+    The current generation is the lane on the target branch with the latest
+    ``cycle_epoch`` (bumped by storage on every status change, so a reopen
+    supersedes earlier closes). Its final tip must have been observed from the
+    branch (``branch_tip_source='branch'``) by the terminal write itself
+    (``branch_tip_observed_at == updated_at``); a tip carried over from open or
+    an earlier generation is not final-source proof. A ``closed`` lane also
+    needs its recorded landing; both must be contained in integration. With
+    ``expected_tip`` (a live source), the receipt must name exactly that tip.
+    """
+    on_target = [
+        lane
+        for lane in lanes
+        if isinstance(lane.get("branch"), str) and _source_branch_names(str(lane["branch"])) & names
+    ]
+    if not on_target:
+        return False, _reap_hold("abandonment_unproven", "no lane record for the deleted target branch")
+    if len(on_target) > 1 and any(lane.get("cycle_epoch") is None for lane in on_target):
+        return False, _reap_hold("generation_unproven", "lane generations on the target branch are unordered")
+    current = max(on_target, key=lambda lane: int(cast(int, lane.get("cycle_epoch") or 0)))
+    lane_id = current.get("lane_id")
+    status = current.get("status")
+    tip = current.get("branch_tip_sha")
+    landing = current.get("landing_commit_sha")
+    if status not in {"merged", "closed"}:
+        return False, _reap_hold("landing_unproven", f"current lane {lane_id} is {status}, not merged or closed")
+    if (
+        not isinstance(tip, str)
+        or current.get("branch_tip_source") != "branch"
+        or current.get("branch_tip_observed_at") is None
+        or current.get("branch_tip_observed_at") != current.get("updated_at")
+    ):
+        return False, _reap_hold(
+            "landing_unproven", f"current lane {lane_id} has no final tip observed from the branch at close"
+        )
+    if status == "closed" and not isinstance(landing, str):
+        return False, _reap_hold("landing_unproven", f"closed lane {lane_id} recorded no landing commit")
+    if expected_tip is not None and tip != expected_tip:
+        return False, _reap_hold(
+            "landing_unproven", f"lane {lane_id} final tip {tip} is not the live tip {expected_tip}"
+        )
+    integration_sha = _resolve_integration_sha(root, integration_ref)
+    if integration_sha is None:
+        return False, _reap_hold("integration_unreadable", f"integration ref {integration_ref} does not resolve")
+    if _reap_contained(root, tip, integration_sha) is not True:
+        return False, _reap_hold("landing_unproven", f"lane {lane_id} final tip {tip} is not in integration")
+    if isinstance(landing, str) and (
+        _reap_contained(root, landing, integration_sha) is not True or _reap_contained(root, tip, landing) is not True
+    ):
+        return False, _reap_hold("landing_unproven", f"lane {lane_id} landing {landing} does not land {tip}")
+    return True, f"lane {lane_id} final tip {tip} contained in integration"
+
+
+def _task_lanes(conn: sqlite3.Connection, task_ref: str) -> list[dict[str, object]]:
+    return [dict(lane) for lane in conn.execute("SELECT * FROM worktree_lanes WHERE task_ref = ?", (task_ref,))]
+
+
+def _resolve_integration_sha(root: Path, integration_ref: str) -> str | None:
+    proc = _reap_git(root, "rev-parse", "--verify", "--quiet", "--end-of-options", integration_ref + "^{commit}")
+    sha = proc.stdout.decode("ascii", "replace").strip() if proc is not None and proc.returncode == 0 else ""
+    return sha if _HEX40.fullmatch(sha) else None
+
+
+def _deleted_source_lane_receipt_hold(
+    conn: sqlite3.Connection, task_ref: str, target_branch: str, integration_ref: str
+) -> str | None:
+    """``None`` when the current-generation lane receipt proves the deleted source landed."""
+    root = Path(get_runtime_config().git_workspace_root)
+    proven, detail = _lane_final_receipt(
+        _task_lanes(conn, task_ref), _source_branch_names(target_branch), root, integration_ref
+    )
+    return None if proven else detail
+
+
+def _reap_source_names(lanes: Iterable[Mapping[str, object]], target_branch: str, integration_ref: str) -> set[str]:
+    """Every branch name final-source proof covers: the target and each non-integration lane branch.
+
+    Shared by the qualifier (:func:`_final_source_hold`) and the locked
+    fence (:class:`_QualifiedRefIdentities`), so the refs re-read under the
+    writer lock are exactly the refs the qualification proved [DBG-10].
+    """
+    names = _source_branch_names(target_branch)
+    for lane in lanes:
+        branch = _normalize_optional_text(lane.get("branch"))
+        if branch and not _is_integration_target_branch(branch, integration_ref):
+            names |= _source_branch_names(branch)
+    return names
+
+
+def _reap_source_refs(names: Iterable[str]) -> set[str]:
+    """Full ref names whose tips final-source proof reads for ``names``."""
+    wanted = set()
+    for name in names:
+        wanted |= {f"refs/heads/{name}", f"refs/remotes/origin/{name}"}
+        if name.startswith("refs/"):
+            wanted.add(name)
+    return wanted
+
+
+def _live_tip_task_binding_hold(
+    root: Path,
+    task_ref: str,
+    target_names: set[str],
+    lanes: Sequence[Mapping[str, object]],
+    tip: str,
+    integration_sha: str,
+    integration_ref: str,
+    updated_at: str,
+) -> str | None:
+    """``None`` when the live tip is bound to this task, else a typed hold.
+
+    Containment in integration and a tip newer than the row only say that some
+    work landed. The tip is this task's source only with (a) BASE's task-bound
+    landing proof (receipt or exact merge subject, tip as second parent), (b)
+    the current-generation terminal lane receipt for exactly this tip, or (c)
+    for a fast-forward landing, a commit newer than the row in the tip's
+    history carrying this task's identity (``<task_ref>:`` subject or a
+    Workbay-Lane receipt naming it). A landing receipt for the tip that names
+    another task contradicts all three [SECD-05].
+    """
+    unbound = _reap_hold("landing_unproven", f"live source tip {tip} has no task-bound landing proof")
+    receipts = _reap_git(
+        root,
+        "log",
+        "--merges",
+        "--fixed-strings",
+        "--grep=Workbay-Lane:",
+        "--format=%H%x00%P%x00%B%x00",
+        integration_sha,
+    )
+    if receipts is None or receipts.returncode != 0:
+        return _reap_hold("source_unreadable", f"landing receipts for live tip {tip} unreadable")
+    fields = os.fsdecode(receipts.stdout).split("\0")
+    for offset in range(0, len(fields) - 2, 3):
+        merge, parents, message = fields[offset].strip(), fields[offset + 1].split(), fields[offset + 2]
+        if parents[1:] != [tip]:
+            continue
+        has_receipt, receipt_task_ref, _ = _landing_receipt_identity(message)
+        if has_receipt and receipt_task_ref != task_ref:
+            return _reap_hold(
+                "landing_unproven",
+                f"landing receipt {merge} for live tip {tip} names {receipt_task_ref or 'no valid task'}",
+            )
+    for name in sorted(target_names):
+        if (
+            _deleted_branch_merge_proof(name, task_ref, integration_ref, task_created_at=updated_at, expected_tip=tip)
+            is True
+        ):
+            return None
+    if _lane_final_receipt(lanes, target_names, root, integration_ref, expected_tip=tip)[0]:
+        return None
+    try:
+        generation = datetime.fromisoformat(updated_at.strip().replace("Z", "+00:00"))
+        since = int((generation if generation.tzinfo else generation.replace(tzinfo=UTC)).timestamp())
+    except (OverflowError, TypeError, ValueError):
+        return unbound
+    history = _reap_git(root, "log", f"--max-age={since}", "--format=%H%x00%ct%x00%B%x00", tip)
+    if history is None or history.returncode != 0:
+        return _reap_hold("source_unreadable", f"history of live tip {tip} unreadable")
+    fields = os.fsdecode(history.stdout).split("\0")
+    for offset in range(0, len(fields) - 2, 3):
+        stamp, message = fields[offset + 1].strip(), fields[offset + 2].strip()
+        if not _merge_is_newer_than_task(stamp, updated_at):
+            continue
+        if message.startswith(f"{task_ref}:") or _landing_receipt_identity(message)[1] == task_ref:
+            return None
+    return unbound
+
+
+def _final_source_hold(
+    conn: sqlite3.Connection,
+    row: Mapping[str, object],
+    integration_ref: str,
+    *,
+    deleted_source_proof: bool,
+) -> str | None:
+    """The single reap predicate: typed hold, or ``None`` when final source is proven.
+
+    Live source: every existing local and remote-tracking ref of the target is
+    contained in integration, every registered worktree on it (Git roster,
+    always read) is clean at that tip, and the tip postdates the task row and
+    is bound to this task (:func:`_live_tip_task_binding_hold`).
+    Deleted source: the caller's typed proof (current-generation lane receipt
+    or the task-bound merge proof) and no registered worktree on the branch.
+    Every lane registration of the task must be terminal and none may record a
+    tip or landing outside integration. A ``done`` row (reap_done) carries its
+    own completion signal and skips only the live generation/binding step.
+    """
+    task_ref = str(row["task_ref"])
+    target_branch = _normalize_optional_text(row["target_branch"])
+    if not target_branch:
+        return _reap_hold("abandonment_unproven", "target branch unknown")
+    root = Path(get_runtime_config().git_workspace_root)
+    unreadable_integration = _reap_hold("integration_unreadable", f"integration ref {integration_ref} does not resolve")
+    resolved: list[str | None] = []
+
+    def contained_in_integration(sha: str) -> bool | None:
+        # Resolve once, on first use: every containment answer below is
+        # against the same integration commit.
+        if not resolved:
+            resolved.append(_resolve_integration_sha(root, integration_ref))
+        return None if resolved[0] is None else _reap_contained(root, sha, resolved[0])
+
+    lanes = _task_lanes(conn, task_ref)
+    for lane in lanes:
+        if lane.get("status") not in TERMINAL_LANE_STATUSES:
+            return _reap_hold("lane_live", f"lane {lane.get('lane_id')} is {lane.get('status')}")
+        for column in ("branch_tip_sha", "landing_commit_sha"):
+            sha = lane.get(column)
+            if sha is None:
+                continue
+            contained = contained_in_integration(str(sha))
+            if resolved[0] is None:
+                return unreadable_integration
+            if contained is None:
+                return _reap_hold("source_unreadable", f"lane {lane.get('lane_id')} {column} {sha} unreadable")
+            if not contained:
+                return _reap_hold(
+                    "landing_unproven", f"lane {lane.get('lane_id')} {column} {sha} is not in {integration_ref}"
+                )
+
+    target_names = _source_branch_names(target_branch)
+    names = _reap_source_names(lanes, target_branch, integration_ref)
+    wanted = _reap_source_refs(names)
+    listed = _reap_git(root, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)")
+    no_repository = (listed is None or listed.returncode != 0) and _reap_no_repository(root)
+    if (listed is None or listed.returncode != 0) and not no_repository:
+        return _reap_hold("source_unreadable", "source refs unreadable")
+    tips: dict[str, str] = {}
+    for line in listed.stdout.splitlines() if listed is not None and not no_repository else ():
+        ref, _, rest = os.fsdecode(line).partition("\0")
+        if ref not in wanted:
+            continue
+        sha, _, kind = rest.partition("\0")
+        if kind != "commit" or _HEX40.fullmatch(sha) is None:
+            return _reap_hold("source_unreadable", f"source ref {ref} is not a commit")
+        tips[ref] = sha
+    for ref, sha in sorted(tips.items()):
+        contained = contained_in_integration(sha)
+        if resolved[0] is None:
+            return unreadable_integration
+        if contained is None:
+            return _reap_hold("source_unreadable", f"source ref {ref} ancestry unreadable")
+        if not contained:
+            return _reap_hold("landing_unproven", f"source ref {ref} tip {sha} is not in {integration_ref}")
+
+    roster = [] if no_repository else _worktree_roster(root)
+    if roster is None:
+        return _reap_hold("custody_unproven", "worktree roster unreadable")
+    registered: set[Path] = set()
+    for path, ref in roster:
+        if ref is None or ref.removeprefix("refs/heads/") not in names:
+            continue
+        registered.add(Path(path).resolve())
+        tip = tips.get(ref)
+        if tip is None:
+            return _reap_hold("custody_unproven", f"worktree {path} holds {ref} with no commit on it")
+        head = _reap_git(Path(path), "rev-parse", "--verify", "HEAD")
+        dirty = _reap_git(Path(path), "status", "--porcelain", "--untracked-files=all")
+        if head is None or dirty is None or head.returncode != 0 or dirty.returncode != 0:
+            return _reap_hold("custody_unproven", f"worktree {path} on {ref} unreadable")
+        if head.stdout.decode("ascii", "replace").strip() != tip or dirty.stdout.strip():
+            return _reap_hold("custody_unproven", f"worktree {path} on {ref} is not clean at {tip}")
+    stored = _normalize_optional_text(row["target_worktree_path"])
+    if stored and Path(stored).exists() and Path(stored).resolve() not in registered:
+        return _reap_hold("custody_unproven", f"stored worktree {stored} is not registered on {target_branch}")
+
+    live = {
+        ref: sha
+        for ref, sha in tips.items()
+        if ref.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/") in target_names
+    }
+    if live:
+        if row["status"] == HandoffStatus.DONE.value:
+            # A done row carries its own completion signal, so BASE asks no
+            # task-bound proof of it. The lane, sibling-ref and custody proof
+            # above still applies: reap_done cannot archive a row reap holds.
+            return None
+        # A source still at a commit older than the task carries no task work.
+        # That generation check is necessary, not sufficient: the tip must also
+        # be bound to this task, or any later landing would complete it.
+        updated_at = _normalize_optional_text(row["updated_at"])
+        hold: str | None = _reap_hold(
+            "generation_unproven", f"no live source tip of {target_branch} postdates the task row"
+        )
+        for sha in sorted(set(live.values())):
+            stamp = _reap_git(root, "log", "-1", "--format=%ct", sha)
+            if (
+                updated_at is None
+                or not resolved
+                or resolved[0] is None
+                or stamp is None
+                or stamp.returncode != 0
+                or not _merge_is_newer_than_task(stamp.stdout.decode("ascii", "replace").strip(), updated_at)
+            ):
+                continue
+            hold = _live_tip_task_binding_hold(
+                root, task_ref, target_names, lanes, sha, resolved[0], integration_ref, updated_at
+            )
+            if hold is None:
+                return None
+        return hold
+    if not deleted_source_proof:
+        return _reap_hold("landing_unproven", f"deleted source {target_branch} has no final-source receipt")
     return None
 
 
@@ -3174,16 +3632,25 @@ def _classify_live_row(
     merged = _branch_is_merged(target_branch, integration_ref)
     branch_ref_resolves: bool | None = None
     merge_proof: bool | None | _MergeProofDegraded = None
+    lane_receipt_hold: str | None = None
+    deleted_source_proof = False
     if target_branch and not merged:
-        branch_ref_resolves = _branch_ref_resolves(target_branch)
+        branch_ref_resolves = _stored_branch_ref_resolves(target_branch)
         if branch_ref_resolves is False:
-            merge_proof = _deleted_branch_merge_proof(
-                target_branch,
-                task_ref,
-                integration_ref,
-                task_created_at=_normalize_optional_text(row["updated_at"]),
-            )
-            merged = merge_proof is True
+            lane_receipt_hold = _deleted_source_lane_receipt_hold(conn, task_ref, target_branch, integration_ref)
+            if lane_receipt_hold is None:
+                merged = deleted_source_proof = True
+            elif lane_receipt_hold.startswith("abandonment_unproven"):
+                # No lane registered on the target: only the task-bound merge
+                # proof (receipt or exact merge subject, newer than the row) can
+                # recover a landing. A registered lane generation is authority.
+                merge_proof = _deleted_branch_merge_proof(
+                    target_branch,
+                    task_ref,
+                    integration_ref,
+                    task_created_at=_normalize_optional_text(row["updated_at"]),
+                )
+                merged = deleted_source_proof = merge_proof is True
     has_open = _count_open_findings(conn, task_ref) > 0
     worktree_live = _worktree_is_live(
         target_worktree_path,
@@ -3193,15 +3660,20 @@ def _classify_live_row(
     )
 
     if merged and not has_open:
-        hold = task_completion_hold_reason(
-            task_ref=task_ref,
-            status=str(row["status"]),
-            target_branch=target_branch,
-            target_worktree_path=target_worktree_path,
-            workspace_root=get_runtime_config().git_workspace_root,
-            integration_ref=integration_ref,
-            task_updated_at=_normalize_optional_text(row["updated_at"]),
-        )
+        hold = _final_source_hold(conn, row, integration_ref, deleted_source_proof=deleted_source_proof)
+        if hold is None:
+            # The exact live tip is proven above; this retains the stored
+            # worktree identity and cleanliness checks, not a merge-subject proof.
+            hold = task_completion_hold_reason(
+                task_ref=task_ref,
+                status=str(row["status"]),
+                target_branch=target_branch,
+                target_worktree_path=target_worktree_path,
+                workspace_root=get_runtime_config().git_workspace_root,
+                integration_ref=integration_ref,
+                task_updated_at=_normalize_optional_text(row["updated_at"]),
+                reap_final_source_proven=True,
+            )
         if hold:
             return "ambiguous", hold
         return "closeable", "branch merged with no open findings"
@@ -3214,6 +3686,8 @@ def _classify_live_row(
     if target_branch and not merged and branch_ref_resolves is not True:
         if isinstance(merge_proof, _MergeProofDegraded):
             return "ambiguous", f"branch missing with degraded merge proof: {merge_proof.value}"
+        if lane_receipt_hold is not None and not lane_receipt_hold.startswith("abandonment_unproven"):
+            return "ambiguous", lane_receipt_hold
         return "ambiguous", "branch missing with no merge proof"
     return "ambiguous", "insufficient signals to classify safely"
 
@@ -3247,6 +3721,9 @@ def _classify_live_rows(
             "reason": reason,
             "target_branch": row["target_branch"],
         }
+        reason_code = _reap_reason_code(reason) if bucket != "closeable" else None
+        if reason_code is not None:
+            entry["reason_code"] = reason_code
         if bucket == "closeable":
             closeable.append(entry)
         elif bucket == "active":
@@ -3380,11 +3857,18 @@ def reap_tasks(
             if archive_result.get("ok"):
                 reaped.append(ref)
             else:
-                # Status is now 'done' but archive failed: the row is no longer
-                # in LIVE_ACTIVE_STATUSES, so a subsequent reap will NOT re-pick
-                # it. Report it so the operator can recover the orphan instead of
-                # it vanishing from `reaped` with no signal.
-                failed.append({"task_ref": ref, "stage": "archive", "error": _reap_error(archive_result)})
+                # Nothing was archived. When the archive held this reap's done
+                # row, it already put back the pre-reap status, compare-and-
+                # swapped on the row this reap wrote, so the row is not left
+                # 'done' on an unproven final source; a row another writer
+                # changed keeps that writer's state. Report the typed hold.
+                held: dict[str, object] = {"task_ref": ref, "stage": "archive", "error": _reap_error(archive_result)}
+                held_data = archive_result.get("data")
+                if isinstance(held_data, dict) and "status_restored" in held_data:
+                    held["status_restored"] = held_data["status_restored"]
+                    if held_data.get("status_restore_error"):
+                        held["status_restore_error"] = held_data["status_restore_error"]
+                failed.append(held)
 
     # internal: stale plan-cursor sweep rides the same task-reap cadence.
     plan_cursors = reap_stale_plan_cursors(apply=apply)
@@ -3905,7 +4389,7 @@ def _classify_done_nonscratch_handoff_rows(
                 }
             )
         elif _is_integration_target_branch(target_branch):
-            hold = task_completion_hold_reason(
+            hold = _integration_target_landing_hold(conn, ref) or task_completion_hold_reason(
                 task_ref=ref,
                 status="done",
                 target_branch=target_branch,
@@ -3917,13 +4401,8 @@ def _classify_done_nonscratch_handoff_rows(
             else:
                 closeable.append({**entry, "reason": "done integration-target row with no open findings"})
         elif _branch_is_merged(target_branch):
-            hold = task_completion_hold_reason(
-                task_ref=ref,
-                status="done",
-                target_branch=target_branch,
-                target_worktree_path=row["target_worktree_path"],
-                workspace_root=get_runtime_config().git_workspace_root,
-            )
+            # Selection uses the archive-time predicate itself (one seam).
+            hold = _arch_c_archive_hold(conn, row, "done_reap")
             if hold:
                 ambiguous.append({**entry, "reason": hold})
             else:
@@ -3931,6 +4410,16 @@ def _classify_done_nonscratch_handoff_rows(
         else:
             ambiguous.append({**entry, "reason": "done row but branch not merged"})
     return {"closeable": closeable, "active": active, "ambiguous": ambiguous}
+
+
+def _integration_target_landing_hold(conn: sqlite3.Connection, task_ref: str) -> str | None:
+    """``landing_unproven:<lane>`` for an integration-target row whose lane tip is unlanded.
+
+    Integration-target rows skip :func:`_final_source_hold`, which proves only
+    non-integration targets; the lane portion is the shared landing predicate.
+    """
+    unlanded = unlanded_lane_tips(conn, task_ref)
+    return f"landing_unproven:{unlanded[0]['lane_id']}" if unlanded else None
 
 
 def reap_done_nonscratch_handoff_rows(
@@ -4059,6 +4548,329 @@ def archives_retention_gc(
     )
 
 
+_REF_ABSENT = "ABSENT"
+_REF_UNREADABLE = "UNREADABLE"
+_HEX_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+class _RefUnreadable(Exception):
+    """A qualified ref cannot be read from ref files; the fence holds [SECD-05]."""
+
+
+def _read_ref_files(git_dir: Path, common_dir: Path, name: str, depth: int = 0) -> str:
+    """Resolve one ref from loose and packed ref files only, with no subprocess.
+
+    It is safe under the writer lock, where the subprocess audit barrier
+    forbids Git. Returns an object id, ``ref:<target>=<value>`` for a symbolic
+    ref, or ``ABSENT``. Anything else raises :class:`_RefUnreadable`.
+    """
+    if depth > 5 or (common_dir / "reftable").exists():
+        raise _RefUnreadable(name)
+    base = git_dir if name == "HEAD" else common_dir
+    try:
+        text: str | None = (base / name).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        text = None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RefUnreadable(name) from exc
+    if text is not None:
+        if text.startswith("ref:") and text[4:].strip():
+            target = text[4:].strip()
+            return f"ref:{target}={_read_ref_files(git_dir, common_dir, target, depth + 1)}"
+        if _HEX_OID.match(text.lower()):
+            return text.lower()
+        raise _RefUnreadable(name)
+    if name == "HEAD":
+        return _REF_ABSENT
+    try:
+        packed = (common_dir / "packed-refs").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _REF_ABSENT
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RefUnreadable(name) from exc
+    for line in packed.splitlines():
+        oid, _, ref = line.partition(" ")
+        if ref.strip() == name and not line.startswith(("#", "^")):
+            if not _HEX_OID.match(oid.lower()):
+                raise _RefUnreadable(name)
+            return oid.lower()
+    return _REF_ABSENT
+
+
+def _read_worktree_head(path: str) -> str:
+    """Identity of a registered worktree: its git dir and HEAD, or ``ABSENT``."""
+    dot_git = Path(path) / ".git"
+    try:
+        if dot_git.is_dir():
+            git_dir = dot_git
+        else:
+            text = dot_git.read_text(encoding="utf-8").strip()
+            if not text.startswith("gitdir:") or not text[7:].strip():
+                raise _RefUnreadable(f"{path}/.git")
+            git_dir = (Path(path) / text[7:].strip()).resolve()
+        try:
+            common = git_dir / (git_dir / "commondir").read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            common = git_dir
+    except (FileNotFoundError, NotADirectoryError):
+        return _REF_ABSENT
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RefUnreadable(f"{path}/.git") from exc
+    return f"{git_dir}:{_read_ref_files(git_dir, common.resolve(), 'HEAD')}"
+
+
+# Lane columns the reap qualifier reads (_final_source_hold, _lane_final_receipt).
+_LANE_FENCE_COLUMNS = (
+    "id",
+    "lane_id",
+    "status",
+    "branch",
+    "worktree_path",
+    "branch_tip_sha",
+    "branch_tip_source",
+    "branch_tip_observed_at",
+    "landing_commit_sha",
+    "cycle_epoch",
+    "updated_at",
+)
+
+
+def _lane_fence_rows(lanes: Iterable[Mapping[str, object]]) -> tuple[tuple[object, ...], ...]:
+    """The task's lane rows, reduced to the columns the qualifier reads."""
+    rows = [tuple(lane.get(column) for column in _LANE_FENCE_COLUMNS) for lane in lanes]
+    return tuple(sorted(rows, key=repr))
+
+
+def _lane_fence_value(rows: tuple[tuple[object, ...], ...]) -> str:
+    digest = hashlib.sha256(repr(rows).encode("utf-8", "backslashreplace")).hexdigest()[:12]
+    lanes = ",".join(f"{row[1]}={row[2]}" for row in rows)
+    return f"[{lanes}]#{digest}"
+
+
+def _read_worktree_registrations(common_dir: Path, names: frozenset[str]) -> str:
+    """Every worktree whose HEAD is registered on one of ``names``, from admin files only.
+
+    Covers the main worktree (``<common>/HEAD``) and each linked worktree
+    (``<common>/worktrees/*/HEAD``), including unborn branches, which no ref
+    file reveals. Same match rule as the qualifier's roster read.
+    """
+    heads = [(".", common_dir / "HEAD")]
+    try:
+        admin = sorted((common_dir / "worktrees").iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        admin = []
+    except OSError as exc:
+        raise _RefUnreadable(f"{common_dir}/worktrees") from exc
+    heads.extend((entry.name, entry / "HEAD") for entry in admin)
+    registered: list[str] = []
+    for label, head in heads:
+        try:
+            text = os.fsdecode(head.read_bytes()).strip()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise _RefUnreadable(str(head)) from exc
+        if text.startswith("ref:") and text[4:].strip().removeprefix("refs/heads/") in names:
+            registered.append(f"{label}={text[4:].strip()}")
+    return ",".join(registered) or _REF_ABSENT
+
+
+@dataclasses.dataclass(frozen=True)
+class _QualifiedRefIdentities:
+    """Identities a completion qualification proved, for a locked compare-and-swap [DATA-05].
+
+    The source refs and roster names come from :func:`_reap_source_names`, the
+    same rule the qualifier proves, so the fence watches exactly the refs the
+    qualification relied on: every spelling of the target and every lane
+    branch of the task. It also fences the worktree registrations on those
+    names, the stored worktree's HEAD, the integration ref, and the task's
+    lane rows (SQL), which must still all be terminal under the lock.
+    """
+
+    git_dir: Path
+    common_dir: Path
+    task_ref: str
+    refs: tuple[str, ...]
+    names: frozenset[str]
+    worktree: str | None
+    lanes: tuple[tuple[object, ...], ...]
+    proved: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def capture(
+        cls, conn: sqlite3.Connection, row: Mapping[str, object], integration_ref: str
+    ) -> _QualifiedRefIdentities:
+        root = get_runtime_config().git_workspace_root
+        dirs = (
+            _git(Path(root), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir") if root else None
+        )
+        lines = dirs.splitlines() if dirs else []
+        if len(lines) != 2:
+            raise _RefUnreadable("git-common-dir")
+        task_ref = str(row.get("task_ref"))
+        task_lanes = _task_lanes(conn, task_ref)
+        branch = _normalize_optional_text(row.get("target_branch"))
+        names = _reap_source_names(task_lanes, branch, integration_ref) if branch else set()
+        refs = sorted(_reap_source_refs(names))
+        ref = integration_ref.strip()
+        if ref.startswith("refs/"):
+            refs.append(ref)
+        elif ref and not _HEX_OID.match(ref.lower()):
+            # Git's own DWIM order for a short name (gitrevisions(7)).
+            refs.extend([ref] if re.fullmatch(r"[A-Z_]+", ref) else [])
+            refs.extend(f"refs/{p}{ref}" for p in ("", "tags/", "heads/", "remotes/"))
+            refs.append(f"refs/remotes/{ref}/HEAD")
+        worktree = _normalize_optional_text(row.get("target_worktree_path"))
+        fence = cls(
+            Path(lines[0]),
+            Path(lines[1]),
+            task_ref,
+            tuple(dict.fromkeys(refs)),
+            frozenset(names),
+            worktree,
+            _lane_fence_rows(task_lanes),
+            (),
+        )
+        return dataclasses.replace(fence, proved=fence.read())
+
+    def read(self) -> tuple[tuple[str, str], ...]:
+        values = [(ref, _read_ref_files(self.git_dir, self.common_dir, ref)) for ref in self.refs]
+        if self.worktree is not None:
+            values.append((f"worktree:{self.worktree}", _read_worktree_head(self.worktree)))
+        values.append(("worktree-registrations", _read_worktree_registrations(self.common_dir, self.names)))
+        return tuple(values)
+
+    def changed(self, conn: sqlite3.Connection) -> tuple[str, str, str] | None:
+        """First proved identity that differs now; an unreadable ref counts as changed.
+
+        Run under the writer lock: ref and admin files only (no Git), then SQL.
+        """
+        try:
+            now = dict(self.read())
+        except _RefUnreadable as exc:
+            now = {name: _REF_UNREADABLE for name, _ in self.proved}
+            _log.warning("qualified ref unreadable at the locked recheck: %s", exc)
+        for name, value in self.proved:
+            if now.get(name) != value:
+                return name, value, now.get(name, _REF_UNREADABLE)
+        # SQL only, allowed under RESERVED.
+        lanes = _lane_fence_rows(_task_lanes(conn, self.task_ref))
+        if lanes != self.lanes:
+            return f"lanes:{self.task_ref}", _lane_fence_value(self.lanes), _lane_fence_value(lanes)
+        for lane in lanes:
+            if lane[2] not in TERMINAL_LANE_STATUSES:
+                return f"lane:{lane[1]}", "terminal", str(lane[2])
+        return None
+
+
+def _classify_with_ref_identities(
+    conn: sqlite3.Connection, row: Mapping[str, object], integration_ref: str
+) -> tuple[str, str, _QualifiedRefIdentities | None]:
+    """Final pre-lock qualification, returning the Git identities it proved.
+
+    Identities are read before classification, so any change from here to
+    the locked recheck, including one during classification, differs.
+    """
+    try:
+        identities: _QualifiedRefIdentities | None = _QualifiedRefIdentities.capture(conn, row, integration_ref)
+        unreadable = None
+    except _RefUnreadable as exc:
+        identities, unreadable = None, f"source_identity_unreadable: {exc}"
+    bucket, reason = _classify_live_row(conn, row, integration_ref)
+    if bucket == "closeable" and unreadable is not None:
+        return "ambiguous", unreadable, None
+    return bucket, reason, identities
+
+
+def _done_reap_with_ref_identities(
+    conn: sqlite3.Connection, row: Mapping[str, object]
+) -> tuple[str | None, _QualifiedRefIdentities | None]:
+    """Done-row archive qualification plus the identities it proved.
+
+    The fence covers rows whose qualification ran the final-source predicate
+    (non-integration targets), with the same capture-before-classify order as
+    :func:`_classify_with_ref_identities`, so the locked recheck rolls back on
+    any change to the refs, registrations or lane rows the sweep relied on.
+    """
+    identities: _QualifiedRefIdentities | None = None
+    unreadable = None
+    branch = _normalize_optional_text(row.get("target_branch"))
+    if branch and not _is_integration_target_branch(branch):
+        try:
+            identities = _QualifiedRefIdentities.capture(conn, row, "main")
+        except _RefUnreadable as exc:
+            unreadable = f"source_identity_unreadable: {exc}"
+    hold = _arch_c_archive_hold(conn, row, "done_reap")
+    if hold is None and unreadable is not None:
+        return unreadable, None
+    return hold, identities
+
+
+def _source_changed_hold(task_ref: str, moved: tuple[str, str, str]) -> dict:
+    ref, qualified, observed = moved
+    return _envelope(
+        ok=False,
+        tool="archive_task_state",
+        task_ref=task_ref,
+        data={
+            "error": (
+                f"source_changed_after_qualification: {ref} was {qualified} at qualification, "
+                f"now {observed}; retry from selection."
+            ),
+            "error_code": "completion_held",
+            "hold": "source_changed_after_qualification",
+            "ref": ref,
+            "qualified": qualified,
+            "observed": observed,
+        },
+    )
+
+
+def _restore_completion_source_status(
+    conn: sqlite3.Connection,
+    held: dict,
+    *,
+    task_ref: str,
+    completion_source: Mapping[str, object],
+    expected_state: Mapping[str, object],
+    write: Callable[[sqlite3.Connection], dict],
+) -> dict:
+    """Undo the caller's done flip when this archive holds; return ``held`` with the outcome.
+
+    ``completion_source`` is the generation reap qualified and ``expected_state``
+    the done row it wrote from it. A reap that does not archive leaves the live
+    row's status as it was before reap [DBG-10]: in the archive's own writer
+    transaction, compare-and-swap the complete row reap wrote and write the
+    pre-reap status back. A row another writer changed after the flip keeps that
+    writer's state [SECD-05]. SQL only (the actor and binding were resolved
+    before the lock). The revision still advances; it never moves back.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    data = held.setdefault("data", {})
+    if not _arch_c_matches(conn, expected_state):
+        conn.rollback()
+        data.update(status_restored=False, status_restore_error="task changed after status")
+        return held
+    restored = write(conn)
+    if not restored.get("ok"):
+        conn.rollback()
+        data.update(status_restored=False, status_restore_error=_reap_error(restored))
+        return held
+    conn.commit()
+    data["status_restored"] = True
+    from .current_task_rendering import _write_per_task_projection  # noqa: PLC0415
+
+    # Derived files observe the committed authority, outside its writer lock.
+    try:
+        with _get_db_connection() as projection_conn:
+            _write_workspace_current_task_json(projection_conn, task_ref)
+        _write_per_task_projection(task_ref)
+    except Exception:  # noqa: BLE001 -- the restore committed; projections refresh on the next write
+        _log.exception("projection refresh failed after restoring %s from %s", task_ref, completion_source["status"])
+    return held
+
+
 def archive_task_state(
     task_ref: str | None = None,
     notes: str | None = None,
@@ -4156,31 +4968,77 @@ def archive_task_state(
             task_ref=resolved_task_ref,
             target_worktree_path=precomputed_target_worktree_path,
         )
+        # An archive (and its auto-flip to done) must not strand an unlanded
+        # lane tip: observe the landing proof before the writer lock.
+        landing_probe = (
+            probe_task_landing(conn, resolved_task_ref)
+            if _task_supersession is None and qualified is not None
+            else None
+        )
+
+        def held_after_reap_flip(held: dict) -> dict:
+            # Reap flipped expected_state to done from completion_source; this
+            # archive will not happen, so put the pre-reap status back.
+            if completion_source is None or expected_state is None:
+                return held
+            source, wrote = completion_source, expected_state
+            from .handoff_state import _set_handoff_state_with_conn  # noqa: PLC0415
+
+            return _restore_completion_source_status(
+                conn,
+                held,
+                task_ref=resolved_task_ref,
+                completion_source=source,
+                expected_state=wrote,
+                write=lambda locked: _set_handoff_state_with_conn(
+                    locked,
+                    task_ref=resolved_task_ref,
+                    status=str(source["status"]),
+                    expected_revision=int(cast(int, wrote["revision"])),
+                    actor=archive_actor,
+                    resolved_ctx=ctx,
+                    precomputed_target_worktree_path=precomputed_target_worktree_path,
+                    producer_binding=_recheck_task_resource_binding(
+                        locked, resolved_task_ref, producer_source_row, producer_binding
+                    ),
+                ),
+            )
+
         # Refresh bounded external evidence before the writer lock. A changed
         # row must not inherit this source qualification, even at the same revision.
+        ref_fence: _QualifiedRefIdentities | None = None
         if expected_state is not None and _task_supersession is None:
             if completion_hold is not None:
                 # Explicit finalization: the caller's qualifier refreshes the
                 # actual target for this exact row; findings use archive triage.
                 hold = completion_hold(expected_state)
             elif completion_source is None:
-                hold = _arch_c_archive_hold(conn, expected_state, "done_reap")
+                hold, ref_fence = _done_reap_with_ref_identities(conn, expected_state)
             else:
                 # The Done write advanced updated_at. Revalidate the original
                 # qualified generation, rather than treating the landing as old
                 # relative to our own status transition (deleted-source recovery).
-                bucket, reason = _classify_live_row(conn, completion_source, integration_ref)
+                bucket, reason, ref_fence = _classify_with_ref_identities(conn, completion_source, integration_ref)
                 hold = None if bucket == "closeable" else reason
             if hold:
-                return _envelope(
-                    ok=False,
-                    tool="archive_task_state",
-                    task_ref=resolved_task_ref,
-                    data={"error": hold, "error_code": "completion_held"},
+                return held_after_reap_flip(
+                    _envelope(
+                        ok=False,
+                        tool="archive_task_state",
+                        task_ref=resolved_task_ref,
+                        data={"error": hold, "error_code": "completion_held"},
+                    )
                 )
         conn.execute("BEGIN IMMEDIATE")
         if qualified is not None and not _arch_c_matches(conn, qualified):
             return _arch_c_changed("archive_task_state", resolved_task_ref)
+        # The SQL recheck cannot see Git. Compare-and-swap what the final
+        # qualification proved: its source refs, worktree registrations and
+        # integration ref from ref/admin files only (no Git under RESERVED),
+        # then the task's lane rows in SQL, which must all still be terminal.
+        if ref_fence is not None and (moved := ref_fence.changed(conn)) is not None:
+            # Nothing is written yet; keep the lock for the restore.
+            return held_after_reap_flip(_source_changed_hold(resolved_task_ref, moved))
         if _task_supersession is not None:
             _task_supersession.check(conn, resolved_task_ref)
         elif qualified is None and supersession.archived_custody_snapshot(conn, resolved_task_ref) is not None:
@@ -4191,7 +5049,7 @@ def archive_task_state(
                 data={"error": "supersession_archive_already_has_custody", "error_code": "completion_held"},
             )
         elif expected_state is not None and completion_hold is None and _count_open_findings(conn, resolved_task_ref):
-            return _arch_c_changed("archive_task_state", resolved_task_ref)
+            return held_after_reap_flip(_arch_c_changed("archive_task_state", resolved_task_ref))
         producer_binding = _recheck_task_resource_binding(
             conn, resolved_task_ref, producer_source_row, producer_binding
         )
@@ -4208,17 +5066,19 @@ def archive_task_state(
                 agent=ctx.agent,
             )
             if pre_triage.get("blocked"):
-                return _envelope(
-                    ok=False,
-                    tool="archive_task_state",
-                    data={
-                        "error": pre_triage.get("error") or "open_high_findings_block_archive",
-                        "remedy": pre_triage.get("remedy") or _HIGH_ARCHIVE_REMEDY,
-                        "high_finding_ids": pre_triage.get("high_finding_ids") or [],
-                        "open_high_count": pre_triage.get("open_high_count") or 0,
-                        "open_low_medium_count": pre_triage.get("open_low_medium_count") or 0,
-                    },
-                    task_ref=resolved_task_ref,
+                return held_after_reap_flip(
+                    _envelope(
+                        ok=False,
+                        tool="archive_task_state",
+                        data={
+                            "error": pre_triage.get("error") or "open_high_findings_block_archive",
+                            "remedy": pre_triage.get("remedy") or _HIGH_ARCHIVE_REMEDY,
+                            "high_finding_ids": pre_triage.get("high_finding_ids") or [],
+                            "open_high_count": pre_triage.get("open_high_count") or 0,
+                            "open_low_medium_count": pre_triage.get("open_low_medium_count") or 0,
+                        },
+                        task_ref=resolved_task_ref,
+                    )
                 )
         if prune_working_rows and not allow_destructive_clear:
             working_counts = _count_task_rows(conn, resolved_task_ref)
@@ -4233,6 +5093,27 @@ def archive_task_state(
                     },
                     task_ref=resolved_task_ref,
                 )
+        # SQL-only fence on the pre-lock probe: a moved roster is a typed,
+        # retryable refusal, never a Git re-probe under RESERVED [CON-21][GRPH-27].
+        landing_fenced = fenced_unlanded(conn, resolved_task_ref, landing_probe) if landing_probe is not None else []
+        if isinstance(landing_fenced, StaleLandingProbe):
+            return held_after_reap_flip(
+                _envelope(
+                    ok=False,
+                    tool="archive_task_state",
+                    task_ref=resolved_task_ref,
+                    data=landing_probe_stale_refusal("archive_task_state", resolved_task_ref),
+                )
+            )
+        if landing_fenced:
+            return held_after_reap_flip(
+                _envelope(
+                    ok=False,
+                    tool="archive_task_state",
+                    task_ref=resolved_task_ref,
+                    data=unlanded_lanes_refusal("archive_task_state", resolved_task_ref, landing_fenced),
+                )
+            )
         # All blockers above precede mutation. Reuse the pre-lock missing-target
         # probe; never run Git while holding the writer lock.
         if (
@@ -4268,6 +5149,7 @@ def archive_task_state(
                 resolved_ctx=ctx,
                 precomputed_target_worktree_path=precomputed_target_worktree_path,
                 producer_binding=producer_binding,
+                landing_probe=landing_probe,
             )
             if not flip_result.get("ok"):
                 conn.rollback()
@@ -4278,6 +5160,11 @@ def archive_task_state(
                     data={
                         "error": flip_data.get("error") or "Failed to flip task status to done before archive.",
                         "status_flip_error": flip_data.get("error"),
+                        **{
+                            key: flip_data[key]
+                            for key in ("error_kind", "error_code", "retryable", "lanes")
+                            if key in flip_data
+                        },
                     },
                     task_ref=resolved_task_ref,
                 )
@@ -4542,6 +5429,7 @@ def update_task_status(
 
     working_revision = expected_revision
     revision_retries = 0
+    landing_probe_retries = 0
     for attempt in range(MAX_OPTIMISTIC_REVISION_ATTEMPTS):
         with _get_db_connection() as conn:
             # Resolve actor first so git work is outside any write lock
@@ -4586,6 +5474,12 @@ def update_task_status(
                     precomputed_target_worktree_path = None
             producer_source_row = dict(branch_row) if branch_row is not None else None
             producer_binding = _prepare_task_resource_binding(ctx, producer_source_row)
+            # Landing proof runs Git: observe it here, fence it under the lock.
+            landing_probe = (
+                probe_task_landing(conn, task_ref)
+                if status == "done" and branch_row is not None and str(branch_row["status"]) != "done"
+                else None
+            )
             # Exclusive lock dominates every write on this connection for the
             # status=done close path: clear + revision read + delegated write.
             # Hoisting BEGIN IMMEDIATE above the clear removes the need for a
@@ -4685,9 +5579,22 @@ def update_task_status(
                 resolved_ctx=ctx,
                 precomputed_target_worktree_path=precomputed_target_worktree_path,
                 producer_binding=producer_binding,
+                landing_probe=landing_probe,
             )
             if not delegated.get("ok"):
                 state_data = delegated.get("data", {}) or {}
+                if (
+                    state_data.get("error_kind") == LANDING_PROBE_STALE
+                    and attempt < MAX_OPTIMISTIC_REVISION_ATTEMPTS - 1
+                ):
+                    # The lane roster moved after the pre-lock landing probe.
+                    # Nothing was written: roll back the exclusive close txn and
+                    # loop, so the probe re-runs before BEGIN IMMEDIATE (never
+                    # Git under RESERVED, [CON-21]). The last attempt returns
+                    # the typed retryable refusal below [GRPH-27].
+                    conn.execute("ROLLBACK")
+                    landing_probe_retries += 1
+                    continue
                 if state_data.get("error") == "Revision conflict.":
                     latest = state_data.get("current_revision")
                     if (
@@ -4721,6 +5628,8 @@ def update_task_status(
                     conn.execute("ROLLBACK")
                 fail_data = dict(state_data)
                 fail_data["revision_retries"] = revision_retries
+                if landing_probe_retries:
+                    fail_data["landing_probe_retries"] = landing_probe_retries
                 return _envelope(
                     ok=False,
                     tool="set_handoff_state",
@@ -4735,6 +5644,8 @@ def update_task_status(
                 "revision_retries": revision_retries,
                 "lifecycle_resource": delegated.get("data", {}).get("lifecycle_resource"),
             }
+            if landing_probe_retries:
+                data["landing_probe_retries"] = landing_probe_retries
             active_path_envelope = _envelope(
                 ok=True,
                 tool="set_handoff_state",
@@ -5515,6 +6426,15 @@ def _arch_c_archive_hold(conn: sqlite3.Connection, row: Mapping[str, object], ki
             return "done row with open findings"
         if not branch or not (_is_integration_target_branch(branch) or _branch_is_merged(branch)):
             return "done row without current integration evidence"
+        if not _is_integration_target_branch(branch):
+            # The same final-source predicate reap uses (every lane terminal,
+            # sibling and remote-tracking refs in integration, roster custody),
+            # so a row reap held is not archived by the done-row sweep [GRPH-14].
+            hold = _final_source_hold(conn, row, "main", deleted_source_proof=False)
+            if hold is not None:
+                return hold
+        elif hold := _integration_target_landing_hold(conn, str(row["task_ref"])):
+            return hold
     return task_completion_hold_reason(
         task_ref=str(row["task_ref"]),
         status=str(row["status"]),

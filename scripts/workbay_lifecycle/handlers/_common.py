@@ -994,6 +994,7 @@ def run_handoff_json(
     argv: list[str],
     timeout_seconds: float = DEFAULT_HANDOFF_TIMEOUT,
     field: str = "handoff",
+    allow_command_error: bool = False,
 ) -> tuple[Any | None, ReceiptWarning | None]:
     """Bounded handoff-CLI JSON probe with structural success gating.
 
@@ -1003,6 +1004,10 @@ def run_handoff_json(
     payload is not a dict or its ``ok`` key is not True — callers treat
     ``warning is None`` as success, so the warning channel is the
     structural place to surface envelope degradation [OBS-08][ARCH-13].
+
+    Probes that interpret command-level errors may opt in to receiving
+    an explicit ``ok: false`` envelope from the CLI's exit-code-1 path.
+    Such envelopes still carry a warning.
     """
     try:
         proc = run_handoff_subprocess(
@@ -1018,7 +1023,8 @@ def run_handoff_json(
             reason="timeout",
             exception_type="TimeoutExpired",
         )
-    if proc.returncode != 0:
+    command_error = allow_command_error and proc.returncode == 1
+    if proc.returncode != 0 and not command_error:
         return None, ReceiptWarning(field=field, reason="unavailable")
     try:
         payload = json.loads(proc.stdout)
@@ -1028,6 +1034,8 @@ def run_handoff_json(
             reason="malformed",
             exception_type="JSONDecodeError",
         )
+    if command_error and (not isinstance(payload, dict) or payload.get("ok") is not False):
+        return None, ReceiptWarning(field=field, reason="unavailable")
     # Hoist dict + ok gates into the shared helper so every call path
     # degrades loudly rather than reading ok=false as success [OBS-08][ARCH-13].
     if not isinstance(payload, dict):

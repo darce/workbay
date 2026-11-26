@@ -81,7 +81,12 @@ def _build_runtime(root: Path) -> Path:
         data = tomllib.loads((project / "pyproject.toml").read_text())["project"]
         info = site / f"{package.replace('-', '_')}-{data['version']}.dist-info"
         info.mkdir()
-        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {package}\nVersion: {data['version']}\n")
+        # Declare the project's dependencies so the probe can bind providers
+        # from Requires-Dist edges, as it does for a real wheel.
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {package}\nVersion: {data['version']}\n"
+            + "".join(f"Requires-Dist: {requirement}\n" for requirement in data.get("dependencies", ()))
+        )
         scripts = data.get("scripts", {})
         (info / "entry_points.txt").write_text(
             "[console_scripts]\n" + "".join(f"{name} = {target}\n" for name, target in scripts.items())

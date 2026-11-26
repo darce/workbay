@@ -27,6 +27,7 @@ subpackage; the core server's write paths import it lazily and treat an
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import os
@@ -45,6 +46,7 @@ from workbay_handoff_mcp.embeddings.provider import (
     EmbeddingBudgetExceeded,
     truncate_embed_text,
 )
+from workbay_handoff_mcp.embeddings.scan import iter_source_concepts
 from workbay_handoff_mcp.embeddings.vector_codec import (
     classify_coverage_row,
     deserialize_vector,
@@ -146,8 +148,9 @@ CONCEPT_ENTITY_KINDS: tuple[str, ...] = (
 # Row-identity half of the backfill contract: (entity_kind, table, id_column,
 # text_column). Doctor and other read-only counters must use this instead of a
 # local SQL projection so a column/table rename cannot silently diverge from
-# _gather_concepts. Additive export only — _gather_concepts is not rewritten
-# to iterate this tuple (write-path SQL stays as-is).
+# the gather. The streamed gather (scan.iter_source_concepts) iterates this
+# tuple, grouping consecutive entries of one table, so its order is the gather
+# order: per source row, kinds in the order listed here.
 CONCEPT_BACKFILL_SOURCES: tuple[tuple[str, str, str, str], ...] = (
     ("decision.title", "decisions", "id", "decision"),
     ("decision.rationale", "decisions", "id", "rationale"),
@@ -198,28 +201,31 @@ def prefetch_owned_vector_blobs(
     conn: sqlite3.Connection,
     keys: Iterable[tuple[str, str]],
 ) -> dict[tuple[str, str], bytes]:
-    """Resolve interned payloads in one lookup keyed by ``(text_hash, model_id)``.
+    """Resolve interned payloads keyed by ``(text_hash, model_id)``.
 
-    Ranking used to call :func:`resolve_vector_blob` per empty row (N+1).
+    Ranking used to call :func:`resolve_vector_blob` per empty row (N+1). The
+    lookup matches the exact ``(text_hash, model_id)`` pairs, so rows of other
+    models never reach Python, and the row-value IN list is split to the
+    connection's bound-variable limit: one IN over every interned hash raised
+    "too many SQL variables" above 32,766 distinct hashes (finding 32527).
     """
-    unique = {(str(text_hash_value), str(model_id)) for text_hash_value, model_id in keys}
-    if not unique:
-        return {}
-    hashes = tuple({text_hash_value for text_hash_value, _model_id in unique})
-    placeholders = ",".join("?" * len(hashes))
-    rows = conn.execute(
-        f"""
-        SELECT text_hash, model_id, vector
-        FROM concept_embeddings
-        WHERE LENGTH(vector) > 0 AND text_hash IN ({placeholders})
-        """,
-        hashes,
-    ).fetchall()
+    from .scan import max_in_list_items, split_for_in_list, values_placeholders
+
+    unique = list(dict.fromkeys((str(text_hash_value), str(model_id)) for text_hash_value, model_id in keys))
     owned: dict[tuple[str, str], bytes] = {}
-    for text_hash_value, model_id, vector in rows:
-        key = (str(text_hash_value), str(model_id))
-        if key in unique and key not in owned and vector is not None:
-            owned[key] = bytes(vector)
+    for part in split_for_in_list(unique, max_in_list_items(conn, arity=2)):
+        rows = conn.execute(
+            f"""
+            SELECT text_hash, model_id, vector
+            FROM concept_embeddings
+            WHERE LENGTH(vector) > 0 AND (text_hash, model_id) IN ({values_placeholders(len(part), 2)})
+            """,
+            [value for pair in part for value in pair],
+        ).fetchall()
+        for text_hash_value, model_id, vector in rows:
+            key = (str(text_hash_value), str(model_id))
+            if key not in owned and vector is not None:
+                owned[key] = bytes(vector)
     return owned
 
 
@@ -856,42 +862,30 @@ def source_row_eligibility_sql(conn: sqlite3.Connection, table: str, *, alias: s
 def _gather_concepts(conn: sqlite3.Connection, task_ref: str | None) -> list[tuple[str, str, str, str | None]]:
     """Collect every embeddable concept as ``(entity_kind, entity_id, task_ref, text)``.
 
-    Each source table is fully materialized before the backfill issues any
-    INSERT, so iterating the work list never races with writes on ``conn``. The
-    entity_id matches embed-on-write: row id for decisions/findings/blockers,
-    task_ref for handoff_state, compaction_id for compactions.
+    Whole-corpus list kept for the dry-run CLI and read-only probes; the
+    backfill and the coverage census stream the same concepts page by page
+    through :func:`~workbay_handoff_mcp.embeddings.scan.iter_source_concepts`
+    instead, so they never hold the corpus. The entity_id matches
+    embed-on-write: row id for decisions/findings/blockers, task_ref for
+    handoff_state, compaction_id for compactions.
+
+    Streaming is safe against the backfill's own writes: each page is one
+    SELECT read to completion before the consumer sees it, so every read
+    happens between write transactions, never inside one, and
+    :func:`_write_backfill_rows` revalidates each source row's text hash
+    under ``BEGIN IMMEDIATE`` before publishing a vector, so a source edited
+    or deleted after it was paged in cannot publish a stale vector.
     """
-    clause = " WHERE task_ref = ?" if task_ref else ""
-    params: tuple[object, ...] = (task_ref,) if task_ref else ()
+    from .scan import iter_source_concepts
+
     out: list[tuple[str, str, str, str | None]] = []
-    decision_clause = " WHERE " + source_row_eligibility_sql(conn, "decisions")
-    if task_ref:
-        decision_clause += " AND task_ref = ?"
-    for row in conn.execute(
-        "SELECT id, task_ref, decision, rationale FROM decisions" + decision_clause, params
-    ).fetchall():
-        out.append(("decision.title", str(row[0]), str(row[1]), row[2]))
-        out.append(("decision.rationale", str(row[0]), str(row[1]), row[3]))
-    for row in conn.execute(
-        "SELECT id, task_ref, description, fix, resolution_notes FROM review_findings" + clause, params
-    ).fetchall():
-        out.append(("finding.description", str(row[0]), str(row[1]), row[2]))
-        out.append(("finding.fix", str(row[0]), str(row[1]), row[3]))
-        out.append(("finding.resolution_notes", str(row[0]), str(row[1]), row[4]))
-    for row in conn.execute("SELECT id, task_ref, description FROM blockers" + clause, params).fetchall():
-        out.append(("blocker.description", str(row[0]), str(row[1]), row[2]))
-    for row in conn.execute("SELECT task_ref, objective, focus FROM handoff_state" + clause, params).fetchall():
-        out.append(("handoff_state.objective", str(row[0]), str(row[0]), row[1]))
-        out.append(("handoff_state.focus", str(row[0]), str(row[0]), row[2]))
-    for row in conn.execute(
-        "SELECT compaction_id, task_ref, prose_residual FROM session_compactions" + clause, params
-    ).fetchall():
-        out.append(("compaction.prose_residual", str(row[0]), str(row[1]), row[2]))
+    for page in iter_source_concepts(conn, task_ref):
+        out.extend(page)
     return out
 
 
 # Public alias so read-only callers share the write-path gather without
-# reaching for the private name. Implementation is unchanged.
+# reaching for the private name (same function object).
 gather_concepts = _gather_concepts
 
 
@@ -939,7 +933,64 @@ def _classify_concept_for_backfill(
 classify_concept_for_backfill = _classify_concept_for_backfill
 
 
-def concept_embedding_coverage(conn: sqlite3.Connection, model_id: str | None) -> dict[str, object]:
+def _existing_hash_and_model_many(
+    conn: sqlite3.Connection,
+    keys: Iterable[tuple[str, str]],
+    *,
+    model_id: str | None = None,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Batched :func:`_existing_hash_and_model`: ``(kind, id) -> (text_hash, model_id)``.
+
+    One SELECT per bound-variable-limit slice (in practice one per batch)
+    instead of one per concept. ``model_id`` restricts the lookup in SQL; a
+    row of another model is then simply absent, which every caller already
+    classifies as not current.
+    """
+    from .scan import max_in_list_items, split_for_in_list, values_placeholders
+
+    unique = list(dict.fromkeys((str(kind), str(entity_id)) for kind, entity_id in keys))
+    found: dict[tuple[str, str], tuple[str, str]] = {}
+    model_sql = " AND model_id = ?" if model_id is not None else ""
+    for part in split_for_in_list(unique, max_in_list_items(conn, arity=2)):
+        params: list[object] = [value for pair in part for value in pair]
+        if model_id is not None:
+            params.append(model_id)
+        for kind, entity_id, hash_value, row_model_id in conn.execute(
+            "SELECT entity_kind, entity_id, text_hash, model_id FROM concept_embeddings "
+            f"WHERE (entity_kind, entity_id) IN ({values_placeholders(len(part), 2)}){model_sql}",
+            params,
+        ).fetchall():
+            found[(str(kind), str(entity_id))] = (str(hash_value), str(row_model_id))
+    return found
+
+
+def _coverage_rows_for_keys(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str]],
+    model_id: str,
+) -> dict[tuple[str, str], tuple[object, ...]]:
+    """Concept rows of ``model_id`` for one census batch, keyed by ``(kind, id)``."""
+    from .scan import max_in_list_items, split_for_in_list, values_placeholders
+
+    found: dict[tuple[str, str], tuple[object, ...]] = {}
+    for part in split_for_in_list(keys, max_in_list_items(conn, arity=2)):
+        params: list[object] = [model_id, *(value for pair in part for value in pair)]
+        for row in conn.execute(
+            "SELECT entity_kind, entity_id, task_ref, text_hash, model_id, vector, dim FROM concept_embeddings "
+            f"WHERE model_id = ? AND (entity_kind, entity_id) IN ({values_placeholders(len(part), 2)})",
+            params,
+        ).fetchall():
+            found[(str(row[0]), str(row[1]))] = tuple(row)
+    return found
+
+
+def concept_embedding_coverage(
+    conn: sqlite3.Connection,
+    model_id: str | None,
+    *,
+    cancel: threading.Event | None = None,
+    batch: int | None = None,
+) -> dict[str, object]:
     """Census of all source concepts, independent of query membership filters.
 
     Unknown model identity never proves current coverage. Counts use the
@@ -947,27 +998,36 @@ def concept_embedding_coverage(conn: sqlite3.Connection, model_id: str | None) -
     This is a read-only global census, not a claim about query recall.
     Existing vectors may still be ranked until reconciliation replaces them;
     pending coverage explicitly prevents interpreting that ranking as complete.
+
+    Streamed: source concepts arrive one page at a time and each page looks up
+    only its own concept rows of ``model_id`` (plus their interned owners), so
+    the census holds O(batch) rows, never the corpus or another model's rows.
+    ``cancel`` stops it between pages with
+    :class:`~workbay_handoff_mcp.embeddings.scan.ScanCancelled`.
     """
+    from .scan import DEFAULT_SOURCE_BATCH_ROWS, check_cancelled, iter_source_concepts
+
     total = current = 0
-    rows = conn.execute(
-        "SELECT entity_kind, entity_id, task_ref, text_hash, model_id, vector, dim FROM concept_embeddings"
-    ).fetchall()
-    index = {(str(r[0]), str(r[1])): r for r in rows}
-    owners = prefetch_owned_vector_blobs(conn, [(str(r[3]), str(r[4])) for r in rows if not r[5]])
-    for kind, entity_id, task_ref, text in _gather_concepts(conn, None):
-        if text is None or not str(text).strip():
+    for page in iter_source_concepts(conn, None, batch=batch or DEFAULT_SOURCE_BATCH_ROWS, cancel=cancel):
+        live = [concept for concept in page if concept[3] is not None and str(concept[3]).strip()]
+        total += len(live)
+        if model_id is None or not live:
             continue
-        total += 1
-        row = index.get((kind, entity_id))
-        if model_id is None or row is None or str(row[2]) != task_ref:
-            continue
-        outcome, _ = classify_coverage_row(text, (str(row[3]), str(row[4])), model_id)
-        if outcome != "skipped":
-            continue
-        blob = resolve_vector_blob(conn, row[5], str(row[3]), str(row[4]), owned_cache=owners)
-        dim = int(row[6])
-        if dim > 0 and len(blob) in (dim, dim * 4):
-            current += 1
+        check_cancelled(cancel)
+        index = _coverage_rows_for_keys(conn, [(kind, entity_id) for kind, entity_id, _tref, _text in live], model_id)
+        owner_keys = [(str(r[3]), str(r[4])) for r in index.values() if not r[5]]
+        owners = prefetch_owned_vector_blobs(conn, owner_keys) if owner_keys else {}
+        for kind, entity_id, task_ref, text in live:
+            row = index.get((kind, entity_id))
+            if row is None or str(row[2]) != task_ref:
+                continue
+            outcome, _ = classify_coverage_row(text, (str(row[3]), str(row[4])), model_id)
+            if outcome != "skipped":
+                continue
+            blob = resolve_vector_blob(conn, row[5], str(row[3]), str(row[4]), owned_cache=owners)  # type: ignore[arg-type]
+            dim = int(row[6])  # type: ignore[call-overload]
+            if dim > 0 and len(blob) in (dim, dim * 4):
+                current += 1
     return {
         "status": "unknown" if model_id is None else "pending" if current < total else "complete",
         "model_id": model_id,
@@ -1287,10 +1347,19 @@ def backfill_concept_embeddings(
     call outside any write transaction, then written under ``BEGIN IMMEDIATE``
     and committed. Crash resume is durable at chunk boundaries.
 
-    Memory honesty ([DATA-16]): ``_gather_concepts`` still materializes the full
-    candidate corpus (including text) before the loop; ``commit_every`` bounds
-    only the per-chunk provider batch and write transaction — not gather-phase
-    resident memory.
+    Memory bound ([DATA-16]; findings 11175, 11610, 12965, 12971, 16890): the
+    gather is streamed. Source rows are paged in with one keyset SELECT of at
+    most ``commit_every`` rows (:func:`~workbay_handoff_mcp.embeddings.scan.iter_source_concepts`),
+    each chunk of ``commit_every`` concepts is classified with one batched
+    SELECT, and pages are read between write transactions, never inside one.
+    Resident memory is therefore one source page (``commit_every`` rows, each
+    with at most three text columns) plus one chunk, its provider batch and its
+    vectors: O(``commit_every``), independent of corpus size. ``kinds`` is
+    pushed into SQL (tables with no requested kind are not read; only the
+    requested text columns are selected) and ``limit`` stops paging once the
+    store budget is spent. Not covered by this bound: the one-time legacy
+    float32 rewrite below loads only legacy-format rows, and the provider's own
+    model/runtime memory is separate (finding 31768).
 
     Refuses a connection that already has an open transaction: a callee must
     not commit work it did not begin ([RES-01], [RES-06]). Callers must commit
@@ -1332,15 +1401,21 @@ def backfill_concept_embeddings(
     db_path = get_runtime_config().db_path
     counts: BackfillCounts = {"stored": 0, "skipped": 0, "empty": 0}
     remaining = limit
-    kind_set = set(kinds) if kinds is not None else None
     with db_writer_heartbeat(db_path, label=label):
-        concepts = _gather_concepts(conn, task_ref)
-        if kind_set is not None:
-            concepts = [row for row in concepts if row[0] in kind_set]
-        for offset in range(0, len(concepts), commit_every):
+        concepts = itertools.chain.from_iterable(iter_source_concepts(conn, task_ref, kinds=kinds, batch=commit_every))
+        while True:
             if remaining is not None and remaining <= 0:
                 break
-            chunk = concepts[offset : offset + commit_every]
+            chunk = list(itertools.islice(concepts, commit_every))
+            if not chunk:
+                break
+            # One classify SELECT per chunk (was one per concept). Writes in
+            # this chunk touch only its own pending keys, so the snapshot stays
+            # exact for the rest of the chunk after a mid-chunk flush.
+            existing_by_key = _existing_hash_and_model_many(
+                conn,
+                [(kind, entity_id) for kind, entity_id, _tref, text in chunk if text is not None and str(text).strip()],
+            )
             chunk_cursor = 0
             while chunk_cursor < len(chunk):
                 if remaining is not None and remaining <= 0:
@@ -1353,12 +1428,10 @@ def backfill_concept_embeddings(
                         break
                     entity_kind, entity_id, tref, text = chunk[chunk_cursor]
                     chunk_cursor += 1
-                    outcome, new_hash = _classify_concept_for_backfill(
-                        conn,
-                        entity_kind,
-                        entity_id,
+                    outcome, new_hash = classify_coverage_row(
                         text,
-                        model_id=provider.model_id,
+                        existing_by_key.get((entity_kind, entity_id)),
+                        provider.model_id,
                     )
                     if outcome == "empty":
                         counts["empty"] += 1

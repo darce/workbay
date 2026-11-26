@@ -174,13 +174,17 @@ LOCK_RETRY_WRITE_OPERATIONS: dict[str, frozenset[str]] = {}
 # Multiplexed allowlist tools whose EVERY operation is verified whole-call
 # idempotent, so no LOCK_RETRY_WRITE_OPERATIONS refinement is needed. ``land``
 # is whole-call idempotent through its (lane, tip) natural key, and the replay
-# test in test_lane_land.py proves it.
+# test in test_lane_land.py proves it. ``reopen`` commits at the lane-row CAS
+# and a retry after that point resumes the task flip and the idempotent
+# (task, decision, session) record instead of refusing.
 # Value: the exact operation set that verification covers. A tool that
 # grows a new operation falls out of this pin and must be re-verified or
 # refined. A multiplexed allowlist tool must appear in exactly one of the
 # two maps — enforced by tests, not by comment.
 LOCK_RETRY_ALL_OPERATIONS_SAFE: dict[str, frozenset[str]] = {
-    "manage_worktree_lane": frozenset({"close", "list", "update_routing", "upsert", "retire", "land", "supersede"}),
+    "manage_worktree_lane": frozenset(
+        {"close", "list", "update_routing", "upsert", "retire", "land", "supersede", "reopen"}
+    ),
 }
 
 
@@ -335,7 +339,7 @@ def rebind_worktree_lane(
 
 
 def manage_worktree_lane(
-    operation: Literal["close", "list", "update_routing", "upsert", "retire", "land", "supersede"],
+    operation: Literal["close", "list", "update_routing", "upsert", "retire", "land", "supersede", "reopen"],
     lane_id: str | None = None,
     worktree_path: str | None = None,
     branch: str | None = None,
@@ -372,8 +376,8 @@ def manage_worktree_lane(
     plan_digest: str | None = None,
     allow_main: bool = False,
 ) -> dict:
-    """Discriminated wrapper for worktree lane upsert, close, list, retire, land, and supersede operations."""
-    valid_operations = {"close", "list", "update_routing", "upsert", "retire", "land", "supersede"}
+    """Discriminated wrapper for worktree lane upsert, close, list, retire, land, supersede and reopen operations."""
+    valid_operations = {"close", "list", "update_routing", "upsert", "retire", "land", "supersede", "reopen"}
     if not isinstance(operation, str) or operation not in valid_operations:
         return _typed_enum_refusal("operation", "invalid_operation", valid_operations)
     if status is not None:
@@ -655,7 +659,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Persist a tool domain (domain='orchestrator'|'worker'|'ops'), plus optional skill_slugs, on the live "
         "task for the next server boot; this does not change the in-session roster."
     ),
-    "manage_worktree_lane": "Compound tool: create, close, list, update routing, retire, land, or supersede worktree lanes. Use operation='upsert'|'close'|'list'|'update_routing'|'retire'|'land'|'supersede'. For land, pass task_ref, lane_id, and expected_tip (the current full branch tip SHA); optional run_id makes retries idempotent. retire is dry-run by default (apply=false). supersede is a preview by default; pass branch, superseded_by, and integration_ref. A main integration_ref requires allow_main=true. Apply only with the plan_digest returned by the preview.",
+    "manage_worktree_lane": "Compound tool: create, close, list, update routing, retire, land, supersede, or reopen worktree lanes. Use operation='upsert'|'close'|'list'|'update_routing'|'retire'|'land'|'supersede'|'reopen'. For reopen, pass task_ref, lane_id, expected_tip and worktree_path to restore a closed lane with an unlanded retained branch. For land, pass task_ref, lane_id, and expected_tip (the current full branch tip SHA); optional run_id makes retries idempotent. retire is dry-run by default (apply=false). supersede is a preview by default; pass branch, superseded_by, and integration_ref. A main integration_ref requires allow_main=true. Apply only with the plan_digest returned by the preview.",
     "get_lane_activity": "Read the current activity summary for a lane, including blockers, actions, findings, messages, and tests.",
     "turn_metrics": "Compound tool: record, list, or summarize turn metrics in one call. Use operation='record'|'list'|'summary'.",
     "lane_communication": "Compound tool: record, update, or list lane messages and briefs in one call. Use kind='message'|'brief' and operation='record'|'update'|'list'.",

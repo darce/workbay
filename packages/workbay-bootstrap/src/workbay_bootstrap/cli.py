@@ -467,15 +467,23 @@ def _build_parser() -> argparse.ArgumentParser:
             "probes for the binary at start and soft-degrades."
         ),
     )
-    p_install.add_argument(
+    remote_opt = p_install.add_mutually_exclusive_group()
+    remote_opt.add_argument(
         "--with-remote",
-        action="store_true",
+        dest="execution_mode",
+        action="store_const",
+        const="remote_only",
+        default="inherit",
         help=(
             "Verify the remote gate via WORKBAY_REMOTE_GATE_HOST + SSH probe and "
             "record remote-only offload policy in the bootstrap ledger. Install "
             "fails when the probe fails — re-run without the flag, then "
             "repair --with-remote later, for deferred setup."
         ),
+    )
+    remote_opt.add_argument(
+        "--no-remote", dest="execution_mode", action="store_const", const="local_ok",
+        help="Record local execution permission in the bootstrap ledger.",
     )
     emb_opt = p_install.add_mutually_exclusive_group()
     emb_opt.add_argument(
@@ -1512,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 no_embeddings=args.no_embeddings,
                 allow_member_skew=args.allow_member_skew,
-                execution_mode=("remote_only" if args.with_remote else "local_ok"),
+                execution_mode=args.execution_mode,
                 embeddings_mode=(
                     "verified" if args.with_embeddings else ("disabled" if args.no_embeddings else "unspecified")
                 ),

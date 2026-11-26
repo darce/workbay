@@ -880,235 +880,6 @@ def _holder_ledger(repo: Path) -> ReviewCycleLedger:
     return ReviewCycleLedger(cycle.authority(repo) / "review_cycle_ledger.json", policy, repo=repo)
 
 
-def _decision_authorizes(rationale: object, digests: dict[str, str]) -> bool:
-    """Require an exact JSON mapping, not the occurrence of unrelated substrings."""
-    if not isinstance(rationale, str):
-        return False
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(rationale):
-        if char != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(rationale[index:])
-        except ValueError:
-            continue
-        if value == digests:
-            return True
-    return False
-
-
-def _holder_release_observations(repo: Path, request: dict, data: dict, locks: ExitStack) -> dict:
-    """Check the exact ledger, protected receipts, operator record and current Git facts.
-
-    Receipt locks remain held by the caller until the ledger append completes.
-    The same checks are made on every later hold walk. The recorded decision and
-    machine observations are distinct controls; a decision ID is not itself
-    proof of a separately authenticated human identity.
-    """
-    from workbay_handoff_mcp.config import RuntimeConfig
-
-    primary, authority = _host(repo)
-    ids = request.get("dispatch_ids")
-    digests = request.get("expected_receipt_sha256s")
-    operator = request.get("operator_decision_id")
-    _require(isinstance(ids, list) and bool(ids) and all(isinstance(i, str) and i for i in ids)
-             and len(set(ids)) == len(ids), "holder_release_invalid_ids", "distinct holder dispatch ids")
-    _require(isinstance(digests, dict) and set(digests) == set(ids)
-             and all(isinstance(v, str) and _SHA.fullmatch(v) for v in digests.values()),
-             "holder_release_invalid_digests", "exact receipt SHA-256 for every holder")
-    _require(type(operator) is int and operator > 0, "holder_release_operator_required", "recorded operator decision")
-    runtime = RuntimeConfig.for_repo(primary)
-    try:
-        uri = "file:" + quote(str(runtime.db_path), safe="/") + "?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=5)
-        try:
-            decision = connection.execute("SELECT decision, rationale FROM decisions WHERE id = ?", (operator,)).fetchone()
-        finally:
-            connection.close()
-    except sqlite3.Error as exc:
-        raise EvidenceHold("holder_release_operator_unavailable", "recorded operator decision") from exc
-    _require(decision is not None and decision[0] == "review_cycle_holder_release_approved"
-             and _decision_authorizes(decision[1], digests),
-             "holder_release_operator_unverified", "approval decision for the exact dispatch-to-digest mapping")
-    observations = {}
-    for dispatch_id in sorted(ids):
-        path = authority / "review_cycle_dispatch" / (_digest(dispatch_id.encode()) + ".json")
-        locks.enter_context(_dispatch_lock(path))
-        receipt, digest = _read(path, authority)
-        _require(digest == digests[dispatch_id], "holder_release_receipt_changed", dispatch_id)
-        try:
-            holder = cycle._receipt_holder(primary, receipt, receipt.get("source_branch"))
-        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            raise EvidenceHold("holder_release_lane_unavailable", dispatch_id) from exc
-        observations[dispatch_id] = _terminal_holder_facts(primary, dispatch_id, receipt,
-                                                           data["rows"].get(dispatch_id), holder)
-    return observations
-
-
-def _holder_integration(primary: Path, lane: dict, dispatch_id: str) -> str:
-    from .review_ratchet import _manifest_lane, _short_branch, task_record
-
-    manifest = _manifest_lane(primary, lane["task_ref"], lane["lane_id"])
-    if manifest is not None:
-        integration_branch = _short_branch(manifest[0].get("integration_branch", "main"))
-    else:
-        # Legacy lanes may have no manifest. A task explicitly targeting
-        # main still names the integration branch; absence alone does not.
-        try:
-            task = task_record(lane["task_ref"])
-        except (OSError, sqlite3.Error) as exc:
-            raise EvidenceHold("holder_release_integration_unverified", dispatch_id) from exc
-        integration_branch = _short_branch(task.get("target_branch")) if task else None
-        if integration_branch != "main":
-            integration_branch = None
-    _require(integration_branch is not None, "holder_release_integration_unverified", dispatch_id)
-    return integration_branch
-
-
-def _ref_created_after_receipt(primary: Path, ref: str, receipt_path: Path) -> bool:
-    """Witness the birth of the current ref. A checkout can adopt even a different worktree's ref."""
-    try:
-        observed_ns = receipt_path.stat().st_mtime_ns
-        log = Path(cycle._git(primary, "rev-parse", "--path-format=absolute", "--git-path", "logs/" + ref))
-        if not log.is_file() or log.is_symlink():
-            return False
-        with log.open("rb") as stream:
-            first = stream.readline(4096)
-            created = re.fullmatch(rb"0{40} ([0-9a-f]{40}) [^\n]+ (\d+) [+-]\d{4}\tbranch: Created from [^\n]+\n", first)
-            if created is None:
-                return False
-            second = int(created[2])
-            receipt_second = observed_ns // 1_000_000_000
-            if second != receipt_second:
-                return second > receipt_second and second <= os.fstat(stream.fileno()).st_mtime_ns // 1_000_000_000
-
-            # Git dates have whole-second precision. Only the original, still
-            # single-entry creation transaction has more precise write times
-            # on both the loose ref and its reflog. Later updates cannot serve
-            # as a subsecond creation witness.
-            if stream.read(1):
-                return False
-            ref_file = Path(cycle._git(primary, "rev-parse", "--path-format=absolute", "--git-path", ref))
-            if not ref_file.is_file() or ref_file.is_symlink():
-                return False
-            with ref_file.open("rb") as loose:
-                times = (os.fstat(stream.fileno()).st_mtime_ns, os.fstat(loose.fileno()).st_mtime_ns)
-                return (loose.read(42) == created[1] + b"\n"
-                        and all(observed_ns < ns and ns // 1_000_000_000 == second for ns in times))
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return False
-
-
-def _ref_has_later_registration(primary: Path, ref: str, holder: cycle._ReceiptHolder, receipt_path: Path) -> bool:
-    """A live checkout of this ref must belong to a distinct, later registration."""
-    from .review_ratchet import _same_worktree
-
-    listing = cycle._git(primary, "worktree", "list", "--porcelain", "-z")
-    checkouts = []
-    for record in listing.split("\0\0"):
-        fields = record.split("\0")
-        if "branch " + ref in fields:
-            path = fields[0].removeprefix("worktree ")
-            if not Path(path).is_dir() or any(field.split(" ", 1)[0] == "prunable" for field in fields):
-                return False
-            checkouts.append(path)
-    if len(checkouts) != 1:
-        return False
-    (checkout,) = checkouts
-    issuer_checkout = holder.lane.get("worktree_path")
-    # A later row can adopt the issuer's checkout without retiring its ref.
-    # Require positive evidence that the old checkout was removed.
-    if not issuer_checkout or not Path(issuer_checkout).is_absolute() or _same_worktree(issuer_checkout, checkout):
-        return False
-    try:
-        Path(issuer_checkout).lstat()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return False
-    else:
-        return False
-    owners = [row for row in holder.competing if row["status"] in LIVE_LANE_STATUSES
-              and _same_worktree(row["worktree_path"], checkout)]
-    return (len(owners) == 1 and owners[0]["id"] > holder.lane["id"]
-            and _ref_created_after_receipt(primary, ref, receipt_path))
-
-
-def _terminal_holder_facts(primary: Path, dispatch_id: str, receipt: dict, row: dict | None,
-                           holder: cycle._ReceiptHolder, *, stamped_receipt: Path | None = None) -> dict:
-    """Live terminal evidence for approved historical releases and bound issuers."""
-    identity, unproven = receipt.get("identity"), receipt.get("source_task_subject_unproven")
-    _require(isinstance(identity, dict) and isinstance(row, dict)
-             and identity == {key: row.get(key) for key in ("dispatch_id", "subject_branch", "kind")}
-             and identity.get("dispatch_id") == dispatch_id and row.get("decision") == "reserved"
-             and row.get("kind") in {"implement", "gate"},
-             "holder_release_ledger_join_unverified", dispatch_id)
-    _require(receipt.get("state") == "transport_started" and receipt.get("source_task_subject") is None
-             and isinstance(unproven, dict) and unproven.get("reason") == "no_producer_proof"
-             and unproven.get("head_on_integration") is True,
-             "holder_release_unproven_record_invalid", dispatch_id)
-    source, head, original_integration = (receipt.get("source_branch"), receipt.get("source_head"),
-                                           unproven.get("integration_sha"))
-    _require(isinstance(source, str) and bool(source) and isinstance(head, str)
-             and re.fullmatch(r"[0-9a-f]{40}", head) is not None
-             and isinstance(original_integration, str)
-             and re.fullmatch(r"[0-9a-f]{40}", original_integration) is not None,
-             "holder_release_source_invalid", dispatch_id)
-    if holder.owner_unproven:
-        candidates = holder.competing
-        blocking = [cycle._issuer_description(r) for r in candidates if r.get("status") not in _TERMINAL]
-        if holder.mismatch or not candidates or blocking:
-            raise EvidenceHold("holder_release_owner_unproven",
-                               dict(dispatch_id=dispatch_id, missing_proof=cycle.ISSUANCE_OWNER_UNPROVEN,
-                                    possible_issuers=blocking))
-    else:
-        # The protected stamp identifies the issuer. Later registrations on
-        # its old branch are checked for receipts without that binding.
-        _require(holder.lane is not None and not holder.mismatch and holder.lane.get("status") in _TERMINAL,
-                 "holder_release_lane_not_terminal", dispatch_id)
-        candidates = (holder.lane,)
-    ref = source if source.startswith("refs/heads/") else "refs/heads/" + source
-    try:
-        valid_ref = cycle._subject_probe(primary, "check-ref-format", ref)
-        branch_exists = cycle._ref_exists(primary, ref)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        raise EvidenceHold("holder_release_branch_present_or_unknown", dispatch_id) from exc
-    branch_absent = not branch_exists
-    _require(valid_ref.returncode == 0 and (branch_absent or (
-                 stamped_receipt is not None and not holder.owner_unproven
-                 and cycle._subject_probe(primary, "rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode == 0
-                 and _ref_has_later_registration(primary, ref, holder, stamped_receipt))),
-             "holder_release_branch_present_or_unknown", dispatch_id)
-    integrations = {}
-    for integration_branch in sorted({_holder_integration(primary, lane, dispatch_id) for lane in candidates}):
-        integration_ref = "refs/heads/" + integration_branch
-        try:
-            valid_integration = cycle._subject_probe(primary, "check-ref-format", integration_ref)
-            _require(valid_integration.returncode == 0, "holder_release_integration_unverified", dispatch_id)
-            landed = cycle._git(primary, "rev-parse", "--verify", integration_ref + "^{commit}")
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            raise EvidenceHold("holder_release_integration_unverified", dispatch_id) from exc
-        try:
-            original_ancestry = cycle._ancestry(primary, head, original_integration)
-            current_ancestry = cycle._ancestry(primary, head, landed)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            raise EvidenceHold("holder_release_head_ancestry_unverified", dispatch_id) from exc
-        _require(original_ancestry == "ancestor" and current_ancestry == "ancestor",
-                 "holder_release_head_not_on_integration", dispatch_id)
-        integrations[integration_branch] = landed
-    # Keep the scalar witness for existing ledger readers. Replay looks up
-    # the recorded name in the complete live map, even when that map grows.
-    integration_branch = min(integrations)
-    result = dict(lane_terminal=True, branch_absent=branch_absent, head_on_integration=True, receipt_sha256_matches=True,
-                  unproven_record=True, task_ref=holder.task_ref or "unknown", lane_id=holder.lane_id or "unknown",
-                  subject_branch=identity["subject_branch"], source_branch=source, source_head=head,
-                  integration_branch=integration_branch, integration_head=integrations[integration_branch],
-                  integration_heads=integrations, final_tip="unknown")
-    if holder.owner_unproven:
-        result["possible_issuers"] = [cycle._issuer_description(r) for r in candidates]
-    return result
-
-
 def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: dict, rows: dict) -> str | None:
     """Recover the issuer's pinned integration from a protected, earlier native admission.
 
@@ -1151,12 +922,15 @@ def _earlier_issuer_integration(repo: Path, primary: Path, lane: dict, receipt: 
 
 
 def _landed_terminal_tip(repo: Path, lane: dict, head: str, landed: str, *, require_exact_land: bool) -> str | None:
-    """A historical Land close can explicitly project the tip as manifest provenance."""
+    """A historical Land close can explicitly project the tip as manifest provenance.
+
+    Callers gate the row's terminal status; this checks its typed landing evidence.
+    """
     from . import landing_log
 
     source = lane.get("branch_tip_source")
     if not require_exact_land and source in {"branch", "backfill"}:
-        return cycle._landed_continuation_tip(repo, head, [lane], landed)
+        return cycle._landed_continuation_tip(repo, head, [lane], landed, statuses=cycle._LANDED_LANE_STATUSES)
     tip, landing = lane.get("branch_tip_sha"), lane.get("landing_commit_sha")
     if (source not in {"manifest", "branch", "backfill", None}
             or any(not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (tip, landing))
@@ -1171,6 +945,106 @@ def _landed_terminal_tip(repo: Path, lane: dict, head: str, landed: str, *, requ
     return None
 
 
+_ARCHIVED_IDENTITY_FIELDS = ("id", "task_ref", "lane_id", "branch", "worktree_path")
+# Producer-observed landing facts: a recorded value is fixed, an unrecorded one may be recorded later.
+_ARCHIVED_ADVANCING_FIELDS = ("branch_tip_sha", "branch_tip_source", "landing_commit_sha")
+_ARCHIVED_LANE_FIELDS = (*_ARCHIVED_IDENTITY_FIELDS, "status", "notes", *_ARCHIVED_ADVANCING_FIELDS)
+
+
+def _canonical_json(value: object) -> str:
+    """Serialization (spacing, key order) is not content; ``true`` and ``1`` are."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _archive_notes_refusal(snapshot: object, live: object, binding: dict | None) -> str | None:
+    """Notes are equal as canonical JSON, or the live envelope only added the bound ``task_subject``."""
+    from workbay_handoff_mcp.lane_notes import notes_envelope
+
+    from .review_ratchet import TASK_SUBJECT_FIELD
+
+    before, after = notes_envelope(snapshot), notes_envelope(live)
+    if before is None or after is None:
+        # Prose notes are not JSON content and compare exactly.
+        return None if snapshot == live else "archive_snapshot_notes_changed"
+    if _canonical_json(before) == _canonical_json(after):
+        return None
+    rest = {key: value for key, value in after.items() if key != TASK_SUBJECT_FIELD}
+    if TASK_SUBJECT_FIELD in before or TASK_SUBJECT_FIELD not in after or _canonical_json(rest) != _canonical_json(before):
+        return "archive_snapshot_notes_changed"
+    if not isinstance(binding, dict) or _canonical_json(after[TASK_SUBJECT_FIELD]) != _canonical_json(binding):
+        return "archive_snapshot_task_subject_foreign"
+    return None
+
+
+def _archive_advance_refusal(snapshot: dict | None, lane: dict, binding: dict | None) -> str | None:
+    """Why the live registry row is not its archive snapshot advanced along the lane lifecycle.
+
+    A ``task_archives`` snapshot is a point-in-time lower bound of the issuer's
+    row, not a copy: the row may only advance from it. Identity is fixed;
+    status moves only from a pre-close status to a landed one; an unrecorded
+    tip or landing may be recorded, a recorded one never changes; notes are
+    equal as canonical JSON, except for an added ``task_subject`` equal to the
+    receipt's protected binding. A row which differs from (or is absent from)
+    the snapshot is admitted only with that binding naming the holder task
+    and lane. ``None`` admits the live row, which callers still prove landed
+    by Git; any other value is the typed reason it keeps holding (SECD-05, CAL-02).
+    """
+    from . import review_ratchet as ratchet
+
+    bound = (isinstance(binding, dict)
+             and (binding.get("task_ref"), binding.get("lane_id"), binding.get("subject_branch"))
+             == (lane.get("task_ref"), lane.get("lane_id"), ratchet._short_branch(lane.get("branch"))))
+    if snapshot is None:
+        return None if bound else "archive_snapshot_row_missing_unbound"
+    if any(snapshot.get(key) != lane.get(key) for key in _ARCHIVED_IDENTITY_FIELDS):
+        return "archive_snapshot_identity_changed"
+    before, after = snapshot.get("status"), lane.get("status")
+    if before != after and not (before in LIVE_LANE_STATUSES and after in cycle._LANDED_LANE_STATUSES):
+        return "archive_snapshot_status_not_advanced"
+    if any(snapshot.get(key) is not None and snapshot.get(key) != lane.get(key) for key in _ARCHIVED_ADVANCING_FIELDS):
+        return "archive_snapshot_landing_changed"
+    refusal = _archive_notes_refusal(snapshot.get("notes"), lane.get("notes"), binding)
+    if refusal is not None:
+        return refusal
+    if not bound and any(snapshot.get(key) != lane.get(key) for key in _ARCHIVED_LANE_FIELDS):
+        return "archive_snapshot_advance_unbound"
+    return None
+
+
+def _archived_lane(lane: dict, binding: dict | None) -> dict | None:
+    """The live row of an archived task's issuer, if it only advanced from the archive snapshot.
+
+    See ``_archive_advance_refusal``; an ``_archived`` row is the snapshot itself.
+    """
+    from . import review_ratchet as ratchet
+
+    snapshot = ratchet.archived_lane_row(lane["task_ref"], lane["lane_id"])
+    return lane if _archive_advance_refusal(snapshot, lane, binding) is None else None
+
+
+def _archived_untyped_tip(repo: Path, lane: dict, binding: dict, head: str, landed: str) -> str | None:
+    """An archived done task's closed or merged row with no typed landing, proven landed by Git.
+
+    The producer-observed tip must carry the commit the protected
+    source-time stamp binds to the holder task (its dispatched source head,
+    after the stamp's own tip) and be on the integration ref. Any other
+    terminal row without typed landing evidence keeps holding (SECD-05).
+    GRPH-14: the lineage is stamp -> source head -> archived tip -> integration.
+    """
+    from . import review_ratchet as ratchet
+
+    tip = lane.get("branch_tip_sha")
+    if (lane.get("status") not in cycle._LANDED_LANE_STATUSES or lane.get("landing_commit_sha") is not None
+            or lane.get("branch_tip_source") not in {"branch", "backfill"}
+            or (binding.get("task_ref"), binding.get("lane_id")) != (lane["task_ref"], lane["lane_id"])
+            or not isinstance(tip, str) or not re.fullmatch(r"[0-9a-f]{40}", tip) or ratchet._commit(repo, tip) != tip
+            or cycle._ancestry(repo, binding["tip_sha"], head) != "ancestor"
+            or cycle._ancestry(repo, head, tip) != "ancestor"
+            or cycle._ancestry(repo, tip, landed) != "ancestor"):
+        return None
+    return tip
+
+
 def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict, rows: dict, proof: dict) -> bool:
     """The issuer's typed final tip covers this source and landed on its own integration."""
     from . import review_ratchet as ratchet
@@ -1179,7 +1053,8 @@ def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict,
     holder = cycle._receipt_holder(primary, receipt, branch)
     lane = holder.lane
     if (holder.mismatch or holder.owner_unproven or holder.competing or lane is None
-            or lane["branch"] != branch or lane["status"] != "merged" or lane["task_ref"] == proof["task_ref"]):
+            or lane["branch"] != branch or lane["status"] not in cycle._LANDED_LANE_STATUSES
+            or lane["task_ref"] == proof["task_ref"]):
         return False
     managed = receipt.get("managed_identity")
     if managed is not None and (
@@ -1188,7 +1063,9 @@ def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict,
         return False
     task = ratchet.task_record(lane["task_ref"])
     located = ratchet._manifest_lane(primary, lane["task_ref"], lane["lane_id"])
-    if task is None or task.get("status") not in {"done", "in_progress"} or located is None:
+    # A closed row is landed work only for a done task; its landing evidence is checked below.
+    if (task is None or task.get("status") not in {"done", "in_progress"} or located is None
+            or (lane["status"] != "merged" and task["status"] != "done")):
         return False
     manifest, member = located
     integration = proof["integration_branch"]
@@ -1206,7 +1083,14 @@ def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict,
     if landed is None:
         return False
     if terminal_feature:
-        if task.get("source") != "live" or lane.get("_archived"):
+        # An archived task's live row must only have advanced from its archive
+        # snapshot, the same record task_record reports, never the live row alone.
+        archived = task.get("source") == "archive"
+        if archived:
+            lane = _archived_lane(lane, binding)
+            if lane is None:
+                return False
+        elif task.get("source") != "live" or lane.get("_archived"):
             return False
         if binding is not None and (binding.get("integration_branch") != integration
                 or receipt.get("source_integration_branch") not in (None, integration)
@@ -1215,9 +1099,11 @@ def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict,
                 or cycle._ancestry(repo, binding["tip_sha"], head) != "ancestor"):
             return False
         final_tip = _landed_terminal_tip(repo, lane, head, landed, require_exact_land=binding is None)
+        if final_tip is None and archived and binding is not None:
+            final_tip = _archived_untyped_tip(repo, lane, binding, head, landed)
         if final_tip is None:
             return False
-    elif (cycle._landed_continuation_tip(repo, head, [lane], landed) is None
+    elif (cycle._landed_continuation_tip(repo, head, [lane], landed, statuses=cycle._LANDED_LANE_STATUSES) is None
             or not cycle._terminal_refs_landed(repo, {branch}, landed)):
         return False
 
@@ -1275,7 +1161,13 @@ def _landed_self_source(repo: Path, primary: Path, private: Path, receipt: dict,
 
 
 class HolderReleaseWalk:
-    """A fresh ledger index and live observations for one subject resolution."""
+    """Ledger reservation index for incoming-proof and bootstrap custody reads.
+
+    Not a hold input: dispatch and preview holds come from
+    ``review_cycle_holds.holder_blocks``. Kept for ``has_reservation``
+    (incoming source proof) and ``landed_self_source_releases``
+    (``bootstrap_holder_report`` custody audit).
+    """
 
     def __init__(self, repo: Path) -> None:
         self.repo = repo
@@ -1299,48 +1191,12 @@ class HolderReleaseWalk:
                         raise ValueError("unprotected holder release events")
         except (_Hold, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
             raise cycle.HolderLedgerUnavailable("review_cycle_holder_release_ledger_unavailable") from exc
-        self.events = self._data.get("holder_releases", [])
-        # The ledger validates unique membership and strictly increasing event sequences.
-        self._by_dispatch = {item: event for event in self.events for item in event["dispatch_ids"]}
-        self._observations: dict[int, dict | None] = {}
-        self.unproven_owners: dict[str, list[dict]] = {}
-
-    def missing_receipts(self, directory: Path, present: set[Path]) -> list[dict]:
-        """Native source and gate reservations require their original receipt."""
-        missing = []
-        for row in self._data.get("rows", {}).values():
-            if (row.get("decision") != "reserved" or row.get("kind") not in {"implement", "gate"}
-                    or row.get("legacy_source")):
-                continue
-            dispatch_id = row["dispatch_id"]
-            path = directory / (_digest(dispatch_id.encode()) + ".json")
-            if path not in present:
-                missing.append(dict(receipt=path.name, dispatch_id=dispatch_id, subject=row["subject_branch"],
-                                    missing_proof="holder_custody_unavailable", has_source_task_subject=False,
-                                    predicates_tried=["native_receipt_membership"]))
-        return missing
+        # holder_releases events stay decodable for audit; holds never read them.
 
     def has_reservation(self, identity: dict) -> bool:
         row = self._data.get("rows", {}).get(identity.get("dispatch_id"))
         return (isinstance(row, dict) and row.get("decision") == "reserved" and row.get("kind") in {"implement", "gate"}
                 and all(row.get(key) == identity.get(key) for key in ("dispatch_id", "subject_branch", "kind")))
-
-    def authenticates_source_reservation(self, path: Path, receipt: dict, digest: str) -> bool:
-        """Read the exact protected source and reservation, without settling or releasing either."""
-        directory = self._ledger_path.parent / "review_cycle_dispatch"
-        if path.parent != directory or not self.has_reservation(receipt["identity"]):
-            return False
-        try:
-            with _dispatch_lock(path):
-                protected, observed = _read(path, directory.parent)
-                if observed != digest or protected != receipt:
-                    return False
-                row = _receipt_reservation(self.repo, path, protected, self._data["rows"])
-                info = self._ledger_path.lstat()
-                return (row.get("legacy_source") is None and self._ledger_path.resolve() == self._ledger_path
-                        and (info.st_dev, info.st_ino, info.st_ctime_ns) == self._ledger_identity)
-        except (EvidenceHold, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-            return False
 
     def landed_self_source_releases(self, path: Path, receipt: dict, digest: str, proof: dict) -> bool:
         """One automatic landing proof for dispatch and reconciliation; no settlement is inferred."""
@@ -1375,69 +1231,6 @@ class HolderReleaseWalk:
         except (EvidenceHold, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError):
             return False
 
-    def terminal_issuer_releases(self, path: Path, receipt: dict, digest: str,
-                                 holder: cycle._ReceiptHolder, proof: dict) -> bool:
-        """A protected issuance binding supplies the owner without an operator decision."""
-        if holder.lane is None or holder.lane.get("status") not in _TERMINAL:
-            return False
-        dispatch_id = receipt["identity"]["dispatch_id"]
-        if path.name != _digest(dispatch_id.encode()) + ".json":
-            return False
-        try:
-            with _dispatch_lock(path):
-                protected, observed_digest = _read(path, path.parent.parent)
-                if observed_digest != digest:
-                    return False
-                primary, _ = _host(self.repo)
-                facts = _terminal_holder_facts(primary, dispatch_id, protected,
-                                              self._data.get("rows", {}).get(dispatch_id), holder, stamped_receipt=path)
-            return proof["integration_branch"] in facts["integration_heads"]
-        except (EvidenceHold, OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError):
-            return False
-
-    def observations(self, event: dict) -> dict | None:
-        sequence = event["recorded_sequence"]
-        if sequence not in self._observations:
-            request = dict(dispatch_ids=event["dispatch_ids"], expected_receipt_sha256s=event["receipt_sha256s"],
-                           operator_decision_id=event["operator_decision_id"])
-            fields = ("task_ref", "lane_id", "subject_branch", "source_branch", "source_head")
-            try:
-                with ExitStack() as locks:
-                    current = _holder_release_observations(self.repo, request, self._data, locks)
-                for item, recorded in event["preconditions"].items():
-                    observed = current[item]
-                    if (any(observed[field] != recorded[field] for field in fields)
-                            or recorded["integration_branch"] not in observed["integration_heads"]
-                            or not re.fullmatch(r"[0-9a-f]{40}", recorded["integration_head"])
-                            or cycle._ancestry(self.repo, recorded["source_head"], recorded["integration_head"])
-                            != "ancestor"):
-                        current = None
-                        break
-            except EvidenceHold as exc:
-                if str(exc) == "holder_release_owner_unproven":
-                    self.unproven_owners[exc.needed["dispatch_id"]] = exc.needed["possible_issuers"]
-                current = None
-            except (_Hold, OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error, subprocess.SubprocessError):
-                current = None
-            self._observations[sequence] = current
-        return self._observations[sequence]
-
-    def is_current(self, receipt: dict, receipt_sha256: str, *, integration_branch: str) -> bool | None:
-        dispatch_id = receipt.get("identity", {}).get("dispatch_id")
-        event = self._by_dispatch.get(dispatch_id)
-        if event is None:
-            return None
-        current = self.observations(event)
-        return (current is not None and receipt_sha256 == event["receipt_sha256s"][dispatch_id]
-                and integration_branch in current[dispatch_id]["integration_heads"])
-
-
-def holder_release_is_current(repo: Path, receipt: dict, receipt_sha256: str, *, integration_branch: str) -> bool | None:
-    try:
-        return HolderReleaseWalk(repo).is_current(receipt, receipt_sha256, integration_branch=integration_branch)
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return False
-
 
 def reconcile(request: dict, *, repo: Path | None = None) -> LedgerDecision:
     """Typed public seam; preview is read-only and apply reauthenticates under CAS."""
@@ -1455,16 +1248,14 @@ def reconcile(request: dict, *, repo: Path | None = None) -> LedgerDecision:
                      "holder_release_invalid_digests", "exact receipt SHA-256 for every holder")
             _require(type(request.get("operator_decision_id")) is int and request["operator_decision_id"] > 0,
                      "holder_release_operator_required", "recorded operator decision")
-            selected = Path(repo or Path.cwd()).resolve()
-            ledger = _holder_ledger(selected)
-            _require(ledger.path.exists(), "holder_release_ledger_unavailable", "canonical ledger")
-            with ExitStack() as locks:
-                return ledger._append_holder_release(
-                    dispatch_ids=request["dispatch_ids"], receipt_sha256s=request.get("expected_receipt_sha256s"),
-                    operator_decision_id=request["operator_decision_id"],
-                    authenticate=lambda data: _holder_release_observations(selected, request, data, locks),
-                )
-        if isinstance(request, dict) and request.get("operation") in {"terminal_preview", "terminal_apply", "source_preview", "source_apply"}:
+            # Holds are computed from git by review_cycle_holds.holder_blocks; a
+            # stored release is no longer an authority, so apply writes no event.
+            # Existing holder_releases events stay decodable for audit only.
+            return LedgerDecision("released", "release_not_required",
+                                  dict(dispatch_ids=list(ids), events_written=0,
+                                       authority="review_cycle_holds.holder_blocks"))
+        if isinstance(request, dict) and request.get("operation") in {"terminal_preview", "terminal_apply", "source_preview", "source_apply",
+                                                                      "stranded_preview", "stranded_apply"}:
             from .review_cycle_terminal_recovery import recover
 
             return recover(request, repo=Path(repo or Path.cwd()).resolve())
