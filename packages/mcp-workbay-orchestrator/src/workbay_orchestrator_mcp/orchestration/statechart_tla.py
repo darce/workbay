@@ -48,8 +48,9 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 GENERATOR_NAME = "statechart_tla.py"
 GENERATOR_VERSION = "1"
@@ -62,6 +63,94 @@ ANCHOR = Path("docs") / "specs" / "orchestrator-lifecycle-statechart-spec.md"
 NAME_RE_TEXT = "[a-z][a-z0-9_]*"
 MACHINE_KEYS = (("outer", "TaskMachine"), ("child", "LaneMachine"))
 NO_EVENT = "__none__"  # cannot collide: chart names must match [a-z][a-z0-9_]*
+DEFAULT_HOST_MAX_DISTINCT_STATES = 5000
+
+
+@dataclass(frozen=True)
+class TlaExecutionTarget:
+    """Deterministic host-vs-VM execution target for a TLA+ TLC check."""
+
+    target: Literal["host", "remote"]
+    reason: str
+    max_distinct_states: int
+    threshold: int
+
+
+def select_tla_execution_target(
+    *,
+    max_distinct_states: int | None,
+    local_java_available: bool,
+    local_tla_jar_available: bool,
+    force_remote: bool = False,
+    host_state_limit: int = DEFAULT_HOST_MAX_DISTINCT_STATES,
+) -> TlaExecutionTarget:
+    """Select host or remote VM execution for a TLA+ TLC check.
+
+    Small specs within ``host_state_limit`` default to fast host execution when
+    local Java and the pinned ``tla2tools.jar`` are available ([PERF-09]).
+    Explicit overrides, missing local prerequisites, or invalid/unknown bounds
+    fail closed to ``"remote"`` ([CAL-02], [SECD-05]).
+    """
+    states_valid = isinstance(max_distinct_states, int) and not isinstance(max_distinct_states, bool)
+    limit_valid = isinstance(host_state_limit, int) and not isinstance(host_state_limit, bool)
+    normalized_states = max_distinct_states if states_valid else -1
+    normalized_threshold = host_state_limit if limit_valid else -1
+
+    if force_remote:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="force_remote",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if not local_java_available:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="local_java_unavailable",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if not local_tla_jar_available:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="local_tla_jar_unavailable",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if max_distinct_states is None:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="missing_max_distinct_states",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if not states_valid or max_distinct_states < 0:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="invalid_max_distinct_states",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if not limit_valid or host_state_limit < 0:
+        return TlaExecutionTarget(
+            target="remote",
+            reason="invalid_host_state_limit",
+            max_distinct_states=normalized_states,
+            threshold=normalized_threshold,
+        )
+    if max_distinct_states <= host_state_limit:
+        return TlaExecutionTarget(
+            target="host",
+            reason="within_host_fast_check_budget",
+            max_distinct_states=max_distinct_states,
+            threshold=host_state_limit,
+        )
+    return TlaExecutionTarget(
+        target="remote",
+        reason="exceeds_host_state_limit",
+        max_distinct_states=max_distinct_states,
+        threshold=host_state_limit,
+    )
 
 
 class ChartError(ValueError):

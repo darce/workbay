@@ -74,48 +74,275 @@ class ReachResult:
 
 _CACHE: dict[str, tuple[str, ReachResult, dict[Path, str]]] = {}
 _MISSING_SOURCE = "<missing-source>"
+_AGY_PLUGINS_POINTER = ".agents/plugins.json"
+_AGY_EFFECTIVE_HOOKS = ".workbay/generated/plugins/workbay-system/effective/agy/hooks.json"
+_AGY_EFFECTIVE_MCP_CONFIG = ".workbay/generated/plugins/workbay-system/effective/agy/mcp_config.json"
+_AGY_HOOK_EVENTS = frozenset(
+    {
+        "PreToolUse",
+        "PostToolUse",
+        "SessionStart",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop",
+    }
+)
+
+
+def _is_agy_plugins_pointer(root: Path, config: Path) -> bool:
+    return config.resolve() == (root / _AGY_PLUGINS_POINTER).resolve()
+
+
+def _agy_pointer_plugin_configs(root: Path, pointer: Path) -> tuple[list[Path], bool]:
+    """Resolve in-workspace plugin hook/MCP configs referenced by ``.agents/plugins.json``.
+
+    Returns ``(discovered_files, valid)``. Escaping paths are ignored per the
+    in-worktree plugin constraint; malformed JSON/schema fails closed.
+    """
+    try:
+        document = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return [], False
+    if not isinstance(document, dict):
+        return [], False
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        return [], False
+
+    discovered: list[Path] = []
+    root_resolved = root.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return [], False
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return [], False
+        base = (root_resolved / raw_path).resolve()
+        if not base.is_relative_to(root_resolved):
+            continue
+        include_only = entry.get("include_only")
+        plugin_dirs: list[Path] = []
+        if include_only is None:
+            plugin_dirs.append(base)
+        elif isinstance(include_only, list) and all(isinstance(item, str) and item.strip() for item in include_only):
+            for item in include_only:
+                candidate_dir = (base / item).resolve()
+                if candidate_dir.is_relative_to(root_resolved):
+                    plugin_dirs.append(candidate_dir)
+        else:
+            return [], False
+        for plugin_dir in plugin_dirs:
+            for filename in ("hooks.json", "mcp_config.json"):
+                candidate = plugin_dir / filename
+                if candidate.is_file():
+                    discovered.append(candidate)
+    return discovered, True
+
+
+def _is_agy_plugin_config(root: Path, config: Path) -> bool:
+    rel = _relative_path(root, config)
+    if rel is None:
+        return False
+    if rel in {_AGY_EFFECTIVE_HOOKS, _AGY_EFFECTIVE_MCP_CONFIG}:
+        return True
+    parts = Path(rel).parts
+    return len(parts) >= 2 and parts[-1] in {"hooks.json", "mcp_config.json"} and "agy" in parts
+
+
+def _validate_agy_hooks_document(document: object) -> bool:
+    """Validate ``agy`` root-level named-group ``hooks.json`` structure."""
+    if not isinstance(document, dict):
+        return False
+    for group_name, group_body in document.items():
+        if not isinstance(group_name, str) or not isinstance(group_body, dict):
+            return False
+        for event_name, handlers in group_body.items():
+            if not isinstance(event_name, str) or not isinstance(handlers, list):
+                return False
+            for item in handlers:
+                if not isinstance(item, dict):
+                    return False
+                if event_name in {"PreToolUse", "PostToolUse"} and "hooks" in item:
+                    nested = item["hooks"]
+                    if not isinstance(nested, list) or not all(isinstance(h, dict) for h in nested):
+                        return False
+    return True
+
+
+def _validate_agy_mcp_config(document: object) -> bool:
+    """Validate ``agy`` plugin ``mcp_config.json`` structure."""
+    if not isinstance(document, dict):
+        return False
+    servers = document.get("mcpServers")
+    if servers is None:
+        return True
+    if not isinstance(servers, dict):
+        return False
+    for name, spec in servers.items():
+        if not isinstance(name, str) or not isinstance(spec, dict):
+            return False
+        cmd = spec.get("command")
+        if cmd is not None and not isinstance(cmd, str):
+            return False
+        args = spec.get("args")
+        if args is not None and (not isinstance(args, list) or not all(isinstance(arg, str) for arg in args)):
+            return False
+    return True
 
 
 def _config_files(root: Path) -> list[Path]:
-    candidates = [*root.glob(".claude/settings*.json"), root / ".codex/hooks.json"]
+    candidates: list[Path] = [*root.glob(".claude/settings*.json"), root / ".codex/hooks.json"]
     github_hooks = root / ".github/hooks"
     if github_hooks.is_dir():
         candidates.extend(github_hooks.glob("*.json"))
-    return sorted(path for path in candidates if path.is_file())
+    pointer = root / _AGY_PLUGINS_POINTER
+    if pointer.is_file():
+        candidates.append(pointer)
+        pointer_configs, _ = _agy_pointer_plugin_configs(root, pointer)
+        candidates.extend(pointer_configs)
+    for rel in (_AGY_EFFECTIVE_HOOKS, _AGY_EFFECTIVE_MCP_CONFIG):
+        candidate = root / rel
+        if candidate.is_file():
+            candidates.append(candidate)
+    return sorted({path.resolve() for path in candidates if path.is_file()})
 
 
 def _commands(value: object) -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
-        for key, child in value.items():
-            if key == "command" and isinstance(child, str):
-                found.append(child)
+        command = value.get("command")
+        if isinstance(command, str):
+            args = value.get("args")
+            if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+                found.append(shlex.join([command, *args]))
             else:
-                found.extend(_commands(child))
+                found.append(command)
+        for key, child in value.items():
+            if key in {"command", "args"} and isinstance(command, str):
+                continue
+            found.extend(_commands(child))
     elif isinstance(value, list):
         for child in value:
             found.extend(_commands(child))
     return found
 
 
-def _paths_in_command(command: str) -> list[str]:
+def _resolve_agy_run_hook_arg(hook_arg: str, root: Path) -> str | None:
+    """Resolve the hook argument passed to ``./hooks/run.py`` under ``scripts/hooks/``.
+
+    Fail closed on absolute paths, parent traversals (``..``), invalid segments,
+    or symlinks escaping ``scripts/hooks/``.
+    """
+    value = hook_arg.rstrip(";,|&")
+    if not value or value.startswith("/"):
+        return None
+    while value.startswith("./"):
+        value = value[2:]
+    if not value or value.startswith("/"):
+        return None
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts):
+        return None
+
+    root_resolved = root.resolve()
+    hooks_root = (root_resolved / "scripts/hooks").resolve()
+    if not hooks_root.is_relative_to(root_resolved):
+        return None
+
+    if parts[-1].endswith((".py", ".sh")):
+        candidates = [f"scripts/hooks/{value}"]
+    else:
+        candidates = [
+            f"scripts/hooks/{value}.py",
+            f"scripts/hooks/{value}.sh",
+            f"scripts/hooks/{value}",
+        ]
+
+    for candidate_rel in candidates:
+        candidate_path = root_resolved / candidate_rel
+        try:
+            resolved = candidate_path.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(hooks_root) or not resolved.is_relative_to(root_resolved):
+            return None
+        if candidate_path.is_file():
+            return _relative_path(root_resolved, resolved)
+
+    if parts[-1].endswith((".py", ".sh")):
+        try:
+            resolved = (root_resolved / "scripts/hooks" / value).resolve()
+        except OSError:
+            return None
+        if resolved.is_relative_to(hooks_root) and resolved.is_relative_to(root_resolved):
+            return _relative_path(root_resolved, resolved)
+    return None
+
+
+def _paths_in_command(
+    command: str,
+    *,
+    base_dir: Path | None = None,
+    root: Path | None = None,
+) -> list[str]:
     """Extract literal repository-relative Python and shell hook paths."""
     paths: list[str] = []
     try:
         tokens = shlex.split(command, comments=True)
     except ValueError:
         return []
-    for token in tokens:
+    if len(tokens) >= 3 and Path(tokens[0]).name in {"sh", "bash"} and tokens[1] == "-c":
+        for nested in _paths_in_command(tokens[2], base_dir=base_dir, root=root):
+            if nested not in paths:
+                paths.append(nested)
+        return paths
+
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
         value = token.rstrip(";,|&")
         rooted = re.match(r"^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)/", value)
         if rooted is not None:
             value = value[rooted.end() :]
         while value.startswith("./"):
             value = value[2:]
+
+        if base_dir is not None and root is not None and value == "hooks/run.py":
+            resolved_runner = (base_dir / value).resolve()
+            rel_runner = _relative_path(root, resolved_runner)
+            if rel_runner is not None and rel_runner not in paths:
+                paths.append(rel_runner)
+            for adapter_rel in (
+                "scripts/hooks/_agy_hook_adapter.py",
+                f"{_PAYLOAD_HOOK_ROOT}/_agy_hook_adapter.py",
+            ):
+                if (root / adapter_rel).is_file() and adapter_rel not in paths:
+                    paths.append(adapter_rel)
+            if idx + 1 < len(tokens):
+                resolved_hook = _resolve_agy_run_hook_arg(tokens[idx + 1], root)
+                if resolved_hook is not None and resolved_hook not in paths:
+                    paths.append(resolved_hook)
+                idx += 2
+                continue
+            idx += 1
+            continue
+
+        idx += 1
         if value.startswith("/") or not value.endswith((".py", ".sh")):
             continue
         parts = value.split("/")
-        if not parts or any(part in {"", ".", ".."} for part in parts):
+        if not parts:
+            continue
+        if any(part == ".." for part in parts):
+            if base_dir is not None and root is not None:
+                resolved = (base_dir / value).resolve()
+                rel = _relative_path(root, resolved)
+                if rel is not None and rel not in paths:
+                    paths.append(rel)
+            continue
+        if any(part in {"", "."} for part in parts):
             continue
         if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts):
             continue
@@ -1814,17 +2041,31 @@ def _build_result(root: Path, runner: Callable[..., object], interpreter: str, s
     config_files = _config_files(root)
     config_invalid = False
     entrypoints: set[str] = set()
-    configured_commands: list[str] = []
+    configured_commands: list[tuple[str, Path | None]] = []
 
     for config in config_files:
+        if _is_agy_plugins_pointer(root, config):
+            _, pointer_valid = _agy_pointer_plugin_configs(root, config)
+            if not pointer_valid:
+                config_invalid = True
+            continue
         try:
             document = json.loads(config.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             config_invalid = True
             continue
+        base_dir: Path | None = None
+        if _is_agy_plugin_config(root, config):
+            base_dir = config.parent
+            if config.name == "hooks.json" and not _validate_agy_hooks_document(document):
+                config_invalid = True
+                continue
+            if config.name == "mcp_config.json" and not _validate_agy_mcp_config(document):
+                config_invalid = True
+                continue
         for command in _commands(document):
-            configured_commands.append(command)
-            entrypoints.update(_paths_in_command(command))
+            configured_commands.append((command, base_dir))
+            entrypoints.update(_paths_in_command(command, base_dir=base_dir, root=root))
 
     git_hooks = hook_root / "git"
     if git_hooks.is_dir():
@@ -1880,8 +2121,8 @@ def _build_result(root: Path, runner: Callable[..., object], interpreter: str, s
                 pass_line = passthrough[0] if passthrough else None
                 if pass_line is None:
                     return finish("degraded", f"shell_hook_unparsed:{entrypoint}:1")
-                for command in configured_commands:
-                    command_paths = _paths_in_command(command)
+                for command, cmd_base_dir in configured_commands:
+                    command_paths = _paths_in_command(command, base_dir=cmd_base_dir, root=root)
                     for index, command_path in enumerate(command_paths):
                         if command_path == entrypoint and not any(
                             candidate.endswith(".py") for candidate in command_paths[index + 1 :]

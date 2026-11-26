@@ -645,6 +645,7 @@ def _undo_contained_predecessor_merge(
     branch: object,
     worktree_path: object,
     branch_tip_sha: object,
+    expected_cycle_epoch: int | None = None,
     native_close: object = None,
 ) -> bool:
     """Put back the status a compare-and-set close claimed, if that claim is still merged."""
@@ -666,6 +667,11 @@ def _undo_contained_predecessor_merge(
         )
         return expected == observed and _restore_native_predecessor(native_close)
 
+    if prior_status not in _RESTORABLE_PREDECESSOR_STATUSES:
+        return False
+    if expected_cycle_epoch is None or isinstance(expected_cycle_epoch, bool) or not isinstance(expected_cycle_epoch, int):
+        return False
+
     import sqlite3
 
     from workbay_orchestrator_mcp.lanes_support import _get_db_connection
@@ -682,8 +688,18 @@ def _undo_contained_predecessor_merge(
                   AND branch IS ?
                   AND worktree_path IS ?
                   AND branch_tip_sha IS ?
+                  AND cycle_epoch = ?
+                  AND landing_commit_sha IS NULL
                 """,
-                (prior_status, task_ref, lane_id, branch, worktree_path, branch_tip_sha),
+                (
+                    prior_status,
+                    task_ref,
+                    lane_id,
+                    branch,
+                    worktree_path,
+                    branch_tip_sha,
+                    expected_cycle_epoch,
+                ),
             )
             return int(cursor.rowcount or 0) == 1
     except sqlite3.Error:
@@ -740,7 +756,7 @@ def _cas_close_contained_predecessor(
         with _get_db_connection(begin_immediate=True) as conn:
             probed = conn.execute(
                 """
-                SELECT id, status, branch, worktree_path, branch_tip_sha
+                SELECT id, status, branch, worktree_path, branch_tip_sha, cycle_epoch
                 FROM worktree_lanes
                 WHERE task_ref = ? AND lane_id = ?
                 """,
@@ -771,6 +787,7 @@ def _cas_close_contained_predecessor(
                   AND branch IS ?
                   AND worktree_path IS ?
                   AND branch_tip_sha IS ?
+                  AND cycle_epoch IS ?
                 """,
                 (
                     task_ref,
@@ -779,10 +796,16 @@ def _cas_close_contained_predecessor(
                     probed["branch"],
                     probed["worktree_path"],
                     probed["branch_tip_sha"],
+                    probed["cycle_epoch"],
                 ),
             )
             if int(cursor.rowcount or 0) != 1:
                 return False, "contained_lane_close_failed:predecessor_status_changed", None
+            after_cas = conn.execute(
+                "SELECT cycle_epoch FROM worktree_lanes WHERE id = ?",
+                (probed["id"],),
+            ).fetchone()
+            claimed_cycle_epoch = after_cas["cycle_epoch"] if after_cas is not None else None
     except sqlite3.Error as exc:
         return False, f"contained_lane_close_failed:{type(exc).__name__}", None
 
@@ -791,6 +814,7 @@ def _cas_close_contained_predecessor(
         "branch": expected_branch,
         "worktree_path": expected_worktree,
         "branch_tip_sha": expected_tip,
+        "cycle_epoch": claimed_cycle_epoch,
     }
     live_row = dict(lane_row)
     live_row["status"] = replaced_status
@@ -812,6 +836,7 @@ def _cas_close_contained_predecessor(
             branch=expected_branch,
             worktree_path=expected_worktree,
             branch_tip_sha=expected_tip,
+            expected_cycle_epoch=claimed_cycle_epoch,
         ):
             return False, "contained_lane_close_failed:predecessor_open_row_restore_failed", None
         return False, f"contained_lane_close_failed:{type(exc).__name__}", None
@@ -824,6 +849,7 @@ def _cas_close_contained_predecessor(
             branch=expected_branch,
             worktree_path=expected_worktree,
             branch_tip_sha=expected_tip,
+            expected_cycle_epoch=claimed_cycle_epoch,
         ):
             return False, "contained_lane_close_failed:predecessor_open_row_restore_failed", None
         return False, f"contained_lane_close_failed:{reason or 'unreadable_result'}", None

@@ -37,6 +37,16 @@ _MAX_RESULT_BYTES = 16 * 1024
 _MAX_ARG_COUNT = 256
 _MAX_ARG_BYTES = 4096
 _MAX_TIMEOUT_S = 24 * 60 * 60
+DEFAULT_WAVE_SLICE = "wb-wave.slice"
+DEFAULT_WAVE_CPU_WEIGHT = 50
+DEFAULT_WAVE_MEMORY_HIGH = "75%"
+WAVE_SLICE_ENV = "WORKBAY_WAVE_SLICE"
+WAVE_CPU_WEIGHT_ENV = "WORKBAY_WAVE_CPU_WEIGHT"
+WAVE_MEMORY_HIGH_ENV = "WORKBAY_WAVE_MEMORY_HIGH"
+_SLICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.slice$")
+_CPU_WEIGHT_RE = re.compile(r"^[0-9]+$")
+_MEMORY_HIGH_PCT_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?%$")
+_MEMORY_HIGH_SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 _REASONS = {
     "budget_exhausted",
     "command_failed",
@@ -173,6 +183,54 @@ def _remaining(deadline: float) -> float:
 def _clean_env() -> dict[str, str]:
     """Do not let inherited Git routing/configuration escape the selected repo."""
     return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def resolve_wave_slice_properties(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Return validated bounded systemd slice placement properties for wave workers."""
+    source = os.environ if env is None else env
+
+    raw_slice = source.get(WAVE_SLICE_ENV)
+    if raw_slice is None:
+        slice_name = DEFAULT_WAVE_SLICE
+    else:
+        if not isinstance(raw_slice, str):
+            raise ExecutorError("invalid_wave_slice")
+        slice_name = raw_slice.strip()
+        if not _SLICE_RE.fullmatch(slice_name) or ".." in slice_name:
+            raise ExecutorError("invalid_wave_slice")
+
+    raw_cpu_weight = source.get(WAVE_CPU_WEIGHT_ENV)
+    if raw_cpu_weight is None:
+        cpu_weight = DEFAULT_WAVE_CPU_WEIGHT
+    else:
+        if not isinstance(raw_cpu_weight, str):
+            raise ExecutorError("invalid_wave_cpu_weight")
+        stripped_weight = raw_cpu_weight.strip()
+        if not _CPU_WEIGHT_RE.fullmatch(stripped_weight):
+            raise ExecutorError("invalid_wave_cpu_weight")
+        cpu_weight = int(stripped_weight)
+        if not 1 <= cpu_weight <= 10000:
+            raise ExecutorError("invalid_wave_cpu_weight")
+
+    raw_memory_high = source.get(WAVE_MEMORY_HIGH_ENV)
+    if raw_memory_high is None:
+        memory_high = DEFAULT_WAVE_MEMORY_HIGH
+    else:
+        if not isinstance(raw_memory_high, str):
+            raise ExecutorError("invalid_wave_memory_high")
+        memory_high = raw_memory_high.strip()
+        if _MEMORY_HIGH_PCT_RE.fullmatch(memory_high):
+            pct = float(memory_high[:-1])
+            if not math.isfinite(pct) or pct <= 0.0 or pct > 100.0:
+                raise ExecutorError("invalid_wave_memory_high")
+        elif not _MEMORY_HIGH_SIZE_RE.fullmatch(memory_high):
+            raise ExecutorError("invalid_wave_memory_high")
+
+    return {
+        "slice": slice_name,
+        "CPUWeight": cpu_weight,
+        "MemoryHigh": memory_high,
+    }
 
 
 def _git(repo: Path, *args: str, timeout: float = 15.0, deadline: float | None = None) -> str:
@@ -693,6 +751,7 @@ def _launch_worker(
     if not executor.local:
         unit = "workbay-job-" + _sha256(str(executor.git_dir) + ":" + job_id) + ".service"
         _update_state(job_dir / "state.json", job_unit=unit)
+        slice_props = resolve_wave_slice_properties(env)
         # env -i also removes Git routing inherited from the user manager.
         command = [
             "systemd-run",
@@ -700,9 +759,12 @@ def _launch_worker(
             "--quiet",
             "--collect",
             "--unit=" + unit,
+            "--slice=" + str(slice_props["slice"]),
             "--service-type=exec",
             "--expand-environment=no",
             "--property=Restart=no",
+            "--property=CPUWeight=" + str(slice_props["CPUWeight"]),
+            "--property=MemoryHigh=" + str(slice_props["MemoryHigh"]),
             "--property=WorkingDirectory=" + str(executor.repo),
             "--",
             "/usr/bin/env",

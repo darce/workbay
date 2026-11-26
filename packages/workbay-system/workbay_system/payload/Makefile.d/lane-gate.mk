@@ -203,6 +203,7 @@ if _unsafe_lane_id(lane):
 
 src_roots = [
     os.path.join(root, "packages", "mcp-workbay-orchestrator", "src"),
+    os.path.join(root, "packages", "mcp-workbay-handoff", "src"),
     os.path.join(root, "packages", "workbay-protocol", "src"),
 ]
 inherited_raw = os.environ.get("PYTHONPATH", "")
@@ -223,12 +224,16 @@ def _module_origin(name):
         return os.pathsep.join(os.path.realpath(path) for path in locations)
     return spec.origin or "unknown"
 
-package_names = ("workbay_orchestrator_mcp", "workbay_protocol")
-if all(os.path.isdir(src_root) for src_root in src_roots):
+package_names = ("workbay_orchestrator_mcp", "workbay_handoff_mcp", "workbay_protocol")
+required_src_roots = (
+    os.path.join(root, "packages", "mcp-workbay-orchestrator", "src"),
+    os.path.join(root, "packages", "workbay-protocol", "src"),
+)
+if all(os.path.isdir(src_root) for src_root in required_src_roots):
     # Preserve the monorepo path: the judge source trees take precedence over
     # site-packages, while inherited PYTHONPATH remains unavailable to imports
     # in this gate process.
-    sys.path[:0] = src_roots
+    sys.path[:0] = [src_root for src_root in src_roots if os.path.isdir(src_root)]
     judge_source_kind = "source_root"
     package_origins = {name: _module_origin(name) for name in package_names}
 else:

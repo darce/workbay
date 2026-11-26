@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.43] — 2026-11-26
+
+### Changed
+- Add `embedding_backfill_doctor` diagnostics and Antigravity CLI (`agy`) compaction parity (`internal`).
+- Enforce landing drain undo epoch guard and import replace merged guard (`agyc03`).
+- Refresh the protocol and optional lifecycle orchestrator dependency floors for WorkBay v0.1.103.
+
 ## [0.3.42] — 2026-11-26
 
 ### Fixed

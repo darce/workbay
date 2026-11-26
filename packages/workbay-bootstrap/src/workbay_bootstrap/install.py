@@ -586,6 +586,7 @@ CARVED_CHILD_IGNORED_NAMES: frozenset[str] = frozenset({"__pycache__", ".DS_Stor
 GENERATED_SURFACES: tuple[str, ...] = surfaces_for_kind("generated")
 
 from workbay_bootstrap.harnesses import (  # noqa: E402,F401,I001
+    AGY_PLUGINS_POINTER_PATH,
     CLAUDE_MARKETPLACE_PATH,
     CLAUDE_SETTINGS_PATH,
     CODEX_CONFIG_PATH,
@@ -600,12 +601,14 @@ from workbay_bootstrap.harnesses import (  # noqa: E402,F401,I001
     PLUGIN_SELECTOR,
     _codex_activation_root,
     _file_has_bytes,
+    agy_plugin_surface_problems,
     harness_materialized_surfaces as _harness_materialized_surfaces,
     materialize_cursor_plugin as _materialize_cursor_plugin,
     materialize_grok_plugin as _materialize_grok_plugin,
     plugin_tree_out as _plugin_tree_out,
     relative_plugin_tree_path as _relative_plugin_tree_path,
     resolve_in_clone,
+    write_agy_plugins_pointer,
     write_codex_plugin_activation_config as _write_codex_plugin_activation_config,
     write_plugin_activation,
     write_plugin_pins as _write_plugin_pins,

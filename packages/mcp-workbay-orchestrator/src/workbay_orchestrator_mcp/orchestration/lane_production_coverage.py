@@ -85,6 +85,7 @@ ROUTE_REGISTRY = MappingProxyType(
             "claude-remote",
             "claude-api-remote",
             "muse-remote",
+            "agy-remote",
             "cursor-cli",
             "structured-turn",
             "local-model-openai",

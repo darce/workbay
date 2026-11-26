@@ -421,6 +421,16 @@ OFFLOAD_AGENT_PROFILES: dict[str, OffloadAgentProfile] = {
         default_model=model_routing.MODEL_ROUTING_DEFAULTS["muse"],
         timeout_cap=BACKEND_TIMEOUT_BOUNDS["muse-remote"][1],
     ),
+    # Antigravity CLI on the VM: wall-clock-only bound (agy has no
+    # --max-turns), device-login credential port (see backend_registry).
+    "agy-remote": OffloadAgentProfile(
+        agent="agy-remote",
+        allowed_efforts=("low", "medium", "high", "xhigh", "max"),
+        single_cycle_bound=BOUND_ADAPTER_TIMEOUT,
+        pinned_model=model_routing.MODEL_ROUTING_DEFAULTS["agy"],
+        default_model=model_routing.MODEL_ROUTING_DEFAULTS["agy"],
+        timeout_cap=BACKEND_TIMEOUT_BOUNDS["agy-remote"][1],
+    ),
 }
 
 

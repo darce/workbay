@@ -3,6 +3,13 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.46] — 2026-11-26
+
+### Changed
+- Add native Antigravity CLI (`agy`) harness adapter, `.agents/plugins.json` and `effective/agy/mcp_config.json` projection, hook adapter, and `agy-cli` harness-protocol sync (`internal`).
+- Include `lane-gate.mk` `src_roots` (`agyc03`) and `render_tech_debt_index.py` maintenance tooling.
+- Refresh the protocol development dependency floor and align the shipped remote-agent boundary pin with the WorkBay v0.1.103 orchestrator (`0.3.49`).
+
 ## [0.4.45] — 2026-11-26
 
 ### Changed

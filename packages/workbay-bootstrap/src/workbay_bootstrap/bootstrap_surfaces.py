@@ -40,6 +40,7 @@ from workbay_bootstrap.harnesses import (
     materialize_cursor_plugin,
     materialize_grok_plugin_symlink,
     plugin_tree_out,
+    write_agy_plugins_pointer,
 )
 from workbay_bootstrap.install import (
     CLONE_SUBDIR,
@@ -200,6 +201,12 @@ def bootstrap_surfaces(*, target: Path, primary: Path | None = None) -> dict[str
                     configs.append(cursor_mcp)
             configs.append(write_plugin_activation("cursor", target, clone=payload_root))
             steps.append({"step": "cursor", "ok": True})
+
+        effective_agy = plugin_tree_out(target, "effective") / "agy"
+        if effective_agy.is_dir():
+            configs.append(write_agy_plugins_pointer(target))
+            configs.append(write_plugin_activation("agy-cli", target, clone=payload_root))
+            steps.append({"step": "agy", "ok": True})
     except (subprocess.SubprocessError, OSError, ClaudePermissionError) as exc:
         steps.append({"step": "emit", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
         return {

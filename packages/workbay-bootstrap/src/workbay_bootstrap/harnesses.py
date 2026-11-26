@@ -54,6 +54,7 @@ CLAUDE_MARKETPLACE_PATH = Path(".claude-plugin") / "marketplace.json"
 CLAUDE_SETTINGS_PATH = Path(".claude") / "settings.json"
 CODEX_MARKETPLACE_PATH = Path(".agents") / "plugins" / "marketplace.json"
 CODEX_CONFIG_PATH = Path(".codex") / "config.toml"
+AGY_PLUGINS_POINTER_PATH = Path(".agents") / "plugins.json"
 CURSOR_COMMANDS_DEST = Path(".cursor") / "commands"
 CURSOR_HOOKS_PATH = Path(".cursor") / "hooks.json"
 # Optional sibling of CURSOR_SKILLS_DEST: emitted skills link
@@ -476,12 +477,66 @@ class GrokHarnessAdapter:
         return surface, config
 
 
+@dataclass(frozen=True)
+class AgyCliHarnessAdapter:
+    key: str = "agy-cli"
+    tree_dir_name: str = "agy"
+    activation_kind: str = "agy_plugin_activation"
+    activation_path: Path = AGY_PLUGINS_POINTER_PATH
+
+    def marketplace_paths(self) -> tuple[str, ...]:
+        return (AGY_PLUGINS_POINTER_PATH.as_posix(),)
+
+    def materialized_paths(self) -> tuple[str, ...]:
+        return ()
+
+    def plugin_tree_dir(self, ctx: HarnessContext, kind: str) -> Path:
+        return plugin_tree_out(ctx.target, kind) / self.tree_dir_name
+
+    def pin_surfaces(self, ctx: HarnessContext, *, write_json: Any, deep_merge: Any) -> list[dict[str, str]]:
+        del deep_merge
+        merged = merge_agy_plugins_pointer(ctx.target, plugin_tree_kind=ctx.plugin_tree_kind)
+        return [
+            write_json(
+                ctx.target / AGY_PLUGINS_POINTER_PATH,
+                merged,
+                manifest_path=AGY_PLUGINS_POINTER_PATH.as_posix(),
+            ),
+        ]
+
+    def activation_step(self, ctx: HarnessContext) -> dict[str, str]:
+        if plugin_activation_row(ctx.clone, self.key) is None:
+            return {
+                "path": self.activation_path.as_posix(),
+                "action": "skipped_no_contract",
+                "kind": self.activation_kind,
+            }
+        write_agy_plugins_pointer(ctx.target, plugin_tree_kind=ctx.plugin_tree_kind)
+        problems = agy_plugin_surface_problems(ctx.target)
+        if problems:
+            return {
+                "path": self.activation_path.as_posix(),
+                "action": "failed",
+                "kind": self.activation_kind,
+                "message": "; ".join(problems),
+            }
+        return {
+            "path": self.activation_path.as_posix(),
+            "action": "applied",
+            "kind": self.activation_kind,
+        }
+
+    def materialization(self, ctx: HarnessContext) -> tuple[dict[str, str], dict[str, str]] | None:
+        return None
+
+
 HARNESSES: dict[str, HarnessAdapter] = {
     "claude-code": ClaudeHarnessAdapter(),
     "codex": CodexHarnessAdapter(),
     "cursor": CursorHarnessAdapter(),
     "vscode": VscodeHarnessAdapter(),
     "grok": GrokHarnessAdapter(),
+    "agy-cli": AgyCliHarnessAdapter(),
 }
 
 HARNESS_PLUGIN_DELIVERY: dict[str, dict[str, tuple[str, ...]]] = {
@@ -635,7 +690,7 @@ def write_plugin_pins(
         override_root=override_root,
     )
     entries: list[dict[str, str]] = []
-    for adapter in (HARNESSES["claude-code"], HARNESSES["codex"]):
+    for adapter in (HARNESSES["claude-code"], HARNESSES["codex"], HARNESSES["agy-cli"]):
         entries.extend(adapter.pin_surfaces(ctx, write_json=write_json_file, deep_merge=deep_merge))
     if include_codex_activation:
         entries.append(write_codex_plugin_activation_config(target))
@@ -1534,4 +1589,222 @@ def grok_plugin_surface_problems(target: Path) -> list[str]:
         actual_skills = {path.name for path in (dest_root / "skills").iterdir() if path.is_dir()}
         if expected_skills != actual_skills:
             problems.append("skills/ slug set differs from effective grok plugin tree")
+    return problems
+
+
+def expected_agy_plugins_entry(plugin_tree_kind: str = "effective") -> dict[str, Any]:
+    """Canonical ``.agents/plugins.json`` entry for the WorkBay agy plugin."""
+    return {
+        "path": "./" + Path(*PLUGIN_GENERATED_ROOT, plugin_tree_kind).as_posix(),
+        "include_only": ["agy"],
+    }
+
+
+def _normalize_rel_pointer_path(raw: str) -> str:
+    cleaned = raw.strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.rstrip("/")
+
+
+def _is_managed_agy_entry_path(raw_path: object) -> bool:
+    if not isinstance(raw_path, str):
+        return False
+    normalized = _normalize_rel_pointer_path(raw_path)
+    return normalized in {
+        Path(*PLUGIN_GENERATED_ROOT, "effective").as_posix(),
+        Path(*PLUGIN_GENERATED_ROOT, "base").as_posix(),
+    }
+
+
+def merge_agy_plugins_pointer(
+    target: Path,
+    *,
+    plugin_tree_kind: str = "effective",
+) -> dict[str, Any]:
+    """Render ``.agents/plugins.json`` preserving unrelated user entries and keys."""
+    expected = expected_agy_plugins_entry(plugin_tree_kind)
+    pointer_path = target / AGY_PLUGINS_POINTER_PATH
+    payload: dict[str, Any] = {}
+    if pointer_path.is_file():
+        try:
+            loaded = json.loads(pointer_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload = dict(loaded)
+
+    raw_entries = payload.get("entries")
+    existing_entries = list(raw_entries) if isinstance(raw_entries, list) else []
+    merged_entries: list[Any] = []
+    updated_managed = False
+
+    for entry in existing_entries:
+        if isinstance(entry, dict) and _is_managed_agy_entry_path(entry.get("path")):
+            if updated_managed:
+                continue
+            updated = dict(entry)
+            updated["path"] = expected["path"]
+            include_only = updated.get("include_only")
+            if isinstance(include_only, list) and all(isinstance(item, str) for item in include_only):
+                if "agy" not in include_only:
+                    updated["include_only"] = [*include_only, "agy"]
+            else:
+                updated["include_only"] = ["agy"]
+            merged_entries.append(updated)
+            updated_managed = True
+        else:
+            merged_entries.append(entry)
+
+    if not updated_managed:
+        merged_entries.append(expected)
+
+    payload["entries"] = merged_entries
+    return payload
+
+
+def write_agy_plugins_pointer(
+    target: Path,
+    *,
+    plugin_tree_kind: str = "effective",
+) -> dict[str, str]:
+    """Write or merge ``.agents/plugins.json`` without clobbering user entries."""
+    from workbay_bootstrap.fsutil import write_json_file
+
+    merged = merge_agy_plugins_pointer(target, plugin_tree_kind=plugin_tree_kind)
+    return write_json_file(
+        target / AGY_PLUGINS_POINTER_PATH,
+        merged,
+        manifest_path=AGY_PLUGINS_POINTER_PATH.as_posix(),
+    )
+
+
+def agy_plugin_surface_problems(target: Path) -> list[str]:
+    """Validate ``.agents/plugins.json`` and in-worktree ``effective/agy`` containment."""
+    from workbay_bootstrap.subcommands import _plugin_tree_integrity_problems
+
+    problems: list[str] = []
+    pointer_path = target / AGY_PLUGINS_POINTER_PATH
+    expected_rel = Path(*PLUGIN_GENERATED_ROOT, "effective").as_posix()
+
+    if not pointer_path.is_file():
+        problems.append(f"{AGY_PLUGINS_POINTER_PATH.as_posix()} is missing")
+    else:
+        try:
+            payload = json.loads(pointer_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            problems.append(f"{AGY_PLUGINS_POINTER_PATH.as_posix()} is invalid JSON: {exc}")
+            payload = None
+        if payload is not None:
+            if not isinstance(payload, dict):
+                problems.append(f"{AGY_PLUGINS_POINTER_PATH.as_posix()} must be a JSON object")
+            else:
+                entries = payload.get("entries")
+                if not isinstance(entries, list):
+                    problems.append(f"{AGY_PLUGINS_POINTER_PATH.as_posix()} entries must be a list")
+                else:
+                    matched = False
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        raw_path = entry.get("path")
+                        if not isinstance(raw_path, str):
+                            continue
+                        if Path(raw_path).is_absolute() and (
+                            raw_path.rstrip("/").endswith(expected_rel)
+                            or raw_path.rstrip("/").endswith(f"{expected_rel}/agy")
+                        ):
+                            problems.append(
+                                f"{AGY_PLUGINS_POINTER_PATH.as_posix()} entry path must be workspace-relative "
+                                "(agy refuses absolute paths outside workspace)"
+                            )
+                            matched = True
+                            break
+                        if _normalize_rel_pointer_path(raw_path) != expected_rel:
+                            continue
+                        include_only = entry.get("include_only")
+                        if include_only is not None and (
+                            not isinstance(include_only, list) or "agy" not in include_only
+                        ):
+                            problems.append(
+                                f"{AGY_PLUGINS_POINTER_PATH.as_posix()} entry for {expected_rel} "
+                                "must include 'agy' in include_only"
+                            )
+                        matched = True
+                        break
+                    if not matched:
+                        problems.append(
+                            f"{AGY_PLUGINS_POINTER_PATH.as_posix()} is missing effective agy entry"
+                        )
+
+    target_resolved = target.resolve()
+    effective_agy = plugin_tree_out(target, "effective") / "agy"
+    if not effective_agy.exists() and not effective_agy.is_symlink():
+        problems.append("effective/agy plugin directory is missing")
+        return problems
+
+    rel_parts = effective_agy.relative_to(target).parts
+    cur = target
+    symlink_ancestor: Path | None = None
+    for part in rel_parts:
+        cur = cur / part
+        if cur.is_symlink():
+            symlink_ancestor = cur
+            break
+
+    if symlink_ancestor is not None:
+        try:
+            resolved = effective_agy.resolve(strict=False)
+            resolved.relative_to(target_resolved)
+            escapes = False
+        except (OSError, ValueError):
+            escapes = True
+        anc_rel = symlink_ancestor.relative_to(target).as_posix()
+        if escapes:
+            problems.append(
+                f"effective/agy resolves outside workspace via symlink {anc_rel} "
+                "(agy refuses symlinks escaping worktree root)"
+            )
+        else:
+            problems.append(
+                f"effective/agy must be a real directory inside workspace, not symlink {anc_rel}"
+            )
+    elif not effective_agy.is_dir():
+        problems.append("effective/agy is not a directory")
+        return problems
+    else:
+        try:
+            effective_agy.resolve().relative_to(target_resolved)
+        except (OSError, ValueError):
+            problems.append("effective/agy resolves outside workspace")
+        for dirpath, dirnames, filenames in os.walk(effective_agy, followlinks=False):
+            cur_dir = Path(dirpath)
+            dirnames.sort()
+            for name in (*dirnames, *sorted(filenames)):
+                entry = cur_dir / name
+                entry_rel = entry.relative_to(effective_agy).as_posix()
+                if entry.is_symlink():
+                    try:
+                        entry.resolve(strict=False).relative_to(target_resolved)
+                        escapes = False
+                    except (OSError, ValueError):
+                        escapes = True
+                    if escapes:
+                        problems.append(
+                            f"effective/agy/{entry_rel} resolves outside workspace via symlink "
+                            "(agy refuses symlinks escaping worktree root)"
+                        )
+                    else:
+                        problems.append(
+                            f"effective/agy/{entry_rel} must not be a symlink inside effective/agy"
+                        )
+                else:
+                    try:
+                        entry.resolve(strict=False).relative_to(target_resolved)
+                    except (OSError, ValueError):
+                        problems.append(f"effective/agy/{entry_rel} resolves outside workspace")
+
+    if effective_agy.is_dir():
+        problems.extend(_plugin_tree_integrity_problems(effective_agy, "agy"))
+
     return problems

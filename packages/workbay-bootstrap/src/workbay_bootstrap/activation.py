@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from workbay_bootstrap.harnesses import (
+    AGY_PLUGINS_POINTER_PATH,
     GROK_BARE_SELECTOR,
     GROK_PLUGIN_DEST,
+    agy_plugin_surface_problems,
     detect_stale_grok_discovery_selectors,
     grok_bare_selector_enabled,
     grok_dest_is_unmanaged_dir,
@@ -19,7 +21,9 @@ from workbay_bootstrap.harnesses import (
     grok_surface_is_foreign_local,
     load_harness_protocol,
     materialize_grok_plugin_symlink,
+    merge_agy_plugins_pointer,
     plugin_activation_row,
+    write_agy_plugins_pointer,
     write_plugin_activation as _write_plugin_activation,
 )
 from workbay_bootstrap.harnesses import (
@@ -29,9 +33,11 @@ from workbay_bootstrap.harnesses import (
 from workbay_bootstrap.harnesses import activate_grok_plugin as _activate_grok_plugin
 
 __all__ = [
+    "AGY_PLUGINS_POINTER_PATH",
     "GROK_BARE_SELECTOR",
     "GROK_PLUGIN_DEST",
     "activate_grok_plugin",
+    "agy_plugin_surface_problems",
     "detect_stale_grok_discovery_selectors",
     "grok_bare_selector_enabled",
     "grok_dest_is_unmanaged_dir",
@@ -39,7 +45,9 @@ __all__ = [
     "grok_surface_is_foreign_local",
     "load_harness_protocol",
     "materialize_grok_plugin_symlink",
+    "merge_agy_plugins_pointer",
     "plugin_activation_row",
+    "write_agy_plugins_pointer",
     "write_plugin_activation",
 ]
 

@@ -140,6 +140,7 @@ _PLUGIN_OVERRIDE_MANIFEST = "overrides.yaml"
 BOOTSTRAP_SEPARATED_OVERRIDE_COMPONENTS = frozenset({"claude_permissions", "claude_settings_shared"})
 _PLUGIN_EFFECTIVE_LOCK = "plugin-lock.json"
 _PLUGIN_HARNESSES: tuple[tuple[str, str], ...] = (
+    ("agy", "."),
     ("claude", ".claude-plugin"),
     ("codex", ".codex-plugin"),
     ("cursor", ".cursor-plugin"),
@@ -302,7 +303,7 @@ def _parse_args() -> argparse.Namespace:
         choices=("legacy", "plugin"),
         default="legacy",
         help="Generator emission mode. 'legacy' (default) emits per-host "
-        "adapter files; 'plugin' (internal) emits Claude/Codex/Grok plugin trees "
+        "adapter files; 'plugin' (internal) emits Agy/Claude/Codex/Cursor/Grok plugin trees "
         "from the canonical skills + portable_commands + mcp_servers.yaml inputs.",
     )
     parser.add_argument(
@@ -315,7 +316,7 @@ def _parse_args() -> argparse.Namespace:
         "--plugin-out",
         type=Path,
         help="Destination root for emitted plugin trees (required when --mode=plugin). "
-        "Trees are written to <plugin-out>/{claude,codex,cursor,grok}/.",
+        "Trees are written to <plugin-out>/{agy,claude,codex,cursor,grok}/.",
     )
     parser.add_argument(
         "--plugin-overrides",
@@ -2096,31 +2097,38 @@ def _load_mcp_servers_manifest(path: Path) -> dict:
 
 
 def _render_mcp_servers_json(mcp_manifest: dict, harness: str) -> str:
-    """Render the .mcp.json blob for the requested harness.
+    """Render the plugin MCP config JSON blob for the requested harness.
 
     Servers whose ``harnesses`` list excludes the harness are skipped.
     Output ordering follows the manifest insertion order; each entry
-    carries ``"type": "stdio"`` to stay compatible with the bootstrap
-    install path. Claude Code uses the camelCase ``mcpServers`` wrapper
-    for plugin MCP config; Codex CLI 0.131.0 rejects wrapped plugin MCP
-    config as an invalid server entry, so Codex receives the bare server
-    map shape.
+    carries ``"type": "stdio"`` for Claude/Cursor/Grok/Codex to stay
+    compatible with the bootstrap install path. ``agy`` uses root
+    ``mcp_config.json`` with ``{"mcpServers": {...}}`` and omits ``"type"``.
+    Codex CLI 0.131.0 rejects wrapped plugin MCP config as an invalid server
+    entry, so Codex receives the bare server map shape.
     """
     entries: dict[str, dict] = {}
     for server in mcp_manifest["mcp_servers"]:
         harnesses = server.get("harnesses") or []
         if harnesses and harness not in harnesses:
             continue
-        entries[server["name"]] = {
-            "type": "stdio",
-            "command": server["command"],
-            "args": list(server.get("args", [])),
-        }
+        if harness == "agy":
+            entry: dict[str, object] = {
+                "command": server["command"],
+                "args": list(server.get("args", [])),
+            }
+        else:
+            entry = {
+                "type": "stdio",
+                "command": server["command"],
+                "args": list(server.get("args", [])),
+            }
         env = server.get("env")
         if isinstance(env, dict) and env:
-            entries[server["name"]]["env"] = dict(env)
-    if harness in {"claude", "cursor", "grok"}:
-        payload = {"mcpServers": entries}
+            entry["env"] = dict(env)
+        entries[server["name"]] = entry
+    if harness in {"agy", "claude", "cursor", "grok"}:
+        payload: dict[str, object] = {"mcpServers": entries}
     elif harness == "codex":
         payload = entries
     else:
@@ -2238,6 +2246,129 @@ def _render_grok_plugin_hooks_json(harness_protocol: dict) -> str:
         )
     payload = {"hooks": {"PreToolUse": entries}}
     return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _render_agy_plugin_hooks_json(harness_protocol: dict) -> str:
+    """Project WorkBay hooks into the ``agy`` plugin root ``hooks.json`` surface.
+
+    ``agy`` uses top-level named hook groups (``workbay-guards`` and
+    ``workbay-lifecycle``). ``PreToolUse`` uses grouped ``{matcher, hooks}``
+    entries, while ``SessionStart``, ``PreInvocation``, and ``Stop`` use flat
+    arrays of handler objects invoking ``python3 ./hooks/run.py <hook>``.
+    """
+    hooks_spec = harness_protocol.get("hooks") or {}
+    pre_entries: list[dict[str, object]] = []
+    for row in hooks_spec.get("pre_tool_use") or []:
+        if not isinstance(row, dict):
+            continue
+        guard_id = row.get("id", "<unknown>")
+        agy_command = render_hook_command(row, "agy_command")
+        has_command = isinstance(agy_command, str) and bool(agy_command.strip())
+        agy_enabled = row.get("agy_enabled")
+        if agy_enabled is False and has_command:
+            raise ValueError(
+                f"pre_tool_use guard {guard_id!r} cannot declare agy_command "
+                "while agy_enabled is false"
+            )
+        if not has_command:
+            reason = row.get("unsupported_reason")
+            if not (
+                agy_enabled is False
+                and isinstance(reason, str)
+                and reason.strip()
+            ):
+                raise ValueError(
+                    f"pre_tool_use guard {guard_id!r} must declare agy_command "
+                    "or opt out via agy_enabled: false plus a non-empty "
+                    "unsupported_reason"
+                )
+            continue
+        matcher = row.get("agy_matcher", row.get("matcher", ""))
+        pre_entries.append(
+            {
+                "matcher": matcher,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": agy_command,
+                    }
+                ],
+            }
+        )
+
+    session_start_entries: list[dict[str, object]] = []
+    for row in hooks_spec.get("session_start") or []:
+        if not isinstance(row, dict) or row.get("agy_enabled") is False:
+            continue
+        agy_command = render_hook_command(row, "agy_command")
+        if isinstance(agy_command, str) and agy_command.strip():
+            session_start_entries.append(
+                {
+                    "type": "command",
+                    "command": agy_command,
+                }
+            )
+
+    pre_invocation_entries: list[dict[str, object]] = []
+    for row in hooks_spec.get("user_prompt_submit") or []:
+        if not isinstance(row, dict) or row.get("agy_enabled") is False:
+            continue
+        agy_command = render_hook_command(row, "agy_command")
+        if isinstance(agy_command, str) and agy_command.strip():
+            pre_invocation_entries.append(
+                {
+                    "type": "command",
+                    "command": agy_command,
+                }
+            )
+
+    compact_cmds = (
+        (harness_protocol.get("bootstrap_overlay") or {}).get("compact_session_command")
+        or {}
+    )
+    stop_command = compact_cmds.get("agy_cli") or "python3 ./hooks/run.py compact-session.py"
+    stop_entries: list[dict[str, object]] = [
+        {
+            "type": "command",
+            "command": stop_command,
+        }
+    ]
+
+    lifecycle: dict[str, object] = {}
+    if session_start_entries:
+        lifecycle["SessionStart"] = session_start_entries
+    if pre_invocation_entries:
+        lifecycle["PreInvocation"] = pre_invocation_entries
+    if stop_entries:
+        lifecycle["Stop"] = stop_entries
+
+    payload: dict[str, object] = {
+        "workbay-guards": {
+            "PreToolUse": pre_entries,
+        },
+        "workbay-lifecycle": lifecycle,
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _render_agy_rules_agents_md(harness_protocol: dict) -> str:
+    """Render the canonical ``agy`` plugin rules file at ``rules/AGENTS.md``."""
+    routing_table = _render_harness_routing_table(harness_protocol).rstrip()
+    return (
+        "# WorkBay System Rules (agy)\n\n"
+        "Follow `docs/workbay/instructions.md` and the active workspace `AGENTS.md`.\n"
+        "Use the bundled WorkBay skills under `skills/` and MCP servers declared in "
+        "`mcp_config.json`.\n\n"
+        "## Review-Parallel Harness Routing\n\n"
+        f"{routing_table}\n"
+    )
+
+
+def _load_agy_hook_adapter_source() -> str:
+    adapter_path = _repo_root() / "scripts" / "hooks" / "_agy_hook_adapter.py"
+    if not adapter_path.is_file():
+        raise SystemExit(f"missing agy hook adapter source: {adapter_path}")
+    return adapter_path.read_text(encoding="utf-8")
 
 
 def _render_plugin_skill(
@@ -2961,6 +3092,9 @@ def _expected_plugin_outputs(
             for component in effective_components
         ]
     grok_hooks_body = _render_grok_plugin_hooks_json(harness_protocol)
+    agy_hooks_body = _render_agy_plugin_hooks_json(harness_protocol)
+    agy_rules_body = _render_agy_rules_agents_md(harness_protocol)
+    agy_adapter_body = _load_agy_hook_adapter_source()
     cursor_hooks_body = render_hooks_config_text(
         render_cursor_hooks_config(harness_protocol.get("hooks") or {})
     )
@@ -2968,17 +3102,27 @@ def _expected_plugin_outputs(
     for harness, plugin_dir in _PLUGIN_HARNESSES:
         harness_root = plugin_out / harness
         plugin_owns_mcp = registration[harness] == "plugin"
-        outputs[harness_root / plugin_dir / "plugin.json"] = (
-            _render_plugin_manifest_json(
-                plugin_version,
-                include_mcp_servers=plugin_owns_mcp,
-                include_commands=harness == "claude",
-            )
+        manifest_path = (
+            harness_root / "plugin.json"
+            if plugin_dir == "."
+            else harness_root / plugin_dir / "plugin.json"
+        )
+        outputs[manifest_path] = _render_plugin_manifest_json(
+            plugin_version,
+            # agy auto-discovers root mcp_config.json and rejects unknown
+            # `mcpServers` fields in plugin.json under `--strict`.
+            include_mcp_servers=plugin_owns_mcp and harness != "agy",
+            include_commands=harness == "claude",
         )
         if plugin_owns_mcp:
-            outputs[harness_root / ".mcp.json"] = _render_mcp_servers_json(
+            mcp_filename = "mcp_config.json" if harness == "agy" else ".mcp.json"
+            outputs[harness_root / mcp_filename] = _render_mcp_servers_json(
                 mcp_manifest, harness
             )
+        if harness == "agy":
+            outputs[harness_root / "hooks.json"] = agy_hooks_body
+            outputs[harness_root / "hooks" / "run.py"] = agy_adapter_body
+            outputs[harness_root / "rules" / "AGENTS.md"] = agy_rules_body
         if harness == "grok":
             outputs[harness_root / "hooks" / "hooks.json"] = grok_hooks_body
         if harness == "cursor":

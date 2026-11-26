@@ -29,6 +29,7 @@ BACKEND_TIMEOUT_BOUNDS = {
     "claude-remote": (3600, 3600),
     "claude-api-remote": (3600, 3600),
     "muse-remote": (1800, 1800),
+    "agy-remote": (1800, 1800),
 }
 
 

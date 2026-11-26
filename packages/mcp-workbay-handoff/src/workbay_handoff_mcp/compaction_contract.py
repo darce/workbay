@@ -26,10 +26,15 @@ _PACKAGE_REFERENCE_CONTRACT_RELATIVE_PATH = (
     Path("packages/workbay-system/workbay_system/payload") / HARNESS_CONTRACT_RELPATH
 )
 _OVERLAY_MANIFEST_NAMES = MANIFEST_NAME_PRECEDENCE
-_CANONICAL_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "manual")
-_HARNESS_ALIASES: dict[str, str] = {"cursor": "vscode"}
+_CANONICAL_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "agy-cli", "manual")
+_HARNESS_ALIASES: dict[str, str] = {
+    "cursor": "vscode",
+    "agy": "agy-cli",
+    "agy-app": "agy-cli",
+    "agy-ide": "agy-cli",
+}
 
-CompactionContractHarness = Literal["claude-code", "codex", "grok", "vscode", "manual"]
+CompactionContractHarness = Literal["claude-code", "codex", "grok", "vscode", "agy-cli", "manual"]
 
 
 class TranscriptDiscoveryRule(BaseModel):
@@ -380,8 +385,13 @@ def _resolve_contract_path(workspace_root: Path) -> Path | None:
     return None
 
 
-def _load_compaction_contract_at_path(contract_path: Path) -> CompactionContract:
-    payload = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+def _load_compaction_contract_at_path(
+    contract_path: Path,
+    *,
+    content: bytes | None = None,
+) -> CompactionContract:
+    raw = content.decode("utf-8") if content is not None else contract_path.read_text(encoding="utf-8")
+    payload = yaml.safe_load(raw) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Compaction contract at {contract_path} must be a mapping")
     compaction_payload = payload.get("compaction")
@@ -445,24 +455,35 @@ def _cached_compaction_contract(contract_path: Path, mtime_ns: int, size: int, i
     return _load_compaction_contract_at_path(contract_path)
 
 
-def load_compaction_contract(workspace_root: str | Path) -> CompactionContract:
-    """Return a private deep copy of the file-identity-cached contract.
+def load_compaction_contract(
+    workspace_root: str | Path,
+    *,
+    contract_path: Path | None = None,
+    content: bytes | None = None,
+) -> CompactionContract:
+    """Return a private deep copy of the file-identity-cached contract, or parse a snapshot.
 
-    Resolve the path and stat the file on every call. An edit is seen on the
+    When both ``contract_path`` and ``content`` are supplied, parse the caller's
+    single-read bytes directly via ``_load_compaction_contract_at_path`` without
+    re-reading disk (preserving content-addressed TOCTOU guarantees). Otherwise
+    resolve the path and stat the file on every call. An edit is seen on the
     next call unless it keeps size, mtime (nanoseconds), and inode identical.
     Environment-dependent harness/threshold resolution is never cached here.
     Nested models, dictionaries, and lists are copied so callers cannot mutate
     the cached value. Failed loads are not cached.
     """
+    if contract_path is not None and content is not None:
+        return _load_compaction_contract_at_path(contract_path, content=content)
+
     root_path = Path(workspace_root).expanduser().resolve()
-    contract_path = _resolve_contract_path(root_path)
-    if contract_path is None:
+    resolved_contract_path = _resolve_contract_path(root_path)
+    if resolved_contract_path is None:
         raise FileNotFoundError(f"No compaction contract found under {root_path}")
 
-    contract_path = contract_path.resolve()
-    identity = contract_path.stat()
+    resolved_contract_path = resolved_contract_path.resolve()
+    identity = resolved_contract_path.stat()
     return _cached_compaction_contract(
-        contract_path, identity.st_mtime_ns, identity.st_size, identity.st_ino
+        resolved_contract_path, identity.st_mtime_ns, identity.st_size, identity.st_ino
     ).model_copy(deep=True)
 
 

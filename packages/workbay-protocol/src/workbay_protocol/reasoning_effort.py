@@ -58,6 +58,7 @@ class ModelId:
     CLAUDE_SONNET_4 = "claude-sonnet-4"
     CLAUDE_OPUS_4 = "claude-opus-4"
     MUSE = "muse-wonder-1.0"
+    AGY_DEFAULT = "gemini-4-neon-high"
 
     OPENROUTER_MIMO = "xiaomi/mimo-v2.6-pro"
     OPENROUTER_GLM = "z-ai/glm-5.3-flash"
@@ -81,6 +82,7 @@ MODEL_ROUTING_DEFAULTS: dict[str, str] = {
     "cursor": ModelId.CURSOR_GROK_45_HIGH_FAST,
     "claude": ModelId.CLAUDE_SONNET,
     "muse": ModelId.MUSE,
+    "agy": ModelId.AGY_DEFAULT,
     "openrouter": ModelId.OPENROUTER_MIMO,
     "plan_review": ModelId.CODEX_SENIOR,
     "preflight_probe": ModelId.CODEX_LEGACY_SENIOR,

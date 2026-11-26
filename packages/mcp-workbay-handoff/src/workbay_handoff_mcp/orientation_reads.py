@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
 
+from .compaction_contract import normalize_compaction_harness
 from .shared_schema import _get_db_connection
 
 # internal: orientation-read instrumentation is opt-IN and gated on a
@@ -69,43 +70,66 @@ def _normalize_harness_slug(value: str) -> str:
     return slug or "unknown"
 
 
-# Boolean harness flags carry no slug (e.g. Claude Code exports
-# ``CLAUDECODE='1'``); presence maps to the harness identity so the
-# ``harness`` column stores ``'claude_code'`` rather than ``'1'``.
-_HARNESS_FLAG_SLUGS: tuple[tuple[str, str], ...] = (("CLAUDECODE", "claude_code"),)
+# Presence-only harness markers that carry no canonical slug (e.g. Claude Code
+# exports ``CLAUDECODE='1'``; Antigravity exports ``ANTIGRAVITY_AGENTAPI_EXE``
+# / ``ANTIGRAVITY_SOURCE_METADATA``).
+_HARNESS_FLAG_CANONICAL: tuple[tuple[str, str], ...] = (
+    ("ANTIGRAVITY_AGENTAPI_EXE", "agy-cli"),
+    ("ANTIGRAVITY_SOURCE_METADATA", "agy-cli"),
+    ("CLAUDECODE", "claude-code"),
+)
 
 
-def _infer_harness_from_env_contract() -> str | None:
+def _normalize_canonical_harness(value: str) -> str:
+    try:
+        return normalize_compaction_harness(value)
+    except ValueError:
+        slug = value.strip().lower().replace("_", "-").replace(" ", "-")
+        return slug or "unknown"
+
+
+def _infer_harness_from_env_contract(env: Mapping[str, str] | None = None) -> str | None:
     """Env-derived harness slug via the shared compaction-contract normalizer."""
     try:
         from .shared_write_context import _infer_harness_agent_from_env  # noqa: PLC0415
 
-        return _infer_harness_agent_from_env()
+        return _infer_harness_agent_from_env(env=env)
     except Exception:  # noqa: BLE001 -- never fail a read on harness detection
         return None
+
+
+def detect_caller_harness(env: Mapping[str, str] | None = None) -> str:
+    """Detect the canonical caller harness identifier (hyphenated, e.g. ``agy-cli``).
+
+    Precedence: explicit ``WORKBAY_HARNESS``/``CODEX_HARNESS`` override (normalized
+    through the compaction harness alias table so ``agy``/``agy-app``/``agy-ide``
+    resolve to ``agy-cli``) → transcript-var/identity-marker contract detection →
+    presence-only runtime markers (``ANTIGRAVITY_AGENTAPI_EXE``,
+    ``ANTIGRAVITY_SOURCE_METADATA``, ``CLAUDECODE``) → ``'unknown'``.
+    """
+    source = env if env is not None else os.environ
+    explicit = _normalize_optional(source.get("WORKBAY_HARNESS")) or _normalize_optional(
+        source.get("CODEX_HARNESS")
+    )
+    if explicit:
+        return _normalize_canonical_harness(explicit)
+    inferred = _infer_harness_from_env_contract(source)
+    if inferred:
+        return _normalize_canonical_harness(inferred)
+    for env_var, canonical in _HARNESS_FLAG_CANONICAL:
+        if _normalize_optional(source.get(env_var)):
+            return canonical
+    return "unknown"
 
 
 def resolve_harness() -> str:
     """Resolve a harness *slug* for the telemetry row.
 
-    Precedence: explicit ``WORKBAY_HARNESS``/``CODEX_HARNESS`` override →
-    transcript-var contract detection (``_infer_harness_agent_from_env`` /
-    ``detect_active_harness``) → boolean harness flag (``CLAUDECODE``) →
-    ``'unknown'``. Raw env values are normalized to a hyphen-free slug so a
-    boolean flag never leaks its literal value into the ``harness`` column.
+    Delegates to :func:`detect_caller_harness` and normalizes to a hyphen-free
+    underscore slug so a boolean flag never leaks its literal value into the
+    ``harness`` column.
     """
-    explicit = _normalize_optional(os.environ.get("WORKBAY_HARNESS")) or _normalize_optional(
-        os.environ.get("CODEX_HARNESS")
-    )
-    if explicit:
-        return _normalize_harness_slug(explicit)
-    inferred = _infer_harness_from_env_contract()
-    if inferred:
-        return _normalize_harness_slug(inferred)
-    for env_var, slug in _HARNESS_FLAG_SLUGS:
-        if _normalize_optional(os.environ.get(env_var)):
-            return slug
-    return "unknown"
+    return _normalize_harness_slug(detect_caller_harness())
 
 
 def record_orientation_read(

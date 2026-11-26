@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.26] — 2026-11-26
+
+### Changed
+- Add Antigravity CLI (`agy`) harness and `agy-remote` backend protocol contracts (`internal`, `internal`).
+- Advance the protocol package version for the WorkBay v0.1.103 Git release.
+
 ## [0.3.25] — 2026-11-26
 
 ### Changed

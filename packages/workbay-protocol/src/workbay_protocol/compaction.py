@@ -9,6 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .handoff import TaskRef
 
+COMPACTION_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "agy-cli", "manual")
+COMPACTION_HARNESS_ALIASES: dict[str, str] = {
+    "cursor": "vscode",
+    "agy": "agy-cli",
+    "agy-app": "agy-cli",
+    "agy-ide": "agy-cli",
+}
+CompactionHarnessLiteral = Literal["claude-code", "codex", "grok", "vscode", "agy-cli", "manual"]
+
 
 class DecisionRef(BaseModel):
     """Stable decision pointer captured in a compaction summary."""
@@ -41,7 +50,7 @@ class StructuredSummary(BaseModel):
 
     compaction_id: str = Field(description="Server-generated stable compaction handle.")
     session_id: str = Field(description="Harness session identifier for the compacted transcript span.")
-    harness: Literal["claude-code", "codex", "grok", "vscode", "manual"] = Field(
+    harness: CompactionHarnessLiteral = Field(
         description="Harness that produced the compaction record."
     )
     task_ref: TaskRef
@@ -63,6 +72,4 @@ class StructuredSummary(BaseModel):
         if not isinstance(value, str):
             return value
         normalized = value.strip().lower()
-        if normalized == "cursor":
-            return "vscode"
-        return normalized
+        return COMPACTION_HARNESS_ALIASES.get(normalized, normalized)

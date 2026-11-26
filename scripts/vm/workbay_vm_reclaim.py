@@ -1192,9 +1192,10 @@ def _custody_git(arguments, deadline=None, stdin=None):
             raise ScanDeadline
     env = {key: value for key, value in os.environ.items() if key not in CUSTODY_GIT_ENV_DROP}
     try:
-        return subprocess.run(["git", *arguments], capture_output=True, text=True, timeout=timeout, check=False,
-                              input=stdin, env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
-                                                "GIT_NO_LAZY_FETCH": "1"})
+        return subprocess.run(["git", *arguments], capture_output=True, text=True, errors="replace",
+                              timeout=timeout, check=False, input=stdin,
+                              env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+                                   "GIT_NO_LAZY_FETCH": "1"})
     except subprocess.TimeoutExpired:
         if deadline is not None and timeout < CUSTODY_GIT_TIMEOUT_SECONDS:
             raise ScanDeadline from None
@@ -1215,24 +1216,83 @@ def _commit_name(value):
     return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) else None
 
 
-def _own_git_dir(slot):
-    """The slot's own object store: a real .git dir or a bare repo; links and gitfiles live elsewhere."""
-    if slot.is_symlink() or not slot.is_dir():
+def _read_git_path(path, *, gitfile=False, base=None):
+    """Read a bounded gitfile or commondir pointer and resolve it to a real directory."""
+    try:
+        raw = read_regular(path).decode("utf-8").rstrip("\r\n")
+    except (OSError, ValueError) as exc:
+        raise CustodyUnknown("source_gitdir_unreadable") from exc
+    if gitfile:
+        if not raw.startswith("gitdir: "):
+            raise CustodyUnknown("source_gitdir_unreadable")
+        raw = raw[len("gitdir: "):]
+    if not raw or any(ch in raw for ch in "\x00\r\n"):
+        raise CustodyUnknown("source_gitdir_unreadable")
+    target = Path(raw)
+    if not target.is_absolute():
+        target = (path.parent if base is None else base) / target
+    resolved = Path(os.path.realpath(target))
+    if not resolved.is_dir():
+        raise CustodyUnknown("source_gitdir_unreadable")
+    return resolved
+
+
+def _own_git_dir(slot, job_root=None):
+    """Resolve slot, .git symlink, gitfile, and commondir; return git dir if it lives inside job_root.
+
+    Git dirs resolving outside job_root (e.g. a sibling lender job) are left to the lender census.
+    """
+    if not os.path.lexists(slot):
         return None
-    dot_git = slot / ".git"
-    if dot_git.is_dir() and not dot_git.is_symlink():
-        return dot_git
-    if not os.path.lexists(dot_git) and (slot / "HEAD").is_file() and (slot / "objects").is_dir():
-        return slot
-    return None
+    job_real = Path(os.path.realpath(job_root if job_root is not None else slot.parent))
+    slot_real = Path(os.path.realpath(slot))
+    if not slot_real.is_dir():
+        return None
+    dot_git = slot_real / ".git"
+    git_dir = None
+    if os.path.lexists(dot_git):
+        dot_git_real = Path(os.path.realpath(dot_git))
+        if dot_git_real.is_file():
+            # A symlinked gitfile still interprets its path relative to slot_real, matching git.
+            try:
+                git_dir = _read_git_path(dot_git_real, gitfile=True, base=slot_real)
+            except CustodyUnknown:
+                if inside(slot_real, job_real):
+                    raise
+                return None
+        elif dot_git_real.is_dir():
+            git_dir = dot_git_real
+        else:
+            if inside(slot_real, job_real):
+                raise CustodyUnknown("source_gitdir_unreadable")
+            return None
+    elif (slot_real / "HEAD").is_file() and (slot_real / "objects").is_dir():
+        git_dir = slot_real
+    else:
+        return None
+    common = git_dir / "commondir"
+    if os.path.lexists(common):
+        try:
+            common_dir = _read_git_path(Path(os.path.realpath(common)), gitfile=False, base=git_dir)
+        except CustodyUnknown:
+            if inside(git_dir, job_real) or inside(slot_real, job_real):
+                raise
+            return None
+        if not inside(common_dir, job_real):
+            return None
+        return common_dir
+    if not inside(git_dir, job_real):
+        return None
+    return git_dir
 
 
 def custody_candidates(directory, deadline=None):
     """Every commit a lane job dir may hold alone: every ref peeled to a commit (branches,
-    tags, remote-tracking and any other namespace), HEAD and declared candidates.
+    tags, remote-tracking and any other namespace), HEAD, linked worktree HEADs, and declared candidates.
 
     Commits that are ancestors of the receipt's recorded base came from the host
     and need no custody. Non-lane dirs (no producer marker) keep owner-release rules.
+    A declared candidate not held by any enumerated in-job store raises CustodyUnknown [CAL-02][SECD-05].
     """
     if not any(os.path.lexists(directory / marker) for marker in CUSTODY_MARKERS):
         return []
@@ -1241,10 +1301,13 @@ def custody_candidates(directory, deadline=None):
                 _commit_name(receipt.get("candidate_commit"))} - {None}
     base = _commit_name(receipt.get("base"))
     candidates = set()
+    held_declared = set()
+    seen_git_dirs = set()
     for name in SOURCE_PATHS:
-        git_dir = _own_git_dir(directory / name)
-        if git_dir is None:
+        git_dir = _own_git_dir(directory / name, job_root=directory)
+        if git_dir is None or git_dir in seen_git_dirs:
             continue
+        seen_git_dirs.add(git_dir)
         prefix = [f"--git-dir={git_dir}"]
         refs = _custody_git([*prefix, "for-each-ref", "--format=%(objectname)"], deadline)
         if refs.returncode != 0:
@@ -1259,26 +1322,48 @@ def custody_candidates(directory, deadline=None):
             commits.update(line.split()[0] for line in peeled.stdout.splitlines() if line.endswith(" commit"))
         head = _custody_git([*prefix, "rev-parse", "-q", "--verify", "HEAD^{commit}"], deadline)
         commits.update(head.stdout.split() if head.returncode == 0 else ())
+        worktrees = _custody_git([*prefix, "worktree", "list", "--porcelain"], deadline)
+        if worktrees.returncode != 0:
+            raise CustodyUnknown("source_worktrees_unreadable")
+        for line in worktrees.stdout.splitlines():
+            if line.startswith("HEAD "):
+                wt_sha = _commit_name(line[len("HEAD "):].strip())
+                if wt_sha and set(wt_sha) != {"0"}:
+                    commits.add(wt_sha)
         for sha in declared:
             if _custody_git([*prefix, "cat-file", "-e", f"{sha}^{{commit}}"], deadline).returncode == 0:
                 commits.add(sha)
+                held_declared.add(sha)
         for sha in commits:
             if base and _custody_git([*prefix, "merge-base", "--is-ancestor", sha, base], deadline).returncode == 0:
                 continue
             candidates.add(sha)
+    if declared - held_declared:
+        raise CustodyUnknown("declared_candidate_unheld")
     return sorted(candidates)
 
 
-def custody_location_forbidden(location, directory, root):
-    """A store inside this job dir, any VM job dir or a tombstone dies with a reclaim."""
+def custody_location_forbidden(location, directory, root=None, *, jobs_root=None, sandbox_root=None):
+    """A store inside this job dir, any VM job dir, a reclaimer-managed sandbox dir, or a tombstone dies with a reclaim."""
+    loc = Path(os.path.realpath(location))
     job = Path(os.path.realpath(directory))
-    if inside(location, job):
+    if inside(loc, job):
         return True
-    for jobs_root in {Path(os.path.realpath(root)), job.parent}:
-        if location != jobs_root and inside(location, jobs_root):
-            first = location.relative_to(jobs_root).parts[0]
-            if JOB_NAME.fullmatch(first) or first.startswith(".reclaiming-"):
+    candidate_roots = {job.parent}
+    for candidate_root in (root, jobs_root):
+        if candidate_root is not None:
+            candidate_roots.add(Path(os.path.realpath(candidate_root)))
+    for base_root in candidate_roots:
+        if loc != base_root and inside(loc, base_root):
+            first = loc.relative_to(base_root).parts[0]
+            if JOB_NAME.fullmatch(first) or first.startswith(".reclaiming-") or first == "workbay-sandbox":
                 return True
+    sandbox_roots = {Path(os.path.realpath(Path.home() / "workbay-sandbox"))}
+    if sandbox_root is not None:
+        sandbox_roots.add(Path(os.path.realpath(sandbox_root)))
+    for sb in sandbox_roots:
+        if inside(loc, sb):
+            return True
     return False
 
 
@@ -1309,9 +1394,17 @@ def custody_store_refusal(git_dir, directory, root, deadline=None):
     return None
 
 
-def custody_verified(directory, root, retention, candidates, deadline=None):
+def custody_verified(directory, root=None, retention=None, candidates=None, deadline=None):
     """Return (True, None) only when a fresh repo, fetched from the claimed independent store,
     holds every candidate's commit and its whole object closure."""
+    directory = Path(directory)
+    if candidates is None and retention is None and isinstance(root, (list, tuple, set)):
+        candidates = list(root)
+        root = directory.absolute().parent
+        try:
+            retention = manifest(directory / "RETENTION.json")
+        except (OSError, ValueError):
+            retention = None
     try:
         claim = manifest(directory / "CUSTODY.json")
     except FileNotFoundError:
@@ -1319,8 +1412,12 @@ def custody_verified(directory, root, retention, candidates, deadline=None):
     except (OSError, ValueError):
         return False, "custody_claim_invalid"
     store = claim.get("bundle")
-    if claim.get("schema") != 1 or claim["owner"] != retention["owner"] or not isinstance(store, str) \
-            or not os.path.isabs(store):
+    if claim.get("schema") != 1 or not isinstance(store, str) or not os.path.isabs(store):
+        return False, "custody_claim_invalid"
+    if retention is not None:
+        if claim.get("owner") != retention["owner"]:
+            return False, "custody_claim_invalid"
+    elif not isinstance(claim.get("owner"), str) or not claim.get("owner"):
         return False, "custody_claim_invalid"
     location = Path(os.path.realpath(store))
     if custody_location_forbidden(location, directory, root):

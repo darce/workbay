@@ -25,6 +25,7 @@ Isolation is safe-by-construction rather than via a runtime allow-list (decision
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -37,12 +38,15 @@ from pathlib import Path
 # ``--check`` cannot desync); the private names below are install internals it
 # orchestrates.
 from workbay_bootstrap.activation import (
+    AGY_PLUGINS_POINTER_PATH,
+    agy_plugin_surface_problems,
     grok_plugin_surface_problems,
     materialize_grok_plugin_symlink,
     write_plugin_activation,
 )
 from workbay_bootstrap.harnesses import (
     CURSOR_HOOKS_PATH,
+    PLUGIN_NAME,
     cursor_native_surface_problems,
     cursor_root_surface_dests,
 )
@@ -122,6 +126,150 @@ def _materialize_workbay_child(target: Path, primary: Path, child: str) -> bool:
     return True
 
 
+def _primary_has_effective_agy(primary: Path) -> bool:
+    return (_plugin_tree_out(primary, "effective") / "agy").is_dir()
+
+
+def _ensure_relative_symlink(dest: Path, src: Path) -> None:
+    if dest.is_symlink():
+        if dest.resolve(strict=False) == src.resolve():
+            return
+        dest.unlink()
+    elif dest.exists():
+        return  # foreign/real local content wins
+    rel = os.path.relpath(src, dest.parent)
+    dest.symlink_to(rel, target_is_directory=src.is_dir())
+
+
+def _tree_snapshot(root: Path, *, allow_symlinks: bool) -> dict[str, bytes] | None:
+    """Return relative-path -> bytes map for ``root``, or None if invalid/symlink."""
+    if not root.is_dir() or (not allow_symlinks and root.is_symlink()):
+        return None
+    files: dict[str, bytes] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=allow_symlinks):
+        cur = Path(dirpath)
+        if not allow_symlinks:
+            for dname in dirnames:
+                if (cur / dname).is_symlink():
+                    return None
+        for fname in filenames:
+            fpath = cur / fname
+            if not allow_symlinks and fpath.is_symlink():
+                return None
+            rel = fpath.relative_to(root).as_posix()
+            try:
+                files[rel] = fpath.read_bytes()
+            except OSError:
+                return None
+    return files
+
+
+def _agy_trees_match(src: Path, dest: Path) -> bool:
+    src_snap = _tree_snapshot(src, allow_symlinks=True)
+    dest_snap = _tree_snapshot(dest, allow_symlinks=False)
+    return src_snap is not None and dest_snap is not None and src_snap == dest_snap
+
+
+def _materialize_generated_with_local_agy(target: Path, primary: Path) -> bool:
+    """Materialize ``.workbay/generated`` with a real in-worktree ``effective/agy`` copy.
+
+    Live ``agy -p`` refuses plugin trees reached through symlinks escaping the
+    worktree root (S1b). Keep ``base/`` and sibling ``effective/{claude,codex,
+    cursor,grok}`` symlinked to primary while copying ``effective/agy`` into a
+    real directory contained inside ``target``.
+    """
+    primary_gen = primary / _RUNTIME / "generated"
+    if not primary_gen.exists():
+        return False
+    ws = target / _RUNTIME
+    if ws.is_symlink():
+        ws.unlink()
+    ws.mkdir(parents=True, exist_ok=True)
+
+    spine: tuple[tuple[Path, Path, str], ...] = (
+        (ws / "generated", primary_gen, "plugins"),
+        (ws / "generated" / "plugins", primary_gen / "plugins", PLUGIN_NAME),
+        (
+            ws / "generated" / "plugins" / PLUGIN_NAME,
+            primary_gen / "plugins" / PLUGIN_NAME,
+            "effective",
+        ),
+        (
+            ws / "generated" / "plugins" / PLUGIN_NAME / "effective",
+            primary_gen / "plugins" / PLUGIN_NAME / "effective",
+            "agy",
+        ),
+    )
+    for t_dir, p_dir, keep_local in spine:
+        if t_dir.is_symlink():
+            t_dir.unlink()
+        t_dir.mkdir(parents=True, exist_ok=True)
+        if p_dir.is_dir():
+            for child in p_dir.iterdir():
+                if child.name == keep_local:
+                    continue
+                _ensure_relative_symlink(t_dir / child.name, child)
+
+    src_agy = _plugin_tree_out(primary, "effective") / "agy"
+    dest_agy = _plugin_tree_out(target, "effective") / "agy"
+    if dest_agy.is_symlink():
+        dest_agy.unlink()
+    if dest_agy.is_dir() and _agy_trees_match(src_agy, dest_agy):
+        return True
+    if dest_agy.exists():
+        if dest_agy.is_dir():
+            shutil.rmtree(dest_agy)
+        else:
+            dest_agy.unlink()
+    shutil.copytree(src_agy, dest_agy, symlinks=False)
+    return True
+
+
+def _generated_agy_tree_drifts(target: Path, primary: Path) -> bool:
+    """Return True iff the local-copy ``effective/agy`` layout or siblings drifted."""
+    ws = target / _RUNTIME
+    if ws.is_symlink() or not ws.is_dir():
+        return True
+    primary_gen = primary / _RUNTIME / "generated"
+    spine: tuple[tuple[Path, Path, str], ...] = (
+        (ws / "generated", primary_gen, "plugins"),
+        (ws / "generated" / "plugins", primary_gen / "plugins", PLUGIN_NAME),
+        (
+            ws / "generated" / "plugins" / PLUGIN_NAME,
+            primary_gen / "plugins" / PLUGIN_NAME,
+            "effective",
+        ),
+        (
+            ws / "generated" / "plugins" / PLUGIN_NAME / "effective",
+            primary_gen / "plugins" / PLUGIN_NAME / "effective",
+            "agy",
+        ),
+    )
+    for t_dir, p_dir, keep_local in spine:
+        if t_dir.is_symlink() or not t_dir.is_dir():
+            return True
+        if p_dir.is_dir():
+            for child in p_dir.iterdir():
+                if child.name == keep_local:
+                    continue
+                t_child = t_dir / child.name
+                if t_child.is_symlink():
+                    if t_child.resolve(strict=False) != child.resolve():
+                        return True
+                elif not t_child.exists():
+                    return True
+
+    src_agy = _plugin_tree_out(primary, "effective") / "agy"
+    dest_agy = _plugin_tree_out(target, "effective") / "agy"
+    if dest_agy.is_symlink() or not dest_agy.is_dir():
+        return True
+    try:
+        dest_agy.resolve().relative_to(target.resolve())
+    except (OSError, ValueError):
+        return True
+    return not _agy_trees_match(src_agy, dest_agy)
+
+
 def _hooks_path_value(target: Path) -> str:
     try:
         return _git("config", "core.hooksPath", cwd=target)
@@ -196,6 +344,10 @@ def _compute_drift(target: Path, primary: Path, clone: Path) -> list[str]:
         src = primary / _RUNTIME / child
         if not src.exists():
             continue
+        if child == "generated" and _primary_has_effective_agy(primary):
+            if _generated_agy_tree_drifts(target, primary):
+                drift.append(f"{_RUNTIME}/generated/plugins/{PLUGIN_NAME}/effective/agy")
+            continue
         dest = target / _RUNTIME / child
         if not (dest.is_symlink() and dest.resolve(strict=False) == src.resolve()):
             drift.append(f"{_RUNTIME}/{child}")
@@ -257,6 +409,16 @@ def _compute_drift(target: Path, primary: Path, clone: Path) -> list[str]:
         )
         if not (target / ".cursor" / "mcp.json").is_file():
             drift.append(".cursor/mcp.json")
+
+    effective_agy = _plugin_tree_out(target, "effective") / "agy"
+    if (
+        (target / AGY_PLUGINS_POINTER_PATH).is_file()
+        and (effective_agy.exists() or effective_agy.is_symlink())
+        and agy_plugin_surface_problems(target)
+    ):
+        agy_rel = f"{_RUNTIME}/generated/plugins/{PLUGIN_NAME}/effective/agy"
+        if agy_rel not in drift:
+            drift.append(agy_rel)
 
     return drift
 
@@ -337,7 +499,10 @@ def adopt_worktree(
 
     # Apply — order mirrors install() under profile=all + lifecycle.
     for child in _WORKBAY_CHILDREN:
-        _materialize_workbay_child(target, primary, child)
+        if child == "generated" and _primary_has_effective_agy(primary):
+            _materialize_generated_with_local_agy(target, primary)
+        else:
+            _materialize_workbay_child(target, primary, child)
 
     surfaces: list[dict[str, str]] = []
     surfaces.extend(_materialize_surfaces(target, clone))

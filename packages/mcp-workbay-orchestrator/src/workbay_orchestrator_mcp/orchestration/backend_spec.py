@@ -853,6 +853,33 @@ def _muse_remote_argv(*, model: str, effort: str | None) -> list[str]:
     ]
 
 
+_AGY_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _agy_remote_argv(*, model: str, effort: str | None) -> list[str]:
+    """Antigravity CLI (`agy` v1.5.17+) headless turn argv recipe.
+
+    `-p` consumes the immediately following argument as the prompt (live-verified
+    on OCI VM agy v1.5.17: `-p --output-format json` exits 2 treating
+    `--output-format` as the prompt). Keep flags first and attach `{brief_inline}`
+    directly to `-p`, matching cursor-remote's staged-brief pattern.
+    """
+    argv = ["--output-format", "json", "--model", model]
+    if effort is not None:
+        argv.extend(("--effort", effort))
+    argv.extend(
+        (
+            "--dangerously-skip-permissions",
+            "--disable-slash-commands",
+            "--json-schema",
+            "{schema_file}",
+            "-p",
+            "{brief_inline}",
+        )
+    )
+    return argv
+
+
 def _build_muse_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
     row = BACKENDS[context.backend_id]
     if row.allowed_models is None or context.model not in row.allowed_models:
@@ -958,6 +985,56 @@ def _build_claude_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
     )
 
 
+def _build_agy_agent_spec(context: _AgentSpecBuildContext) -> AgentSpec:
+    row = BACKENDS[context.backend_id]
+    if row.allowed_models is None or context.model not in row.allowed_models:
+        allowed = sorted(row.allowed_models or ())
+        raise ValueError(
+            f"Refusing {context.backend_id} dispatch with model {context.model!r}: allowed models are {allowed!r}"
+        )
+    if context.effort is not None and context.effort not in _AGY_EFFORTS:
+        raise ValueError(
+            f"Refusing {context.backend_id} dispatch with effort {context.effort!r}: "
+            f"allowed efforts are {sorted(_AGY_EFFORTS)}"
+        )
+    return _seal_agent_spec(
+        AgentSpec(
+            spec_version=2,
+            backend_id=context.backend_id,
+            binary="agy",
+            path_prepend=[".local/bin"],
+            env={"WORKBAY_HARNESS": "agy-cli"},
+            argv=context.recipe(model=context.model, effort=context.effort),
+            operator_values=[context.model, context.effort or "", ""],
+            stdin="/dev/null",
+            stdout="{result_file}",
+            stderr="{run_log}",
+            close_fds=[9],
+            requires_timeout=context.requires_timeout,
+            lane_timeout_s=context.lane_timeout_s,
+            result_source="stdout",
+            agent_exit_to_status={"0": "ok", "*": "agent_failed"},
+            auth_match={
+                "streams": list(AUTH_MATCH_STREAMS),
+                "exit_codes": [],
+                "patterns": ["Please sign in to view available models", "Please sign in"],
+                "precedence": "exit_codes_then_patterns",
+                "lane_timeout_s": context.lane_timeout_s,
+                "default_model": context.recipe.default_model(),
+            },
+            requires_live_sandbox_preflight=False,
+            routing_requested=context.requested_routing,
+            routing_effective=RoutingQuad(
+                backend=context.backend_id,
+                model=context.model,
+                effort=context.effort,
+                speed=None,
+                tier=None,
+            ),
+        )
+    )
+
+
 _grok_remote_argv = _RegistryLaunchRecipe(
     argv_builder=_grok_remote_argv,
     spec_builder=_build_grok_agent_spec,
@@ -1000,6 +1077,12 @@ _muse_remote_argv = _RegistryLaunchRecipe(
     argv_builder=_muse_remote_argv,
     spec_builder=_build_muse_agent_spec,
     default_model=lambda: model_routing.MODEL_ROUTING_DEFAULTS["muse"],
+    default_est_tokens=lambda: codex_lane_config.DEFAULT_EST_TOKENS,
+)
+_agy_remote_argv = _RegistryLaunchRecipe(
+    argv_builder=_agy_remote_argv,
+    spec_builder=_build_agy_agent_spec,
+    default_model=lambda: model_routing.MODEL_ROUTING_DEFAULTS["agy"],
     default_est_tokens=lambda: codex_lane_config.DEFAULT_EST_TOKENS,
 )
 
@@ -1106,6 +1189,14 @@ def _muse_remote_timeout_ceiling_s() -> int:
     return int(offload_timeout_ssot.BACKEND_TIMEOUT_BOUNDS["muse-remote"][1])
 
 
+def _agy_remote_default_timeout_s() -> int:
+    return int(offload_timeout_ssot.BACKEND_TIMEOUT_BOUNDS["agy-remote"][0])
+
+
+def _agy_remote_timeout_ceiling_s() -> int:
+    return int(offload_timeout_ssot.BACKEND_TIMEOUT_BOUNDS["agy-remote"][1])
+
+
 # Named owners only. A new adapter-timeout remote must be added here; it must
 # not inherit another backend's bound by falling through.
 _ADAPTER_TIMEOUT_BACKEND_BOUNDS = {
@@ -1116,6 +1207,7 @@ _ADAPTER_TIMEOUT_BACKEND_BOUNDS = {
     "claude-remote": (_claude_remote_default_timeout_s, _claude_remote_timeout_ceiling_s),
     "claude-api-remote": (_claude_api_remote_default_timeout_s, _claude_api_remote_timeout_ceiling_s),
     "muse-remote": (_muse_remote_default_timeout_s, _muse_remote_timeout_ceiling_s),
+    "agy-remote": (_agy_remote_default_timeout_s, _agy_remote_timeout_ceiling_s),
 }
 
 

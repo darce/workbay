@@ -290,7 +290,7 @@ def _emit(message: str) -> None:
         _record_compaction_failed(message)
 
 
-_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "manual")
+_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "agy-cli", "manual")
 
 
 def _env_alias(canonical: str, default: str | None = None) -> str | None:

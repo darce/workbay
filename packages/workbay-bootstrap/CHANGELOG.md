@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.44] — 2026-11-26
+
+### Changed
+- Add native Antigravity CLI (`agy`) harness projection support (`.agents/plugins.json`, `effective/agy/mcp_config.json`, hook adapter) (`internal`).
+- Refresh the protocol and system dependency floors for WorkBay v0.1.103 and align bootstrap install and profile handling with the v0.1.103 runtime.
+
 ## [0.4.43] — 2026-11-26
 
 ### Changed

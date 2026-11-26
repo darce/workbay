@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.34] — 2026-11-26
+
+### Changed
+- Refresh the handoff and orchestrator dependency floors for WorkBay v0.1.103 (`agyv103train` `1b6c2481934d`).
+
 ## [0.1.33] — 2026-11-26
 
 ### Changed

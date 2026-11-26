@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Sequence, TypedDict
@@ -224,32 +225,47 @@ def _commit_sha_validation_enabled() -> bool:
     return bypass not in {"1", "true", "yes", "on"}
 
 
-def _infer_harness_agent_from_env() -> str | None:
-    """Best-effort harness slug from transcript env vars, then identity markers.
+_AGY_IDENTITY_ENV_MARKERS: tuple[str, ...] = (
+    "ANTIGRAVITY_AGENTAPI_EXE",
+    "ANTIGRAVITY_SOURCE_METADATA",
+)
 
-    Transcript-path detection (``detect_active_harness``) wins when exactly one
-    transcript env var is set. When that returns no harness, fall back to
-    presence-only identity markers (``detect_harness_from_identity_markers``),
-    e.g. ``CLAUDE_CODE_SESSION_ID`` for Claude Code MCP subprocesses that never
-    receive a transcript path. Fail-open: any exception → ``None``.
+
+def _infer_harness_agent_from_env(env: Mapping[str, str] | None = None) -> str | None:
+    """Best-effort harness slug from explicit env, transcript vars, then identity markers.
+
+    Explicit ``WORKBAY_HARNESS`` (normalized through ``normalize_compaction_harness``)
+    wins when set to a recognized harness or alias (e.g. ``agy`` → ``agy-cli``).
+    Otherwise transcript-path detection (``detect_active_harness``) wins when
+    exactly one transcript env var is set. When that returns no harness, fall
+    back to presence-only identity markers (``detect_harness_from_identity_markers``
+    and built-in Antigravity runtime markers). Fail-open: any exception → ``None``.
     """
+    source_env = dict(os.environ) if env is None else dict(env)
     try:
         from .compaction_contract import (
             detect_active_harness,
             detect_harness_from_identity_markers,
             load_compaction_contract,
+            normalize_compaction_harness,
         )
         from .runtime import get_runtime_config
 
+        explicit_harness = _normalize_optional_text(source_env.get("WORKBAY_HARNESS"))
+        if explicit_harness is not None:
+            try:
+                return str(normalize_compaction_harness(explicit_harness))
+            except ValueError:
+                pass
+
         contract = load_compaction_contract(get_runtime_config().workspace_root)
-        env = dict(os.environ)
         # ``detect_active_harness`` reads its source mapping from the ``env``
         # argument; with ``env`` omitted it defaults to an empty dict and never
         # matches a transcript var, so the harness slug is *always* None. Pass
         # the process environment so a present transcript var actually resolves
         # to its harness identity (the precedence at :902-903 then prefers it
         # over the harness-agent fallback).
-        resolution = detect_active_harness(contract, env=env)
+        resolution = detect_active_harness(contract, env=source_env)
         if resolution.harness is not None:
             return str(resolution.harness)
         # internal: fall back to identity markers ONLY when transcript
@@ -268,11 +284,19 @@ def _infer_harness_agent_from_env() -> str | None:
             return None
         # MCP subprocesses often lack transcript path vars but still carry
         # harness identity markers (contract.harness_identity_markers).
-        marker_resolution = detect_harness_from_identity_markers(contract, env)
-        if marker_resolution.harness is None:
+        marker_resolution = detect_harness_from_identity_markers(contract, source_env)
+        if marker_resolution.harness is not None:
+            return str(marker_resolution.harness)
+        if marker_resolution.ambiguous:
             return None
-        return str(marker_resolution.harness)
+        for marker in _AGY_IDENTITY_ENV_MARKERS:
+            if source_env.get(marker, "").strip():
+                return "agy-cli"
+        return None
     except Exception:
+        for marker in _AGY_IDENTITY_ENV_MARKERS:
+            if source_env.get(marker, "").strip():
+                return "agy-cli"
         return None
 
 
@@ -290,6 +314,8 @@ def normalize_actor_harness(agent: str | None) -> str:
         return "cursor"
     if slug.startswith("grok"):
         return "grok"
+    if slug in {"agy", "agy-cli", "agy-app", "agy-ide", "agy-remote"} or slug.startswith("agy-"):
+        return "agy-cli"
     if "copilot" in slug:
         return "copilot"
     if slug in {"automation", "hook", "mcp", "manual", "workbay-lifecycle", "tasks-gc"}:

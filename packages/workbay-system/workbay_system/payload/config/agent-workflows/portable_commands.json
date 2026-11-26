@@ -743,6 +743,22 @@
               ]
             }
           }
+        },
+        {
+          "harness": "agy-cli",
+          "target": ".workbay/generated/plugins/workbay-system/effective/agy/hooks.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-agy-stop-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.workbay-lifecycle.Stop",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "type": "command",
+              "command": "python3 ./hooks/run.py compact-session.py"
+            }
+          }
         }
       ]
     },
@@ -751,9 +767,10 @@
       "description": "Managed SessionStart adapter declarations for handoff.db context re-injection (internal / implementation note).",
       "trigger": "session-start",
       "supported_harnesses": [
-        "claude-code"
+        "claude-code",
+        "agy-cli"
       ],
-      "rationale": "Re-injection relies on SessionStart stdout being added to model context, which only Claude Code provides today; the internal generated session_start family for codex/vscode is always-on (no install-time opt-in) and its injection semantic is unverified there. Revisit when an opt-in surface or verified injection semantic exists.",
+      "rationale": "Re-injection relies on SessionStart context injection (Claude Code stdout or agy injectSteps); the internal generated session_start family for codex/vscode/grok is always-on without verified injection semantics. Revisit when an opt-in surface or verified injection semantic exists.",
       "required_artifacts": [
         {
           "kind": "file",
@@ -784,6 +801,22 @@
               ]
             }
           }
+        },
+        {
+          "harness": "agy-cli",
+          "target": ".workbay/generated/plugins/workbay-system/effective/agy/hooks.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-agy-reinject-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.workbay-lifecycle.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "type": "command",
+              "command": "python3 ./hooks/run.py reinject-context.py"
+            }
+          }
         }
       ]
     },
@@ -794,7 +827,8 @@
       "supported_harnesses": [
         "codex",
         "vscode",
-        "grok"
+        "grok",
+        "agy-cli"
       ],
       "rationale": "Script body ships once under scripts/hooks/ (shared, already fenced). Claude base always-on registration is harness-protocol session_start / settings.hooks.json (wholesale write) — NO claude-code adapter here, which would double-register against that base. Non-claude adapters mirror compact-session multi-harness shape and are opt-in only so a harness with no selected adapter registers nothing (no crash).",
       "required_artifacts": [
@@ -855,6 +889,22 @@
                   "command": "bash \"{{consumer_root}}/scripts/hooks/ensure-agent-surfaces.sh\""
                 }
               ]
+            }
+          }
+        },
+        {
+          "harness": "agy-cli",
+          "target": ".workbay/generated/plugins/workbay-system/effective/agy/hooks.json",
+          "write_kind": "shared_checked_in",
+          "opt_in_flag": "--install-agy-ensure-agent-surfaces-hook",
+          "patch": {
+            "operation": "merge_array_entry",
+            "json_path": "$.workbay-lifecycle.SessionStart",
+            "match_key": "_managed_by",
+            "entry": {
+              "_managed_by": "workbay-bootstrap",
+              "type": "command",
+              "command": "python3 ./hooks/run.py ensure-agent-surfaces.sh"
             }
           }
         }

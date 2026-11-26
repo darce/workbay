@@ -30,15 +30,19 @@ from typing import Any, Literal, Mapping
 import yaml
 from workbay_protocol import RUNTIME_ROOT_DIRNAME
 
+from workbay_bootstrap._mcp_pins import MCP_REGISTRATION
 from workbay_bootstrap.embedding_backfill_doctor import (
     _doctor_embedding_backfill_gap,
 )
 from workbay_bootstrap.harnesses import (
+    AGY_PLUGINS_POINTER_PATH,
     CURSOR_COMMANDS_DEST,
     CURSOR_HOOKS_PATH,
     CURSOR_SKILLS_DEST,
     LEGACY_CODEX_PLUGIN_SELECTOR,
+    agy_plugin_surface_problems,
     cursor_native_surface_problems,
+    write_agy_plugins_pointer,
 )
 from workbay_bootstrap.install import (
     BOOTSTRAP_MANIFEST_NAME,
@@ -169,6 +173,13 @@ def _selfhost_missing_surface_paths(target: Path) -> list[str]:
     rules_dir = target / RULES_DIR
     if not (rules_dir.is_dir() and any(rules_dir.glob("*.md"))):
         missing.append(RULES_DIR)
+    effective_agy = _plugin_tree_out(target, "effective") / "agy"
+    effective_agy_plugin = effective_agy / "plugin.json"
+    has_agy_pointer = (target / AGY_PLUGINS_POINTER_PATH).is_file()
+    if has_agy_pointer and (not effective_agy_plugin.is_file() or effective_agy.is_symlink()):
+        missing.append(effective_agy_plugin.relative_to(target).as_posix())
+    elif effective_agy.is_dir() and not has_agy_pointer:
+        missing.append(AGY_PLUGINS_POINTER_PATH.as_posix())
     return missing
 
 
@@ -4784,14 +4795,45 @@ def _resolve_plugin_source_path(
 
 
 def _plugin_tree_integrity_problems(root: Path, harness: str) -> list[str]:
+    problems: list[str] = []
+    if not root.is_dir():
+        return [f"source path does not exist: {root}"]
+    if harness == "agy":
+        manifest_path = root / "plugin.json"
+        if not manifest_path.is_file():
+            problems.append("missing plugin.json")
+        else:
+            try:
+                manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                manifest_payload = None
+            if not isinstance(manifest_payload, dict):
+                problems.append("invalid plugin.json")
+            else:
+                if manifest_payload.get("name") != PLUGIN_NAME:
+                    problems.append(f"plugin.json name must be {PLUGIN_NAME!r}")
+                version = manifest_payload.get("version")
+                if not isinstance(version, str) or not version.strip():
+                    problems.append("plugin.json missing version")
+        if not (root / "hooks.json").is_file():
+            problems.append("missing hooks.json")
+        if MCP_REGISTRATION.get("agy") == "plugin" and not (root / "mcp_config.json").is_file():
+            problems.append("missing mcp_config.json")
+        if not (root / "rules" / "AGENTS.md").is_file():
+            problems.append("missing rules/AGENTS.md")
+        if (root / "GEMINI.md").exists() or (root / "rules" / "GEMINI.md").exists():
+            problems.append("deprecated GEMINI.md must not be present in agy plugin tree")
+        skills_root = root / "skills"
+        if not skills_root.is_dir():
+            problems.append("missing skills/")
+        elif not any(path.is_file() for path in skills_root.glob("*/SKILL.md")):
+            problems.append("skills/ contains no SKILL.md entries")
+        return problems
     manifest_dir = {
         "claude": ".claude-plugin",
         "codex": ".codex-plugin",
         "grok": ".grok-plugin",
     }.get(harness, f".{harness}-plugin")
-    problems: list[str] = []
-    if not root.is_dir():
-        return [f"source path does not exist: {root}"]
     manifest_path = root / manifest_dir / "plugin.json"
     if not manifest_path.is_file():
         problems.append(f"missing {manifest_dir}/plugin.json")
@@ -4828,7 +4870,11 @@ def _doctor_effective_tree_missing(target: Path) -> list[Finding]:
     effective_root = target.joinpath(*PLUGIN_GENERATED_ROOT, "effective")
     if effective_root.is_dir():
         return []
-    if not (target / CLAUDE_MARKETPLACE_PATH).is_file() and not (target / CODEX_MARKETPLACE_PATH).is_file():
+    if (
+        not (target / CLAUDE_MARKETPLACE_PATH).is_file()
+        and not (target / CODEX_MARKETPLACE_PATH).is_file()
+        and not (target / AGY_PLUGINS_POINTER_PATH).is_file()
+    ):
         return []
     try:
         display = effective_root.relative_to(target).as_posix()
@@ -4925,7 +4971,26 @@ def _doctor_plugin_source_integrity(target: Path) -> list[Finding]:
 
     findings.extend(_doctor_grok_plugin_materialization(target))
     findings.extend(_doctor_cursor_native_surfaces(target))
+    findings.extend(_doctor_agy_plugin_surface(target))
     return findings
+
+
+def _doctor_agy_plugin_surface(target: Path) -> list[Finding]:
+    """Validate ``.agents/plugins.json`` pointer, real-dir containment, and ``effective/agy`` integrity."""
+    effective_agy = _plugin_tree_out(target, "effective") / "agy"
+    has_pointer = (target / AGY_PLUGINS_POINTER_PATH).is_file()
+    if not has_pointer and not effective_agy.exists() and not effective_agy.is_symlink():
+        return []
+    problems = agy_plugin_surface_problems(target)
+    if not problems:
+        return []
+    return [
+        {
+            "kind": "agy_plugin_drift",
+            "path": AGY_PLUGINS_POINTER_PATH.as_posix(),
+            "message": "; ".join(problems),
+        }
+    ]
 
 
 def _doctor_cursor_native_surfaces(target: Path) -> list[Finding]:
@@ -6094,6 +6159,33 @@ def repair(
                 activate_grok_plugin(target)
             except Exception:
                 skipped.append(finding)
+                continue
+            repaired.append(finding)
+            continue
+
+        if kind == "agy_plugin_drift":
+            if any(f["kind"] == "agy_plugin_drift" for f in repaired):
+                repaired.append(finding)
+                continue
+            from workbay_bootstrap.adopt import (
+                _materialize_generated_with_local_agy,
+                _primary_has_effective_agy,
+            )
+
+            try:
+                if is_linked_worktree(target):
+                    primary = primary_overlay_root(target)
+                    if primary is not None and _primary_has_effective_agy(primary):
+                        _materialize_generated_with_local_agy(target, primary)
+                write_agy_plugins_pointer(target)
+                problems = agy_plugin_surface_problems(target)
+            except Exception:
+                skipped.append(finding)
+                continue
+            if problems:
+                stamped = dict(finding)
+                stamped["message"] = "; ".join(problems)
+                skipped.append(stamped)
                 continue
             repaired.append(finding)
             continue

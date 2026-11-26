@@ -11,8 +11,37 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
+import re
 
 Finding = dict[str, str]
+
+_SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+
+
+def _is_sql_identifier(value: str) -> bool:
+    """True when ``value`` is a bare ASCII SQL identifier."""
+    return isinstance(value, str) and _SQL_IDENTIFIER_RE.fullmatch(value) is not None
+
+
+def _validate_source_identifiers(
+    sources: tuple[tuple[str, str, str, str], ...],
+) -> BackfillGapOutcome | None:
+    """Fail closed before any SQL interpolation if a catalog identifier is invalid."""
+    for kind, table, id_col, text_col in sources:
+        for label, candidate in (
+            ("table", table),
+            ("id_col", id_col),
+            ("text_col", text_col),
+        ):
+            if not _is_sql_identifier(candidate):
+                return BackfillGapOutcome(
+                    BackfillGapStatus.UNMEASURABLE,
+                    reason=(
+                        f"invalid SQL identifier in backfill catalog: "
+                        f"{kind} {label}={candidate!r}"
+                    ),
+                )
+    return None
 
 
 class BackfillGapStatus(str, Enum):
@@ -143,6 +172,9 @@ def _aligned_store_contract() -> StoreBackfillContract | BackfillGapOutcome:
     drift = _source_kind_drift_reason(contract)
     if drift:
         return BackfillGapOutcome(BackfillGapStatus.UNMEASURABLE, reason=drift)
+    invalid = _validate_source_identifiers(contract.sources)
+    if invalid is not None:
+        return invalid
     return contract
 
 
@@ -283,6 +315,10 @@ def _iter_present_concepts(
     """One SELECT per present source table (review_findings read once)."""
     import sqlite3
 
+    invalid = _validate_source_identifiers(sources)
+    if invalid is not None:
+        return invalid
+
     grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for kind, table, id_col, text_col in sources:
         if table not in tables:
@@ -319,6 +355,10 @@ def _source_tables_nonempty(
 ) -> bool | BackfillGapOutcome:
     """True when any present source table has an eligible row."""
     import sqlite3
+
+    invalid = _validate_source_identifiers(sources)
+    if invalid is not None:
+        return invalid
 
     seen: set[str] = set()
     try:

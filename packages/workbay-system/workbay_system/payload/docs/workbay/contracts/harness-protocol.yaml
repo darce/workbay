@@ -23,6 +23,10 @@ harness_capabilities:
         label: Grok (coordinator is a Grok agent)
         primitive: "in-process `task` tool for subagent fan-out"
         notes: "In-process. **Must not** shell out to an external CLI from inside an active Grok session — that inverts the cost premise when used mid-session. Fallback when `task` is unavailable: `run_structured_turn` on `workbay-orchestrator-mcp`."
+      - harness_key: agy-cli
+        label: Antigravity / agy (coordinator is an in-process agy agent)
+        primitive: "in-process `invoke_subagent` tool for reviewer fan-out"
+        notes: "In-process. Use `invoke_subagent` from the active session when available; fallback to `run_structured_turn` on `workbay-orchestrator-mcp` when subagents are unavailable."
       - harness_key: external
         label: External orchestrator (no interactive harness)
         primitive: "`backend_registry.get_adapter(<kind>)` + `BackendAdapter.execute(...)`"
@@ -69,6 +73,16 @@ harness_capabilities:
         materialization: copytree
         adopt_materialization: symlink
         notes: "S1 (grok 0.2.22): project-scoped .grok/config.toml enabled alone does not activate discovery; CLI install+enable required. Symlinked plugin dirs are discovered. grok plugin install copies to ~/.grok/installed-plugins/."
+      - harness_key: agy-cli
+        mechanism: project_plugins_json
+        scope: project
+        selector_form: include_only
+        selector: agy
+        config_path: .agents/plugins.json
+        field: entries
+        materialization: copytree
+        adopt_materialization: copytree
+        notes: "S1/S1b: agy discovers project plugins via .agents/plugins.json pointing at ./.workbay/generated/plugins/workbay-system/effective with include_only: [agy]. Symlinked paths escaping the worktree root and external absolute paths are refused by agy; linked worktrees must materialize effective/agy as a real in-worktree directory copy."
 
 cold_start:
   shared_steps:
@@ -312,6 +326,7 @@ bootstrap_overlay:
       codex: "{{consumer_root}}/scripts/hooks/compact-session.py"
       vscode: "{{consumer_root}}/scripts/hooks/compact-session.py"
       grok: 'python3 "{{consumer_root}}/scripts/hooks/compact-session.py"'
+      agy_cli: 'python3 ./hooks/run.py compact-session.py'
     tokens:
       consumer_root: >
         Template placeholder substituted at install/apply-hooks time with the
@@ -391,6 +406,10 @@ compaction:
     grok:
       env_var: GROK_SESSION_TRANSCRIPT_PATH
       fallback_glob: ~/.grok/sessions/**/events.jsonl
+    agy-cli:
+      env_var: AGY_SESSION_TRANSCRIPT_PATH
+      # External agy binary brain log location (read-only fallback glob).
+      fallback_glob: ~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl
   # Presence-only identity markers (distinct from transcript_discovery paths).
   # Used by write-attribution harness detection when transcript path env vars
   # are absent (common for MCP subprocesses). Seed only grounded markers —
@@ -400,6 +419,10 @@ compaction:
     claude-code:
       markers:
         - CLAUDE_CODE_SESSION_ID
+    agy-cli:
+      markers:
+        - ANTIGRAVITY_AGENTAPI_EXE
+        - ANTIGRAVITY_SOURCE_METADATA
 
 reinjection:
   # SessionStart re-injection of handoff.db references (internal /
@@ -557,6 +580,7 @@ hooks:
     - id: worktree-drift
       matcher: Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file
       cursor_matcher: ApplyPatch|Edit|Write
+      agy_matcher: write_to_file|replace_file_content|multi_replace_file_content
       status_message: Guarding worktree drift
       timeout: 5
       # A cold identity probe that expires is unknown and blocks drift checks.
@@ -568,9 +592,11 @@ hooks:
       codex_command: python3 .github/hooks/guard-worktree-drift.py
       cursor_command: bash scripts/hooks/guard-worktree-drift.sh
       grok_command: bash "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-worktree-drift.sh"
+      agy_command: python3 ./hooks/run.py guard-worktree-drift.sh
     - id: main-branch
       matcher: Edit|Write|apply_patch|create_file|replace_string_in_file|multi_replace_string_in_file
       cursor_matcher: ApplyPatch|Edit|Write
+      agy_matcher: write_to_file|replace_file_content|multi_replace_file_content
       status_message: Guarding main branch edits
       timeout: 5
       # The shell guard's task probe is advisory. The Python adapter has no advisory probe.
@@ -580,10 +606,12 @@ hooks:
       codex_command: python3 .github/hooks/guard-main-branch.py
       cursor_command: bash scripts/hooks/guard-main-branch.sh
       grok_command: bash "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-main-branch.sh"
+      agy_command: python3 ./hooks/run.py guard-main-branch.sh
     - id: bash-main-branch
       matcher: Bash
       codex_matcher: Bash|exec_command|functions\.exec_command
       cursor_matcher: Shell
+      agy_matcher: run_command
       status_message: Guarding main branch
       timeout: 5
       claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-bash-main-branch.py"
@@ -591,10 +619,12 @@ hooks:
       codex_command: python3 scripts/hooks/guard-bash-main-branch.py
       cursor_command: python3 scripts/hooks/guard-bash-main-branch.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-bash-main-branch.py"
+      agy_command: python3 ./hooks/run.py guard-bash-main-branch.py
     - id: bash-lifecycle-primitives
       matcher: Bash
       codex_matcher: Bash|exec_command|functions\.exec_command
       cursor_matcher: Shell
+      agy_matcher: run_command
       status_message: Guarding lifecycle primitives
       timeout: 5
       claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-bash-lifecycle-primitives.py"
@@ -602,11 +632,13 @@ hooks:
       codex_command: python3 scripts/hooks/guard-bash-lifecycle-primitives.py
       cursor_command: python3 scripts/hooks/guard-bash-lifecycle-primitives.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-bash-lifecycle-primitives.py"
+      agy_command: python3 ./hooks/run.py guard-bash-lifecycle-primitives.py
     - id: bash-remote-gate-routing
       matcher: Bash
       codex_matcher: Bash|exec_command|functions\.exec_command
       cursor_matcher: Shell
       vscode_matcher: "Bash|run_in_terminal"
+      agy_matcher: run_command
       status_message: Guarding remote-only test routing
       timeout: 5
       claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-bash-remote-gate-routing.py"
@@ -614,10 +646,12 @@ hooks:
       codex_command: python3 scripts/hooks/guard-bash-remote-gate-routing.py
       cursor_command: python3 scripts/hooks/guard-bash-remote-gate-routing.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-bash-remote-gate-routing.py"
+      agy_command: python3 ./hooks/run.py guard-bash-remote-gate-routing.py
     - id: codemap-first
       matcher: Bash|Grep|Glob
       codex_matcher: Bash|exec_command|functions\.exec_command|Grep|Glob
       cursor_matcher: Shell|Grep|Glob
+      agy_matcher: run_command|grep_search|find_by_name
       status_message: Guarding source discovery through codemap
       timeout: 5
       fail_mode: closed
@@ -626,9 +660,11 @@ hooks:
       codex_command: python3 scripts/hooks/guard-codemap-first.py
       cursor_command: python3 scripts/hooks/guard-codemap-first.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-codemap-first.py"
+      agy_command: python3 ./hooks/run.py guard-codemap-first.py
     - id: task-plan-findings
       matcher: Edit|Write
       cursor_matcher: ApplyPatch|Edit|Write
+      agy_matcher: write_to_file|replace_file_content|multi_replace_file_content
       status_message: Guarding task plan findings
       timeout: 5
       claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-task-plan-findings.py"
@@ -636,9 +672,11 @@ hooks:
       codex_command: python3 scripts/hooks/guard-task-plan-findings.py
       cursor_command: python3 scripts/hooks/guard-task-plan-findings.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-task-plan-findings.py"
+      agy_command: python3 ./hooks/run.py guard-task-plan-findings.py
     - id: generated-render-write
       matcher: Edit|Write
       cursor_matcher: ApplyPatch|Edit|Write
+      agy_matcher: write_to_file|replace_file_content|multi_replace_file_content
       status_message: Guarding generated render writes
       timeout: 5
       claude_command: python3 "$CLAUDE_PROJECT_DIR/scripts/hooks/guard-generated-render-write.py"
@@ -646,6 +684,7 @@ hooks:
       codex_command: python3 scripts/hooks/guard-generated-render-write.py
       cursor_command: python3 scripts/hooks/guard-generated-render-write.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-generated-render-write.py"
+      agy_command: python3 ./hooks/run.py guard-generated-render-write.py
     - id: network-sourced-authority
       matcher: Edit|Write
       status_message: Guarding network-sourced authority
@@ -655,11 +694,12 @@ hooks:
       # transcript for network-fetched content before a write to an
       # agent-authoritative surface (rules / skill bodies). No other harness
       # exposes that transcript or a matching event, so delivery is opted out of
-      # vscode / codex / cursor / grok via the *_enabled flags below.
+      # vscode / codex / cursor / grok / agy via the *_enabled flags below.
       vscode_enabled: false
       codex_enabled: false
       cursor_enabled: false
       grok_enabled: false
+      agy_enabled: false
       unsupported_reason: >-
         Claude-only guard: inspects the Claude Code session transcript for
         network-sourced content; no equivalent transcript or event exists on the
@@ -674,16 +714,18 @@ hooks:
       # implementation-shaped local subagents and names dispatch_wave /
       # run_offload_pass; `[local-ok]` in the prompt or
       # WORKBAY_ALLOW_LOCAL_IMPLEMENT_SUBAGENT=1 is the audited override. Codex
-      # fans out via run_structured_turn, Cursor via Subagent, Grok via `task`;
-      # none of those share the Agent payload shape, so delivery is opted out.
+      # fans out via run_structured_turn, Cursor via Subagent, Grok via `task`,
+      # agy via `invoke_subagent`; none share the Agent payload shape, so
+      # delivery is opted out.
       vscode_enabled: false
       codex_enabled: false
       cursor_enabled: false
       grok_enabled: false
+      agy_enabled: false
       unsupported_reason: >-
         Claude-only guard: matches the Claude Code `Agent` subagent tool payload;
-        Codex (run_structured_turn), Cursor (Subagent) and Grok (task) expose
-        different fan-out primitives and payloads (tech-debt follow-up).
+        Codex (run_structured_turn), Cursor (Subagent), Grok (task) and agy
+        (invoke_subagent) expose different fan-out primitives and payloads (tech-debt follow-up).
     - id: rationale-size
       matcher: mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_close_slice|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice
       claude_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__close_slice
@@ -696,6 +738,7 @@ hooks:
       codex_command: python3 scripts/hooks/guard-rationale-size.py
       cursor_command: python3 scripts/hooks/guard-rationale-size.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-rationale-size.py"
+      agy_command: python3 ./hooks/run.py guard-rationale-size.py
     - id: validate-mcp-dict-params
       matcher: mcp_workbay-handoff-mcp_record_event|mcp_workbay-handoff-mcp_review_findings|mcp_workbay-handoff-mcp_review_runs|mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs
       claude_matcher: mcp__workbay-handoff-mcp__record_event|mcp__workbay-handoff-mcp__review_findings|mcp__workbay-handoff-mcp__review_runs
@@ -708,6 +751,7 @@ hooks:
       codex_command: python3 scripts/hooks/validate-mcp-dict-params.py
       cursor_command: python3 scripts/hooks/validate-mcp-dict-params.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/validate-mcp-dict-params.py"
+      agy_command: python3 ./hooks/run.py validate-mcp-dict-params.py
     - id: review-finding-resolve
       matcher: mcp_workbay-handoff-mcp_review_findings|mcp__workbay-handoff-mcp__review_findings
       claude_matcher: mcp__workbay-handoff-mcp__review_findings
@@ -720,6 +764,7 @@ hooks:
       codex_command: python3 scripts/hooks/guard-review-finding-resolve.py
       cursor_command: python3 scripts/hooks/guard-review-finding-resolve.py
       grok_command: python3 "${GROK_WORKSPACE_ROOT}/scripts/hooks/guard-review-finding-resolve.py"
+      agy_command: python3 ./hooks/run.py guard-review-finding-resolve.py
   post_tool_use:
     - id: record-file-touch
       matcher: Edit|Write
@@ -798,7 +843,8 @@ hooks:
       vscode_enabled: false
       cursor_enabled: false
       codex_enabled: false
-      unsupported_reason: "Claude SessionStart only; Codex (and VS Code/Cursor) have no SessionStart hook surface, and the script runs monorepo-only make targets."
+      agy_enabled: false
+      unsupported_reason: "Claude SessionStart only; Codex (and VS Code/Cursor/agy) do not register this monorepo-only make target on SessionStart."
     - id: advise-worktree-cd
       status_message: Advising worktree cd
       timeout: 15
@@ -806,6 +852,7 @@ hooks:
       vscode_command: python3 scripts/hooks/advise-worktree-cd.py
       codex_command: python3 scripts/hooks/advise-worktree-cd.py
       cursor_command: python3 scripts/hooks/advise-worktree-cd.py
+      agy_command: python3 ./hooks/run.py advise-worktree-cd.py
     # internal: surfaces dangling hook references at session start
     # (warn-only via additionalContext, always exit 0; the fail-open
     # _run_guard.py wrapper is the runtime net once configs carry the
@@ -817,6 +864,7 @@ hooks:
       vscode_command: python3 scripts/hooks/coherence-self-check.py
       codex_command: python3 scripts/hooks/coherence-self-check.py
       cursor_command: python3 scripts/hooks/coherence-self-check.py
+      agy_command: python3 ./hooks/run.py coherence-self-check.py
   user_prompt_submit:
     - id: advise-worktree-cd
       status_message: Advising worktree cd
@@ -825,3 +873,4 @@ hooks:
       vscode_command: python3 scripts/hooks/advise-worktree-cd.py
       codex_command: python3 scripts/hooks/advise-worktree-cd.py
       cursor_command: python3 scripts/hooks/advise-worktree-cd.py
+      agy_command: python3 ./hooks/run.py advise-worktree-cd.py

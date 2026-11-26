@@ -23,6 +23,8 @@ DEFAULT_LANE_PIDS_COST = 66
 DEFAULT_LANE_ANON_COST_BYTES = 512 * MIB
 DEFAULT_MEMORY_RESERVE_BYTES = 512 * MIB
 MEMORY_RESERVE_ENV = "WORKBAY_REMOTE_GATE_MEMORY_FLOOR_MB"
+DEFAULT_CPU_PSI_MAX = 60.0
+CPU_PSI_MAX_ENV = "WORKBAY_REMOTE_GATE_CPU_PSI_MAX"
 MEMINFO_PATH = Path("/proc/meminfo")
 UNLIMITED_MEMORY_EXEMPTION_ENV = "WORKBAY_REMOTE_GATE_ALLOW_UNLIMITED_MEMORY"
 
@@ -115,12 +117,65 @@ def _decision(
     )
 
 
+def _resolve_cpu_psi_ceiling(ceiling: float | None) -> float | None:
+    if ceiling is None:
+        resolved = _env_number(CPU_PSI_MAX_ENV, DEFAULT_CPU_PSI_MAX)
+    else:
+        resolved = _finite_number(ceiling)
+    if resolved is None or resolved <= 0:
+        return None
+    return float(resolved)
+
+
+def evaluate_cpu_psi_admission(
+    *,
+    cpu_some_avg60: float | None,
+    ceiling: float | None = None,
+) -> AdmissionDecision:
+    """Evaluate CPU PSI (``some avg60``) admission against a bounded ceiling.
+
+    Fails closed when either the measured ``cpu_some_avg60`` or the effective
+    ceiling is missing, non-finite, or out of range. Refuses when
+    ``cpu_some_avg60 >= ceiling`` and admits strictly below ``ceiling``.
+    """
+    resolved_ceiling = _resolve_cpu_psi_ceiling(ceiling)
+    if resolved_ceiling is None:
+        return AdmissionDecision(
+            admitted=False,
+            reason="vm_admission_unmeasured:vm_cpu_psi",
+            details={
+                "cpu_some_avg60": cpu_some_avg60,
+                "ceiling": ceiling,
+                "ceiling_env": CPU_PSI_MAX_ENV,
+            },
+        )
+    measured_psi = _finite_number(cpu_some_avg60)
+    if measured_psi is None:
+        return AdmissionDecision(
+            admitted=False,
+            reason="vm_admission_unmeasured:vm_cpu_psi",
+            details={
+                "cpu_some_avg60": cpu_some_avg60,
+                "ceiling": resolved_ceiling,
+            },
+        )
+    measured_value = float(measured_psi)
+    details: dict[str, object] = {
+        "cpu_some_avg60": measured_value,
+        "ceiling": resolved_ceiling,
+    }
+    if measured_value >= resolved_ceiling:
+        return AdmissionDecision(admitted=False, reason="vm_cpu_psi", details=details)
+    return AdmissionDecision(admitted=True, reason="admit", details=details)
+
+
 def decide(
     gauges: Mapping[str, object],
     pending: int | object,
     measured_cost: Mapping[str, object],
 ) -> AdmissionDecision:
     """Return a fail-closed measured-pressure decision with projection details."""
+    has_cpu_some = "cpu_some_avg60" in gauges or "cpu_psi_some_avg60" in gauges
     required_gauges = (
         ("pids_current", True, "vm_pids"),
         ("memory_anon_bytes", True, "vm_memory"),
@@ -136,10 +191,24 @@ def decide(
     )
     values: dict[str, int | float] = {}
     for name, integer, reason_gauge in required_gauges:
+        if has_cpu_some and name in {"cpu_psi_avg60", "cpu_psi_max"} and name not in gauges:
+            continue
         value = _gauge_number(gauges, name, integer=integer)
         if value is None or (name in {"pids_reserve", "memory_reserve_bytes"} and value <= 0):
             return _decision(False, f"vm_admission_unmeasured:{reason_gauge}", gauges)
         values[name] = value
+
+    cpu_some_decision: AdmissionDecision | None = None
+    if has_cpu_some:
+        raw_cpu_some = gauges["cpu_some_avg60"] if "cpu_some_avg60" in gauges else gauges["cpu_psi_some_avg60"]
+        cpu_some_ceiling = float(values["cpu_psi_max"]) if "cpu_psi_max" in values else None
+        cpu_some_decision = evaluate_cpu_psi_admission(
+            cpu_some_avg60=raw_cpu_some,  # type: ignore[arg-type]
+            ceiling=cpu_some_ceiling,
+        )
+        if not cpu_some_decision.admitted and cpu_some_decision.reason.startswith("vm_admission_unmeasured:"):
+            base = _decision(False, cpu_some_decision.reason, gauges)
+            return AdmissionDecision(False, cpu_some_decision.reason, {**base.details, **cpu_some_decision.details})
 
     pids_max = _limit_value(gauges, "pids_max")
     if pids_max is None:
@@ -201,7 +270,10 @@ def decide(
 
     if values["memory_psi_avg60"] > values["memory_psi_max"]:
         return result(False, "vm_memory_psi")
-    if values["cpu_psi_avg60"] > values["cpu_psi_max"]:
+    if cpu_some_decision is not None and not cpu_some_decision.admitted:
+        decision = result(False, cpu_some_decision.reason)
+        return AdmissionDecision(False, cpu_some_decision.reason, {**decision.details, **cpu_some_decision.details})
+    if "cpu_psi_avg60" in values and "cpu_psi_max" in values and values["cpu_psi_avg60"] > values["cpu_psi_max"]:
         return result(False, "vm_cpu_psi")
 
     if values["disk_free_bytes"] - projected_job_dirs < values["disk_floor_bytes"]:
@@ -347,7 +419,7 @@ def read_gauges(root: Path) -> dict[str, object]:
         "disk_floor_bytes": disk_floor_bytes,
         "memory_headroom_pct": _env_number("WORKBAY_REMOTE_GATE_HEADROOM_PCT", 75, integer=True),
         "memory_psi_max": _env_number("WORKBAY_REMOTE_GATE_MEM_PSI_MAX", 10),
-        "cpu_psi_max": _env_number("WORKBAY_REMOTE_GATE_CPU_PSI_MAX", 60),
+        "cpu_psi_max": _env_number(CPU_PSI_MAX_ENV, DEFAULT_CPU_PSI_MAX),
         "pids_reserve": _env_positive_integer("WORKBAY_REMOTE_GATE_PID_FLOOR", DEFAULT_PIDS_RESERVE),
         "memory_reserve_bytes": memory_reserve_bytes,
         "unlimited_memory_exemption": os.environ.get(UNLIMITED_MEMORY_EXEMPTION_ENV) == "1",

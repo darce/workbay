@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.49] — 2026-11-26
+
+### Changed
+- Add `agy-remote` backend registry/spec/config and gate fixes (`internal`, `AGY-GATE-01..04`), plus Antigravity CLI (`agy`) orchestrator parity (`internal`).
+- Harden custody export-and-claim (`agycust05`: `G165-02/04/05`, `AGYCUST04-G167-01`) and enforce landing drain undo epoch guard, import replace merged guard, and `lane-gate.mk` `src_roots` (`agyc03`).
+- Add VM capacity and reliability controls: `vm_compute_semaphore`, `wave_admission` CPU PSI gating, `remote_probe` capacity metrics, and `statechart_tla` host routing with `LandingDrain.tla` and `ReviewCycleHolder.tla`.
+- Refresh the protocol, handoff, system, and optional Codex bridge dependency floors for WorkBay v0.1.103.
+
 ## [0.3.48] — 2026-11-26
 
 ### Changed

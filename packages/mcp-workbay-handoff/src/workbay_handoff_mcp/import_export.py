@@ -1240,6 +1240,41 @@ class _NativeImportRefusal(ValueError):
     """Snapshot labels cannot supply or discard live native authority."""
 
 
+class _TerminalLaneImportRefusal(ValueError):
+    """replace_task cannot displace or rewrite a live terminal merged lane row [GRPH-14]."""
+
+
+def _check_terminal_lane_import(
+    conn: sqlite3.Connection | None,
+    task_ref: str,
+    incoming: list[dict],
+    mode: str,
+) -> None:
+    if conn is None or mode != "replace_task":
+        return
+    issuer_fields = ("task_ref", "lane_id", "worktree_path", "branch", "status", "identity_seq")
+    imported_by_id = {row["id"]: row for row in incoming if type(row.get("id")) is int}
+    for row in conn.execute(
+        "SELECT * FROM worktree_lanes WHERE task_ref = ? AND status = 'merged'",
+        (task_ref,),
+    ):
+        candidate = imported_by_id.get(row["id"])
+        in_place = candidate is not None and all(row[key] == candidate.get(key) for key in issuer_fields)
+        if not in_place:
+            raise _TerminalLaneImportRefusal(
+                f"replace_task cannot replace or delete live terminal merged lane '{row['lane_id']}'."
+            )
+
+
+def _terminal_lane_import_refusal(task_ref: str, exc: _TerminalLaneImportRefusal) -> dict:
+    return _envelope(
+        ok=False,
+        tool="import_handoff_state",
+        task_ref=task_ref,
+        data={"error": str(exc), "error_kind": "lane_terminal"},
+    )
+
+
 def _check_native_import(
     snapshot: dict, conn: sqlite3.Connection | None = None, task_ref: str = "", mode: str = "merge"
 ) -> None:
@@ -1541,6 +1576,7 @@ def _import_snapshot(
     retained_live: set[tuple] = set()
     if mode == "replace_task":
         _check_native_import(snapshot, conn, task_ref, mode)
+        _check_terminal_lane_import(conn, task_ref, lanes, mode)
         retained_live = _retain_displaced_lanes(conn, task_ref, lanes)
         for table in (
             "blockers",
@@ -1960,10 +1996,13 @@ def import_handoff_state(
     try:
         with _get_db_connection() as conn:
             _check_native_import(snapshot, conn, task_ref, mode)
+            _check_terminal_lane_import(conn, task_ref, snapshot.get("worktree_lanes", []), mode)
             if set_active and isinstance(snapshot.get("active"), dict):
                 custody_archive = supersession.archived_custody_snapshot(conn, task_ref)
     except _NativeImportRefusal as exc:
         return _native_import_refusal(task_ref, exc)
+    except _TerminalLaneImportRefusal as exc:
+        return _terminal_lane_import_refusal(task_ref, exc)
     with _get_db_connection() as conn:
         if mode == "replace_task" and not allow_destructive_clear:
             existing_counts = _count_task_rows(conn, task_ref)
@@ -2033,6 +2072,8 @@ def import_handoff_state(
         )
     except _NativeImportRefusal as exc:
         return _native_import_refusal(task_ref, exc)
+    except _TerminalLaneImportRefusal as exc:
+        return _terminal_lane_import_refusal(task_ref, exc)
     except Exception:
         if not production_imports:
             raise

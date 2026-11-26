@@ -8,7 +8,118 @@ from pathlib import Path
 _CONTRACT_PATH = Path("docs/workbay/contracts/harness-protocol.yaml")
 _KEY = "tracked_overlay_source_paths:"
 _LANDING_KEY = "landing:"
+_HARNESS_CAPABILITIES_KEY = "harness_capabilities:"
 _LANDING_SEVERITIES = frozenset({"LOW", "MEDIUM", "HIGH", "CRITICAL", "BLOCKING"})
+
+CANONICAL_HARNESS_KEYS: frozenset[str] = frozenset(
+    {
+        "claude-code",
+        "codex",
+        "cursor",
+        "vscode",
+        "grok",
+        "agy-cli",
+        "external",
+    }
+)
+HARNESS_KEY_ALIASES: dict[str, str] = {
+    "agy": "agy-cli",
+    "agy-app": "agy-cli",
+    "agy-ide": "agy-cli",
+}
+HARNESS_SURFACE_KEYS: dict[str, str] = {
+    "claude-code": "claude-code",
+    "codex": "codex",
+    "cursor": "cursor",
+    "vscode": "vscode",
+    "grok": "grok",
+    "agy-cli": "agy",
+}
+
+
+def normalize_harness_key(harness: str | None) -> str | None:
+    """Normalize a harness identifier, mapping ``agy`` aliases to ``agy-cli``."""
+    if harness is None:
+        return None
+    cleaned = harness.strip().lower()
+    if not cleaned:
+        return None
+    return HARNESS_KEY_ALIASES.get(cleaned, cleaned)
+
+
+def is_known_harness_key(harness: str | None) -> bool:
+    """Return True when *harness* (or an alias) maps to a canonical harness key."""
+    normalized = normalize_harness_key(harness)
+    return normalized is not None and normalized in CANONICAL_HARNESS_KEYS
+
+
+def resolve_harness_surface(harness: str | None) -> str | None:
+    """Return the plugin/surface output directory key for *harness*, or ``None``."""
+    normalized = normalize_harness_key(harness)
+    if normalized is None:
+        return None
+    return HARNESS_SURFACE_KEYS.get(normalized)
+
+
+def load_harness_capability_keys(
+    workspace_root: Path | str,
+    section: str = "plugin_activation",
+) -> frozenset[str] | None:
+    """Read normalized ``harness_key`` entries from ``harness_capabilities.<section>``.
+
+    Returns ``None`` when the contract or requested section is missing or
+    unreadable so callers can fail closed ([OBS-08]).
+    """
+    path = Path(workspace_root).expanduser().resolve() / _CONTRACT_PATH
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+    cap_index = next((idx for idx, raw in enumerate(lines) if raw == _HARNESS_CAPABILITIES_KEY), None)
+    if cap_index is None:
+        return None
+
+    cap_end = len(lines)
+    for idx in range(cap_index + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if stripped and not stripped.startswith("#"):
+            indent = len(lines[idx]) - len(lines[idx].lstrip(" "))
+            if indent <= 0:
+                cap_end = idx
+                break
+
+    target_header = f"{section}:"
+    section_index: int | None = None
+    section_indent = 0
+    for idx in range(cap_index + 1, cap_end):
+        raw = lines[idx]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if stripped == target_header:
+            section_index = idx
+            section_indent = indent
+            break
+    if section_index is None:
+        return None
+
+    keys: set[str] = set()
+    for idx in range(section_index + 1, cap_end):
+        raw = lines[idx]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent <= section_indent:
+            break
+        if stripped.startswith("- harness_key:") or stripped.startswith("harness_key:"):
+            _, _, value = stripped.partition(":")
+            normalized = normalize_harness_key(value.split(" #", 1)[0].strip().strip("'\""))
+            if normalized is not None:
+                keys.add(normalized)
+    return frozenset(keys)
 
 
 @dataclass(frozen=True)

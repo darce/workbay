@@ -459,6 +459,13 @@ check-overlay-drift: ## Fail when root docs/workbay/{contracts,rules,templates} 
 	@scripts/assert_gate_interpreter.sh "$(SYSTEM_PYTHON)" "check-overlay-drift"
 	@$(SYSTEM_PYTHON) scripts/check_overlay_drift.py
 
+.PHONY: tech-debt-index check-tech-debt-index
+tech-debt-index: ## Regenerate the corresponding implementation note from tech-debt entries
+	$(JUDGE_PYTHON) scripts/render_tech_debt_index.py
+
+check-tech-debt-index: ## Fail (exit 1) when the corresponding implementation note drifts from tech-debt entries
+	$(JUDGE_PYTHON) scripts/render_tech_debt_index.py --check
+
 .PHONY: check-remote
 check-remote: ## Run gate suites on the remote offload host: [TARGETS="check-system test-handoff"] (default host = runbook gate user; override via WORKBAY_REMOTE_GATE_HOST or .workbay/remote-gate.env)
 	@bash scripts/remote_gate.sh run $(TARGETS)

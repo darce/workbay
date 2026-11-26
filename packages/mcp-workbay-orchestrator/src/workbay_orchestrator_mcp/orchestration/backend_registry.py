@@ -16,6 +16,14 @@ from typing import Any, Callable, Literal
 from workbay_protocol import reasoning_effort as model_routing
 from workbay_protocol.remote_probe import probe_remote_gate, resolve_remote_gate_host
 
+from workbay_orchestrator_mcp.orchestration.agy_lane_config import (
+    AGY_LIST_MODELS_ARGV,
+    AGY_REMOTE_ALLOWED_MODELS,
+    AGY_REMOTE_BIN,
+    DEFAULT_AGY_MODEL,
+    TRACKED_AGY_MODEL,
+    WORKBAY_AGY_MODEL_ENV,
+)
 from workbay_orchestrator_mcp.orchestration.backend_adapter import BackendAdapter
 from workbay_orchestrator_mcp.orchestration.codex_lane_config import (
     CODEX_ALLOWED_MODELS,
@@ -928,6 +936,46 @@ BACKENDS: dict[str, BackendSpec] = {
             dispatchable_off_box=True,
         ),
     ),
+    # Antigravity CLI (agy) on the remote OCI VM via remote_agent.sh --agent-spec.
+    # Binary verified 2026-11-25: agy 1.5.16 at ~/.local/bin/agy on the VM;
+    # headless auth check via `agy models` (exits 0 when signed in, 1 otherwise).
+    "agy-remote": BackendSpec(
+        launch_recipe_path="workbay_orchestrator_mcp.orchestration.backend_spec._agy_remote_argv",
+        kind="cli",
+        adapter_path="workbay_orchestrator_mcp.orchestration.adapters.remote_exec.RemoteExecAdapter",
+        cost_class=COST_REMOTE,
+        model_family="agy",
+        review_eligible=False,
+        description=("Ship an Antigravity CLI (agy) turn to the remote OCI VM via remote_agent.sh --agent-spec."),
+        shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.agy_cli.AgyCliAdapter",
+        availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_agy_remote",
+        allowed_model=DEFAULT_AGY_MODEL,
+        allowed_models=AGY_REMOTE_ALLOWED_MODELS,
+        allowed_model_env=WORKBAY_AGY_MODEL_ENV,
+        list_models_argv=AGY_LIST_MODELS_ARGV,
+        tracked_model=TRACKED_AGY_MODEL,
+        post_turn_fetch_headroom_s=15,
+        auth=AuthPort(
+            kind="device_login",
+            artifact="~/.gemini/antigravity-cli/antigravity-oauth-token",
+            binary=AGY_REMOTE_BIN,
+            status_argv=("models",),
+        ),
+        capabilities=BackendCapabilities(
+            is_available=False,
+            supports_structured_output=True,  # agy -p --output-format json --json-schema
+            supports_reasoning_effort=True,  # agy --effort low|medium|high|xhigh|max
+            supports_token_telemetry=False,
+            token_telemetry_presentation=_NEUTRAL_TOKEN_TELEMETRY_PRESENTATION,
+            supports_sandbox=True,
+            supports_token_budget_cycle_bounds=False,  # no --max-turns in agy CLI
+            supports_adapter_timeout_bounds=True,
+            runs_self_verify_off_box=True,
+            dispatchable_off_box=True,
+            provisions_lane_venv=True,
+            retained_artifact_aliases=REMOTE_RETAINED_ARTIFACT_ALIASES,
+        ),
+    ),
     "cursor-cli": BackendSpec(
         kind="cli",
         adapter_path="workbay_orchestrator_mcp.orchestration.adapters.cursor_cli.CursorCliAdapter",
@@ -1628,6 +1676,12 @@ _MUSE_REMOTE_REMEDY = (
     "~/.config/muse/auth.json (run `muse login` on the VM). "
     "See docs/runbooks/remote-gate-provisioning.md."
 )
+_AGY_REMOTE_REMEDY = (
+    "agy-remote requires WORKBAY_REMOTE_GATE_HOST and a provisioned OCI VM with "
+    "the agy binary at ~/.local/bin/agy plus a signed-in session under "
+    "~/.gemini/antigravity-cli (run `/home/gate/.local/bin/agy` on the VM and verify `agy models` exits 0). "
+    "See docs/runbooks/remote-gate-provisioning.md."
+)
 # S4-L-06: env file / env var come from the row's AuthPort (single literal).
 _OPENROUTER_REMOTE_REMEDY = (
     "openrouter-remote requires WORKBAY_REMOTE_GATE_HOST and a provisioned OCI VM with "
@@ -1830,6 +1884,8 @@ _PROBE_CURSOR_REMOTE_TTL_S = 30.0
 _probe_cursor_remote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _PROBE_MUSE_REMOTE_TTL_S = 30.0
 _probe_muse_remote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_PROBE_AGY_REMOTE_TTL_S = 30.0
+_probe_agy_remote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _PROBE_CLAUDE_REMOTE_TTL_S = 30.0
 _probe_claude_remote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _probe_claude_api_remote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -2289,6 +2345,101 @@ def _probe_muse_remote(*, workspace_root: Path | str | None = None) -> dict[str,
             "auth_state": REMOTE_AUTH_UNVERIFIED,
         }
     _probe_muse_remote_cache[host] = (now + _PROBE_MUSE_REMOTE_TTL_S, payload)
+    return payload
+
+
+def _probe_agy_remote(*, workspace_root: Path | str | None = None) -> dict[str, Any]:
+    """Availability probe for agy-remote. Never raises.
+
+    One ssh round-trip via the declared device_login AuthPort: the VM agy
+    binary must be installed, the session artifact (~/.gemini/antigravity-cli)
+    must exist, and `agy models` must exit 0. Availability flips only on
+    REMOTE_AUTH_AUTHENTICATED ([SECD-05], [CAL-02]).
+    """
+    base = BACKENDS["agy-remote"].capabilities
+    host = _resolve_remote_gate_host_for_probe(workspace_root=workspace_root)
+    if not host:
+        return {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_NOT_INSTALLED,
+            "detail": _AGY_REMOTE_REMEDY,
+            "install_state": "not_installed",
+            "auth_state": REMOTE_AUTH_NA,
+        }
+    if _remote_host_is_malformed(host):
+        return {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_UNAVAILABLE,
+            "detail": (
+                f"Remote gate host is malformed and was refused before probing (leading '-' or whitespace): {host!r}."
+            ),
+            "install_state": "not_installed",
+            "auth_state": REMOTE_AUTH_NA,
+        }
+    now = time.monotonic()
+    cached = _probe_agy_remote_cache.get(host)
+    if cached is not None:
+        expires_at, payload = cached
+        if now < expires_at:
+            return payload
+        del _probe_agy_remote_cache[host]
+    auth = probe_remote_auth("agy-remote", host=host, timeout=20)
+    rc = auth["exit_code"]
+    auth_state = auth["auth_state"]
+    if rc == _REMOTE_AUTH_TRANSPORT_EXIT:
+        payload = {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_UNAVAILABLE,
+            "detail": f"Remote gate '{host}' unreachable for agy-remote: {auth['marker']}.",
+            "install_state": "not_installed",
+            "auth_state": REMOTE_AUTH_NA,
+        }
+    elif auth_state == REMOTE_AUTH_AUTHENTICATED:
+        payload = {
+            "capabilities": _availability_caps(base, is_available=True),
+            "is_available": True,
+            "state": AVAIL_AVAILABLE,
+            "detail": (
+                f"Remote gate '{host}' reachable; VM agy installed and "
+                "authenticated (session artifact present; `agy models` ok)."
+            ),
+            "install_state": "installed",
+            "auth_state": REMOTE_AUTH_AUTHENTICATED,
+        }
+    elif auth_state == REMOTE_AUTH_MISSING:
+        payload = {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_UNAVAILABLE,
+            "detail": (
+                f"Remote gate '{host}' has agy installed but its session "
+                "artifact ~/.gemini/antigravity-cli/antigravity-oauth-token is missing (sign in on the VM via `/home/gate/.local/bin/agy`)."
+            ),
+            "install_state": "installed",
+            "auth_state": REMOTE_AUTH_MISSING,
+        }
+    elif auth_state == REMOTE_AUTH_FAILED:
+        payload = {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_UNAVAILABLE,
+            "detail": f"Remote gate '{host}' refused agy auth readiness ({auth['marker']}).",
+            "install_state": "installed",
+            "auth_state": REMOTE_AUTH_FAILED,
+        }
+    else:
+        payload = {
+            "capabilities": _availability_caps(base, is_available=False),
+            "is_available": False,
+            "state": AVAIL_UNAVAILABLE,
+            "detail": f"Remote gate '{host}' has agy installed but auth readiness is unverified ({auth['marker']}).",
+            "install_state": "installed",
+            "auth_state": REMOTE_AUTH_UNVERIFIED,
+        }
+    _probe_agy_remote_cache[host] = (now + _PROBE_AGY_REMOTE_TTL_S, payload)
     return payload
 
 

@@ -254,6 +254,8 @@ HOOK_STAGES: tuple[tuple[str, str], ...] = (
 )
 GROK_PLUGIN_HOOKS_PATH = Path(".workbay/generated/plugins/workbay-system/base/grok/hooks/hooks.json")
 CURSOR_PLUGIN_HOOKS_PATH = Path(".workbay/generated/plugins/workbay-system/base/cursor/hooks.json")
+AGY_PLUGIN_HOOKS_PATH = Path(".workbay/generated/plugins/workbay-system/base/agy/hooks.json")
+AGY_PLUGIN_MCP_CONFIG_PATH = Path(".workbay/generated/plugins/workbay-system/base/agy/mcp_config.json")
 
 
 class CheckFindings(list):
@@ -371,6 +373,39 @@ def _load_cursor_plugin_hook_pairs(repo_root: Path) -> set[tuple[str, str]]:
         if not isinstance(stage_entries, list):
             continue
         pairs |= _flatten_vscode_entries(stage_entries)
+    return pairs
+
+
+def _load_agy_plugin_hook_pairs(repo_root: Path) -> set[tuple[str, str]]:
+    hooks_path = _candidate_path(repo_root, AGY_PLUGIN_HOOKS_PATH)
+    if not hooks_path.is_file():
+        return set()
+    payload = json.loads(hooks_path.read_text())
+    if not isinstance(payload, dict):
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for group_payload in payload.values():
+        if not isinstance(group_payload, dict):
+            continue
+        for stage_entries in group_payload.values():
+            if not isinstance(stage_entries, list):
+                continue
+            for entry in stage_entries:
+                if not isinstance(entry, dict):
+                    continue
+                nested = entry.get("hooks")
+                if isinstance(nested, list):
+                    matcher = entry.get("matcher", "")
+                    for hook in nested:
+                        if not isinstance(hook, dict):
+                            continue
+                        command = hook.get("command")
+                        if isinstance(command, str) and command:
+                            pairs.add((matcher, command))
+                else:
+                    command = entry.get("command")
+                    if isinstance(command, str) and command:
+                        pairs.add(("", command))
     return pairs
 
 
@@ -630,6 +665,7 @@ def _check_hooks(contract: dict, *, repo_root: Path = REPO_ROOT) -> CheckFinding
     anchor = _load_guard_wrap_module().anchor_to_repo_root
     grok_pairs = _load_grok_plugin_hook_pairs(repo_root)
     cursor_pairs = _load_cursor_plugin_hook_pairs(repo_root)
+    agy_pairs = _load_agy_plugin_hook_pairs(repo_root)
     errors: list[str] = []
     # Generated per-agent artifacts are optional at this layer: Claude and
     # Codex wiring is only validated when the harness config file exists.
@@ -781,6 +817,8 @@ def _check_hooks(contract: dict, *, repo_root: Path = REPO_ROOT) -> CheckFinding
     # merge the separate absence channel rather than folding it into errors.
     findings.extend(_check_grok_plugin_hooks(contract, grok_pairs, repo_root=repo_root))
     findings.extend(_check_cursor_plugin_hooks(contract, cursor_pairs, repo_root=repo_root))
+    findings.extend(_check_agy_plugin_hooks(contract, agy_pairs, repo_root=repo_root))
+    findings.extend(_check_agy_plugin_mcp_config(repo_root=repo_root))
     return findings
 
 
@@ -959,6 +997,123 @@ def _check_cursor_plugin_hooks(
             wrapped = wrap(cursor_command, fail_mode=item.get("fail_mode"))
             if (matcher, wrapped) not in cursor_pairs:
                 errors.append(f"missing Cursor plugin hook `{item.get('id', '<unknown>')}` ({stage})")
+    return CheckFindings(errors)
+
+
+def _check_agy_plugin_hooks(
+    contract: dict,
+    agy_pairs: set[tuple[str, str]],
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> CheckFindings:
+    """Assert emitted agy plugin ``hooks.json`` matches harness-protocol rows.
+
+    Mirrors ``_check_grok_plugin_hooks`` / ``_check_cursor_plugin_hooks``:
+    true non-existence under the gitignored ``.workbay/generated`` tree is
+    reported on ``.absences``, while non-regular files or missing rows are
+    reported as drift errors.
+    """
+    hook_spec = contract.get("hooks") or {}
+    pre_rows = hook_spec.get("pre_tool_use") or []
+    agy_aware = any(isinstance(item, dict) and "agy_command" in item for item in pre_rows)
+    if not agy_aware:
+        return CheckFindings()
+    hooks_path = _candidate_path(repo_root, AGY_PLUGIN_HOOKS_PATH)
+    if not hooks_path.is_file():
+        named = AGY_PLUGIN_HOOKS_PATH.as_posix()
+        try:
+            os.lstat(hooks_path)
+        except FileNotFoundError:
+            return CheckFindings(absences=[named])
+        except OSError as exc:
+            return CheckFindings([f"unable to stat generated agy plugin hooks `{named}`: {exc}"])
+        return CheckFindings([f"generated agy plugin hooks `{named}` exists but is not a readable regular file"])
+
+    errors: list[str] = []
+    for item in pre_rows:
+        if not isinstance(item, dict):
+            continue
+        hook_id = item.get("id", "<unknown>")
+        agy_command = _render_hook_command(item, "agy_command", repo_root)
+        if not isinstance(agy_command, str) or not agy_command.strip():
+            unsupported_reason = item.get("unsupported_reason")
+            if not (
+                item.get("agy_enabled") is False
+                and isinstance(unsupported_reason, str)
+                and unsupported_reason.strip()
+            ):
+                errors.append(f"missing agy_command on pre_tool_use guard `{hook_id}`")
+            continue
+        if item.get("agy_enabled") is False:
+            errors.append(
+                f"pre_tool_use guard `{hook_id}` declares `agy_enabled: false` but still sets agy_command"
+            )
+        matcher = item.get("agy_matcher", item.get("matcher", ""))
+        if (matcher, agy_command) not in agy_pairs:
+            errors.append(f"missing agy plugin hook `{hook_id}` (pre_tool_use)")
+
+    for stage in ("session_start", "user_prompt_submit"):
+        for item in hook_spec.get(stage) or []:
+            if not isinstance(item, dict) or item.get("agy_enabled") is False:
+                continue
+            agy_command = _render_hook_command(item, "agy_command", repo_root)
+            if not isinstance(agy_command, str) or not agy_command.strip():
+                continue
+            if ("", agy_command) not in agy_pairs:
+                errors.append(f"missing agy plugin hook `{item.get('id', '<unknown>')}` ({stage})")
+
+    return CheckFindings(errors)
+
+
+def _check_agy_plugin_mcp_config(*, repo_root: Path = REPO_ROOT) -> CheckFindings:
+    """Assert emitted agy plugin ``mcp_config.json`` matches ``mcp_servers.yaml``."""
+    mcp_manifest_path = _candidate_path(
+        repo_root, Path("config/agent-workflows/mcp_servers.yaml")
+    )
+    if not mcp_manifest_path.is_file():
+        return CheckFindings()
+    manifest = yaml.safe_load(mcp_manifest_path.read_text()) or {}
+    if not isinstance(manifest, dict):
+        return CheckFindings()
+    registration = manifest.get("registration") or {}
+    if registration.get("agy") != "plugin":
+        return CheckFindings()
+
+    mcp_config_path = _candidate_path(repo_root, AGY_PLUGIN_MCP_CONFIG_PATH)
+    if not mcp_config_path.is_file():
+        named = AGY_PLUGIN_MCP_CONFIG_PATH.as_posix()
+        try:
+            os.lstat(mcp_config_path)
+        except FileNotFoundError:
+            return CheckFindings(absences=[named])
+        except OSError as exc:
+            return CheckFindings([f"unable to stat generated agy plugin MCP config `{named}`: {exc}"])
+        return CheckFindings(
+            [f"generated agy plugin MCP config `{named}` exists but is not a readable regular file"]
+        )
+
+    payload = json.loads(mcp_config_path.read_text())
+    if not isinstance(payload, dict) or not isinstance(payload.get("mcpServers"), dict):
+        return CheckFindings(["generated agy plugin mcp_config.json must declare a top-level `mcpServers` mapping"])
+    rendered_servers = payload["mcpServers"]
+    errors: list[str] = []
+    for server in manifest.get("mcp_servers") or []:
+        if not isinstance(server, dict):
+            continue
+        harnesses = server.get("harnesses") or []
+        if harnesses and "agy" not in harnesses:
+            continue
+        name = server.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        entry = rendered_servers.get(name)
+        if not isinstance(entry, dict):
+            errors.append(f"missing agy plugin MCP server `{name}` in mcp_config.json")
+            continue
+        if "type" in entry:
+            errors.append(f"agy plugin MCP server `{name}` must omit `type` in mcp_config.json")
+        if entry.get("command") != server.get("command") or entry.get("args") != list(server.get("args", [])):
+            errors.append(f"agy plugin MCP server `{name}` command/args drifted from mcp_servers.yaml")
     return CheckFindings(errors)
 
 
@@ -1834,10 +1989,12 @@ def _check_compaction_contract(contract: dict) -> list[str]:
         errors.append("compaction.transcript_discovery must be a mapping")
         return errors
 
-    expected_harnesses = {"claude-code", "codex", "grok", "vscode"}
+    expected_harnesses = {"agy-cli", "claude-code", "codex", "grok", "vscode"}
     actual_harnesses = set(transcript_discovery)
     if actual_harnesses != expected_harnesses:
-        errors.append("compaction.transcript_discovery must define exactly `claude-code`, `codex`, and `vscode`")
+        errors.append(
+            "compaction.transcript_discovery must define exactly `agy-cli`, `claude-code`, `codex`, `grok`, and `vscode`"
+        )
 
     for harness in sorted(expected_harnesses & actual_harnesses):
         rule = transcript_discovery.get(harness)

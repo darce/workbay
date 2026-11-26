@@ -29,7 +29,6 @@ from queue import Empty, Queue
 from threading import BoundedSemaphore, Lock, Thread
 from typing import Literal, cast
 
-import yaml
 from pydantic import BaseModel, Field, field_validator
 from workbay_protocol import StructuredSummary, TurnRange
 
@@ -37,17 +36,14 @@ from .compaction_contract import (
     CompactionContract,
     CompactionContractHarness,
     EffectiveThresholds,
-    HarnessIdentityMarkersRule,
     TranscriptDiscoveryRule,
     _resolve_contract_path,
     build_contract_source_report,
     detect_active_harness,
+    load_compaction_contract,
     normalize_compaction_harness,
     resolve_effective_thresholds,
     resolve_min_new_tokens_gate_with_fallback,
-)
-from .compaction_contract import (
-    load_compaction_contract as _load_compaction_contract_from_disk,
 )
 from .concept_embed_hook import embed_compaction_anchor_on_write, embed_concept_on_write
 from .review_findings import list_review_findings
@@ -58,16 +54,31 @@ from .verified_tests import get_verified_tests
 
 _log = logging.getLogger("workbay_handoff_mcp")
 
-CompactionHarness = Literal["claude-code", "codex", "grok", "vscode", "manual"]
-CompactionHarnessInput = Literal["claude-code", "codex", "grok", "vscode", "manual", "cursor"]
-COMPACTION_HARNESS_CHOICES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "manual")
+CompactionHarness = Literal["claude-code", "codex", "grok", "vscode", "agy-cli", "manual"]
+CompactionHarnessInput = Literal[
+    "claude-code",
+    "codex",
+    "grok",
+    "vscode",
+    "agy-cli",
+    "manual",
+    "cursor",
+    "agy",
+    "agy-app",
+    "agy-ide",
+]
+COMPACTION_HARNESS_CHOICES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "agy-cli", "manual")
 COMPACTION_HARNESS_INPUT_CHOICES: tuple[str, ...] = (
     "claude-code",
     "codex",
     "grok",
     "vscode",
+    "agy-cli",
     "manual",
     "cursor",
+    "agy",
+    "agy-app",
+    "agy-ide",
 )
 PROSE_RESIDUAL_SOFT_LIMIT_CHARS = 4096
 PROSE_RESIDUAL_HARD_LIMIT_CHARS = 16384
@@ -87,7 +98,8 @@ _JSONL_DROP_RECORD_TYPES = frozenset(
         "system",
     }
 )
-_JSONL_TURN_RECORD_TYPES = frozenset({"user", "assistant"})
+_AGY_JSONL_TURN_RECORD_TYPES = frozenset({"USER_INPUT", "PLANNER_RESPONSE"})
+_JSONL_TURN_RECORD_TYPES = frozenset({"user", "assistant"}) | _AGY_JSONL_TURN_RECORD_TYPES
 
 DEFAULT_MIN_NEW_TURNS = 0
 # Emergency fallback for the Stop-hook token gate, used ONLY when the canonical
@@ -126,80 +138,6 @@ _FALSY_FLAG_VALUES: frozenset[str] = frozenset({"", "0", "false", "no", "off"})
 _CompactionContractCacheKey = tuple[Path, str]
 _compaction_contract_cache: tuple[_CompactionContractCacheKey, CompactionContract] | None = None
 _compaction_contract_cache_lock = Lock()
-
-
-def _parse_compaction_contract_content(contract_path: Path, content: bytes) -> CompactionContract:
-    """Parse a contract from the exact bytes used to derive its cache identity."""
-
-    payload = yaml.safe_load(content.decode("utf-8")) or {}
-    if not isinstance(payload, dict):
-        raise ValueError(f"Compaction contract at {contract_path} must be a mapping")
-    compaction_payload = payload.get("compaction")
-    if not isinstance(compaction_payload, dict):
-        raise ValueError(f"Compaction contract at {contract_path} is missing the top-level 'compaction' block")
-
-    discovery_payload = compaction_payload.get("transcript_discovery")
-    if not isinstance(discovery_payload, dict):
-        raise ValueError(f"Compaction contract at {contract_path} is missing 'compaction.transcript_discovery'")
-
-    transcript_discovery: dict[str, TranscriptDiscoveryRule] = {}
-    for harness_name, harness_payload in discovery_payload.items():
-        if not isinstance(harness_name, str):
-            raise ValueError(f"Compaction contract at {contract_path} has a non-string harness name")
-        if not isinstance(harness_payload, dict):
-            raise ValueError(
-                f"Compaction contract at {contract_path} has a non-mapping transcript discovery entry "
-                f"for {harness_name!r}"
-            )
-        transcript_discovery[normalize_compaction_harness(harness_name)] = TranscriptDiscoveryRule.model_validate(
-            harness_payload
-        )
-
-    harness_identity_markers: dict[str, HarnessIdentityMarkersRule] = {}
-    markers_payload = compaction_payload.get("harness_identity_markers")
-    if markers_payload is not None:
-        if not isinstance(markers_payload, dict):
-            raise ValueError(
-                f"Compaction contract at {contract_path} has a non-mapping 'compaction.harness_identity_markers' block"
-            )
-        for harness_name, harness_payload in markers_payload.items():
-            if not isinstance(harness_name, str):
-                raise ValueError(
-                    f"Compaction contract at {contract_path} has a non-string harness name in harness_identity_markers"
-                )
-            if not isinstance(harness_payload, dict):
-                raise ValueError(
-                    f"Compaction contract at {contract_path} has a non-mapping "
-                    f"harness_identity_markers entry for {harness_name!r}"
-                )
-            harness_identity_markers[normalize_compaction_harness(harness_name)] = (
-                HarnessIdentityMarkersRule.model_validate(harness_payload)
-            )
-
-    return CompactionContract.model_validate(
-        {
-            "contract_path": contract_path,
-            "advisory_field": compaction_payload.get("advisory_field"),
-            "threshold_tokens": compaction_payload.get("threshold_tokens"),
-            "threshold_chars": compaction_payload.get("threshold_chars"),
-            "unknown_harness": compaction_payload.get("unknown_harness"),
-            "transcript_discovery": transcript_discovery,
-            "harness_identity_markers": harness_identity_markers,
-        }
-    )
-
-
-def load_compaction_contract(
-    workspace_root: str | Path,
-    *,
-    contract_path: Path | None = None,
-    content: bytes | None = None,
-) -> CompactionContract:
-    """Load from disk normally, or parse a caller's single-read snapshot."""
-
-    if contract_path is None or content is None:
-        return _load_compaction_contract_from_disk(workspace_root)
-    return _parse_compaction_contract_content(contract_path, content)
 
 
 def _read_compaction_contract(
@@ -1133,6 +1071,95 @@ def _extract_text_from_content(content: object) -> list[str]:
     return parts
 
 
+_AGY_TOOL_ARG_SUMMARY_KEYS: tuple[str, ...] = (
+    "Path",
+    "TargetFile",
+    "CommandLine",
+    "path",
+    "command",
+    "query",
+    "pattern",
+)
+_AGY_TOOL_SUMMARY_MAX_CHARS = 120
+
+
+def _extract_agy_content_parts(content: object) -> list[str]:
+    if isinstance(content, dict):
+        parts: list[str] = []
+        for key in ("text", "content", "message"):
+            if key in content:
+                parts.extend(_extract_text_from_content(content.get(key)))
+        return parts
+    return _extract_text_from_content(content)
+
+
+def _format_agy_tool_calls(tool_calls: object) -> list[str]:
+    if not isinstance(tool_calls, list):
+        return []
+    summaries: list[str] = []
+    for item in tool_calls:
+        if isinstance(item, str):
+            stripped = item.strip()
+            if stripped:
+                summaries.append(stripped)
+            continue
+        if not isinstance(item, dict):
+            continue
+        func = item.get("function")
+        name_raw = (
+            item.get("name")
+            or item.get("tool")
+            or (func.get("name") if isinstance(func, dict) else None)
+        )
+        name = str(name_raw).strip() if name_raw is not None else ""
+        if not name:
+            continue
+        detail: str | None = None
+        summary_raw = item.get("summary")
+        if isinstance(summary_raw, str) and summary_raw.strip():
+            detail = summary_raw.strip()
+        else:
+            args = item.get("args")
+            if not isinstance(args, dict):
+                args = item.get("arguments")
+            if isinstance(args, dict):
+                for key in _AGY_TOOL_ARG_SUMMARY_KEYS:
+                    val = args.get(key)
+                    if isinstance(val, str) and val.strip():
+                        detail = val.strip()
+                        break
+        if detail:
+            if len(detail) > _AGY_TOOL_SUMMARY_MAX_CHARS:
+                detail = detail[: _AGY_TOOL_SUMMARY_MAX_CHARS - 3] + "..."
+            summaries.append(f"{name}({detail})")
+        else:
+            summaries.append(name)
+    return summaries
+
+
+def _slim_agy_jsonl_record(record: dict[str, object]) -> str | None:
+    record_type = record.get("type")
+    if record_type == "USER_INPUT":
+        role = "user"
+    elif record_type == "PLANNER_RESPONSE":
+        role = "assistant"
+    elif record_type == "GENERIC":
+        role = "generic"
+    else:
+        return None
+    parts = [_strip_harness_boilerplate(part) for part in _extract_agy_content_parts(record.get("content"))]
+    parts = [part for part in parts if part]
+    tool_summaries = _format_agy_tool_calls(record.get("tool_calls"))
+    segments: list[str] = []
+    if parts:
+        segments.append(" ".join(parts))
+    if tool_summaries:
+        segments.append(f"[tools: {', '.join(tool_summaries)}]")
+    if not segments:
+        return None
+    return f"{role}: {' '.join(segments)}"
+
+
 def _slim_jsonl_record(record: dict[str, object]) -> str | None:
     record_type = record.get("type")
     if record_type in _JSONL_DROP_RECORD_TYPES:
@@ -1146,6 +1173,8 @@ def _slim_jsonl_record(record: dict[str, object]) -> str | None:
         if not parts:
             return None
         return f"{record_type}: {' '.join(parts)}"
+    if record_type in ("USER_INPUT", "PLANNER_RESPONSE", "GENERIC"):
+        return _slim_agy_jsonl_record(record)
     return None
 
 
@@ -2175,16 +2204,91 @@ def _detect_harness_from_fallback_glob(
     return None
 
 
+def _discover_agy_brain_transcripts(
+    *,
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[Path]:
+    """Discover standalone ``agy-cli`` transcripts from brain log directories."""
+    source_env = env if env is not None else os.environ
+    resolved_home = home if home is not None else Path(source_env.get("HOME") or Path.home())
+    search_roots: list[Path] = []
+    app_data_raw = source_env.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+    if app_data_raw:
+        search_roots.append(Path(app_data_raw).expanduser())
+    search_roots.append(resolved_home / ".agy" / "antigravity-cli")
+    # External agy binary default app-data log location (read-only filesystem fallback).
+    search_roots.append(resolved_home / ".gemini" / "antigravity-cli")
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        brain_dir = root / "brain"
+        if not brain_dir.is_dir():
+            continue
+        for match in brain_dir.glob("*/.system_generated/logs/transcript*.jsonl"):
+            if not match.is_file():
+                continue
+            resolved = match.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(match)
+    return sorted(
+        candidates,
+        key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name == "transcript_full.jsonl"),
+        reverse=True,
+    )
+
+
 def _resolve_transcript(
     contract: CompactionContract,
     harness: str | None,
     env: Mapping[str, str],
+    *,
+    transcript_path: str | Path | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Return (path, source, warning) for the resolved transcript."""
+    if transcript_path is not None and str(transcript_path).strip():
+        candidate = Path(transcript_path).expanduser()
+        if candidate.exists():
+            return str(candidate), "explicit", None
+        return (
+            None,
+            None,
+            f"explicit transcript path does not exist: {candidate}",
+        )
 
-    if harness is None or harness not in contract.transcript_discovery:
+    if harness is None:
         return None, None, None
-    rule = contract.transcript_discovery[harness]
+    normalized_harness = harness
+    try:
+        normalized_harness = normalize_compaction_harness(harness)
+    except ValueError:
+        pass
+
+    if normalized_harness not in contract.transcript_discovery:
+        if normalized_harness == "agy-cli":
+            env_value = env.get("AGY_SESSION_TRANSCRIPT_PATH", "").strip()
+            if env_value:
+                candidate = Path(env_value).expanduser()
+                if candidate.exists():
+                    return str(candidate), "env_var", None
+                return (
+                    None,
+                    None,
+                    f"transcript path from AGY_SESSION_TRANSCRIPT_PATH does not exist: {candidate}",
+                )
+            matches = _discover_agy_brain_transcripts(env=env)
+            if matches:
+                return str(matches[0]), "fallback_glob", None
+            return (
+                None,
+                None,
+                "no transcript found for harness 'agy-cli' (env AGY_SESSION_TRANSCRIPT_PATH unset, brain log fallback had no matches)",
+            )
+        return None, None, None
+    rule = contract.transcript_discovery[normalized_harness]
     env_value = env.get(rule.env_var, "").strip()
     if env_value:
         candidate = Path(env_value).expanduser()
@@ -2199,10 +2303,14 @@ def _resolve_transcript(
     matches = _glob_matches_for_harness(rule)
     if matches:
         return str(matches[0]), "fallback_glob", None
+    if normalized_harness == "agy-cli":
+        brain_matches = _discover_agy_brain_transcripts(env=env)
+        if brain_matches:
+            return str(brain_matches[0]), "fallback_glob", None
     return (
         None,
         None,
-        f"no transcript found for harness {harness!r} (env {rule.env_var} unset, fallback_glob had no matches)",
+        f"no transcript found for harness {normalized_harness!r} (env {rule.env_var} unset, fallback_glob had no matches)",
     )
 
 

@@ -757,8 +757,11 @@ _REGISTERED_BACKEND_IDS: frozenset[str] = frozenset(
         "grok-remote",
         "grok-cli",
         "claude-code",
+        "claude-remote",
         "codex-cli",
         "cursor-cli",
+        "agy-cli",
+        "agy-remote",
     }
 )
 

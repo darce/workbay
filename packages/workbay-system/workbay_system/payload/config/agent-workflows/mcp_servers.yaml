@@ -29,6 +29,7 @@ registration:
   cursor: root
   vscode: root
   grok: root
+  agy: plugin
 mcp_servers:
   - name: workbay-handoff-mcp
     command: sh
@@ -39,7 +40,7 @@ mcp_servers:
       - workbay-handoff-mcp
     env:
       WORKBAY_TOOL_ROSTER_POLICY: all
-    harnesses: [claude, codex, cursor, grok, vscode]
+    harnesses: [agy, claude, codex, cursor, grok, vscode]
   - name: workbay-orchestrator-mcp
     command: sh
     args:
@@ -49,7 +50,7 @@ mcp_servers:
       - workbay-orchestrator-mcp
     env:
       WORKBAY_TOOL_ROSTER_POLICY: all
-    harnesses: [claude, codex, cursor, grok, vscode]
+    harnesses: [agy, claude, codex, cursor, grok, vscode]
 
 # Opt-in managed servers. Kept under a DISTINCT top-level key (not `mcp_servers`)
 # so any consumer that predates opt-in support — an older `render()`, or the
@@ -69,5 +70,5 @@ optional_mcp_servers:
       - 'root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"; exec python3 "$root/scripts/hooks/mcp_launch.py" "$@"'
       - "sh"
       - codebase-graph-mcp
-    harnesses: [claude, codex, cursor, grok, vscode]
+    harnesses: [agy, claude, codex, cursor, grok, vscode]
     opt_in_flag: --with-codebase-graph

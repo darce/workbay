@@ -24,6 +24,7 @@ MCP_REGISTRATION: dict[str, str] = {
     "cursor": "root",
     "vscode": "root",
     "grok": "root",
+    "agy": "plugin",
 }
 
 # Managed-server launch specs (bootstrap `type: stdio` shape).

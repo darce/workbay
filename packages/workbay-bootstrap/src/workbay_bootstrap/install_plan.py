@@ -818,6 +818,7 @@ def _execute_profile_all_generator_and_configs(
             configs,
             write_plugin_activation("claude-code", target, clone=clone),
         )
+        _append_config_entry(configs, write_plugin_activation("agy-cli", target, clone=clone))
 
 
 def _finalize_install_plan_manifest(

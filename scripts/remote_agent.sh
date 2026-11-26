@@ -134,6 +134,12 @@
 #                      recency window (default 60); 0 disables the skip.
 #   WORKBAY_REMOTE_AGENT_SANDBOX_REAP_BUDGET_SEC  dispatch-local sandbox sweep
 #                      budget (default 60); 0 still means a bounded minimum pass.
+#   WORKBAY_VM_COMPUTE_SLOTS           optional VM-wide flock compute semaphore
+#                      slot count for off-box self-verify (unset/empty = disabled;
+#                      when set, must be an integer >= 1). Fails open if
+#                      vm_compute_semaphore is absent in the lane venv [SECD-05].
+#   WORKBAY_VM_COMPUTE_SLOT_DIR        optional lock directory for the VM-wide
+#                      compute semaphore (default: vm_compute_semaphore resolver).
 #
 # Security: `git archive` ships TRACKED files only (no gitignored secrets) ->
 # fresh `git init` -> ONE synthetic commit -> NO remote, so grok has no history,
@@ -416,7 +422,7 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.48
+_BOUNDARY_RUNTIME_VERSION=0.3.49
 # One resolver for every WorkBay control-plane import on the VM: the codex
 # model-boundary handshake, the analysis classifier and harvest, and doctor.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
@@ -934,6 +940,8 @@ _env_reap_legacy="${WORKBAY_REMOTE_AGENT_REAP_LEGACY_REFS:-}"
 _env_sweep_min_interval="${WORKBAY_REMOTE_AGENT_SWEEP_MIN_INTERVAL_SEC:-${SWEEP_MIN_INTERVAL_SEC:-}}"
 _env_sandbox_reap_budget="${WORKBAY_REMOTE_AGENT_SANDBOX_REAP_BUDGET_SEC:-${SANDBOX_REAP_BUDGET_SEC:-}}"
 _env_unbounded_ceiling="${WORKBAY_REMOTE_AGENT_UNBOUNDED_CEILING_S:-}"
+_env_vm_compute_slots="${WORKBAY_VM_COMPUTE_SLOTS:-}"
+_env_vm_compute_slot_dir="${WORKBAY_VM_COMPUTE_SLOT_DIR:-}"
 REMOTE_GATE_HOST="" REMOTE_GATE_DIR=""
 config_file="$repo_root/.workbay/remote-gate.env"
 _remote_gate_env_load "$config_file" \
@@ -975,6 +983,9 @@ MEM_FLOOR_MB="${_env_mem_floor:-2048}"
 # Optional operator ceiling; unset/empty means no count ceiling. Resource gauges
 # determine admission independently of the number of lanes.
 MAX_LANES="${_env_max_lanes:-}"
+# Optional VM-wide flock compute semaphore for off-box self-verify (unset/empty = off).
+VM_COMPUTE_SLOTS="${_env_vm_compute_slots:-}"
+VM_COMPUTE_SLOT_DIR="${_env_vm_compute_slot_dir:-}"
 # Additional pid reserve after paying the measured per-lane cost.
 PID_FLOOR="${WORKBAY_REMOTE_GATE_PID_FLOOR:-64}"
 HEADROOM_PCT="${WORKBAY_REMOTE_GATE_HEADROOM_PCT:-75}"
@@ -1088,6 +1099,9 @@ case "$MEM_MAX" in *[!0-9GMK]*|"") echo "remote_agent: MEMORY_MAX must look like
 case "$CPU_QUOTA" in *[!0-9%]*|"") echo "remote_agent: CPU_QUOTA must look like 200%" >&2; exit 2 ;; esac
 case "$MEM_FLOOR_MB" in *[!0-9]*|"") echo "remote_agent: MEM_FLOOR_MB must be an integer (MiB)" >&2; exit 2 ;; esac
 case "$MAX_LANES" in *[!0-9]*) echo "remote_agent: MAX_LANES must be an integer >= 1" >&2; exit 2 ;; esac
+case "$VM_COMPUTE_SLOTS" in *[!0-9]*) echo "remote_agent: WORKBAY_VM_COMPUTE_SLOTS must be an integer >= 1" >&2; exit 2 ;; esac
+case "$VM_COMPUTE_SLOT_DIR" in *[!A-Za-z0-9/_.-]*) echo "remote_agent: WORKBAY_VM_COMPUTE_SLOT_DIR may only contain letters, digits, / _ . -" >&2; exit 2 ;; esac
+case "/$VM_COMPUTE_SLOT_DIR/" in *"/../"*) echo "remote_agent: invalid WORKBAY_VM_COMPUTE_SLOT_DIR" >&2; exit 2 ;; esac
 case "$PID_FLOOR" in *[!0-9]*|"") echo "remote_agent: PID_FLOOR must be a non-negative integer (0=no extra pid reserve)" >&2; exit 2 ;; esac
 for _gauge_value in "$HEADROOM_PCT" "$MEM_PSI_MAX" "$CPU_PSI_MAX" "$DISK_FLOOR_GB" "$LANE_PIDS_FLOOR" "$LANE_ANON_FLOOR_MB"; do
     case "$_gauge_value" in *[!0-9]*|"") echo "remote_agent: measured admission thresholds must be non-negative integers" >&2; exit 2 ;; esac
@@ -1110,6 +1124,10 @@ case "$KEEP_REFS" in *[!A-Za-z0-9/_.\ -]*) echo "remote_agent: KEEP_REFS may onl
 case "$REAP_LEGACY_REFS" in 0|1) ;; *) echo "remote_agent: REAP_LEGACY_REFS must be 0 or 1" >&2; exit 2 ;; esac
 if [ -n "$MAX_LANES" ] && [ "$MAX_LANES" -lt 1 ]; then
     echo "remote_agent: MAX_LANES must be an integer >= 1" >&2
+    exit 2
+fi
+if [ -n "$VM_COMPUTE_SLOTS" ] && [ "$VM_COMPUTE_SLOTS" -lt 1 ]; then
+    echo "remote_agent: WORKBAY_VM_COMPUTE_SLOTS must be an integer >= 1" >&2
     exit 2
 fi
 # Preserve warm retention above an explicit operator ceiling; 0 keeps all venvs.
@@ -16234,13 +16252,46 @@ except OSError:
     sys.exit(125)
 os.execvp("bash", ["bash", "-c", sys.argv[2]])
 '
+        _sv_sem_enabled=0
+        _sv_compute_slots='${VM_COMPUTE_SLOTS:-}'
+        if [ -z "\$_sv_compute_slots" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOTS:-}" ]; then
+            _sv_compute_slots="\${WORKBAY_VM_COMPUTE_SLOTS}"
+        fi
+        _sv_compute_slot_dir='${VM_COMPUTE_SLOT_DIR:-}'
+        if [ -z "\$_sv_compute_slot_dir" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOT_DIR:-}" ]; then
+            _sv_compute_slot_dir="\${WORKBAY_VM_COMPUTE_SLOT_DIR}"
+        fi
+        case "\$_sv_compute_slots" in
+            ""|*[!0-9]*) _sv_compute_slots='' ;;
+            *)
+                if [ "\$_sv_compute_slots" -lt 1 ] 2>/dev/null; then
+                    _sv_compute_slots=''
+                fi
+                ;;
+        esac
+        if [ -n "\$_sv_compute_slots" ]; then
+            if [ -x "\$SBX/.venv/bin/python" ] && "\$SBX/.venv/bin/python" -c 'import workbay_orchestrator_mcp.orchestration.vm_compute_semaphore' >/dev/null 2>&1; then
+                _sv_sem_enabled=1
+            else
+                echo 'remote_agent: vm_compute_semaphore unavailable in lane venv — falling back to unwrapped self-verify [SECD-05]' >&2
+            fi
+        fi
         _sv_capture_test() {
             _sv_capture_mode="\$1"
             shift
-            if [ "\$_sv_capture_mode" = scoped ]; then
-                _sv_run_capture \$_sv_scope_tw bash -c 'printf started > "\$1"; shift; exec "\$@"' bash "\$_sv_scope_started" \$_sv_tw python3 -c "\$_sv_capture_python_code" "\$@"
+            if [ "\$_sv_sem_enabled" = 1 ]; then
+                if [ -n "\$_sv_compute_slot_dir" ]; then
+                    set -- "\$SBX/.venv/bin/python" -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" --slot-dir "\$_sv_compute_slot_dir" -- python3 -c "\$_sv_capture_python_code" "\$@"
+                else
+                    set -- "\$SBX/.venv/bin/python" -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" -- python3 -c "\$_sv_capture_python_code" "\$@"
+                fi
             else
-                _sv_run_capture \$_sv_tw python3 -c "\$_sv_capture_python_code" "\$@"
+                set -- python3 -c "\$_sv_capture_python_code" "\$@"
+            fi
+            if [ "\$_sv_capture_mode" = scoped ]; then
+                _sv_run_capture \$_sv_scope_tw bash -c 'printf started > "\$1"; shift; exec "\$@"' bash "\$_sv_scope_started" \$_sv_tw "\$@"
+            else
+                _sv_run_capture \$_sv_tw "\$@"
             fi
         }
         _sv_capture_not_run=0

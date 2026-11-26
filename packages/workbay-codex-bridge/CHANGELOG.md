@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.19] — 2026-11-26
+
+### Changed
+- Advance the Codex bridge package version for the WorkBay v0.1.103 Git release (`agyv103train` `1b6c2481934d`).
+
 ## [0.3.18] — 2026-11-26
 
 ### Changed

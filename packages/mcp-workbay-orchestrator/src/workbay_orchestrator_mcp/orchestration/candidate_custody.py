@@ -81,6 +81,7 @@ def _git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str
             ["git", *arguments],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=_GIT_TIMEOUT_SECONDS,
             check=False,
             env=_git_env(),
@@ -217,31 +218,58 @@ def export_candidate(
     root.mkdir(parents=True, exist_ok=True)
     bundle = root / f"{sha}.bundle"
 
-    # A bundle needs refs: a branch at the candidate (when there is one) and a private
-    # temporary ref for every custody tip, so one bundle carries the gate's whole set.
-    branches = _git(*git_dir, "for-each-ref", "--format=%(refname)", "--points-at", sha, "refs/heads").stdout.split()
-    created: list[tuple[str, str]] = []
-    staged: Path | None = None
-    try:
-        for tip in tips:
-            reference = f"{_CUSTODY_REF_PREFIX}{tip}"
-            _git(*git_dir, "update-ref", reference, tip)
-            created.append((reference, tip))
-        descriptor, staged_name = tempfile.mkstemp(prefix=f".{sha}.", suffix=".bundle.tmp", dir=root)
-        os.close(descriptor)
-        staged = Path(staged_name)
-        _git(*git_dir, "bundle", "create", "-q", str(staged), *branches[:1], *(ref for ref, _ in created))
-        with staged.open("rb") as stream:
-            os.fsync(stream.fileno())
-        _verify_bundle(staged, tips)
-        digest = _sha256_file(staged)
-        os.replace(staged, bundle)
-        _fsync_dir(root)
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
-        for reference, tip in created:
-            _git(*git_dir, "update-ref", "-d", reference, tip, check=False)
+    # Never overwrite an existing <sha>.bundle in place (which would invalidate an earlier
+    # job's recorded bundle digest in a shared custody root). Reuse it when fresh-fetch
+    # verifies every required tip; otherwise write a content-addressed <sha>-<sha256[:16]>.bundle.
+    digest: str | None = None
+    if bundle.is_file() and not bundle.is_symlink():
+        try:
+            _verify_bundle(bundle, tips)
+        except CandidateCustodyError:
+            pass
+        else:
+            digest = _sha256_file(bundle)
+
+    if digest is None:
+        # A bundle needs refs: a branch at the candidate (when there is one) and a private
+        # temporary ref for every custody tip, so one bundle carries the gate's whole set.
+        branches = _git(*git_dir, "for-each-ref", "--format=%(refname)", "--points-at", sha, "refs/heads").stdout.split()
+        created: list[tuple[str, str]] = []
+        staged: Path | None = None
+        try:
+            for tip in tips:
+                reference = f"{_CUSTODY_REF_PREFIX}{tip}"
+                _git(*git_dir, "update-ref", reference, tip)
+                created.append((reference, tip))
+            descriptor, staged_name = tempfile.mkstemp(prefix=f".{sha}.", suffix=".bundle.tmp", dir=root)
+            os.close(descriptor)
+            staged = Path(staged_name)
+            _git(*git_dir, "bundle", "create", "-q", str(staged), *branches[:1], *(ref for ref, _ in created))
+            with staged.open("rb") as stream:
+                os.fsync(stream.fileno())
+            _verify_bundle(staged, tips)
+            digest = _sha256_file(staged)
+            target = bundle if not os.path.lexists(bundle) else root / f"{sha}-{digest[:16]}.bundle"
+            try:
+                os.link(staged, target)
+            except FileExistsError:
+                target = root / f"{sha}-{digest[:16]}.bundle"
+                if not target.is_file() or target.is_symlink() or _sha256_file(target) != digest:
+                    try:
+                        os.link(staged, target)
+                    except FileExistsError:
+                        _verify_bundle(target, tips)
+                        digest = _sha256_file(target)
+            bundle = target
+            _fsync_dir(root)
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+            for reference, tip in created:
+                try:
+                    _git(*git_dir, "update-ref", "-d", reference, tip, check=False)
+                except CandidateCustodyError:
+                    pass
 
     # Scope is evaluated only after custody exists, and only ever reported.
     violations: list[str] | None = None
@@ -297,7 +325,12 @@ def export_candidate(
     }
 
 
-def write_custody_claim(job_dir: str | os.PathLike[str], *, owner: str, export: dict[str, Any]) -> Path:
+def write_custody_claim(
+    job_dir: str | os.PathLike[str],
+    export: dict[str, Any] | None = None,
+    *,
+    owner: str | None = None,
+) -> Path:
     """Publish ``<job_dir>/CUSTODY.json`` for a verified export (the reclaim gate re-verifies it).
 
     The bundle must lie where the gate accepts custody: the gate's own
@@ -307,9 +340,16 @@ def write_custody_claim(job_dir: str | os.PathLike[str], *, owner: str, export: 
     the export's candidates); only a staged claim the gate accepts is renamed into
     place, so a claim the gate would reject is never published [CON-11][SECD-05].
     """
+    if export is None:
+        raise TypeError("write_custody_claim() missing required argument: 'export'")
     if export.get("verified") is not True:
         raise CandidateCustodyError("custody_claim_requires_verified_export")
     job = Path(job_dir).absolute()
+    if owner is None:
+        try:
+            owner = _retention_owner(job)
+        except CandidateCustodyError:
+            owner = "workbay-custody"
     bundle = Path(export["bundle"])
     gate = _gate()
     if not bundle.is_absolute() or gate.custody_location_forbidden(Path(os.path.realpath(bundle)), job, job.parent):

@@ -20,7 +20,13 @@ import sys
 import uuid
 from pathlib import Path
 
-from .compaction import COMPACTION_HARNESS_INPUT_CHOICES, compact_session, format_compaction_record_receipt_lines
+from .compaction import (
+    COMPACTION_HARNESS_INPUT_CHOICES,
+    _discover_agy_brain_transcripts,
+    compact_session,
+    format_compaction_record_receipt_lines,
+)
+from .compaction_contract import normalize_compaction_harness
 from .config import RuntimeConfig
 from .runtime import configure_runtime
 
@@ -72,7 +78,23 @@ def _claude_projects_slug(workspace_root: Path) -> str:
     return str(workspace_root.resolve()).replace(os.sep, "-")
 
 
-def _resolve_transcript(workspace_root: Path) -> Path:
+def _resolve_transcript(workspace_root: Path, *, harness: str | None = None) -> Path:
+    normalized_harness: str | None = None
+    if harness is not None:
+        try:
+            normalized_harness = normalize_compaction_harness(harness)
+        except ValueError:
+            normalized_harness = harness.strip().lower()
+
+    if normalized_harness == "agy-cli":
+        candidates = _discover_agy_brain_transcripts()
+        if not candidates:
+            raise FileNotFoundError(
+                "compact-now: --transcript not provided and no agy-cli brain "
+                "transcript logs found. Pass --transcript <path> explicitly."
+            )
+        return candidates[0]
+
     home = Path(os.environ.get("HOME") or Path.home())
     projects_dir = home / ".claude" / "projects" / _claude_projects_slug(workspace_root)
     if not projects_dir.is_dir():
@@ -101,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         transcript_path = Path(args.transcript)
     else:
         try:
-            transcript_path = _resolve_transcript(runtime.workspace_root)
+            transcript_path = _resolve_transcript(runtime.workspace_root, harness=args.harness)
         except FileNotFoundError as exc:
             print(str(exc), file=sys.stderr)
             return 2

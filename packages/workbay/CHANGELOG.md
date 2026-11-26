@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.101] — 2026-11-26
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.1.103 Git release (`agyv103train` `1b6c2481934d`).
+- Include native Antigravity CLI (`agy`) harness adapter, `.agents/plugins.json` and `effective/agy/mcp_config.json` projection, hook adapter, compaction and orchestrator parity (`internal`), plus `agy-remote` backend registry/spec/config and gate fixes (`internal`, `AGY-GATE-01..04`).
+- Include custody export-and-claim hardening (`agycust05`: `G165-02/04/05`, `AGYCUST04-G167-01`) and landing drain undo epoch guard, import replace merged guard, and `lane-gate.mk` `src_roots` (`agyc03`).
+- Include VM capacity and reliability updates: `vm_compute_semaphore`, `wave_admission` CPU PSI gating, `remote_probe` capacity metrics, `statechart_tla` host routing with `LandingDrain.tla` / `ReviewCycleHolder.tla`, `embedding_backfill_doctor`, and `render_tech_debt_index.py`.
+
 ## [0.3.100] — 2026-11-26
 
 ### Changed

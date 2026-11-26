@@ -142,7 +142,7 @@ def _shell_tool_payload():
     return module
 
 
-_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "manual")
+_HARNESS_CHOICES = ("claude-code", "codex", "grok", "cursor", "agy-cli", "manual")
 
 
 def _env_alias(canonical: str, default: str | None = None) -> str | None:

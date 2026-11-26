@@ -230,6 +230,11 @@ class PromptFormatter:
     @staticmethod
     def brief_message(message: dict[str, Any]) -> str:
         payload = message.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (ValueError, TypeError):
+                payload = None
         if not isinstance(payload, dict):
             return PromptFormatter.message(message)
         source_lane = str(payload.get("source_lane") or "").strip()
@@ -457,18 +462,56 @@ def _actionable_state(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _brief_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    briefs: list[dict[str, Any]] = []
-    for message in messages:
-        subject = str(message.get("subject") or "").strip().lower()
-        if subject.startswith("brief:"):
-            briefs.append(message)
-    return briefs
+_OWN_BRIEF_SOURCES = frozenset({"", "orchestrator", "coordinator", "self"})
+_OWN_BRIEF_REASONS = frozenset({"", "dispatch", "assignment", "re-dispatch", "redispatch", "retry"})
 
 
-def _non_brief_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    briefs = {message.get("id") for message in _brief_messages(messages)}
-    return [message for message in messages if message.get("id") not in briefs]
+def _parse_message_payload(raw_payload: Any) -> dict[str, Any]:
+    if isinstance(raw_payload, dict):
+        return raw_payload
+    if isinstance(raw_payload, str):
+        try:
+            parsed = json.loads(raw_payload)
+        except (ValueError, TypeError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _is_brief_message(message: dict[str, Any]) -> bool:
+    subject = str(message.get("subject") or "").strip().lower()
+    return subject.startswith("brief:")
+
+
+def _is_dependency_brief(message: dict[str, Any], *, lane_id: str | None = None) -> bool:
+    """Return True iff *message* is a dependency brief rather than the lane's own brief."""
+    subject = str(message.get("subject") or "").strip().lower()
+    if not subject.startswith("brief:"):
+        return False
+    payload = _parse_message_payload(message.get("payload"))
+    if str(payload.get("origin") or "").strip().lower() == "self":
+        return False
+    source_lane = str(payload.get("source_lane") or "").strip().lower()
+    raw_reason = payload.get("reason")
+    reason = str(raw_reason).strip().lower() if raw_reason is not None else ""
+    if not reason:
+        reason = subject[len("brief:") :].strip()
+    normalized_lane_id = (lane_id or "").strip().lower()
+    is_own_source = source_lane in _OWN_BRIEF_SOURCES or (
+        bool(normalized_lane_id) and source_lane == normalized_lane_id
+    )
+    if is_own_source and reason in _OWN_BRIEF_REASONS:
+        return False
+    return True
+
+
+def _brief_messages(messages: list[dict[str, Any]], *, lane_id: str | None = None) -> list[dict[str, Any]]:
+    return [message for message in messages if _is_dependency_brief(message, lane_id=lane_id)]
+
+
+def _non_brief_messages(messages: list[dict[str, Any]], *, lane_id: str | None = None) -> list[dict[str, Any]]:
+    return [message for message in messages if not _is_dependency_brief(message, lane_id=lane_id)]
 
 
 def _runtime_guidance(
@@ -1233,8 +1276,8 @@ def _build_prompt_sections(
     actions = state["actions"]
     blockers = state["blockers"]
     findings = state["findings"]
-    brief_messages = _brief_messages(messages)
-    assignment_messages = _non_brief_messages(messages)
+    brief_messages = _brief_messages(messages, lane_id=lane_id)
+    assignment_messages = _non_brief_messages(messages, lane_id=lane_id)
     latest_report = _as_dicts(activity.get("reports"))[:1]
 
     header = [
@@ -1254,7 +1297,10 @@ def _build_prompt_sections(
 
     assignment_items = _bounded_items(
         [
-            *[_format_message(message) for message in assignment_messages],
+            *[
+                _format_brief_message(message) if _is_brief_message(message) else _format_message(message)
+                for message in assignment_messages
+            ],
             *[_format_action(action) for action in actions],
             *[_format_finding(finding) for finding in findings],
             *[_format_blocker(blocker) for blocker in blockers],
