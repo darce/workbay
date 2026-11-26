@@ -49,14 +49,14 @@ class SidecarEmbeddingAdapter:
                 raise TimeoutError(timeout_message)
             raise SidecarEmbeddingError(result.reason)
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def embed(self, texts: list[str], *, allow_cold: bool = True) -> np.ndarray:
         if not texts:
             return np.empty((0, self.dim), dtype="<f4")
         # Direct query/anchor callers do not use the loader protocol themselves.
         # Share one budget across startup and the single inference request.
         deadline = time.monotonic() + SIDECAR_EMBED_TIMEOUT_SECONDS
         try:
-            if not self.is_loaded:
+            if allow_cold and not self.is_loaded:
                 self._ensure_loaded_with_timeout(
                     timeout_seconds=max(0.0, deadline - time.monotonic()),
                     timeout_message="embedding sidecar request timed out",

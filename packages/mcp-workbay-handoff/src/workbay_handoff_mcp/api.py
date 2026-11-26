@@ -2285,6 +2285,7 @@ def find_related_prior_work(
         str | None, Field(description="Optional caller session id for orientation-read telemetry.")
     ] = None,
     _cancel: threading.Event | None = None,
+    semantic_mode: Literal["warm_only", "allow_cold"] = "allow_cold",
 ) -> dict[str, object]:
     """Return prior findings/decisions that resemble the query (advisory context only).
 
@@ -2301,16 +2302,58 @@ def find_related_prior_work(
     embeddings_mode = _compaction_module._embeddings_mode_from_ledger()
     try:
         with _related_prior_work_cancellation(_cancel):
-            result = core.find_related_prior_work(
-                text=text,
-                finding_id=finding_id,
-                task_ref=task_ref,
-                include_task_refs=include_task_refs,
-                include_plan_paths=include_plan_paths,
-                include_statuses=include_statuses,
-                limit=limit,
-                min_score=min_score,
-            )
+            if semantic_mode == "allow_cold":
+                result = core.find_related_prior_work(
+                    text=text,
+                    finding_id=finding_id,
+                    task_ref=task_ref,
+                    include_task_refs=include_task_refs,
+                    include_plan_paths=include_plan_paths,
+                    include_statuses=include_statuses,
+                    limit=limit,
+                    min_score=min_score,
+                )
+            else:
+                try:
+                    from .embeddings.related_prior_work import (
+                        DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE as embeddings_default_min_score,
+                    )
+                    from .embeddings.related_prior_work import (
+                        find_related_prior_work_public,
+                    )
+                except ImportError as exc:
+                    missing_module = getattr(exc, "name", None)
+                    note = "embeddings_extra_not_installed"
+                    if missing_module:
+                        note = f"{note}:{missing_module}"
+                    result = {
+                        "status": "provider_unavailable",
+                        "results": [],
+                        "min_score": core.DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE if min_score is None else min_score,
+                        "query_mode": "finding_id" if finding_id else "text" if text else None,
+                        "query_model_id": None,
+                        "note": note,
+                        "coverage": {
+                            "status": "unknown",
+                            "model_id": None,
+                            "total": None,
+                            "current": None,
+                            "pending": None,
+                            "scope": "all_source_concepts",
+                        },
+                    }
+                else:
+                    result = find_related_prior_work_public(
+                        text=text,
+                        finding_id=finding_id,
+                        task_ref=task_ref,
+                        include_task_refs=include_task_refs,
+                        include_plan_paths=include_plan_paths,
+                        include_statuses=include_statuses,
+                        limit=limit,
+                        min_score=embeddings_default_min_score if min_score is None else min_score,
+                        semantic_mode=semantic_mode,
+                    )
     except ValueError as exc:
         if "exactly one of" not in str(exc):
             raise
@@ -2349,11 +2392,15 @@ def find_related_prior_work(
     return result
 
 
-# The cancel token is internal transport plumbing set by the MCP bridge
-# (_run_sync_tool_cancellable), never a client input: keep the published
-# signature, and therefore the tool's input schema, byte-identical.
+# The cancel token and CLI-only semantic_mode are internal/CLI plumbing, never
+# MCP client inputs: keep the published signature, and therefore the tool's
+# input schema, byte-identical.
 find_related_prior_work.__signature__ = inspect.signature(find_related_prior_work).replace(  # type: ignore[attr-defined]
-    parameters=[p for p in inspect.signature(find_related_prior_work).parameters.values() if p.name != "_cancel"]
+    parameters=[
+        p
+        for p in inspect.signature(find_related_prior_work).parameters.values()
+        if p.name not in ("_cancel", "semantic_mode")
+    ]
 )
 
 
@@ -3421,6 +3468,13 @@ def _task_state_tool_entries() -> list[ToolEntry]:
                 ArgSpec("--description"),
                 ArgSpec("--blocker-id", type=int),
                 ArgSpec("--task-ref"),
+                ArgSpec("--agent", help="Actor agent override for write provenance."),
+                ArgSpec("--model", help="Actor model identifier for write provenance."),
+                ArgSpec(
+                    "--model-label",
+                    help="Optional canonical model label (validated against --model by the server).",
+                ),
+                ArgSpec("--reasoning-level", help="Actor reasoning level for write provenance."),
                 ArgSpec("--branch", help="Actor branch override for write provenance."),
                 ArgSpec("--commit-sha", help="Actor commit SHA override for write provenance."),
                 ArgSpec("--lane-id", help="Actor lane id override for write provenance."),
@@ -3815,6 +3869,22 @@ def _lifecycle_tool_entries() -> list[ToolEntry]:
                 ArgSpec("--include-status", action="append", dest="include_statuses"),
                 ArgSpec("--limit", type=int),
                 ArgSpec("--min-score", type=float, dest="min_score"),
+                ArgSpec(
+                    "--semantic",
+                    choices=["warm-only", "require", "allow-cold"],
+                    default=None,
+                    help=(
+                        "Semantic embedding mode: warm-only (use warm sidecar/provider only, never spawn), "
+                        "require (warm-only and fail with exit 4 if provider_unavailable), "
+                        "or allow-cold (allow cold sidecar start within --deadline)."
+                    ),
+                ),
+                ArgSpec(
+                    "--deadline",
+                    type=float,
+                    default=None,
+                    help="Optional deadline in seconds for semantic query execution.",
+                ),
             ],
             surface_class="query",
             entity_family="handoff_state",

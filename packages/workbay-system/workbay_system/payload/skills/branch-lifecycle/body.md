@@ -19,6 +19,14 @@ Do not use it for planning-only work on `main`, planning reviews, or within-slic
 
 Move one task cleanly through branch start, slice execution, review, local merge-readiness check, integration, canonical teardown, and the raw strict close gate without leaving code on `main`, stale task state, or an unarchived worktree behind.
 
+## CLI-First Contract & Optional MCP Projection
+
+`workbay <noun> <verb> --json` is the **primary universal contract** for task, handoff, finding, continuation, and lane operations across interactive sessions, hooks, CI, and host orchestration (inspect all registered verbs via `workbay commands --json`). WorkBay MCP servers are a **thin optional interactive projection** over the same `api.py` authority, with zero degradation when MCP is absent:
+
+- Lane & task operations: `workbay lane status --json`, `workbay lane list --json`, `workbay lane close --json`, `workbay lane reclaim-scan --json`, `workbay task state --json`, `workbay task set --json`, `workbay task next --json`
+- Handoff, findings & continuations: `workbay handoff load-session --json`, `workbay handoff decision record --json`, `workbay finding list --json`, `workbay finding record --json`, `workbay continuation load --json`, `workbay continuation save --json`
+- Remote worker artifacts stay single-writer on the host via `workbay handoff ingest --from OUTPUT/handoff.json --json`.
+
 ## Canonical Policy
 
 - [../../../docs/workbay/instructions.md](../../../docs/workbay/instructions.md)

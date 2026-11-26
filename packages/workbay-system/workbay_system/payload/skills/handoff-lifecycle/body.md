@@ -17,7 +17,15 @@ Do not use it for branch review execution or the TDD loop inside a slice.
 
 ## Goal
 
-Keep MCP task state, shell context, and generated task views aligned throughout the session so another agent can resume work without reconstructing intent from chat.
+Keep WorkBay task state, shell context, and generated task views aligned throughout the session so another agent can resume work without reconstructing intent from chat.
+
+## CLI-First Contract & Optional MCP Projection
+
+`workbay <noun> <verb> --json` is the **primary universal contract** for session orientation, state reads/writes, findings, continuations, and prior-work search (discover all verbs and `query`/`action` classes via `workbay commands --json`). WorkBay MCP tools (`load_session`, `get_handoff_state`, `record_event`, `review_findings`, `continuation`, `find_related_prior_work`, etc.) are a **thin optional interactive projection** over the same `api.py` authority with zero degradation when MCP is absent:
+
+- Session & task state: `workbay handoff load-session --json`, `workbay task state --json`, `workbay task set --json`, `workbay task next --json`
+- Decisions, search & findings: `workbay handoff decision record --json`, `workbay handoff search --json`, `workbay finding list --json`, `workbay finding record --json`, `workbay search prior-work --json` (warm-only by default; never spawns a cold sidecar)
+- Continuations & host-only ingest: `workbay continuation load --json`, `workbay continuation save --json`, and host-side `workbay handoff ingest --from OUTPUT/handoff.json --json` for remote VM artifacts
 
 ## Canonical Policy
 

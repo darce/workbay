@@ -5,9 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 
 from . import __version__
 from .api import (
@@ -32,6 +33,7 @@ from .api import (
     configure_runtime,
     continuation,
     export_handoff_state,
+    find_related_prior_work,
     get_handoff_state,
     get_verified_tests,
     import_handoff_state,
@@ -55,6 +57,7 @@ from .api import (
 )
 from .config import RuntimeConfig
 from .embedding_env import apply_embedding_env
+from .orientation_reads import resolve_harness
 from .review_findings_api import (
     ReviewFindingsBatchRecordOp,
     ReviewFindingsDispositionOp,
@@ -492,10 +495,20 @@ def _dispatch_event_record(args: argparse.Namespace) -> Any:
         payload["task_ref"] = args.task_ref
 
     actor: dict[str, str] = {}
-    for flag in ("branch", "commit_sha", "lane_id"):
+    for flag in ("agent", "model", "model_label", "reasoning_level", "branch", "commit_sha", "lane_id"):
         value = getattr(args, flag, None)
         if value is not None:
             actor[flag] = value
+    harness = resolve_harness()
+    if (
+        "agent" not in actor
+        and "model" not in actor
+        and "model_label" not in actor
+        and not (os.environ.get("WORKBAY_HANDOFF_DEFAULT_AGENT") or "").strip()
+        and ((os.environ.get("WORKBAY_HARNESS") or "").strip() or (os.environ.get("CODEX_HARNESS") or "").strip())
+        and harness != "unknown"
+    ):
+        actor["agent"] = harness
     if actor:
         payload["actor"] = actor
 
@@ -1070,6 +1083,71 @@ def _dispatch_findings_triage(args: argparse.Namespace) -> Any:
     }
 
 
+def _dispatch_find_related_prior_work(args: argparse.Namespace) -> Any:
+    semantic_flag = getattr(args, "semantic", None)
+    semantic_mode: Literal["warm_only", "allow_cold"] = (
+        "warm_only" if semantic_flag in ("warm-only", "require") else "allow_cold"
+    )
+    deadline = getattr(args, "deadline", None)
+    if deadline is not None and deadline <= 0:
+        raise SystemExit("--deadline must be greater than 0")
+
+    kwargs: dict[str, Any] = {
+        "text": getattr(args, "text", None),
+        "finding_id": getattr(args, "finding_id", None),
+        "task_ref": getattr(args, "task_ref", None),
+        "include_task_refs": getattr(args, "include_task_refs", None),
+        "include_plan_paths": getattr(args, "include_plan_paths", None),
+        "include_statuses": getattr(args, "include_statuses", None),
+        "min_score": getattr(args, "min_score", None),
+        "semantic_mode": semantic_mode,
+    }
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        kwargs["limit"] = limit
+
+    cancel_event: threading.Event | None = None
+    timer: threading.Timer | None = None
+    if deadline is not None:
+        cancel_event = threading.Event()
+        timer = threading.Timer(deadline, cancel_event.set)
+        timer.daemon = True
+        timer.start()
+        kwargs["_cancel"] = cancel_event
+
+    try:
+        result = find_related_prior_work(**kwargs)
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set() and type(exc).__name__ == "ScanCancelled":
+            result = {
+                "ok": True,
+                "status": "provider_unavailable",
+                "results": [],
+                "query_mode": "finding_id" if kwargs["finding_id"] else "text" if kwargs["text"] else None,
+                "query_model_id": None,
+                "note": "deadline_exceeded",
+                "task_ref": kwargs["task_ref"],
+            }
+        else:
+            raise
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+    if semantic_flag == "require" and isinstance(result, dict) and result.get("status") in ("provider_unavailable", "busy"):
+        note = str(result.get("note") or result.get("status") or "provider_unavailable")
+        error_kind = "timeout" if note == "deadline_exceeded" else "provider_unavailable"
+        result = {
+            **result,
+            "ok": False,
+            "error": {
+                "kind": error_kind,
+                "note": note,
+            },
+        }
+    return result
+
+
 _CLI_DISPATCH_OVERRIDES: dict[str, Callable[[argparse.Namespace], Any]] = {
     "set_handoff_state": _dispatch_set_handoff_state,
     "record_event": _dispatch_event_record,
@@ -1087,6 +1165,7 @@ _CLI_DISPATCH_OVERRIDES: dict[str, Callable[[argparse.Namespace], Any]] = {
     "touched_files": _dispatch_touched_files,
     "integrity_check": _dispatch_integrity_check,
     "archive": _dispatch_archive,
+    "find_related_prior_work": _dispatch_find_related_prior_work,
 }
 
 
@@ -1519,32 +1598,46 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_EMBEDDING_CLI_COMMANDS: frozenset[str] = frozenset(
+    {
+        "find-related-prior-work",
+        "semantic-reinjection-packet",
+        "compaction",
+    }
+)
+
+
+def _apply_embedding_env_for_config(config: RuntimeConfig) -> None:
+    """Load ``.workbay/embedding.env`` using the git-toplevel of the caller workspace."""
+    # Shared state uses the primary checkout; pins belong to this worktree.
+    # git_workspace_root preserves the caller path, which may be nested.
+    embedding_root = config.git_workspace_root or config.workspace_root
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(embedding_root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            embedding_root = Path(probe.stdout.strip()).resolve()
+    except (OSError, subprocess.SubprocessError):
+        pass  # Like the launcher, fall back to the resolved caller path.
+    try:
+        apply_embedding_env(embedding_root)
+    except Exception as exc:
+        print(f"Warning: could not load .workbay/embedding.env: {exc!r}", file=sys.stderr)
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     config = RuntimeConfig.from_args(args)
     configure_runtime(config)
 
-    if args.subcommand in ("serve-stdio", "serve-http"):
-        # Shared state uses the primary checkout; pins belong to this worktree.
-        # git_workspace_root preserves the caller path, which may be nested.
-        embedding_root = config.git_workspace_root or config.workspace_root
-        try:
-            probe = subprocess.run(
-                ["git", "-C", str(embedding_root), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
-            )
-            if probe.returncode == 0 and probe.stdout.strip():
-                embedding_root = Path(probe.stdout.strip()).resolve()
-        except (OSError, subprocess.SubprocessError):
-            pass  # Like the launcher, fall back to the resolved caller path.
-        try:
-            apply_embedding_env(embedding_root)
-        except Exception as exc:
-            print(f"Warning: could not load .workbay/embedding.env: {exc!r}", file=sys.stderr)
+    if args.subcommand in ("serve-stdio", "serve-http") or args.subcommand in _EMBEDDING_CLI_COMMANDS:
+        _apply_embedding_env_for_config(config)
 
     # Special-case commands
     if args.subcommand == "serve-stdio":

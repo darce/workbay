@@ -34,6 +34,7 @@ KIND_ORDER = (
     "shadowed_by_policy",
     "mcp_path_bypass",
     "mcp_bypass_unresolved",
+    "workbay_action_grant",
     "stale_path",
     "one_shot",
     "fixed_cap_env",
@@ -46,6 +47,7 @@ DROP_KINDS = frozenset(
         "shadowed_by_policy",
         "mcp_path_bypass",
         "mcp_bypass_unresolved",
+        "workbay_action_grant",
         "stale_path",
         "one_shot",
     }
@@ -56,10 +58,26 @@ _CANON = {
     "shadowed_by_policy": "SECD-05 lexicons/security.md:255",
     "mcp_path_bypass": "SECD-03 lexicons/security.md:253",
     "mcp_bypass_unresolved": "SECD-05 lexicons/security.md:255",
+    "workbay_action_grant": "SECD-01 lexicons/security.md:264; SECD-05 lexicons/security.md:255",
     "stale_path": "P6 PRINCIPLES.md:59",
     "one_shot": "",
     "fixed_cap_env": "COST-03 docs/canon/CANON-internal.md:75",
 }
+
+# Fallback action surface table used only when ``workbay.cli`` cannot be
+# imported in a minimal environment, ensuring ``permission_audit`` fails closed.
+_FALLBACK_WORKBAY_ACTION_VERBS: tuple[tuple[str, str], ...] = (
+    ("continuation", "save"),
+    ("finding", "record"),
+    ("fleet", "*"),
+    ("handoff", "decision record"),
+    ("lane", "close"),
+    ("task", "next"),
+    ("task", "set"),
+)
+_FALLBACK_WORKBAY_ACTION_FLAGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("lane", "reclaim-scan", ("--lane-id",)),
+)
 
 # Longest first so ``python3`` and ``.venv/bin/python`` win over ``python``.
 _BROAD_TOOLS = (
@@ -124,6 +142,28 @@ def audit(local_doc: Mapping[str, Any] | Any, policy: Mapping[str, Any] | Any) -
         if finding is not None:
             findings.append(finding)
     findings.extend(_fixed_cap_findings(local_doc))
+    return findings
+
+
+def audit_policy(policy: Mapping[str, Any] | Any) -> list[Finding]:
+    """Audit managed policy allow rules for forbidden ``workbay`` action grants."""
+    if not isinstance(policy, Mapping):
+        return []
+    findings: list[Finding] = []
+    for index, entry in enumerate(_rules(policy)):
+        if entry.get("effect") != "allow":
+            continue
+        rule = str(entry["rule"])
+        reason = _workbay_action_grant_reason(rule)
+        if reason is not None:
+            findings.append(
+                _finding(
+                    "workbay_action_grant",
+                    f"policy.rules[{index}]",
+                    _public_rule_description(rule),
+                    reason,
+                )
+            )
     return findings
 
 
@@ -354,6 +394,14 @@ def _classify_rule(
             rule_id,
             _public_rule_description(rule),
             f"local allow is covered by a policy {effect} and does not grant the command",
+        )
+    workbay_action = _workbay_action_grant_reason(rule)
+    if workbay_action is not None:
+        return _finding(
+            "workbay_action_grant",
+            rule_id,
+            _public_rule_description(rule),
+            workbay_action,
         )
     if rule.strip() not in _BROAD_SENTINELS:
         missing = _missing_absolute_paths(rule)
@@ -836,6 +884,115 @@ def _missing_absolute_paths(rule: str) -> list[str]:
         if not Path(path).exists():
             missing.append(path)
     return missing
+
+
+def _workbay_action_surfaces() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, tuple[str, ...]], ...]]:
+    """Return ``(action_verbs, conditional_action_flags)`` from ``workbay.cli`` or fallback."""
+    action_verbs: set[tuple[str, str]] = set(_FALLBACK_WORKBAY_ACTION_VERBS)
+    action_flags: dict[tuple[str, str], set[str]] = {
+        (noun, verb): set(flags) for noun, verb, flags in _FALLBACK_WORKBAY_ACTION_FLAGS
+    }
+    try:
+        from workbay.cli import collect_commands_manifest
+
+        for entry in collect_commands_manifest():
+            noun = str(entry.get("noun") or "").strip()
+            verb = str(entry.get("verb") or "").strip()
+            if not noun or not verb:
+                continue
+            if entry.get("surface_class") == "action":
+                action_verbs.add((noun, verb))
+            raw_flags = entry.get("action_flags")
+            if isinstance(raw_flags, (list, tuple)):
+                flag_set = action_flags.setdefault((noun, verb), set())
+                for flag in raw_flags:
+                    if isinstance(flag, str) and flag.strip():
+                        flag_set.add(flag.strip())
+    except Exception:
+        pass
+    return (
+        tuple(sorted(action_verbs)),
+        tuple((noun, verb, tuple(sorted(flags))) for (noun, verb), flags in sorted(action_flags.items())),
+    )
+
+
+def _normalize_workbay_args(arguments: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for token in arguments:
+        if token.endswith(":*") and len(token) > 2:
+            normalized.append(token[:-2])
+            normalized.append("*")
+        else:
+            normalized.append(token)
+    return normalized
+
+
+def _strip_leading_flags(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-":
+        index += 1
+    return tokens[index:]
+
+
+def _workbay_action_grant_reason(rule: str) -> str | None:
+    """Return a reason if ``rule`` allows a ``workbay`` action verb or wildcard covering one."""
+    body = _bash_body(rule)
+    if body is None:
+        return None
+    try:
+        segments = _shell_segments(body)
+    except ValueError:
+        return None
+
+    action_verbs, conditional_flags = _workbay_action_surfaces()
+
+    for segment in segments:
+        resolved = _resolve_executable(segment)
+        if resolved is None:
+            continue
+        executable, arguments = resolved
+        if executable.endswith(":*"):
+            base = _executable_basename(executable[:-2])
+            if base == "workbay":
+                return "Bash grant on workbay covers action verbs via bare wildcard"
+            continue
+        if _executable_basename(executable) != "workbay":
+            continue
+
+        norm_args = _normalize_workbay_args(arguments)
+        stripped_args = _strip_leading_flags(norm_args)
+        raw_pattern = " ".join(["workbay", *norm_args])
+        stripped_pattern = " ".join(["workbay", *stripped_args])
+
+        for noun, verb in action_verbs:
+            if verb == "*":
+                samples = (
+                    f"workbay {noun}",
+                    f"workbay {noun} action",
+                    f"workbay {noun} action --flag",
+                )
+                label = f"workbay {noun}"
+            else:
+                samples = (
+                    f"workbay {noun} {verb}",
+                    f"workbay {noun} {verb} --flag",
+                )
+                label = f"workbay {noun} {verb}"
+            if any(
+                fnmatch.fnmatchcase(sample, raw_pattern) or fnmatch.fnmatchcase(sample, stripped_pattern)
+                for sample in samples
+            ):
+                return f"Bash grant on workbay matches action command '{label}'"
+
+        for noun, verb, flags in conditional_flags:
+            verb_tokens = [noun, *verb.split()]
+            if stripped_args[: len(verb_tokens)] == verb_tokens:
+                tail = stripped_args[len(verb_tokens) :]
+                for flag in flags:
+                    if any(tok == flag or tok.startswith(f"{flag}=") for tok in tail):
+                        return f"Bash grant on workbay enables action flag '{flag}' on 'workbay {noun} {verb}'"
+
+    return None
 
 
 def _is_fixed_cap_env(key: str) -> bool:

@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.45] — 2026-11-26
+
+### Changed
+- Align query-only Claude permission rules and `permission_audit` `workbay_action_grant` enforcement with the universal `workbay <noun> <verb> --json` CLI (`internal`, gate `clifirstg02rr` PASS).
+- Refresh the protocol and system dependency floors for WorkBay v0.1.104 and align bootstrap install and profile handling with the v0.1.104 runtime.
+
 ## [0.4.44] — 2026-11-26
 
 ### Changed

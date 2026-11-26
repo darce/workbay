@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.27] — 2026-11-26
+
+### Changed
+- Add `workbay_protocol.cli_contract` (`ExitCode` 0..6 and universal `workbay <noun> <verb> --json` envelope contracts) for `internal` (gate `clifirstg02rr` PASS).
+- Advance the protocol package version for the WorkBay v0.1.104 Git release.
+
 ## [0.3.26] — 2026-11-26
 
 ### Changed

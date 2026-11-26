@@ -93,6 +93,9 @@ RelatedPriorWorkStatus = Literal[
     "busy",
 ]
 
+SemanticMode = Literal["warm_only", "allow_cold"]
+_VALID_SEMANTIC_MODES: frozenset[str] = frozenset({"warm_only", "allow_cold"})
+
 # Rows per fetchmany chunk of the bounded scan: peak resident memory is one
 # chunk (rows + an (n, dim) float32 matrix) plus the top-k, never the store.
 RELATED_PRIOR_WORK_SCAN_CHUNK_ROWS: int = 1024
@@ -550,6 +553,7 @@ def _find_related_prior_work(
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
     cancel: threading.Event | None = None,
+    semantic_mode: SemanticMode = "allow_cold",
 ) -> RelatedPriorWorkResult:
     """Return prior concept rows that resemble the query (advisory context only).
 
@@ -618,6 +622,9 @@ def _find_related_prior_work(
     if limit < 0:
         raise ValueError("limit must be >= 0")
 
+    if semantic_mode not in _VALID_SEMANTIC_MODES:
+        raise ValueError(f"semantic_mode must be 'warm_only' or 'allow_cold', got {semantic_mode!r}")
+
     exclude_task = task_ref.strip() if task_ref is not None and task_ref.strip() else None
     inc_tasks = _normalize_include(include_task_refs)
     inc_plans = _normalize_include(include_plan_paths)
@@ -672,12 +679,52 @@ def _find_related_prior_work(
             note="no_embedding_provider_for_free_text_query",
         )
 
-    from .provider import EmbeddingArtifactError
+    from .provider import EmbeddingArtifactError, EmbeddingProvider
+    from .sidecar_adapter import SidecarEmbeddingAdapter, SidecarEmbeddingError
+
+    if semantic_mode == "warm_only":
+        if isinstance(prov, SidecarEmbeddingAdapter):
+            if not prov.is_loaded:
+                return _empty(
+                    "provider_unavailable",
+                    min_score=min_score,
+                    query_mode="text",
+                    note="sidecar_cold",
+                )
+        elif isinstance(prov, EmbeddingProvider):
+            if not prov.is_loaded:
+                return _empty(
+                    "provider_unavailable",
+                    min_score=min_score,
+                    query_mode="text",
+                    note="sidecar_disabled_cold",
+                )
+        elif not bool(getattr(prov, "is_loaded", True)):
+            return _empty(
+                "provider_unavailable",
+                min_score=min_score,
+                query_mode="text",
+                note="provider_cold",
+            )
 
     check_cancelled(cancel)
     try:
-        vectors = prov.embed([str(text).strip()])
+        if semantic_mode == "warm_only" and isinstance(prov, SidecarEmbeddingAdapter):
+            vectors = prov.embed([str(text).strip()], allow_cold=False)
+        else:
+            vectors = prov.embed([str(text).strip()])
     except EmbeddingArtifactError as exc:
+        if (
+            semantic_mode == "warm_only"
+            and isinstance(exc, SidecarEmbeddingError)
+            and exc.reason in ("socket_missing", "connection_refused", "unavailable")
+        ):
+            return _empty(
+                "provider_unavailable",
+                min_score=min_score,
+                query_mode="text",
+                note="sidecar_cold",
+            )
         logging.getLogger("workbay_handoff_mcp").warning(
             "related_prior_work_degraded embedding_artifact_%s path=%s error=%s",
             exc.kind or "error",
@@ -727,6 +774,7 @@ def find_related_prior_work(
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
     cancel: threading.Event | None = None,
+    semantic_mode: SemanticMode = "allow_cold",
 ) -> RelatedPriorWorkResult:
     """Retrieve advisory prior art and report source-derived global coverage.
 
@@ -748,6 +796,7 @@ def find_related_prior_work(
         min_score=min_score,
         provider=provider,
         cancel=cancel,
+        semantic_mode=semantic_mode,
     )
     return replace(result, coverage=concept_embedding_coverage(conn, result.query_model_id, cancel=cancel))
 
@@ -794,6 +843,7 @@ def find_related_prior_work_public(
     min_score: float = DEFAULT_RELATED_PRIOR_WORK_MIN_SCORE,
     provider: SupportsEmbed | None = None,
     cancel: threading.Event | None = None,
+    semantic_mode: SemanticMode = "allow_cold",
 ) -> dict[str, Any]:
     """Package-level entry: open the handoff DB and return a JSON-friendly dict.
 
@@ -832,6 +882,7 @@ def find_related_prior_work_public(
                 min_score=min_score,
                 provider=provider,
                 cancel=token,
+                semantic_mode=semantic_mode,
             )
         payload = result.as_dict()
         if result.note == "no_candidates_after_exclusions" and any(

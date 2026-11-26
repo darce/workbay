@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.47] — 2026-11-26
+
+### Changed
+- Update portable `body.md` skills and query-only Claude permission rules with `permission_audit` `workbay_action_grant` enforcement for the universal `workbay <noun> <verb> --json` CLI (`internal`, gate `clifirstg02rr` PASS).
+- Refresh the protocol development dependency floor and align the shipped remote-agent boundary pin with the WorkBay v0.1.104 orchestrator (`0.3.50`).
+
 ## [0.4.46] — 2026-11-26
 
 ### Changed

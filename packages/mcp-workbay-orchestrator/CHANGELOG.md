@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.50] — 2026-11-26
+
+### Changed
+- Add the orchestrator `lane` CLI noun (`workbay lane <verb> --json` over `workbay_protocol.cli_contract`), hoist pure-core `lane_reclaim_scan.py`, and add golden CLI-vs-MCP equivalence suites (`internal`, gate `clifirstg02rr` PASS).
+- Refresh the protocol, handoff, system, and optional Codex bridge dependency floors for WorkBay v0.1.104.
+
 ## [0.3.49] — 2026-11-26
 
 ### Changed

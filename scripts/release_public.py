@@ -254,9 +254,9 @@ def _origin_ls_remote_tag_sha(monorepo_tag: str) -> str | None:
     import release_publication as publication
 
     expected_ref = f"refs/tags/{monorepo_tag}"
-    return publication.remote_refs(
-        REPO_ROOT, publication.remote_identity(REPO_ROOT, "origin"), destinations=[expected_ref]
-    ).get(expected_ref)
+    return publication.origin_tag_ref_sha(
+        REPO_ROOT, publication.remote_identity(REPO_ROOT, "origin"), expected_ref
+    )
 
 
 def _push_and_verify_origin_monorepo_tag(monorepo_tag: str, command: tuple[str, ...]) -> int:

@@ -588,6 +588,64 @@ def remote_refs(repo, identity, *, destinations=(), transport=None):
     return refs
 
 
+def origin_tag_ref_sha(repo, identity, ref, *, transport=None):
+    """Observe one exact tag ref on private source ``origin`` without public GitHub API checks.
+
+    Scoped strictly to ``refs/tags/*`` observation for source-monorepo tag sync
+    (never public-mirror ``main`` publication). Honors ``identity["push_url"]``
+    and frozen ``transport_settings()``, bounds network probes via ``bounded_probe``,
+    validates Git v2 packet exchange, rejects symbolic destinations, and fails
+    closed on transport/probe errors or malformed output.
+    """
+    require(
+        isinstance(ref, str)
+        and ref.startswith("refs/tags/")
+        and len(ref) > len("refs/tags/")
+        and not ref.endswith("^{}")
+        and not any(c in ref for c in "*?[]\\ \n\t\r"),
+        "unsupported_origin_tag_ref",
+    )
+    settings = transport if transport is not None else transport_settings(repo, identity["push_url"])
+    network = identity["local_identity"] is None
+    result = git(repo, "ls-remote", "--symref", identity["push_url"], ref, transport=settings, packet_trace=network)
+    if network:
+        out, trace = result
+        proven_refs, proven_symbolic = v2_refs(trace)
+    else:
+        out = result
+    refs, symbolic = {}, {}
+    for line in out.splitlines():
+        fields = line.split("\t")
+        require(len(fields) == 2, "remote_namespace_unknown")
+        value, name = fields
+        if value.startswith("ref: "):
+            require(name not in symbolic, "remote_namespace_unknown")
+            symbolic[name] = value[5:]
+        else:
+            require(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value), "remote_namespace_unknown")
+            require(name not in refs, "remote_namespace_unknown")
+            if name.startswith("refs/") and not name.endswith("^{}"):
+                refs[name] = value
+    if network:
+        require(
+            all(proven_refs.get(k) == v for k, v in refs.items())
+            and refs.get(ref) == proven_refs.get(ref)
+            and all(proven_symbolic.get(k) == v for k, v in symbolic.items()),
+            "remote_namespace_unknown:advertisement_mismatch",
+        )
+        require(ref not in symbolic and ref not in proven_symbolic, "symbolic_destination_unsupported:" + ref)
+        return refs.get(ref)
+    require(ref not in symbolic, "symbolic_destination_unsupported:" + ref)
+    receiver = identity["push_url"].removeprefix("file://")
+    try:
+        target = git(receiver, "symbolic-ref", "--quiet", "--no-recurse", ref)
+    except subprocess.CalledProcessError as exc:
+        require(exc.returncode == 1, "remote_namespace_unknown")
+    else:
+        require(not target, "symbolic_destination_unsupported:" + ref)
+    return refs.get(ref)
+
+
 def resolve_updates(repo, objects, remote=None, refspecs=None, *, transport=None):
     """Resolve supported Git routes before deciding authority; fail closed on
     wildcard/matching/deletion/force/duplicate/ambiguous routes. No push here.

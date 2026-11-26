@@ -3,6 +3,12 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.44] — 2026-11-26
+
+### Changed
+- Add `handoff`, `task`, `finding`, `continuation`, and `search` CLI nouns over `_build_cli_registry()` with warm-only semantic search default, host-side `workbay handoff ingest --from OUTPUT/handoff.json`, and golden CLI-vs-MCP equivalence suites (`internal`, gate `clifirstg02rr` PASS).
+- Refresh the protocol and optional lifecycle orchestrator dependency floors for WorkBay v0.1.104.
+
 ## [0.3.43] — 2026-11-26
 
 ### Changed

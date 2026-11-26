@@ -3,6 +3,14 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.102] — 2026-11-26
+
+### Changed
+- Refresh the exact runtime package pins for the WorkBay v0.1.104 Git release (`internal` + `origintagfix01`).
+- Add the universal `workbay <noun> <verb> --json` CLI contract (`ExitCode` 0..6, `workbay_protocol.cli_contract`, lazy front-door router, `workbay commands --json` manifest) (`internal` Wave 1 + Wave 2A/2B/2C/2D, gate `clifirstg02rr` PASS).
+- Include handoff/task/finding/continuation/search nouns over `_build_cli_registry()` (warm-only semantic search default, host-side `workbay handoff ingest --from OUTPUT/handoff.json`), orchestrator `lane` noun + pure-core `lane_reclaim_scan.py` hoist, golden CLI-vs-MCP equivalence suites, query-only Claude permission rules + `permission_audit` `workbay_action_grant` enforcement, and updated docs/portable `body.md` skills.
+- Include private-repo `origin_tag` observation via authenticated `git ls-remote --symref` in `scripts/release_publication.py` (`origin_tag_ref_sha`) without weakening public-mirror publication authority (`origintagfix01`).
+
 ## [0.3.101] — 2026-11-26
 
 ### Changed

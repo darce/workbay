@@ -55,5 +55,81 @@ Retired ids are fail-closed discovery metadata, never resolvable commands. Do no
 
 <!-- END GENERATED: codex-command-router -->
 
+## CLI-First Universal Contract
+
+`workbay <noun> <verb> --json` is the **primary universal contract** for
+interactive agents, harness hooks, CI pipelines, and host-side orchestration.
+All structured reads and writes route through the shared `api.py` authority and
+emit a single compact JSON object to `stdout` (diagnostics on `stderr`).
+
+### Core CLI Surface
+
+Discover every registered noun, verb, `surface_class` (`query` vs `action`), and
+owner package with:
+
+```bash
+workbay commands --json
+```
+
+Core nouns and verbs:
+
+- `handoff`: `workbay handoff load-session --json`, `workbay handoff search --json`, `workbay handoff decision record --json`, and host-only `workbay handoff ingest --from OUTPUT/handoff.json --json`
+- `task`: `workbay task state --json`, `workbay task set --json`, `workbay task next --json`
+- `finding`: `workbay finding list --json`, `workbay finding record --json`
+- `continuation`: `workbay continuation load --json`, `workbay continuation save --json`
+- `search`: `workbay search prior-work --json`
+- `lane`: `workbay lane status --json`, `workbay lane list --json`, `workbay lane close --json`, `workbay lane reclaim-scan --json`
+
+Generated harness permission policies auto-allow `query` verbs only; `action`
+verbs remain gated at explicit approval.
+
+### WorkBay MCP Servers (Thin Optional Projection)
+
+WorkBay MCP servers (`workbay-handoff-mcp`, `workbay-orchestrator-mcp`) are a
+**thin optional interactive projection** over the exact same `api.py` authority.
+Where connected, MCP preserves per-tool approval UX and typed interactive
+invocation; when MCP is absent, agents and hooks fall back to
+`workbay <noun> <verb> --json` with **zero degradation** in state authority or
+envelope schema.
+
+### ExitCode Contract
+
+Every `workbay <noun> <verb> --json` invocation maps its typed response envelope
+to the canonical `ExitCode` table in `workbay_protocol.cli_contract` (never by
+matching prose):
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `0` | `OK` | Command succeeded (`ok: true`, not degraded). |
+| `1` | `REFUSED` | Generic refusal (`ok: false`) or unrecognized `error.kind`. |
+| `2` | `USAGE` | Argument/usage validation failed before dispatch (zero mutation). |
+| `3` | `POLICY` (`POLICY_REFUSED`) | Typed policy, guard, custody, or hold refusal (`error.kind` in `POLICY_KINDS`). |
+| `4` | `UNAVAILABLE` | Required provider, sidecar, or plugin is unavailable (`error.kind` in `UNAVAILABLE_KINDS`). |
+| `5` | `DEGRADED` | Command succeeded (`ok: true`) with `degraded: true` (partial/incomplete result). |
+| `6` | `INTERNAL` | Invalid envelope or uncaught internal exception (emits only exception type name and source). |
+
+### Fail-Safe Warm-Only Semantic Search
+
+`workbay search prior-work --json` defaults to **`--semantic warm-only`**: it
+pings an already-warm embedding sidecar and, if the sidecar is cold, disabled,
+or absent, returns a typed `provider_unavailable` result with exit `0` without
+spawning a detached sidecar or loading ONNX in-process. Pass
+`--semantic require` to fail closed with exit `4` (`UNAVAILABLE`) when semantic
+search is unavailable, or `--semantic allow-cold` (with an explicit deadline)
+when cold startup is intentionally authorized.
+
+### Host-Only Single-Writer Ingest
+
+Remote VM workers and isolated sandboxes do not write directly to the host
+handoff database. They emit structured artifact packets (`OUTPUT/handoff.json`),
+and the host ingests them as the single writer via:
+
+```bash
+workbay handoff ingest --from OUTPUT/handoff.json --json
+```
+
+This validates the payload against the shared `workbay-protocol` envelope,
+stamps receipt provenance, and writes through `api.py`.
+
 For task-specific procedures, defer to the package and plan documents in this
 repository.

@@ -89,6 +89,16 @@
     {"rule": "Bash(make test-orchestrator)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Run this exact project test without command-line overrides."},
     {"rule": "Bash(make test-rehearsal)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Run this exact project test without command-line overrides."},
     {"rule": "Bash(make test-tier-e2e)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Run this exact project test without command-line overrides."},
-    {"rule": "Bash(make test-tier-fast)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Run this exact project test without command-line overrides."}
+    {"rule": "Bash(make test-tier-fast)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Run this exact project test without command-line overrides."},
+
+    {"rule": "Bash(workbay continuation load *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Read a saved continuation packet through the query-only CLI verb."},
+    {"rule": "Bash(workbay finding list *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "List review findings through the query-only CLI verb."},
+    {"rule": "Bash(workbay handoff load-session *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Load compound session handoff context through the query-only CLI verb."},
+    {"rule": "Bash(workbay handoff search *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Search handoff records through the query-only CLI verb."},
+    {"rule": "Bash(workbay lane list *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "List worktree lanes through the query-only CLI verb."},
+    {"rule": "Bash(workbay lane reclaim-scan *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Scan terminal on-disk lanes for reclaim candidates through the query-only CLI verb."},
+    {"rule": "Bash(workbay lane status *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Read bounded census snapshot for active lanes through the query-only CLI verb."},
+    {"rule": "Bash(workbay search prior-work *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Retrieve advisory prior-work matches through the query-only CLI verb."},
+    {"rule": "Bash(workbay task state *)", "effect": "allow", "canon": ["SECD-08 lexicons/security.md:258", "SEC-04 lexicons/security.md:69"], "why": "Read canonical task handoff state through the query-only CLI verb."}
   ]
 }

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-workbay-handoff"
-version = "0.3.43"
+version = "0.3.44"
 description = "Portable MCP server for agent handoff state and review tracking."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,11 +14,18 @@ dependencies = [
     "packaging>=23",
     "pydantic>=2.6.0,<3.0.0",
     "tiktoken>=0.9.0",
-    "workbay-protocol>=0.3.26,<0.4.0",
+    "workbay-protocol>=0.3.27,<0.4.0",
 ]
 
 [project.scripts]
 mcp-workbay-handoff = "workbay_handoff_mcp.cli:main"
+
+[project.entry-points."workbay.commands"]
+handoff = "workbay_handoff_mcp.noun_cli:handoff_main"
+task = "workbay_handoff_mcp.noun_cli:task_main"
+finding = "workbay_handoff_mcp.noun_cli:finding_main"
+continuation = "workbay_handoff_mcp.noun_cli:continuation_main"
+search = "workbay_handoff_mcp.noun_cli:search_main"
 
 [project.urls]
 Homepage = "https://github.com/darce/workbay"
@@ -29,7 +36,7 @@ Issues = "https://github.com/darce/workbay/issues"
 
 [project.optional-dependencies]
 # Optional R3 storage capability; runtime checks the small resource_events module.
-lifecycle = ["mcp-workbay-orchestrator>=0.3.49,<0.4.0"]
+lifecycle = ["mcp-workbay-orchestrator>=0.3.50,<0.4.0"]
 test = ["pytest>=8.0.0", "pytest-timeout>=2.3.0", "jsonschema>=4.0.0", "numpy>=2.0.0,<3.0.0"]
 # Local semantic-reinjection embedding provider. Opt-in: the core server runs
 # without these. The ~147MB gte-base-en-v1.5 ONNX model is NOT a pip dependency

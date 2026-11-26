@@ -81,6 +81,7 @@ from .api import (
     run_tools_snapshot,
 )
 from .lane_reaping import _branch_bundle_key, _bundle_dir
+from .lane_reclaim_scan import LEGACY_DEGRADED_EXIT, run_lane_reclaim_scan
 from .lanes import (
     _DEFAULT_BUNDLE_RETENTION_COUNT as DEFAULT_BUNDLE_RETENTION_COUNT,
 )
@@ -104,7 +105,6 @@ from .orchestration.branch_reclaim_queue import (
 )
 from .orchestration.lane_postmerge import reap_preserved_lanes_cross_session
 from .orchestration.lane_reclaim import (
-    NudgeFailure,
     nudge_reclaim_candidate,
     scan_terminal_lanes,
 )
@@ -116,7 +116,7 @@ from .terminal_lane_blocker_reap import with_terminal_lane_blocker_drain
 
 # OBS-08 / REVHARD-EXIT-CODE-NOT-PINNED-01: incomplete scan must exit this exact
 # nonzero code (distinct from clean-empty exit 0 and from generic handler error 1).
-_LANE_RECLAIM_SCAN_DEGRADED_EXIT = 2
+_LANE_RECLAIM_SCAN_DEGRADED_EXIT = LEGACY_DEGRADED_EXIT
 _ORPHAN_RECLAIM_DEGRADED_EXIT = 2
 _LANE_DISPOSE_SCAN_DEGRADED_EXIT = 2
 # Advisory: unintegrated backlog is not reclaimable; operators still need the signal.
@@ -861,124 +861,26 @@ def _handle_lane_reclaim_scan(
 ) -> None:
     """Run scan_terminal_lanes and optional nudge_reclaim_candidate.
 
-    Never-raise wrapper (RES-07/AGT-10): the whole post-validation body is under
-    one try/except so non-conforming returns and symbol faults become an
-    ``ok: false`` JSON report and exit 1 (no traceback). Incomplete scans
-    (``ScanResult.complete`` is False) exit with the pinned degraded code 2
-    (OBS-08), distinct from generic error exit 1. Clean complete scans exit 0.
+    Delegates to :func:`workbay_orchestrator_mcp.lane_reclaim_scan.run_lane_reclaim_scan`
+    while preserving byte-identical legacy stdout and exit codes (0 / 1 / degraded 2).
     """
-    # Blank/whitespace --task-ref refused before any symbol call (mirror lane-reap).
-    if task_ref is not None and task_ref.strip() == "":
-        _emit_lane_payload(
-            {
-                "ok": False,
-                "error": (
-                    "blank_task_ref: --task-ref was provided but empty/whitespace; "
-                    "an empty scope is not a valid reclaim scan. "
-                    "Pass a real task_ref."
-                ),
-            }
-        )
+    result = run_lane_reclaim_scan(
+        orchestrator_root=orchestrator_root,
+        task_ref=task_ref,
+        all_tasks=all_tasks,
+        lane_id=lane_id,
+        limit=limit,
+        offset=offset,
+        scan_fn=scan_terminal_lanes,
+        nudge_fn=nudge_reclaim_candidate,
+    )
+    for line in result.legacy_lines:
+        print(line)
+    if result.outcome in ("validation_error", "fault"):
+        _emit_lane_payload({"ok": False, "error": result.legacy_error})
         return
-
-    if all_tasks and lane_id is not None:
-        _emit_lane_payload({"ok": False, "error": "all_tasks_lane_id: --lane-id requires a scoped --task-ref scan."})
-        return
-
-    # Blank/whitespace --lane-id refused the same way when the flag is present.
-    if lane_id is not None and lane_id.strip() == "":
-        _emit_lane_payload(
-            {
-                "ok": False,
-                "error": (
-                    "blank_lane_id: --lane-id was provided but empty/whitespace; "
-                    "an empty lane_id is not a valid reclaim nudge. "
-                    "Pass a real lane_id or omit the flag."
-                ),
-            }
-        )
-        return
-
-    # Whole post-validation body under never-raise (REAPCONV-RECLAIMWIRE-NEVERRAISE-WRAP-INCOMPLETE-01):
-    # scan, complete/candidate access, iteration, and nudge result rendering.
-    # SystemExit (degraded=2 or _emit_lane_payload=1) is BaseException — not caught here.
-    try:
-
-        def _progress(rows_done: int, rows_total: int | None = None) -> None:
-            total = "?" if rows_total is None else str(rows_total)
-            print(f"lane-reclaim-scan progress rows={rows_done}/{total}", file=sys.stderr)
-
-        def _log(level: str, event: str, **fields: Any) -> None:
-            print(json.dumps({"level": level, "event": event, **fields}, default=str), file=sys.stderr)
-
-        scan = scan_terminal_lanes(
-            orchestrator_root=orchestrator_root,
-            limit=limit,
-            offset=offset,
-            progress=_progress,
-            log=_log,
-            **({"all_tasks": True} if all_tasks else {"task_ref": task_ref}),
-        )
-
-        print(f"unchanged_skipped={scan.unchanged_skipped}")
-        if not scan.complete:
-            reason = scan.refusal_reason if scan.refusal_reason is not None else "scan_incomplete"
-            print(f"refusal_reason={reason}")
-            raise SystemExit(_LANE_RECLAIM_SCAN_DEGRADED_EXIT)
-
-        print(f"candidates={len(scan)}")
-        # Per-lane faults do not flip complete (OBS-08 / PARTIAL-SCAN-FIELDS): surface counts.
-        failed_n = len(scan.failed_lanes)
-        unrecorded_n = len(scan.unrecorded_lanes)
-        if failed_n or unrecorded_n:
-            print(f"failed_lanes={failed_n} unrecorded_lanes={unrecorded_n}")
-
-        for cand in scan:
-            verdict = cand.verdict
-            print(
-                f"candidate lane_id={cand.lane_id} "
-                f"reclaimable={verdict.reclaimable} "
-                f"reason={verdict.reason} "
-                f"recorded={cand.recorded}"
-            )
-            branch_verdict = cand.branch_verdict
-            if branch_verdict is not None:
-                print(
-                    f"branch_candidate task_ref={cand.task_ref} lane_id={cand.lane_id} "
-                    f"reclaimable={branch_verdict.reclaimable} "
-                    f"reason={branch_verdict.reason} "
-                    f"recorded={cand.branch_recorded}"
-                )
-
-        if lane_id is None:
-            return
-
-        nudged = nudge_reclaim_candidate(
-            orchestrator_root=orchestrator_root,
-            task_ref=task_ref,
-            lane_id=lane_id,
-        )
-
-        if nudged is None:
-            print(f"nudge lane_id={lane_id} not-a-candidate")
-        elif isinstance(nudged, NudgeFailure):
-            print(f"nudge lane_id={nudged.lane_id} failure reason={nudged.reason}")
-        else:
-            verdict = nudged.verdict
-            print(
-                f"nudge lane_id={nudged.lane_id} "
-                f"reclaimable={verdict.reclaimable} "
-                f"reason={verdict.reason} "
-                f"recorded={nudged.recorded}"
-            )
-    except Exception as exc:  # noqa: BLE001 — CLI never-raise surface
-        # Unify error surface with blank-flag refusal: JSON ok:false, exit 1.
-        _emit_lane_payload(
-            {
-                "ok": False,
-                "error": f"lane-reclaim-scan error: {exc}",
-            }
-        )
+    if result.outcome == "degraded":
+        raise SystemExit(LEGACY_DEGRADED_EXIT)
 
 
 def _handle_orphan_reclaim(

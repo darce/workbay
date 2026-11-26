@@ -20,7 +20,14 @@ Do not use this skill for:
 
 ## Goal
 
-Identify and verify the root cause of a defect before applying a fix, then preserve the decision/evidence trail in MCP so the diagnosis survives handoff. Only confirmed defects become review findings.
+Identify and verify the root cause of a defect before applying a fix, then preserve the decision/evidence trail through the WorkBay CLI or optional MCP projection so the diagnosis survives handoff. Only confirmed defects become review findings.
+
+## CLI-First Contract & Optional MCP Projection
+
+`workbay <noun> <verb> --json` is the **primary universal contract** for investigation reads, prior-work recall, decision trails, findings, and continuation packets (discover verbs and `query`/`action` classes via `workbay commands --json`). WorkBay MCP tools (`get_handoff_state`, `search_handoff`, `find_related_prior_work`, `record_event`, `review_findings`) are a **thin optional interactive projection** over the same `api.py` authority, with zero degradation when MCP is absent:
+
+- Scope & recall: `workbay task state --json`, `workbay task set --json`, `workbay handoff search --json`, `workbay search prior-work --json` (warm-only by default; returns typed `provider_unavailable` without spawning a cold sidecar)
+- Evidence & findings: `workbay handoff decision record --json`, `workbay finding list --json`, `workbay finding record --json`, `workbay continuation load --json`, `workbay continuation save --json`
 
 ## Canonical Policy
 
