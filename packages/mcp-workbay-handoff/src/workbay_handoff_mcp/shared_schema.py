@@ -8,7 +8,7 @@ Ownership:
   triggers, indexes.
 - Orchestration-owned DDL (currently bootstrapped here because internal moved the Python
   orchestration code but did not relocate the DDL):
-  worktree_lanes, worker_reports, lane_messages, plan_cursors, turn_metrics.
+  worktree_lanes, worker_reports, lane_messages, plan_cursors, turn_metrics, lane_prep_metrics.
     TODO(internal-followon): Move orchestration-owned DDL to mcp-workbay-orchestrator bootstrap.
 """
 
@@ -524,7 +524,9 @@ _HANDOFF_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
             "created_at",
         }
     ),
-    "decisions": frozenset({"slice_number", "changed_files_json", "harness", "decision_origin"}),
+    "decisions": frozenset(
+        {"slice_number", "changed_files_json", "harness", "decision_origin", "supersedes_decision_id", "reversal_cause"}
+    ),
     "review_runs": frozenset(
         {
             "cycle_n",
@@ -769,7 +771,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     commit_sha    TEXT,
     decision_origin TEXT
                   CHECK (decision_origin IS NULL OR decision_origin IN ('agent', 'system')),
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    supersedes_decision_id INTEGER,
+    reversal_cause TEXT
 );
 
 CREATE TABLE IF NOT EXISTS blockers (
@@ -1104,6 +1108,21 @@ CREATE TABLE IF NOT EXISTS turn_metrics (
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS lane_prep_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_ref TEXT NOT NULL,
+    lane_id TEXT,
+    session TEXT NOT NULL,
+    cycle INTEGER,
+    backend TEXT NOT NULL,
+    phys_footprint_mb REAL,
+    phys_footprint_source TEXT,
+    pid INTEGER,
+    cost_class TEXT,
+    attribution_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- End orchestration-owned tables.
 
 CREATE TABLE IF NOT EXISTS review_runs (
@@ -1319,6 +1338,10 @@ CREATE INDEX IF NOT EXISTS idx_turn_metrics_task_lane_created
     ON turn_metrics(task_ref, lane_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_turn_metrics_task_backend_model
     ON turn_metrics(task_ref, backend, model, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_lane_prep_metrics_task_lane_created
+    ON lane_prep_metrics(task_ref, lane_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lane_prep_metrics_task_created
+    ON lane_prep_metrics(task_ref, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_review_runs_task_reviewed
     ON review_runs(task_ref, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_review_runs_subject_path
@@ -1825,6 +1848,7 @@ def _handoff_schema_bootstrapped(conn: sqlite3.Connection) -> bool:
         return False
     return (
         _required_columns_present(conn)
+        and _sqlite_table_exists(conn, "lane_prep_metrics")
         and _native_validation_schema_present(conn)
         and lane_close_evidence.schema_present(conn)
     )
@@ -2605,6 +2629,32 @@ def _migrate_add_turn_metrics(conn: sqlite3.Connection) -> None:
             "CREATE INDEX idx_turn_metrics_task_backend_model "
             "ON turn_metrics(task_ref, backend, model, created_at DESC, id DESC)"
         )
+
+
+def _migrate_lane_prep_metrics(conn: sqlite3.Connection) -> None:
+    """Move prep rows under the caller's transaction, retaining the raw attribution."""
+    conn.execute(
+        """
+        WITH legacy AS (
+            SELECT *, CASE WHEN json_valid(attribution_json) THEN attribution_json END AS valid_attribution
+            FROM turn_metrics
+            WHERE phase = 'lane_prep'
+        )
+        INSERT INTO lane_prep_metrics (
+            task_ref, lane_id, session, cycle, backend, phys_footprint_mb,
+            phys_footprint_source, pid, cost_class, attribution_json, created_at
+        )
+        SELECT task_ref, lane_id, session, cycle, backend,
+               json_extract(valid_attribution, '$.phys_footprint_mb'),
+               json_extract(valid_attribution, '$.phys_footprint_source'),
+               json_extract(valid_attribution, '$.pid'),
+               json_extract(valid_attribution, '$.cost_class'),
+               attribution_json, created_at
+        FROM legacy
+        ORDER BY id
+        """
+    )
+    conn.execute("DELETE FROM turn_metrics WHERE phase = 'lane_prep'")
 
 
 def _turn_metrics_usage_source_allows_grok_context_delta(conn: sqlite3.Connection) -> bool:
@@ -4258,6 +4308,11 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
         try:
             schema_version = handoff_schema_version(conn)
             identity_gap = _bootstrap_identity_gap(conn)
+            # Repair existing databases before validating v51 close-evidence upgrade eligibility.
+            # Fresh databases get both nullable columns from the base DDL below.
+            if _sqlite_objects_exist(conn, "table", frozenset({"decisions"})):
+                _add_column_if_missing(conn, "decisions", "supersedes_decision_id", "INTEGER")
+                _add_column_if_missing(conn, "decisions", "reversal_cause", "TEXT")
             eligible_close_upgrade = (
                 schema_version == 51
                 and _sqlite_objects_exist(conn, "table", _HANDOFF_REQUIRED_TABLES)
@@ -4278,6 +4333,7 @@ def _bootstrap_handoff_schema(conn: sqlite3.Connection) -> None:
             _migrate_lane_completion_evidence_columns(conn)
             _execute_sql_script(conn, HANDOFF_SCHEMA_SQL)
             _apply_handoff_migrations(conn)
+            _migrate_lane_prep_metrics(conn)
             _ensure_released_row_terminal_trigger(conn)
             lane_close_evidence.migrate(conn, eligible_upgrade=eligible_close_upgrade)
             if (
@@ -5707,7 +5763,8 @@ def _ensure_blocking_review_schema(conn: sqlite3.Connection) -> None:
         # The canonical finding ID survives line moves and updates to reviewer
         # wording. Gate settlement compares identities within one subject.
         (
-            "review_findings", "fingerprint",
+            "review_findings",
+            "fingerprint",
             "TEXT GENERATED ALWAYS AS (json_array(task_ref, branch, file_path, finding_id)) VIRTUAL",
         ),
     ):
@@ -5779,9 +5836,12 @@ def _ensure_blocking_review_schema(conn: sqlite3.Connection) -> None:
 def review_history_unavailable(conn: sqlite3.Connection, task_ref: str) -> bool:
     if not conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='review_snapshot_history'").fetchone():
         return True
-    return conn.execute(
-        "SELECT 1 FROM review_snapshot_history WHERE task_ref = ? AND state = 'unavailable'", (task_ref,)
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM review_snapshot_history WHERE task_ref = ? AND state = 'unavailable'", (task_ref,)
+        ).fetchone()
+        is not None
+    )
 
 
 def _prepare_handoff_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -6221,6 +6281,15 @@ def init_handoff_db(db_path: Path | str) -> Path:
     conn = _connect_handoff_sqlite(resolved)
     try:
         _prepare_handoff_connection(conn)
+        # An explicit init also drains rows left by older writers after the table
+        # was installed, without scanning turn_metrics on routine warm opens.
+        if (
+            _sqlite_table_exists(conn, "lane_prep_metrics")
+            and conn.execute("SELECT 1 FROM turn_metrics WHERE phase = 'lane_prep' LIMIT 1").fetchone()
+        ):
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                _migrate_lane_prep_metrics(conn)
     finally:
         conn.close()
     return resolved

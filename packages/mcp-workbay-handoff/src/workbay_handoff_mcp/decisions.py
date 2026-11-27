@@ -8,7 +8,9 @@ and integrity helpers.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import shlex
 import signal
 import sqlite3
@@ -17,6 +19,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -57,6 +60,42 @@ from .shared_write_context import (
     write_deadline,
 )
 from .slice_decision import classify_decision_id, is_slice_complete_decision
+
+_log = logging.getLogger(__name__)
+_DECISION_LINT_MODULE = "workbay_canon_lint.adapters.decision"
+_CANON_REVERSAL_CAUSE_RE = re.compile(r"^canon:([A-Za-z]+-[0-9]+)$", re.IGNORECASE)
+# These phrase matches raise questions for review when workbay-canon-lint is not
+# installed. Return shape matches workbay_canon_lint.adapters.decision.
+_DECISION_LINT_HINTS = (
+    (
+        "DATA-14",
+        "B",
+        "decision.dual-write",
+        re.compile(r"\bdual[- ]writ(?:e|es|ing)\b", re.IGNORECASE),
+        "Write to a single source of truth and derive the other copy from it.",
+    ),
+    (
+        "AGT-13",
+        "S",
+        "decision.adr-override",
+        re.compile(r"\b(?:override|ignore|bypass)\b[^.\n]{0,40}\badr\b", re.IGNORECASE),
+        "Amend or supersede the recorded ADR before implementing the conflicting decision.",
+    ),
+    (
+        "SECD-05",
+        "B",
+        "decision.fail-open",
+        re.compile(r"\bfail(?:s|ing)?[- ]open\b", re.IGNORECASE),
+        "Keep verification enabled and fail to a documented safe state on error.",
+    ),
+    (
+        "RES-02",
+        "B",
+        "decision.unbounded-wait",
+        re.compile(r"\b(?:no |without (?:a |any )?)timeout\b", re.IGNORECASE),
+        "Set finite timeouts on blocking calls and give retries or loops a stopping condition.",
+    ),
+)
 
 
 def _normalize_changed_files_payload(changed_files: Sequence[object] | None) -> tuple[list[str] | None, str | None]:
@@ -157,6 +196,60 @@ def _normalize_test_traces_payload(
     return normalized, None
 
 
+def _normalize_reversal_fields(
+    supersedes_decision_id: int | None,
+    reversal_cause: str | None,
+) -> tuple[int | None, str | None, str | None]:
+    if supersedes_decision_id is not None and (
+        isinstance(supersedes_decision_id, bool)
+        or not isinstance(supersedes_decision_id, int)
+        or supersedes_decision_id <= 0
+    ):
+        return None, None, f"supersedes_decision_id must be a positive integer; got {supersedes_decision_id!r}"
+    cleaned_cause = reversal_cause.strip() if isinstance(reversal_cause, str) else None
+    if cleaned_cause == "":
+        cleaned_cause = None
+    if cleaned_cause is not None:
+        if supersedes_decision_id is None:
+            return None, None, "reversal_cause requires supersedes_decision_id to link the superseded decision"
+        if cleaned_cause.lower().startswith("canon:"):
+            match = _CANON_REVERSAL_CAUSE_RE.match(cleaned_cause)
+            if match is None:
+                return (
+                    None,
+                    None,
+                    (
+                        f"canon reversal_cause must match 'canon:<RULE-ID>' (e.g. 'canon:DATA-14'); got {cleaned_cause!r}"
+                    ),
+                )
+            cleaned_cause = f"canon:{match.group(1).upper()}"
+    return supersedes_decision_id, cleaned_cause, None
+
+
+def _lint_decision_text(decision: str, rationale: str = "") -> list[dict]:
+    try:
+        adapter = import_module(_DECISION_LINT_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"workbay_canon_lint", "workbay_canon_lint.adapters", _DECISION_LINT_MODULE}:
+            raise
+        combined = f"{decision}\n{rationale}"
+        advisories = []
+        for rule_id, tier, check_id, pattern, message in _DECISION_LINT_HINTS:
+            match = pattern.search(combined)
+            if match is not None:
+                advisories.append(
+                    {
+                        "rule_id": rule_id,
+                        "tier": tier,
+                        "check_id": check_id,
+                        "message": message,
+                        "matched_signal": match.group(),
+                    }
+                )
+        return advisories
+    return list(adapter.lint_decision_text(decision, rationale))
+
+
 def record_decision(
     session: str,
     decision: str,
@@ -172,6 +265,8 @@ def record_decision(
     decision_origin: str | None = None,
     refresh_rationale_on_conflict: bool = False,
     deadline: float | None = None,
+    supersedes_decision_id: int | None = None,
+    reversal_cause: str | None = None,
 ) -> dict:
     """Record a decision; bounded writes defer optional embedding to backfill.
 
@@ -191,6 +286,11 @@ def record_decision(
     normalized_changed_files, changed_files_error = _normalize_changed_files_payload(changed_files)
     if changed_files_error is not None:
         return _envelope(ok=False, tool="record_decision", data={"error": changed_files_error})
+    supersedes_decision_id, reversal_cause, reversal_error = _normalize_reversal_fields(
+        supersedes_decision_id, reversal_cause
+    )
+    if reversal_error is not None:
+        return _envelope(ok=False, tool="record_decision", data={"error": reversal_error})
     with (
         write_deadline(deadline),
         _get_db_connection(**({"deadline": deadline} if deadline is not None else {})) as conn,
@@ -213,6 +313,8 @@ def record_decision(
                 slice_number=slice_number,
                 decision_origin=decision_origin,
                 refresh_rationale_on_conflict=refresh_rationale_on_conflict,
+                supersedes_decision_id=supersedes_decision_id,
+                reversal_cause=reversal_cause,
             )
             if deadline is not None:
                 # Refresh immediately before commit, whose busy wait must use
@@ -228,6 +330,14 @@ def record_decision(
             if deadline is not None:
                 conn.set_progress_handler(None, 0)
     mutation = m if isinstance((m := result.get("mutation")), dict) else {}
+    if result.get("ok") and mutation.get("operation") in {"insert", "update"}:
+        try:
+            stored = result["data"]["decision"]
+            advisories = _lint_decision_text(stored["decision"], stored["rationale"] or "")
+            if advisories:
+                result["data"]["canon_lint_advisories"] = advisories
+        except Exception:
+            _log.warning("Post-commit Canon decision lint failed", exc_info=True)
     # Insert and DO UPDATE both change the stored rationale and must re-embed;
     # DO NOTHING (operation='noop') must not (PLAN0181-S2REFRESHIDEM-01).
     # Embed the rationale actually persisted on the row, not the caller's
@@ -279,6 +389,44 @@ def record_decision(
     return result
 
 
+def _hydrate_decision_tokens_from_turn_metrics(
+    conn: sqlite3.Connection,
+    *,
+    task_ref: str,
+    lane_id: str | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Read the lane's observed usage that decisions have yet to account for."""
+    if not lane_id:
+        return None, None, None
+    query = """
+        WITH observed AS (
+            SELECT SUM(input_tokens) AS tokens_in, SUM(output_tokens) AS tokens_out, SUM(total_tokens) AS total
+            FROM turn_metrics
+            WHERE task_ref = :task_ref AND lane_id = :lane_id
+              AND usage_source = 'observed' AND total_tokens IS NOT NULL
+        ), attributed AS (
+            SELECT SUM(input_tokens) AS tokens_in, SUM(output_tokens) AS tokens_out, SUM(total_tokens) AS total
+            FROM decisions
+            WHERE task_ref = :task_ref AND lane_id = :lane_id AND total_tokens IS NOT NULL
+        )
+        SELECT MAX(0, COALESCE(observed.tokens_in, 0) - COALESCE(attributed.tokens_in, 0)),
+               MAX(0, COALESCE(observed.tokens_out, 0) - COALESCE(attributed.tokens_out, 0)),
+               MAX(0, COALESCE(observed.total, 0) - COALESCE(attributed.total, 0))
+        FROM observed CROSS JOIN attributed
+    """
+    try:
+        input_delta, output_delta, total_delta = conn.execute(
+            query, {"task_ref": task_ref, "lane_id": lane_id}
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if str(exc) != "no such table: turn_metrics":
+            raise
+        return None, None, None
+    if total_delta == 0:
+        return None, None, None
+    return input_delta, output_delta, total_delta
+
+
 def _record_decision_with_conn(
     conn: sqlite3.Connection,
     *,
@@ -298,6 +446,8 @@ def _record_decision_with_conn(
     resolved_ctx: ResolvedWriteContext | None = None,
     target_context_warnings: list[str] | None = None,
     precomputed_target_worktree_path: str | None = None,
+    supersedes_decision_id: int | None = None,
+    reversal_cause: str | None = None,
 ) -> dict:
     if decision_origin is not None and decision_origin not in {"agent", "system"}:
         return _envelope(
@@ -500,7 +650,9 @@ def _record_decision_with_conn(
         # '[]' means omitted — refreshing callers cannot clear a stored file list.
         "changed_files_json = COALESCE(NULLIF(excluded.changed_files_json, '[]'), decisions.changed_files_json), "
         "slice_number = COALESCE(excluded.slice_number, decisions.slice_number), "
-        "decision_origin = COALESCE(excluded.decision_origin, decisions.decision_origin)"
+        "decision_origin = COALESCE(excluded.decision_origin, decisions.decision_origin), "
+        "supersedes_decision_id = COALESCE(excluded.supersedes_decision_id, decisions.supersedes_decision_id), "
+        "reversal_cause = COALESCE(excluded.reversal_cause, decisions.reversal_cause)"
         if refresh_rationale_on_conflict
         else "ON CONFLICT(task_ref, decision, session) DO NOTHING"
     )
@@ -513,19 +665,42 @@ def _record_decision_with_conn(
     # (PLAN0181-S2GATE2-LASTROWID-FALSE-ORACLE-01). rowcount is statement-
     # scoped: 1 for INSERT or DO UPDATE, 0 for DO NOTHING. Combined with the
     # pre-existence check that is sufficient (PLAN0181-S2REFRESHIDEM-01).
+    if supersedes_decision_id is not None:
+        target = conn.execute("SELECT id FROM decisions WHERE id = ?", (supersedes_decision_id,)).fetchone()
+        if target is None:
+            return _envelope(
+                ok=False,
+                tool="record_decision",
+                data={
+                    "error": f"supersedes_decision_id {supersedes_decision_id} does not reference an existing decision"
+                },
+                task_ref=resolved_task_ref,
+            )
+    should_hydrate = bool(ctx.lane_id) and input_tokens is None and output_tokens is None and total_tokens is None
+    if should_hydrate and not conn.in_transaction:
+        # Serialize the balance read and insert so two decisions cannot claim the same usage.
+        conn.execute("BEGIN IMMEDIATE")
     existing_before = conn.execute(
         "SELECT id FROM decisions WHERE task_ref = ? AND decision = ? AND session = ?",
         (resolved_task_ref, decision, session),
     ).fetchone()
+    # Conflict refreshes keep the original token attribution.
+    if should_hydrate and existing_before is None:
+        input_tokens, output_tokens, total_tokens = _hydrate_decision_tokens_from_turn_metrics(
+            conn, task_ref=resolved_task_ref, lane_id=ctx.lane_id
+        )
+    elif total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
     cur = conn.execute(
         f"""
         INSERT INTO decisions (
             task_ref, lane_id, session, decision, rationale, agent, harness,
             model, model_label, reasoning_level,
             input_tokens, output_tokens, total_tokens,
-            branch, commit_sha, changed_files_json, slice_number, decision_origin, created_at
+            branch, commit_sha, changed_files_json, slice_number, decision_origin,
+            supersedes_decision_id, reversal_cause, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         {on_conflict}
         """,
         (
@@ -547,6 +722,8 @@ def _record_decision_with_conn(
             changed_files_json,
             slice_number,
             decision_origin,
+            supersedes_decision_id,
+            reversal_cause,
         ),
     )
     stored = conn.execute(
@@ -583,6 +760,42 @@ def _record_decision_with_conn(
         },
         warnings=warnings if warnings else None,
     )
+
+
+def get_canon_reversal_metrics(conn: sqlite3.Connection, task_ref: str | None = None) -> dict:
+    """Count recorded reversals and report Canon reversals per recorded decision."""
+    task_filter = "WHERE task_ref = ?" if task_ref is not None else ""
+    groups = conn.execute(
+        f"""
+        SELECT CASE
+                   WHEN supersedes_decision_id IS NOT NULL
+                        AND LOWER(reversal_cause) LIKE 'canon:%'
+                        AND LENGTH(TRIM(substr(reversal_cause, 7))) > 0
+                   THEN UPPER(TRIM(substr(reversal_cause, 7)))
+               END AS rule_id,
+               COUNT(*) AS decisions_total,
+               COUNT(supersedes_decision_id) AS reversals_total
+        FROM decisions
+        {task_filter}
+        GROUP BY rule_id
+        """,
+        (task_ref,) if task_ref is not None else (),
+    )
+    total_decisions = reversals_total = 0
+    by_rule_id: dict[str, int] = {}
+    for rule_id, decisions_count, reversals_count in groups:
+        total_decisions += decisions_count
+        reversals_total += reversals_count
+        if rule_id is not None:
+            by_rule_id[rule_id] = decisions_count
+    canon_reversals = sum(by_rule_id.values())
+    return {
+        "total_decisions": total_decisions,
+        "reversals_total": reversals_total,
+        "canon_reversals": canon_reversals,
+        "canon_reversal_rate": canon_reversals / total_decisions if total_decisions else 0.0,
+        "by_rule_id": by_rule_id,
+    }
 
 
 def update_next_actions(

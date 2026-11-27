@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Host-side current-workspace release writer and installed VM reclaimer driver.
+"""Host-side current-workspace release writer and scratch reclaimer driver.
 
 The writer owns idle/landed proof and release records. The installed VM service
-owns deletion and its safety limits. This driver only delegates and measures.
+owns remote deletion. The same reclaimer checks local diagnostic scratch.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from pathlib import Path
 DF = "df -B1 --output=avail /"
 STATUS = "python3 -I ~/.local/lib/workbay/workbay_vm_reclaim.py status --json"
 START = "systemctl --user start workbay-vm-reclaim.service"
+LOCAL_RECLAIMER = Path(__file__).resolve().parent / "vm/workbay_vm_reclaim.py"
 
 
 class StepFailure(Exception):
@@ -201,6 +202,16 @@ def verdict(workspace, apply, runner, task_ref=None):
             raise StepFailure("reclaimer-status", "stale_last_run", next_command=shlex.join(ssh + [STATUS]))
     reclaimed = count(last_run.get("reclaimed"), "reclaimer-status") if apply else 0
     freed = count(last_run.get("bytes_freed"), "reclaimer-status") if apply else 0
+    local_argv = [sys.executable, "-I", str(LOCAL_RECLAIMER), "idle-host"]
+    if apply:
+        local_argv.append("--apply")
+    host_idle = json_object(run_step(runner, "host-idle-retention", local_argv), "host-idle-retention")
+    categories = host_idle.get("categories")
+    if not isinstance(categories, dict) or any(not isinstance(row, dict) for row in categories.values()):
+        raise StepFailure("host-idle-retention", str(host_idle.get("error") or "missing category totals"))
+    if apply:
+        reclaimed += sum(count(row.get("reclaimed_count"), "host-idle-retention") for row in categories.values())
+        freed += sum(count(row.get("reclaimed_bytes"), "host-idle-retention") for row in categories.values())
     starvation = last_run.get("starved")
     starved = ("yes" if reclaimer.get("health") == "starved" or isinstance(starvation, dict) and starvation
                else "no" if "health" in reclaimer else "unknown")
@@ -210,15 +221,18 @@ def verdict(workspace, apply, runner, task_ref=None):
         "released": released, "reclaimed": reclaimed, "held": held, "holds": holds,
         "top_reasons": top_reasons, "starved": starved,
         "last_run_age_seconds": reclaimer.get("last_run_age_seconds") if not apply else None,
+        "vm_idle_retention": (last_run if apply else reclaimer).get("idle_retention"),
+        "host_idle_retention": host_idle,
         "writer": writer, "reclaimer": reclaimer,
     }
 
 
 def main(argv=None, *, runner=None):
     parser = argparse.ArgumentParser(description="Release idle, landed sandboxes for the current workspace "
-                                     "and run the installed VM reclaimer. Cross-consumer discovery is not supported.")
+                                     "and reclaim idle VM and host scratch.")
     parser.add_argument("--workspace-root", type=Path, default=Path.cwd())
-    parser.add_argument("--apply", action="store_true", help="write releases and start the VM service (default: dry run)")
+    parser.add_argument("--apply", action="store_true",
+                        help="write releases, start the VM service, and reclaim host scratch (default: dry run)")
     parser.add_argument("--task-ref", help="task that owns the writer decision receipt (make vm-reap TASK=<ref>)")
     parser.add_argument("--json", action="store_true", help="print one JSON object including the original step receipts")
     args = parser.parse_args(argv)
@@ -231,7 +245,11 @@ def main(argv=None, *, runner=None):
             print(json.dumps({"ok": False, "step": exc.step, "error": str(exc), "next": next_command}))
         print(f"vm-reap failed step={exc} next={next_command}", file=sys.stderr)
         return 2
-    if apply:
+    if result["host_idle_retention"].get("errors"):
+        rc = 2
+        for failure in result["host_idle_retention"]["errors"]:
+            print(f"host idle retention failed for {failure['path']}: {failure['reason']}", file=sys.stderr)
+    elif apply:
         rc = 0 if result["reclaimed"] >= 1 or result["freed_bytes"] > 0 else 3
     else:
         rc = 3 if result["starved"] == "yes" else 0
@@ -256,6 +274,10 @@ def main(argv=None, *, runner=None):
               f"starved={result['starved']} mode={result['mode']}{age}{next_step}")
         for row in result["holds"][:20]:
             print(f"held {row['key']} {row['reason']} owner={row.get('owner') or 'unknown'}")
+        for report in (result["vm_idle_retention"], result["host_idle_retention"]):
+            for name, totals in sorted((report or {}).get("categories", {}).items()):
+                print(f"{name} candidates={totals['candidate_count']} ({human(totals['candidate_bytes'])}) "
+                      f"reclaimed={totals['reclaimed_count']} ({human(totals['reclaimed_bytes'])})")
     return rc
 
 

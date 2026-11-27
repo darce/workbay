@@ -1,0 +1,67 @@
+{
+  "schema": "wb.vm-check-routing/1",
+  "workflows": {
+    "workbay-gate": {
+      "events": {
+        "pull_request": {
+          "paths": [
+            "packages/**",
+            "scripts/**",
+            "Makefile",
+            "Makefile.d/**",
+            "pyproject.toml",
+            "uv.lock",
+            "config/vm-ci/**",
+            ".workbay/canon-lint.toml"
+          ]
+        },
+        "push": {
+          "branches": ["main"],
+          "paths": [
+            "packages/**",
+            "scripts/**",
+            "Makefile",
+            "Makefile.d/**",
+            "pyproject.toml",
+            "uv.lock",
+            "config/vm-ci/**",
+            ".workbay/canon-lint.toml"
+          ]
+        }
+      },
+      "checks": {
+        "workbay-manifest-gate": {
+          "script": "scripts/ci/checks/workbay-gate.sh",
+          "timeout_seconds": 3600,
+          "hosted_name": "WorkBay manifest gate"
+        },
+        "workbay-canon-lint": {
+          "script": "scripts/ci/checks/workbay-gate.sh",
+          "timeout_seconds": 300,
+          "hosted_name": "WorkBay canon lint"
+        }
+      }
+    },
+    "workbay-release": {
+      "events": {
+        "push": {
+          "branches": ["main"],
+          "paths": [
+            "packages/**",
+            "scripts/release*.py",
+            "scripts/export_public.py",
+            "config/release/**",
+            "config/vm-ci/**"
+          ]
+        }
+      },
+      "checks": {
+        "workbay-release-dry-run": {
+          "script": "scripts/ci/checks/workbay-release-check.sh",
+          "timeout_seconds": 1200,
+          "hosted_name": "WorkBay public release dry-run"
+        }
+      }
+    }
+  }
+}

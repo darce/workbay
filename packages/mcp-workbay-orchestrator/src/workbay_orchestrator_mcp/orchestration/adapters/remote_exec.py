@@ -112,6 +112,7 @@ from ..remote_phase_budget import (
     plan_dispatch_clocks,
     remote_bound_seconds,
 )
+from ..transport_ref import is_transport_ref
 from . import remote_job_runner
 from ._result_text import (
     RECOVERY_TIER_BALANCED,
@@ -6458,8 +6459,7 @@ def _source_provenance_from_json(
         or payload["remote_source_commit"] != head_sha
         or head_tree is None
         or payload["remote_source_tree"] != head_tree
-        or not payload["dispatch_ref"].startswith("refs/heads/")
-        or not payload["dispatch_ref"].endswith(f"-{payload['dispatch_nonce']}")
+        or not is_transport_ref(payload["dispatch_ref"], payload["dispatch_nonce"])
     ):
         return None, "identity_mismatch"
     if payload["sandbox_base_tree"] != payload["remote_source_tree"]:
@@ -10040,17 +10040,31 @@ class RemoteExecAdapter(BackendAdapter):
                 if isinstance(execution_proof, dict):
                     raw["execution_preflight"] = execution_proof
                     if execution_proof.get("status") != "PASS":
+                        reason = execution_proof.get("reason")
+                        if not isinstance(reason, str) or not reason:
+                            reason = "execution_preflight_unknown"
                         raw.update(
-                            failure_reason=execution_proof.get("reason", "execution_preflight_unknown"),
+                            failure_reason=reason,
                             preflight_required=True,
                             failure_class="transport" if execution_proof.get("retryable") is True else "configuration",
                             retryable=execution_proof.get("retryable") is True,
                         )
+                        summary, details = stamped.summary, stamped.details
+                        blockers = [*stamped.blockers, "execution_preflight_refused"]
+                        if completed_rc == _RC_POLICY_REFUSED:
+                            policy_blocker = _TRANSPORT_EXIT_FAILURES[_RC_POLICY_REFUSED][2]
+                            blockers = [reason, *(blocker for blocker in blockers if blocker != policy_blocker)]
+                            summary = f"{self.backend_id} execution preflight refused ({reason})"
+                            repair_hint = execution_proof.get("repair_hint")
+                            if isinstance(repair_hint, str) and repair_hint:
+                                details = repair_hint
                         stamped = replace(
                             stamped,
+                            summary=summary,
+                            details=details,
                             merge_ready=False,
                             handoff_action="needs_guidance",
-                            blockers=[*stamped.blockers, "execution_preflight_refused"],
+                            blockers=blockers,
                         )
                 if provenance.get("model_process_started") is not True:
                     raw["execution_failure"] = "model_process_not_started"

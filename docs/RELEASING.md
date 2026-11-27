@@ -109,9 +109,9 @@ release is five steps, orchestrated by `make release-public`
    build environments or caches. See [Canvas delivery](contracts/canvas-public-release-v1.md).
 2. **Prepare** with `make release-public FLAGS=--json`. Export copies the
    Git-tracked operational subset plus the checked generated Canvas package
-   data. The consumer gate installs **ALL8** local-path members: protocol,
-   handoff, orchestrator, bootstrap, codex-bridge, system, Canvas (exactly once),
-   and workbay. Preparation retains the checked objects, exact source identity,
+   data. The consumer gate installs every exported local-path member, including
+   the optional canon linter. Canvas participates exactly once. Preparation
+   retains the checked objects, exact source identity,
    remote preimage, final commit/tree and version-tag update set.
 3. **Inspect and explicitly approve** that exact retained subject externally.
    For an existing remote main, its tip becomes the prepared commit's parent;
@@ -421,9 +421,12 @@ a newly prepared, explicitly approved plan with `--execute --prepared <plan-id>`
 ## Who runs the release
 
 While the monorepo is private, only the maintainer with **push access to
-`darce/workbay`** runs releases. CI does not auto-release —
-`.github/workflows/test.yml` is a gate, not a release driver; there is no
-publish workflow.
+`darce/workbay`** runs releases. The `vm-ci` transport replaces the retired
+GitHub Actions workflow (`.github/workflows/test.yml`) and runs release dry-run
+checks. Site settings live in `config/vm-ci/site.json`, and check routing lives
+in `scripts/ci/vm-check-policy.json`. The release publish targets in
+`mk/vm-ci.mk` invoke `scripts/ci/vm-ci-workbay-publish.sh` for operator-driven
+dry runs and live releases.
 
 When the repo flips public, the same playbook applies; consumers install
 from the public tags and need no `darce/*` access.

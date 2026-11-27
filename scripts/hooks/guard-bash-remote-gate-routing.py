@@ -158,36 +158,26 @@ _TEST_TARGETS = frozenset(
     }
 )
 
-# Evidence: root help prints an awk listing; package help recipes only echo
-# their command lists. Root check-remote invokes remote_gate.sh, with no local
-# test prerequisite. Decision 34038 also admits the five documented lifecycle
-# facades below, and decision 40139 adds the plan-done facade: each has tracked
-# recipe-closure evidence and an allowance control. plan-accept stays refused:
-# its recipe's `test -n` guard fails the closure check. The recipe-closure guard
-# tests every tracked definition.
-# slice-commit and task-start pass the same closure check; the shipped Git
-# pre-commit hook runs branch/checklist guards, not tests. maint-start's two
-# `test -n` guards fail that check, so its refusal names the metadata CLI.
-# A missing goal is an availability cost; adding an unproven goal is a bypass.
+# Explicit non-host-test goals. Lifecycle handlers own their execution policy,
+# including slice-start's remote-only check before measuring a test command.
 _INERT_MAKE_GOALS = frozenset({
     "help", "check-remote", "lane-land", "finalize-plan", "handoff-write",
-    "offload-flock", "lane-reap", "plan-done", "slice-commit", "task-start", "vm-reap", "doctor",
+    "offload-flock", "lane-reap", "vm-reap",
+    "maint-start", "task-start", "task-finish", "task-reap",
+    "slice-start", "slice-commit", "plan-accept", "plan-done",
+    "context", "handoff-close-check", "review-ready", "close-check",
+    "doctor", "check-harness-coherence",
 })
 
 # Shipped orientation and readiness commands. Their recipes also accept
 # arguments and Make variable overrides, so admission is limited to the
-# documented read-only forms. In particular, task-reap has an apply mode.
+# documented read-only forms.
 # A goal belongs here only when its whole recipe, handler body and any child
 # dispatch included, is proven to write nothing; an unproven goal stays refused.
-# handoff-close-check and context are withdrawn (gate rel93g140): the first
-# dispatches a child close-check that runs the full maintenance cadence, and the
-# context handler replays the error and terminal-guard spools and reaps scratch.
 _READ_ONLY_MAKE_ARGS = MappingProxyType({
     "compaction-status": {"TASK"},
     "crap-report": {"COVERAGE", "PATHS", "INCLUDE_UNMEASURED"},
-    "review-ready": {"LIFECYCLE_ARGS"},
     "status": {"LIFECYCLE_ARGS"},
-    "task-reap": {"LIFECYCLE_ARGS", "TASK", "REAP_ARGS"},
     "tasks": {"LIFECYCLE_ARGS"},
 })
 _READ_ONLY_MAKE_VALUES = MappingProxyType({
@@ -196,7 +186,6 @@ _READ_ONLY_MAKE_VALUES = MappingProxyType({
     "INCLUDE_UNMEASURED": r"1?",
     "TASK": r"[A-Za-z0-9][A-Za-z0-9_.-]*",
     "LIFECYCLE_ARGS": r"(?:--json)?",
-    "REAP_ARGS": r"",
 })
 _READ_ONLY_MAKE_ENV = re.compile(
     r"(?<![\w${])(?:LIFECYCLE(?:_ARGS|_PYTHON|_RUNNER)?|REAP_ARGS|TASK|"
@@ -575,6 +564,7 @@ class _Segment:
 
 
 _Heredoc = tuple[_Segment, str, bool, bool]
+_AMBIGUOUS_QUOTE = re.compile(r"\$(?:'|\\\n)")
 # Stands in for the earlier text where a shell reads a produced file on stdin. The scan merges the earlier
 # text itself, so copying it into every reader's text would make a run of readers quadratic.
 _PRIOR_STDIN = "\x01prior-stdin\x01"
@@ -636,7 +626,7 @@ def _lex_heredoc_operator(command: str, index: int, segment: _Segment, pending: 
     return index
 
 
-def _read_heredoc_bodies(command: str, index: int, pending: list[_Heredoc]) -> int:
+def _read_heredoc_bodies(command: str, index: int, pending: list[_Heredoc], *, strict_quotes: bool) -> int:
     """Attach here-document bodies to the segments that declared them."""
     for segment, delimiter, strip_tabs, expands in pending:
         lines: list[str] = []
@@ -650,13 +640,16 @@ def _read_heredoc_bodies(command: str, index: int, pending: list[_Heredoc]) -> i
             lines.append(line)
         body = "\n".join(lines)
         segment.bodies.append(body)
-        if expands and ("$(" in body or "`" in body):
-            segment.opaque = True
+        if expands:
+            if strict_quotes and _AMBIGUOUS_QUOTE.search(body):
+                raise _NeedsRawScan
+            if "$(" in body or "`" in body:
+                segment.opaque = True
     pending.clear()
     return index
 
 
-def _lex_substitution(command: str, index: int, segment: _Segment, nesting: int) -> int:
+def _lex_substitution(command: str, index: int, segment: _Segment, nesting: int, *, strict_quotes: bool) -> int:
     """Lex ``$(...)``, ``<(...)``, ``>(...)``, backquotes or ``$((...))``."""
     if command.startswith("$((", index):
         end = _arithmetic_end(command, index + 3)
@@ -669,10 +662,13 @@ def _lex_substitution(command: str, index: int, segment: _Segment, nesting: int)
             end += 2 if command[end] == "\\" else 1
         if end >= len(command):
             raise ValueError("unterminated backquote substitution")
-        inner, _ = _lex(re.sub(r"\\([\\`$])", r"\1", command[index + 1 : end]), nesting=nesting + 1)
+        inner, _ = _lex(
+            re.sub(r"\\([\\`$])", r"\1", command[index + 1 : end]),
+            nesting=nesting + 1, strict_quotes=strict_quotes,
+        )
         end += 1
     else:
-        inner, end = _lex(command, index + 2, closer=True, nesting=nesting + 1)
+        inner, end = _lex(command, index + 2, closer=True, nesting=nesting + 1, strict_quotes=strict_quotes)
         if command[index] == "$" and command[index + 2 : end - 1] == "MAKE":
             segment.add(command[index:end])
             return end
@@ -692,11 +688,12 @@ def _lex_substitution(command: str, index: int, segment: _Segment, nesting: int)
 class _Lexer:
     """Scan state for one ``_lex`` call: the cursor, the open segment and quoting."""
 
-    def __init__(self, command: str, index: int, *, closer: bool, nesting: int) -> None:
+    def __init__(self, command: str, index: int, *, closer: bool, nesting: int, strict_quotes: bool) -> None:
         self.command = command
         self.index = index
         self.closer = closer
         self.nesting = nesting
+        self.strict_quotes = strict_quotes
         self.segments: list[_Segment] = []
         self.current = _Segment()
         self.pipeline: list[_Segment] = []
@@ -745,13 +742,30 @@ class _Lexer:
         """Consume quoted text, escapes, substitutions and comments; False for unquoted syntax."""
         command, char = self.command, self.command[self.index]
         if self.quote == "'":
-            self._add_quoted(char)
+            end = command.find("'", self.index)
+            if end < 0:
+                end = len(command)
+                next_index = end
+            else:
+                self.quote = None
+                next_index = end + 1
+            self.quoted_characters += end - self.index
+            self.current.add(command[self.index : next_index])
+            self.index = next_index
             return True
+        if (
+            char == "$" and self.strict_quotes
+            and _AMBIGUOUS_QUOTE.match(command, self.index)
+            and (self.quote is None or command[self.index + 1] == "\\")
+        ):
+            raise _NeedsRawScan
         if char == "\\":
             self._escape()
             return True
         if char == "`" or command.startswith("$(", self.index):
-            self.index = _lex_substitution(command, self.index, self.current, self.nesting)
+            self.index = _lex_substitution(
+                command, self.index, self.current, self.nesting, strict_quotes=self.strict_quotes
+            )
             self.word_started = True
             return True
         if self.quote == '"':
@@ -778,9 +792,13 @@ class _Lexer:
             self.index += 3
         elif command.startswith("<<", index):
             self.index = _lex_heredoc_operator(command, index, self.current, self.pending)
+            if self.strict_quotes and _AMBIGUOUS_QUOTE.search(command, index, self.index):
+                raise _NeedsRawScan
             self.word_started = True
         elif command.startswith(("<(", ">("), index):
-            self.index = _lex_substitution(command, index, self.current, self.nesting)
+            self.index = _lex_substitution(
+                command, index, self.current, self.nesting, strict_quotes=self.strict_quotes
+            )
             self.word_started = True
         elif command.startswith("((", index) and not self.word_started:
             end = _arithmetic_end(command, index + 2)
@@ -839,7 +857,7 @@ class _Lexer:
         self.index += 1
         if char == "\n" and self.pending:
             body_start = self.index
-            self.index = _read_heredoc_bodies(command, self.index, self.pending)
+            self.index = _read_heredoc_bodies(command, self.index, self.pending, strict_quotes=self.strict_quotes)
             self.heredoc_characters += self.index - body_start
 
 
@@ -847,8 +865,13 @@ class _ShellTextTooLarge(Exception):
     """The executable shell syntax exceeds the structural scan budget."""
 
 
+class _NeedsRawScan(Exception):
+    """Oversized input has no data boundary or uses ambiguous shell quoting."""
+
+
 def _lex(
-    command: str, index: int = 0, *, closer: bool = False, nesting: int = 0, syntax_limit: int | None = None,
+    command: str, index: int = 0, *, closer: bool = False, nesting: int = 0,
+    syntax_limit: int | None = None, strict_quotes: bool = False,
 ) -> tuple[list[_Segment], int]:
     """Split shell text into simple-command segments.
 
@@ -860,7 +883,9 @@ def _lex(
     """
     if nesting > _MAX_SUBSTITUTION_NESTING:
         raise ValueError("command substitution nested too deeply")
-    lexer = _Lexer(command, index, closer=closer, nesting=nesting)
+    if syntax_limit is not None and not any(marker in command for marker in ("<<", "'", '"')):
+        raise _NeedsRawScan
+    lexer = _Lexer(command, index, closer=closer, nesting=nesting, strict_quotes=strict_quotes)
     start = index
     while lexer.index < len(command):
         if lexer.step():
@@ -3057,13 +3082,12 @@ def _scan_command(
     # Stdin is data until the classified command actually runs it. Counting it
     # as shell syntax would send even `bash -c 'cat'` through the raw fallback.
     oversized = len(command.encode("utf-8")) > _MAX_COMMAND_BYTES
-    # The lexer cannot reliably locate command boundaries after an ANSI-C quote
-    # or a dollar followed by a line continuation. Keep the raw fallback there.
-    if oversized and (
-        not any(marker in command for marker in ("<<", "'", '"'))
-        or "$'" in command
-        or "$\\\n" in command
-    ):
+    try:
+        # Let the lexer associate large data with its consumer and bound the
+        # surrounding syntax. Fall back for ambiguous quotes in shell syntax,
+        # while treating their spelling inside literal data as ordinary text.
+        segments, _ = _lex(command, syntax_limit=_MAX_COMMAND_BYTES if oversized else None, strict_quotes=oversized)
+    except _NeedsRawScan:
         # The bounded fallback deliberately proves no command-text override.
         # Ambient overrides still use the mandatory receipt path.
         # Default make goals must remain refused when structural parsing is skipped.
@@ -3071,11 +3095,6 @@ def _scan_command(
         if word is not None:
             scan.findings.append((_UNPARSED_SHAPE, word[1], None, word[0]))
         return scan
-    try:
-        # A large quoted heredoc may be data for an inert writer or executable
-        # input for a shell. Let the lexer associate it with its consumer while
-        # keeping a separate bound on the surrounding shell syntax.
-        segments, _ = _lex(command, syntax_limit=_MAX_COMMAND_BYTES if oversized else None)
     except _ShellTextTooLarge:
         scan.findings.append(("unverified_size", "test-files", None, "shell syntax"))
         return scan
@@ -3201,17 +3220,6 @@ def _refusal_message(findings: list[_Finding]) -> str:
                     f"BLOCKED (unverified_size): {prefix}. "
                     "Move large data into a quoted heredoc (cat > file <<'EOF') or a separate file, "
                     f"or route test runs through make check-remote.\n\n{_blocked_message(targets)}"
-                )
-            if reason == "make_goal_not_allowlisted" and word == "maint-start":
-                return (
-                    f"BLOCKED ({reason}): {prefix}; refused word '{word}'.\n"
-                    "For on-main maintenance in the primary checkout, use maint-start's metadata registration:\n"
-                    '  WORKBAY_HANDOFF_DEFAULT_AGENT=${WORKBAY_HANDOFF_DEFAULT_AGENT:-operator} '
-                    'mcp-workbay-handoff set --task-ref MAINT-... --objective "..." '
-                    '--target-branch main --target-worktree-path "$(git rev-parse --show-toplevel)"\n'
-                    "Replace MAINT-... and the objective with the maintenance task and objective. "
-                    "Then run make slice-commit TASK=<task-ref> MSG=\"<message>\" PATHS=\"<owned paths>\" "
-                    "and make plan-done TASK=<task-ref>.\n"
                 )
             word = _bounded_text(word, _MAX_WORD_BYTES)
             if reason.startswith("make_"):

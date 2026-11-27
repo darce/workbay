@@ -1,9 +1,9 @@
 {
   "routes": {
     "implement": {
-      "backend": "muse-remote",
-      "model": "muse-wonder-1.0",
-      "effort": "high"
+      "backend": "codex-remote",
+      "model": "gpt-6.2-sol",
+      "effort": "medium"
     }
   }
 }

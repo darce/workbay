@@ -15,7 +15,7 @@ from typing import Any
 from workbay_protocol import resolve_env_alias
 
 from workbay_orchestrator_mcp._assets import bundled_rules_dir
-from workbay_orchestrator_mcp.lanes import get_lane_activity, record_turn_metric
+from workbay_orchestrator_mcp.lanes import _lane_prep_as_turn_metric, get_lane_activity, record_lane_prep_metric
 from workbay_orchestrator_mcp.orchestration.proc_footprint import (
     current_phys_footprint_mb,
     phys_footprint_source,
@@ -812,15 +812,15 @@ def _engineering_guidance_lines(worktree_path: str) -> list[str]:
                         f"against {pin['manifest']} (sha256 {digest[:12]}, {schema})."
                     )
                     live_label = (
-                        "WORKBAY_HEURISTICS_CANON_ROOT" if env_configured
-                        else "~/Development/heuristics-canon-current"
+                        "WORKBAY_HEURISTICS_CANON_ROOT" if env_configured else "~/Development/heuristics-canon-current"
                     )
                     lines[2] = f"pointer: {live_label}"
                     if pin["release_tag"] != "v" + version:
                         logger.warning(
                             "heuristics canon: shipped pointer pin %s differs from live release v%s; "
                             "the shipped pin is stale or the operator moved the link",
-                            pin["release_tag"], version,
+                            pin["release_tag"],
+                            version,
                         )
                     return lines
     logger.warning("heuristics canon: live release unavailable (%s); using the pointer pin", cause)
@@ -1540,7 +1540,7 @@ def _emit_lane_prep_footprint_metric(
     orchestrator_root: Path,
     backend: str | None,
 ) -> dict | None:
-    """Self-write ONE ``lane_prep`` turn_metric row capturing this short-lived
+    """Self-write one lane prep metric row capturing this short-lived
     ``lane_prompt`` subprocess's phys_footprint (D4/D6). It lands only on the full
     execution-turn render path (never on ``--check``/``--summary``), so a freshness gate
     must key off the worker-daemon liveness heartbeat, not "expect a periodic lane_prep
@@ -1588,9 +1588,8 @@ def _emit_lane_prep_footprint_metric(
             "offload_semantic_reinjection_flag": reinject_flag,
         }
         # Latest-wins in the same DB transaction as the insert (RES-07 / CON-11).
-        raw = record_turn_metric(
+        payload = record_lane_prep_metric(
             session=f"lane_prep:{lane_id}:{cycle}",
-            phase="lane_prep",
             backend=resolved_backend,
             cycle=cycle,
             lane_id=lane_id,
@@ -1598,8 +1597,8 @@ def _emit_lane_prep_footprint_metric(
             attribution=attribution,
             replace_prior_same_phase=True,
         )
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(payload, dict) and payload.get("ok"):
+        if payload.get("ok"):
+            payload["turn_metric"] = _lane_prep_as_turn_metric(payload["lane_prep_metric"])
             return payload
         return None
     except Exception as exc:  # noqa: BLE001 - telemetry must never break the render

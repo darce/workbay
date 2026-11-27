@@ -6,16 +6,7 @@ from workbay_protocol.reasoning_effort import validate_reasoning_effort
 from workbay_orchestrator_mcp.orchestration.backend_registry import BACKENDS
 from workbay_orchestrator_mcp.orchestration.openrouter_lane_config import OPENROUTER_MODEL_ALLOWED_EFFORTS
 
-# Models whose omitted effort must resolve to ``max`` rather than the shared
-# ``high`` default. Luna is a reasoning-first model: run below max and it
-# degrades quietly, producing lane output that reads plausible and has to be
-# rescued or re-run later. The operator directive is that every Luna lane runs
-# at max, and a default that silently disagrees is the failure mode -- the
-# dispatch succeeds, so nothing surfaces until the work is already wrong.
-#
-# Omission resolves to max, and concrete lower efforts are refused by
-# resolve_dispatch_effort below. Selection modes (auto/inherit) remain
-# execution-time choices and are not concrete dispatch efforts.
+# Luna defaults to max on backends without per-model routing preferences.
 MAX_EFFORT_MODELS = frozenset({model_routing.ModelId.CODEX_LEGACY_JUNIOR, model_routing.ModelId.CODEX_JUNIOR})
 
 DEFAULT_EFFORT = "high"
@@ -23,7 +14,7 @@ _MODEL_EFFORT_CAPABILITY_TABLES = (OPENROUTER_MODEL_ALLOWED_EFFORTS,)
 
 
 class LunaEffortPolicyError(ValueError):
-    """Raised when a max-effort model is given a concrete lower effort."""
+    """Legacy error type retained for dispatch callers during upgrade."""
 
 
 def _normalize_model(model: str | None) -> str:
@@ -57,10 +48,6 @@ def default_effort_for_model(backend_id: str, model: str) -> str | None:
 
 
 def resolve_dispatch_effort(backend_id: str, model: str, effort: str | None) -> str | None:
-    """Resolve omitted effort and enforce max-effort model policy."""
+    """Resolve omitted effort and preserve explicit operator choices."""
     validated = validate_reasoning_effort(effort)
-    if _normalize_model(model) in MAX_EFFORT_MODELS and validated in {"low", "medium", "high", "xhigh"}:
-        raise LunaEffortPolicyError(
-            f"model {model!r} requires effort 'max'; explicit effort {validated!r} is refused [OBS-08]"
-        )
     return default_effort_for_model(backend_id, model) if validated is None else validated

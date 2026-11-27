@@ -198,7 +198,6 @@ Do NOT add `ssh gate@… *` (and never `ssh ubuntu@… *`) — the wrapper + tar
   allowlisted `KEY=VALUE` data; it does not execute the file or expand shell
   expressions. The file is operator-local and gitignored.
 - PG scratch role for gate (least privilege): `CREATE ROLE gate_test LOGIN CREATEDB PASSWORD NULL` restricted via pg_hba to localhost, or a second PG container owned by gate.
-- GHA reuse: add `tag:ci` to the ACL ssh rule src; CI then runs the same `remote_gate.sh run` path.
 - Tailscale SSH session recording for `gate` sessions (audit trail).
 - Upgrade path: dedicated `tag:dev` VM; move ACL dst, add network ACL denying tag:dev → tag:oci-vm.
 
@@ -231,15 +230,14 @@ failures; drop the per-repo env file in first.
 
 ## CI reporting from the gate host (`make ci-report`)
 
-The gate host can publish the verdict to GitHub instead of only to the invoking
-terminal, which is what lets it stand in for a hosted Actions run. `make
-ci-report` runs `scripts/remote_gate.sh` over a CI-parity target set and POSTs
-one commit status per target.
+`make ci-report` runs `scripts/remote_gate.sh` on demand and posts one GitHub
+commit status per target.
 
-`.github/workflows/test.yml` stays on disk either way — the file is a pinned
-contract (`packages/workbay-system/tests/make/test_workbay_ci_gate.py`), and
-whether GitHub actually runs it is a repository setting, not something this
-script changes.
+The `vm-ci` transport replaces the retired GitHub Actions workflow
+(`.github/workflows/test.yml`). Site settings live in `config/vm-ci/site.json`,
+and `scripts/ci/vm-check-policy.json` routes repository events to checks. The
+release publish targets in `mk/vm-ci.mk` invoke
+`scripts/ci/vm-ci-workbay-publish.sh`.
 
 ### Token (operator, one-time, on the VM)
 
@@ -311,10 +309,11 @@ already be on an origin branch or GitHub rejects the status with a 422.
 - Commit statuses are append-only. Re-running supersedes a context in the
   combined view; it never deletes the earlier status.
 
-`CI_PARITY_TARGETS` in `scripts/ci_report.sh` carries a `# job:` annotation per
-entry, and `packages/workbay-system/tests/make/test_ci_report_parity.py` fails
-when a `test.yml` job has no gate target — otherwise a job added to CI would go
-ungated with every status still green.
+`scripts/ci_report.sh` derives its default targets from the remote stage of
+`scripts/gate_manifest.txt`. The parity tests in
+`packages/workbay-system/tests/make/test_ci_report_parity.py` verify that the
+reporter includes every remote target and that the manifest targets exist in
+the root Makefile.
 
 ## Remote agent execution (grok on the VM)
 

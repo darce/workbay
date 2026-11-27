@@ -31,6 +31,7 @@ from .invocation_disposition import DispositionHold, _json, regular_bytes
 from .lane_lifecycle_contracts import JOB_ID_RE, job_id_for
 from .offload_pass_index import _parse_ledger_line, _valid_pass_id
 from .review_ratchet import _scope_path
+from .transport_ref import TRANSPORT_REF_PREFIXES
 
 OID = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -152,12 +153,12 @@ def _lane_key(branch: str) -> str:
 
 
 def _lane_prefix(branch: str) -> str:
-    return f"refs/workbay/remote-agent/{_lane_key(branch)}-"
+    return _lane_prefixes(branch)[0]
 
 
-def _lane_prefixes(branch: str) -> tuple[str, str]:
+def _lane_prefixes(branch: str) -> tuple[str, ...]:
     key = _lane_key(branch)
-    return (f"refs/workbay/remote-agent/{key}-", f"refs/heads/{key}-")
+    return tuple(f"{prefix}{key}-" for prefix in TRANSPORT_REF_PREFIXES)
 
 
 def _ref_rows(output: str, ref: str, prefixes: str | tuple[str, ...], exact: set[str]) -> dict[str, str]:

@@ -1470,72 +1470,71 @@ def _check_commit_relation_guard(
     verified_commit_sha: str | None,
     branch: str | None,
     resolution_notes: str | None,
-) -> dict | None:
+    *,
+    verified_commit_invalid: bool,
+) -> list[dict]:
     finding_commit_sha = _normalize_optional_text(existing["commit_sha"])
     current_commit_sha = _normalize_optional_text(commit_sha)
     commit_relation = _classify_commit_relation(finding_commit_sha, current_commit_sha)
     if commit_relation in {"ancestor", "diverged"}:
-        payload = rejection_commit_ancestry(
-            relation=commit_relation,
-            finding_commit_sha=finding_commit_sha,
-            current_commit_sha=current_commit_sha,
-            current_branch=branch,
-            verified_commit_sha=verified_commit_sha,
-            finding_id=str(existing["finding_id"]) if "finding_id" in existing.keys() else None,
-        )
-        return {"ok": False, **payload}
-    if commit_relation == "descendant":
-        if resolution_notes is None:
-            return {
-                "ok": False,
+        return [
+            rejection_commit_ancestry(
+                relation=commit_relation,
+                finding_commit_sha=finding_commit_sha,
+                current_commit_sha=current_commit_sha,
+                current_branch=branch,
+                verified_commit_sha=verified_commit_sha,
+                finding_id=str(existing["finding_id"]),
+            )
+        ]
+    if commit_relation != "descendant":
+        return []
+
+    violations: list[dict] = []
+    commit_guard = {
+        "finding_commit_sha": finding_commit_sha,
+        "current_commit_sha": current_commit_sha,
+        "current_branch": branch,
+        "relation": commit_relation,
+        "requires_verified_commit_sha": True,
+    }
+    if resolution_notes is None:
+        violations.append(
+            {
                 "error": "resolution_notes is required when fixing a finding from a newer descendant commit.",
-                "commit_guard": {
-                    "finding_commit_sha": finding_commit_sha,
-                    "current_commit_sha": current_commit_sha,
-                    "current_branch": branch,
-                    "relation": commit_relation,
-                    "requires_verified_commit_sha": True,
-                },
+                "commit_guard": commit_guard,
             }
-        if verified_commit_sha is None:
-            return {
-                "ok": False,
+        )
+    if verified_commit_invalid:
+        return violations
+    if verified_commit_sha is None:
+        violations.append(
+            {
                 "error": "verified_commit_sha is required when fixing a finding from a newer descendant commit.",
-                "commit_guard": {
-                    "finding_commit_sha": finding_commit_sha,
-                    "current_commit_sha": current_commit_sha,
-                    "current_branch": branch,
-                    "relation": commit_relation,
-                    "requires_verified_commit_sha": True,
-                },
+                "commit_guard": commit_guard,
             }
-        if current_commit_sha is not None and verified_commit_sha != current_commit_sha:
-            return {
-                "ok": False,
+        )
+    elif verified_commit_sha != current_commit_sha:
+        violations.append(
+            {
                 "error": "verified_commit_sha must match the current workspace/actor commit when resolving from a newer descendant commit.",
-                "commit_guard": {
-                    "finding_commit_sha": finding_commit_sha,
-                    "current_commit_sha": current_commit_sha,
-                    "current_branch": branch,
-                    "verified_commit_sha": verified_commit_sha,
-                    "relation": commit_relation,
-                },
+                "commit_guard": {**commit_guard, "verified_commit_sha": verified_commit_sha},
             }
+        )
+    else:
         verified_relation = _classify_commit_relation(finding_commit_sha, verified_commit_sha)
         if verified_relation not in {"same", "descendant"}:
-            return {
-                "ok": False,
-                "error": "verified_commit_sha must be the finding commit or a descendant of it.",
-                "commit_guard": {
-                    "finding_commit_sha": finding_commit_sha,
-                    "current_commit_sha": current_commit_sha,
-                    "current_branch": branch,
-                    "verified_commit_sha": verified_commit_sha,
-                    "relation": commit_relation,
-                    "verified_relation": verified_relation,
-                },
-            }
-    return None
+            violations.append(
+                {
+                    "error": "verified_commit_sha must be the finding commit or a descendant of it.",
+                    "commit_guard": {
+                        **commit_guard,
+                        "verified_commit_sha": verified_commit_sha,
+                        "verified_relation": verified_relation,
+                    },
+                }
+            )
+    return violations
 
 
 def _apply_finding_update(update_ctx: FindingUpdateContext, update_input: FindingUpdateInput) -> dict:
@@ -1729,80 +1728,83 @@ def _validate_update_finding_input(
     normalized_reopen_reason: str | None,
     normalized_verified_commit_sha: str | None,
     normalized_verification_evidence: str | None,
-) -> tuple[FindingStatus | None, dict | None]:
-    if (finding_id is None and finding_db_id is None) or (finding_id is not None and finding_db_id is not None):
-        return None, {"ok": False, "error": "Pass exactly one of finding_id (preferred) or finding_db_id."}
+) -> tuple[FindingStatus | None, list[dict]]:
+    violations: list[dict] = []
+    valid_target = False
+    if (finding_id is None) == (finding_db_id is None):
+        violations.append({"error": "Pass exactly one of finding_id (preferred) or finding_db_id."})
+    elif normalized_finding_id == "":
+        violations.append({"error": "finding_id must not be empty."})
+    else:
+        valid_target = True
+
     try:
-        normalized_status = FindingStatus(status)
+        normalized_status: FindingStatus | None = FindingStatus(status)
     except ValueError:
-        return None, {
-            "ok": False,
-            "error": f"Invalid status. Valid: {', '.join(sorted(REVIEW_FINDING_STATUSES))}",
-        }
-    # internal: the new lifecycle values are integrate-managed or
-    # write-derived. Direct ``update`` callers must close as ``fixed`` and let
-    # the runtime flag flip the persisted value to ``resolved_on_branch``.
+        normalized_status = None
+        violations.append({"error": f"Invalid status. Valid: {', '.join(sorted(REVIEW_FINDING_STATUSES))}"})
     if normalized_status is FindingStatus.INTEGRATED:
-        return None, {
-            "ok": False,
-            "error": "status='integrated' is integrate-managed; use operation=integrate.",
-        }
+        violations.append({"error": "status='integrated' is integrate-managed; use operation=integrate."})
+        normalized_status = None
     if normalized_status is FindingStatus.SUPERSEDED:
-        return None, {"ok": False, **rejection_superseded_merge_managed()}
+        violations.append(rejection_superseded_merge_managed())
+        normalized_status = None
     if normalized_status is FindingStatus.RESOLVED_ON_BRANCH:
-        # internal (BR-002): when the lifecycle flag is on, the task
-        # plan's Update Path × Flag matrix permits explicit
-        # ``status='resolved_on_branch'`` updates. Normalize to ``FIXED`` here
-        # so the downstream guards (reopen escalation, batch close, commit
-        # relation) and the SQL CASE-WHEN guards in ``_apply_finding_update``
-        # — keyed on the user-input ``'fixed'`` string — run unchanged; the
-        # flag-aware ``effective_status_value`` mapping then persists
-        # ``status='resolved_on_branch'`` on the row.
+        # Normalize the allowed alias to FIXED for the guards and SQL update.
         if bool(get_runtime_config().finding_lifecycle_states_enabled):
             normalized_status = FindingStatus.FIXED
         else:
-            return None, {
-                "ok": False,
-                "error": (
-                    "status='resolved_on_branch' is write-derived from status='fixed'; "
-                    "close the finding as 'fixed' and enable finding_lifecycle_states_enabled."
-                ),
-            }
-    if normalized_finding_id == "":
-        return None, {"ok": False, "error": "finding_id must not be empty."}
+            violations.append(
+                {
+                    "error": (
+                        "status='resolved_on_branch' is write-derived from status='fixed'; "
+                        "close the finding as 'fixed' and enable finding_lifecycle_states_enabled."
+                    ),
+                }
+            )
+            normalized_status = None
+
     if (
         normalized_verification_evidence is not None
         and len(normalized_verification_evidence) > MAX_VERIFICATION_EVIDENCE_LENGTH
     ):
-        return None, {
-            "ok": False,
-            "error": f"verification_evidence must be <= {MAX_VERIFICATION_EVIDENCE_LENGTH} characters.",
-        }
-    if normalized_status is not FindingStatus.FIXED and normalized_verification_evidence is not None:
-        return None, {"ok": False, "error": "verification_evidence is only supported when status='fixed'."}
+        violations.append(
+            rejection_verification_evidence_max_length(
+                actual_length=len(normalized_verification_evidence),
+                finding_id=normalized_finding_id,
+            )
+        )
+    if normalized_status not in {None, FindingStatus.FIXED} and normalized_verification_evidence is not None:
+        violations.append({"error": "verification_evidence is only supported when status='fixed'."})
     if normalized_status in {FindingStatus.WONTFIX, FindingStatus.DEFERRED} and normalized_resolution_notes is None:
-        return None, {
-            "ok": False,
-            "error": f"resolution_notes is required when status is '{normalized_status.value}'.",
-        }
+        violations.append({"error": f"resolution_notes is required when status is '{normalized_status.value}'."})
     if normalized_status is FindingStatus.OPEN and normalized_resolution_notes is not None:
-        return None, {
-            "ok": False,
-            "error": "resolution_notes is not supported for status='open'. Use reopen_reason when reopening.",
-        }
+        violations.append(
+            {
+                "error": "resolution_notes is not supported for status='open'. Use reopen_reason when reopening.",
+            }
+        )
     if normalized_resolution_notes is not None and len(normalized_resolution_notes) > MAX_RESOLUTION_NOTES_LENGTH:
-        return None, {
-            "ok": False,
-            **rejection_resolution_notes_max_length(
+        violations.append(
+            rejection_resolution_notes_max_length(
                 actual_length=len(normalized_resolution_notes),
                 finding_id=normalized_finding_id,
-            ),
-        }
+            )
+        )
     if normalized_reopen_reason is not None and len(normalized_reopen_reason) > MAX_REOPEN_REASON_LENGTH:
-        return None, {"ok": False, "error": f"reopen_reason must be <= {MAX_REOPEN_REASON_LENGTH} characters."}
-    if normalized_status is not FindingStatus.FIXED and normalized_verified_commit_sha is not None:
-        return None, {"ok": False, "error": "verified_commit_sha is only supported when status='fixed'."}
-    return normalized_status, None
+        violations.append({"error": f"reopen_reason must be <= {MAX_REOPEN_REASON_LENGTH} characters."})
+    if normalized_status not in {None, FindingStatus.FIXED} and normalized_verified_commit_sha is not None:
+        violations.append({"error": "verified_commit_sha is only supported when status='fixed'."})
+    return (normalized_status if valid_target else None), violations
+
+
+def _finding_update_rejection(violations: list[dict], task_ref: str | None = None) -> dict:
+    # Retain the primary rejection fields for callers that use the existing rule IDs.
+    data = dict(violations[0])
+    if len(violations) > 1:
+        data["error"] = " ".join(violation["error"] for violation in violations)
+        data["violations"] = violations
+    return _envelope(ok=False, tool="update_review_finding", data=data, task_ref=task_ref, entity="finding")
 
 
 def update_review_finding(
@@ -2075,23 +2077,9 @@ def _update_review_finding_impl(
     normalized_finding_id = finding_id.strip() if isinstance(finding_id, str) else None
     normalized_resolution_notes = _normalize_optional_text(resolution_notes)
     normalized_reopen_reason = _normalize_optional_text(reopen_reason)
-    impact_error = _validate_impact_origin(impact, origin)
-    if impact_error is not None:
-        return _envelope(ok=False, tool="update_review_finding", data={"error": impact_error}, entity="finding")
     normalized_verified_commit_sha = _normalize_optional_text(verified_commit_sha)
-    try:
-        normalized_verified_commit_sha = _shared_write_context._validate_and_expand_commit_sha(
-            normalized_verified_commit_sha
-        )
-    except InvalidCommitShaError as exc:
-        return _envelope(
-            ok=False,
-            tool="update_review_finding",
-            data={"error": str(exc)},
-            entity="finding",
-        )
     normalized_verification_evidence = _normalize_optional_text(verification_evidence)
-    normalized_status, input_error = _validate_update_finding_input(
+    normalized_status, violations = _validate_update_finding_input(
         status,
         finding_id,
         finding_db_id,
@@ -2101,19 +2089,19 @@ def _update_review_finding_impl(
         normalized_verified_commit_sha,
         normalized_verification_evidence,
     )
-    if input_error is not None or normalized_status is None:
-        # Pass the full structured rejection (internal) when present;
-        # fall back to a bare error only for the invalid-status edge case.
-        if input_error is not None:
-            data = {key: value for key, value in input_error.items() if key != "ok"}
-        else:
-            data = {"error": "invalid status"}
-        return _envelope(
-            ok=False,
-            tool="update_review_finding",
-            data=data,
-            entity="finding",
+    for impact_error in (_validate_impact_origin(impact, None), _validate_impact_origin(None, origin)):
+        if impact_error is not None:
+            violations.append({"error": impact_error})
+    verified_commit_invalid = False
+    try:
+        normalized_verified_commit_sha = _shared_write_context._validate_and_expand_commit_sha(
+            normalized_verified_commit_sha
         )
+    except InvalidCommitShaError as exc:
+        verified_commit_invalid = True
+        violations.append({"error": str(exc)})
+    if normalized_status is None:
+        return _finding_update_rejection(violations)
 
     with _get_db_connection() as conn:
         if task_ref is None:
@@ -2124,22 +2112,13 @@ def _update_review_finding_impl(
             else:
                 rows = conn.execute("SELECT * FROM review_findings WHERE id = ?", (finding_db_id,)).fetchall()
             if not rows:
-                return _envelope(
-                    ok=False,
-                    tool="update_review_finding",
-                    data={"error": "Finding not found."},
-                    entity="finding",
-                )
+                return _finding_update_rejection([*violations, {"error": "Finding not found."}])
             if len(rows) > 1:
                 candidate_scopes = sorted({str(row["task_ref"]) for row in rows})
-                return _envelope(
-                    ok=False,
-                    tool="update_review_finding",
-                    data={
-                        "error": f"Ambiguous finding_id: {len(rows)} rows across task_refs {candidate_scopes}. Pass task_ref explicitly to disambiguate.",
-                    },
-                    entity="finding",
-                )
+                ambiguity = {
+                    "error": f"Ambiguous finding_id: {len(rows)} rows across task_refs {candidate_scopes}. Pass task_ref explicitly to disambiguate.",
+                }
+                return _finding_update_rejection([*violations, ambiguity])
             existing = rows[0]
             resolved_task_ref = str(existing["task_ref"])
         else:
@@ -2153,12 +2132,9 @@ def _update_review_finding_impl(
                 else (finding_db_id, resolved_task_ref),
             ).fetchone()
             if existing is None:
-                return _envelope(
-                    ok=False,
-                    tool="update_review_finding",
-                    data={"error": "Finding not found for task."},
-                    task_ref=resolved_task_ref,
-                    entity="finding",
+                return _finding_update_rejection(
+                    [*violations, {"error": "Finding not found for task."}],
+                    resolved_task_ref,
                 )
 
         ctx = _resolve_write_actor(
@@ -2196,13 +2172,7 @@ def _update_review_finding_impl(
                     finding_id=str(existing["finding_id"]),
                     finding_commit_sha=_normalize_optional_text(existing["commit_sha"]),
                 )
-                return _envelope(
-                    ok=False,
-                    tool="update_review_finding",
-                    data=ambiguity,
-                    task_ref=resolved_task_ref,
-                    entity="finding",
-                )
+                return _finding_update_rejection([*violations, ambiguity], resolved_task_ref)
             update_worktree_path = cast("str | None", derived_worktree)
             if update_worktree_path is not None:
                 worktree_branch, worktree_commit_sha = _shared_write_context._detect_git_write_context_at(
@@ -2219,13 +2189,7 @@ def _update_review_finding_impl(
                         finding_id=str(existing["finding_id"]),
                         finding_commit_sha=_normalize_optional_text(existing["commit_sha"]),
                     )
-                    return _envelope(
-                        ok=False,
-                        tool="update_review_finding",
-                        data=ambiguity,
-                        task_ref=resolved_task_ref,
-                        entity="finding",
-                    )
+                    return _finding_update_rejection([*violations, ambiguity], resolved_task_ref)
                 if not ctx.branch_explicit and worktree_branch is not None:
                     ctx.branch = worktree_branch
 
@@ -2235,21 +2199,9 @@ def _update_review_finding_impl(
         )
         warnings.extend(context_notes)
         if is_reopen_transition and normalized_reopen_reason is None:
-            return _envelope(
-                ok=False,
-                tool="update_review_finding",
-                data={"error": "reopen_reason is required when reopening a finding."},
-                task_ref=resolved_task_ref,
-                entity="finding",
-            )
+            violations.append({"error": "reopen_reason is required when reopening a finding."})
         if not is_reopen_transition and normalized_reopen_reason is not None:
-            return _envelope(
-                ok=False,
-                tool="update_review_finding",
-                data={"error": "reopen_reason is only valid when transitioning a finding back to open."},
-                task_ref=resolved_task_ref,
-                entity="finding",
-            )
+            violations.append({"error": "reopen_reason is only valid when transitioning a finding back to open."})
 
         if normalized_status is FindingStatus.FIXED:
             if update_worktree_path is not None:
@@ -2266,16 +2218,22 @@ def _update_review_finding_impl(
                         current_branch=worktree_branch,
                         actor_commit_sha=actor_commit_sha,
                     )
-                    return _envelope(
-                        ok=False,
-                        tool="update_review_finding",
-                        data=ambiguity,
-                        task_ref=resolved_task_ref,
-                        entity="finding",
-                    )
+                    return _finding_update_rejection([*violations, ambiguity], resolved_task_ref)
                 if not ctx.commit_explicit:
                     assert worktree_commit_sha is not None
                     ctx.commit_sha = worktree_commit_sha
+            violations.extend(
+                _check_commit_relation_guard(
+                    existing,
+                    ctx.commit_sha,
+                    normalized_verified_commit_sha,
+                    ctx.branch,
+                    normalized_resolution_notes,
+                    verified_commit_invalid=verified_commit_invalid,
+                )
+            )
+            if violations:
+                return _finding_update_rejection(violations, resolved_task_ref)
             guard_error = _check_reopen_escalation_guard(existing, normalized_verification_evidence)
             if guard_error is not None:
                 return _envelope(
@@ -2295,21 +2253,9 @@ def _update_review_finding_impl(
                         task_ref=resolved_task_ref,
                         entity="finding",
                     )
-            guard_error = _check_commit_relation_guard(
-                existing,
-                ctx.commit_sha,
-                normalized_verified_commit_sha,
-                ctx.branch,
-                normalized_resolution_notes,
-            )
-            if guard_error is not None:
-                return _envelope(
-                    ok=False,
-                    tool="update_review_finding",
-                    data={key: value for key, value in guard_error.items() if key != "ok"},
-                    task_ref=resolved_task_ref,
-                    entity="finding",
-                )
+
+        if violations:
+            return _finding_update_rejection(violations, resolved_task_ref)
 
         return _apply_finding_update(
             FindingUpdateContext(

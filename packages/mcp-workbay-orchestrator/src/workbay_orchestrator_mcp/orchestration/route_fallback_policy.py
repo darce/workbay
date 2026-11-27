@@ -1,4 +1,4 @@
-"""Pure, explicit capacity fallback authorization and replay receipts."""
+"""Pure, explicit route fallback authorization and replay receipts."""
 
 import json
 from collections.abc import Collection, Mapping
@@ -10,7 +10,8 @@ from workbay_orchestrator_mcp.orchestration.backend_registry import validate_bac
 from workbay_orchestrator_mcp.orchestration.lane_routing import RoutingQuad
 
 ExecutionLocation = Literal["remote_vm", "local_host"]
-FAILURE_CLASSES = ("capacity", "auth", "configuration", "validation", "transport", "unknown")
+FALLBACK_FAILURE_CLASSES = frozenset({"capacity", "auth", "transport", "provider_refused"})
+FAILURE_CLASSES = ("capacity", "auth", "configuration", "validation", "transport", "unknown", "provider_refused")
 
 
 def execution_location(backend: str | None, *, admitted_remote: Collection[str]) -> ExecutionLocation:
@@ -33,8 +34,8 @@ class FallbackRule:
     on: frozenset[str] = frozenset({"capacity"})
 
     def __post_init__(self) -> None:
-        if self.on != frozenset({"capacity"}):
-            raise ValueError("on must contain only capacity")
+        if not self.on or not self.on <= FALLBACK_FAILURE_CLASSES:
+            raise ValueError("on must contain one or more of: " + ", ".join(sorted(FALLBACK_FAILURE_CLASSES)))
         if not self.to.backend or not self.to.model:
             raise ValueError("target backend and model are required")
 
@@ -92,8 +93,9 @@ def policy_from_mapping(data: Mapping, *, source: str) -> FallbackPolicy:
     seen = set()
     for row in data["rules"]:
         _keys(row, {"rule_id", "from_backend", "from_model", "to", "on"})
-        if row.get("on") != ["capacity"]:
-            raise ValueError("on must be ['capacity']")
+        on = row.get("on", ["capacity"])
+        if not isinstance(on, list) or any(not isinstance(value, str) for value in on):
+            raise ValueError("on must be a list of failure classes")
         rule_id = _required(row.get("rule_id"), "rule_id")
         if rule_id in seen:
             raise ValueError(f"duplicate rule_id: {rule_id}")
@@ -109,7 +111,9 @@ def policy_from_mapping(data: Mapping, *, source: str) -> FallbackPolicy:
         from_model = row.get("from_model")
         if from_model is not None:
             _required(from_model, "from_model")
-        rules.append(FallbackRule(rule_id, _backend(row.get("from_backend")), from_model, RoutingQuad(**values)))
+        rules.append(
+            FallbackRule(rule_id, _backend(row.get("from_backend")), from_model, RoutingQuad(**values), frozenset(on))
+        )
     return FallbackPolicy(tuple(rules), source)
 
 
@@ -127,6 +131,9 @@ def classify_route_failure(result: Mapping) -> RouteFailure:
         return RouteFailure("validation", str(result["outcome"]), "typed")
     if result.get("failure_class") == "configuration" or raw.get("failure_class") == "configuration":
         return RouteFailure("configuration", "configuration", "typed")
+    for failure_class in (result.get("failure_class"), raw.get("failure_class")):
+        if isinstance(failure_class, str) and failure_class in FALLBACK_FAILURE_CLASSES:
+            return RouteFailure(failure_class, failure_class, "typed")
     if raw.get("origin") == "dispatch":
         text = json.dumps(dict(result), default=str).lower()
         for failure_class, markers in (
@@ -165,26 +172,28 @@ def decide_route_transition(
     review gates on the effective route.
     """
     decision = RouteDecision(
-        "refused", requested, None, "fallback_not_capacity", None, failure, policy.digest, policy.source, decided_at
+        "refused", requested, None, "fallback_not_authorized", None, failure, policy.digest, policy.source, decided_at
     )
-    if failure.failure_class != "capacity":
-        return decision
     rule = next(
         (
             r
             for r in policy.rules
-            if r.from_backend == requested.backend and (r.from_model is None or r.from_model == requested.model)
+            if failure.failure_class in r.on
+            and r.from_backend == requested.backend
+            and (r.from_model is None or r.from_model == requested.model)
         ),
         None,
     )
     if rule is None:
-        return replace(decision, reason_code="fallback_not_authorized")
+        return decision
     decision = replace(decision, rule_id=rule.rule_id)
     if execution_mode == "remote_only" and rule.to.backend not in admitted_remote:
         return replace(decision, reason_code="remote_required")
     if all(getattr(rule.to, field) == getattr(requested, field) for field in ("backend", "model", "effort", "speed")):
         return replace(decision, reason_code="fallback_same_route")
-    return replace(decision, kind="transition", effective=rule.to, reason_code="capacity_fallback_authorized")
+    return replace(
+        decision, kind="transition", effective=rule.to, reason_code=f"{failure.failure_class}_fallback_authorized"
+    )
 
 
 def route_decision_record(decision: RouteDecision, *, admitted_remote: Collection[str]) -> dict:

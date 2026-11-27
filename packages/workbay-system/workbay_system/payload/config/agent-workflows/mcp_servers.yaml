@@ -5,6 +5,8 @@
 # and the bootstrap-side root-surface pins in
 # packages/workbay-bootstrap/src/workbay_bootstrap/install.py are
 # generated from it.
+# Declared loading tiers must agree with docs/workbay/maps/mcp-tool-routing.yaml
+# wherever that policy lists a catalog server.
 #
 # Git-only delivery (internal S2): launch through the stdlib
 # ``mcp_launch.py`` shim, which execs the git-installed / workspace ``.venv``
@@ -32,6 +34,7 @@ registration:
   agy: plugin
 mcp_servers:
   - name: workbay-handoff-mcp
+    loading_tier: always
     command: sh
     args:
       - "-c"
@@ -42,6 +45,7 @@ mcp_servers:
       WORKBAY_TOOL_ROSTER_POLICY: all
     harnesses: [agy, claude, codex, cursor, grok, vscode]
   - name: workbay-orchestrator-mcp
+    loading_tier: on_demand
     command: sh
     args:
       - "-c"
@@ -64,6 +68,7 @@ mcp_servers:
 # leaks into the canonical manifest (correctness-checklist §6).
 optional_mcp_servers:
   - name: codebase-graph-mcp
+    loading_tier: always
     command: sh
     args:
       - "-c"

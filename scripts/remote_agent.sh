@@ -422,9 +422,9 @@ PROBE_TRUST_SH
 
 # The mcp-workbay-orchestrator release this transport renders against. It must
 # equal packages/mcp-workbay-orchestrator/pyproject.toml at the same tag.
-_BOUNDARY_RUNTIME_VERSION=0.3.51
+_BOUNDARY_RUNTIME_VERSION=0.3.55
 # One resolver for every WorkBay control-plane import on the VM: the codex
-# model-boundary handshake, the analysis classifier and harvest, and doctor.
+# model-boundary handshake, analysis classifier and harvest, and self-verify.
 # Dispatch and doctor ship this same text, so both select the same interpreter.
 # Read it outside command substitution: Bash 3.2 scans a heredoc inside $(...)
 # for parentheses, and the case arms below end that substitution early. read
@@ -436,8 +436,9 @@ IFS= read -r -d '' _boundary_runtime_sh <<'BOUNDARY_RUNTIME_SH' || [ -n "$_bound
 # Bound the isolated probe even on hosts without coreutils. Keep this helper
 # in the rendered text: the host ladder and doctor eval the same resolver.
 _boundary_runtime_probe() {
+    local _probe_seconds="${_boundary_runtime_probe_seconds:-60}" _probe_grace="${_boundary_runtime_probe_grace:-5}"
     if command -v timeout >/dev/null 2>&1; then
-        timeout -k 5 60 "$@"
+        timeout -k "$_probe_grace" "$_probe_seconds" "$@"
         return $?
     fi
     local _probe_pid _watchdog_pid _probe_rc=0 _watchdog_rc=0
@@ -457,15 +458,15 @@ _boundary_runtime_probe() {
             exit "$_expired"
         }
         trap _cancel_sleep TERM
-        sleep 60 &
+        sleep "$2" &
         wait "$!" || :
         _expired=124
         kill -TERM "$_probe_pid" 2>/dev/null || :
-        sleep 5 &
+        sleep "$3" &
         wait "$!" || :
         kill -KILL "$_probe_pid" 2>/dev/null || :
         exit 124
-    ' boundary-runtime-watchdog "$_probe_pid" >/dev/null 2>&1 &
+    ' boundary-runtime-watchdog "$_probe_pid" "$_probe_seconds" "$_probe_grace" >/dev/null 2>&1 &
     _watchdog_pid=$!
     wait "$_probe_pid" || _probe_rc=$?
     kill -TERM "$_watchdog_pid" 2>/dev/null || :
@@ -474,39 +475,50 @@ _boundary_runtime_probe() {
     return "$_probe_rc"
 }
 
-# _boundary_runtime_resolve [LANE_PYTHON LANE_PYPROJECT]
+# _boundary_runtime_resolve [REPO_PYTHON [SANDBOX LANE_PYTHON [MODULE]]]
 # A sandbox that carries the orchestrator source runs it from its
 # origin-verified lane venv, because the native handshake refuses any other
 # import origin there; its version is the one that source declares. Otherwise
-# the operator override WORKBAY_BOUNDARY_PYTHON, else the declared uv tool,
-# must hold this rendering tag. Never PATH, never the user site: the probe runs
-# isolated (-I), as do all callers. Sets _boundary_runtime_python, or prints
-# one named, non-retryable refusal and returns 7.
+# an explicit override is authoritative. With no override, try the uv tool
+# and then the repo interpreter. All three must hold this rendering tag.
+# The probe and consumers run isolated (-I). MODULE selects a probe for an
+# auxiliary command. Sets _boundary_runtime_python or returns a typed refusal.
 _boundary_runtime_resolve() {
-    local _expected="$_BOUNDARY_RUNTIME_VERSION" _pyproject="${2:-}" _candidate _source _out _rc=0
+    local _expected="$_BOUNDARY_RUNTIME_VERSION" _pyproject='' _candidate _source _out _rc
+    local _sources=() _repo_python="${1:-}" _sandbox="${2:-}" _lane_python="${3:-}" _module="${4:-}"
     _boundary_runtime_python=''
     _boundary_runtime_refusal=''
-    if [ -n "${1:-}" ]; then
-        _source=lane_source
-        _candidate=$1
+    if [ -n "$_lane_python" ] && [ "${_ORIGIN_GUARD_STATUS:-}" = verified_roots ] &&
+        [ -f "$_sandbox/packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/__init__.py" ]; then
+        _sources=(lane_source)
+        _pyproject="$_sandbox/packages/mcp-workbay-orchestrator/pyproject.toml"
         _expected=''
     elif [ -n "${WORKBAY_BOUNDARY_PYTHON:-}" ]; then
-        _source=operator_override
-        _candidate=$WORKBAY_BOUNDARY_PYTHON
+        _sources=(operator_override)
     else
-        _source=uv_tool
-        _candidate="${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}/mcp-workbay-orchestrator/bin/python"
+        _sources=(uv_tool)
+        [ ! -x "$_repo_python" ] || _sources+=(repo_venv)
     fi
-    if [ ! -x "$_candidate" ]; then
-        _out="boundary_runtime_missing error_type=FileNotFoundError module=python"
-    else
-        _out=$(_boundary_runtime_probe "$_candidate" -I -c '
+    for _source in "${_sources[@]}"; do
+        case "$_source" in
+            lane_source) _candidate=$_lane_python ;;
+            operator_override) _candidate=$WORKBAY_BOUNDARY_PYTHON ;;
+            uv_tool) _candidate="${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}/mcp-workbay-orchestrator/bin/python" ;;
+            repo_venv) _candidate=$_repo_python ;;
+        esac
+        _rc=0
+        if [[ "$_candidate" != /* ]]; then
+            _out="boundary_runtime_missing error_type=ValueError module=python"
+        elif [ ! -x "$_candidate" ]; then
+            _out="boundary_runtime_missing error_type=FileNotFoundError module=python"
+        else
+            _out=$(_boundary_runtime_probe "$_candidate" -I -c '
 import importlib
 import importlib.metadata
 import sys
 import tomllib
 
-expected, pyproject = sys.argv[1:3]
+expected, pyproject, module = sys.argv[1:4]
 
 
 def refuse(kind, **fields):
@@ -528,7 +540,7 @@ if found != expected:
     refuse("boundary_runtime_version_mismatch", expected=expected, found=found)
 # Every module the VM control plane imports, so a broken install refuses
 # here instead of after a paid model turn.
-for name in (
+for name in (module,) if module else (
     "workbay_orchestrator_mcp.orchestration.execution_preflight",
     "workbay_orchestrator_mcp.orchestration.preflight_attestation",
     "workbay_orchestrator_mcp.orchestration.plan_review_driver",
@@ -539,22 +551,22 @@ for name in (
     except Exception as exc:
         refuse("boundary_runtime_missing", error_type=type(exc).__name__, module=getattr(exc, "name", None) or name)
 print("boundary_runtime_ok version=" + found)
-' "$_expected" "$_pyproject" </dev/null 2>/dev/null) || _rc=$?
-        _out=${_out##*$'\n'}
-        case "$_rc:$_out" in
-            "0:boundary_runtime_ok "*|"3:boundary_runtime_missing "*|"3:boundary_runtime_version_mismatch "*) ;;
-            *) _out="boundary_runtime_missing error_type=probe_exit_$_rc module=-" ;;
-        esac
-    fi
-    case "$_out" in
-        boundary_runtime_ok\ *)
+' "$_expected" "$_pyproject" "$_module" </dev/null 2>/dev/null) || _rc=$?
+            _out=${_out##*$'\n'}
+            case "$_rc:$_out" in
+                "0:boundary_runtime_ok "*|"3:boundary_runtime_missing "*|"3:boundary_runtime_version_mismatch "*) ;;
+                *) _out="boundary_runtime_missing error_type=probe_exit_$_rc module=-" ;;
+            esac
+        fi
+        if [[ "$_out" == boundary_runtime_ok\ * ]]; then
             _boundary_runtime_python=$_candidate
+            _boundary_runtime_refusal=''
             printf 'remote_agent: boundary_runtime selected source=%s interpreter=%s %s\n' \
                 "$_source" "$_candidate" "${_out#boundary_runtime_ok }" >&2
             return 0
-            ;;
-    esac
-    _boundary_runtime_refusal="$_out source=$_source interpreter=$_candidate"
+        fi
+        _boundary_runtime_refusal="$_out source=$_source interpreter=$_candidate"
+    done
     printf 'remote_agent: %s (non-retryable; provision the WorkBay runtime or set WORKBAY_REMOTE_BOUNDARY_PYTHON)\n' \
         "$_boundary_runtime_refusal" >&2
     return 7
@@ -573,7 +585,9 @@ _boundary_runtime_preamble() {
         *[!A-Za-z0-9._/+-]*) echo "remote_agent: invalid WORKBAY_REMOTE_BOUNDARY_PYTHON (characters outside [A-Za-z0-9._/+-])" >&2; return 2 ;;
     esac
     printf "_BOUNDARY_RUNTIME_VERSION='%s'\n" "$_BOUNDARY_RUNTIME_VERSION"
-    printf "WORKBAY_BOUNDARY_PYTHON='%s'\n" "${WORKBAY_REMOTE_BOUNDARY_PYTHON:-}"
+    if [ -n "${WORKBAY_REMOTE_BOUNDARY_PYTHON:-}" ]; then
+        printf "WORKBAY_BOUNDARY_PYTHON='%s'\n" "$WORKBAY_REMOTE_BOUNDARY_PYTHON"
+    fi
     printf '%s\n' "$_boundary_runtime_sh"
 }
 
@@ -4650,8 +4664,9 @@ doctor)
     # First VM probe: the boundary runtime every codex/analysis dispatch
     # resolves, through the same resolver text, before anything is dispatched.
     if _doc_boundary=$(_boundary_runtime_preamble); then
-        if ! { printf '%s\n' "$_doc_boundary"; cat <<'DOCTOR_BOUNDARY_EOF'; } | "${SSH[@]}" 'bash -s'
-if _boundary_runtime_resolve 2>/dev/null; then
+        if ! { printf '%s\n' "$_doc_boundary"; printf 'agent_root=%q\n' "$AGENT_ROOT"; cat <<'DOCTOR_BOUNDARY_EOF'; } | "${SSH[@]}" 'bash -s'
+case "$agent_root" in /*) ;; *) agent_root="$HOME/$agent_root" ;; esac
+if _boundary_runtime_resolve "$agent_root/.venv/bin/python" 2>/dev/null; then
     echo "boundary: ok interpreter=$_boundary_runtime_python version=$_BOUNDARY_RUNTIME_VERSION"
 else
     echo "boundary: REFUSED $_boundary_runtime_refusal"
@@ -6263,14 +6278,12 @@ _lane_reap_deleted_cwd_orphans() {
 }
 
 _stat_uid() {
-    _su_path="${1:-}"
-    [ -n "$_su_path" ] || return 1
-    _su_value=
-    if _su_value="$(stat -c %u -- "$_su_path" 2>/dev/null)"; then
-        case "$_su_value" in ''|*[!0-9]*) _su_value= ;; *) printf '%s' "$_su_value"; return 0 ;; esac
+    _stat_uid_value=
+    if _stat_uid_value="$(exec stat -c %u -- "$1" 2>/dev/null)"; then
+        case "$_stat_uid_value" in ''|*[!0-9]*) ;; *) return 0 ;; esac
     fi
-    if _su_value="$(stat -f %u "$_su_path" 2>/dev/null)"; then
-        case "$_su_value" in ''|*[!0-9]*) return 1 ;; *) printf '%s' "$_su_value"; return 0 ;; esac
+    if _stat_uid_value="$(exec stat -f %u "$1" 2>/dev/null)"; then
+        case "$_stat_uid_value" in ''|*[!0-9]*) ;; *) return 0 ;; esac
     fi
     return 1
 }
@@ -7362,7 +7375,6 @@ would_tmp_scratch_reaped=0
 # they must BALANCE: candidates_seen == sum(skipped_*) + would_tmp_scratch_reaped.
 tmp_scratch_candidates_seen=0
 tmp_scratch_scan_truncated=0
-_tmp_scratch_scan_seen=0
 tmp_scratch_skipped_unnamed=0
 tmp_scratch_skipped_no_owner=0
 tmp_scratch_skipped_live=0
@@ -7775,16 +7787,14 @@ _scratch_skip() {
 # _du_bytes is not reused: it discards du's exit status, which is what separates
 # measured from partial. Measures one path into one bucket.
 _tmp_account_path() {
-    local _tap_bucket="$1" _tap_path="$2" _tap_now _tap_left _tap_out _tap_rc=0 _tap_bytes
-    _tap_now=$(date +%s)
-    if [ "$_tap_now" -ge "$_tmp_acct_deadline" ]; then
+    local _tap_bucket="$1" _tap_path="$2" _tap_left _tap_out _tap_rc=0 _tap_bytes
+    _tap_left=$((_tmp_acct_deadline - SECONDS))
+    if [ "$_tap_left" -le 0 ]; then
         tmp_skipped_bytes_unmeasured=$((tmp_skipped_bytes_unmeasured + 1))
         tmp_skipped_bytes_truncated=1
         return 0
     fi
-    # Both are whole epoch seconds and the guard above returned on now >= deadline, so this is >= 1.
-    _tap_left=$((_tmp_acct_deadline - _tap_now))
-    _tap_out="$(timeout -k 1 "$_tap_left" du -sb -- "$_tap_path" 2>/dev/null)" || _tap_rc=$?
+    _tap_out="$(exec timeout -k 1 "$_tap_left" du -sb -- "$_tap_path" 2>/dev/null)" || _tap_rc=$?
     case "$_tap_rc" in
         124|137)
             # The timeout is the accounting window cutting this measurement short (CARD-06).
@@ -7799,17 +7809,53 @@ _tmp_account_path() {
         return 0
         ;;
     esac
-    case "$_tap_bucket" in
-        unnamed) tmp_scratch_skipped_unnamed_bytes=$((tmp_scratch_skipped_unnamed_bytes + _tap_bytes)) ;;
-        no_owner) tmp_scratch_skipped_no_owner_bytes=$((tmp_scratch_skipped_no_owner_bytes + _tap_bytes)) ;;
-        fresh) tmp_scratch_skipped_fresh_bytes=$((tmp_scratch_skipped_fresh_bytes + _tap_bytes)) ;;
-        live) tmp_scratch_skipped_live_bytes=$((tmp_scratch_skipped_live_bytes + _tap_bytes)) ;;
-        foreign_owner) tmp_scratch_skipped_foreign_owner_bytes=$((tmp_scratch_skipped_foreign_owner_bytes + _tap_bytes)) ;;
-    esac
+    _tmp_add_skipped_bytes "$_tap_bucket" "$_tap_bytes"
     if [ "$_tap_rc" -ne 0 ]; then
         tmp_skipped_bytes_partial=$((tmp_skipped_bytes_partial + 1))
     fi
     return 0
+}
+
+_tmp_add_skipped_bytes() {
+    local _bucket="$1" _bytes="$2"
+    case "$_bucket" in
+        unnamed) tmp_scratch_skipped_unnamed_bytes=$((tmp_scratch_skipped_unnamed_bytes + _bytes)) ;;
+        no_owner) tmp_scratch_skipped_no_owner_bytes=$((tmp_scratch_skipped_no_owner_bytes + _bytes)) ;;
+        fresh) tmp_scratch_skipped_fresh_bytes=$((tmp_scratch_skipped_fresh_bytes + _bytes)) ;;
+        live) tmp_scratch_skipped_live_bytes=$((tmp_scratch_skipped_live_bytes + _bytes)) ;;
+        foreign_owner) tmp_scratch_skipped_foreign_owner_bytes=$((tmp_scratch_skipped_foreign_owner_bytes + _bytes)) ;;
+    esac
+}
+
+_tmp_account_bucket() {
+    local _bucket="$1" _left _total _path
+    shift
+    _left=$((_tmp_acct_deadline - SECONDS))
+    # One du per dry-run bucket keeps a large inventory within the accounting
+    # window. A failed or incomplete batch falls back to per-path diagnostics.
+    if [ "$dry_run" -eq 1 ] && [ "$#" -gt 1 ] && [ "$_left" -gt 0 ] &&
+        _total="$(
+            set -o pipefail
+            printf '%s\0' "$@" |
+                timeout -k 1 "$_left" du -sb --null --files0-from=- 2>/dev/null |
+                (
+                    _sum=0 _count=0
+                    while IFS= read -r -d '' _row; do
+                        _bytes=${_row%%$'\t'*}
+                        case "$_bytes" in ''|*[!0-9]*) exit 1 ;; esac
+                        _sum=$((_sum + _bytes))
+                        _count=$((_count + 1))
+                    done
+                    [ "$_count" -eq "$#" ] || exit 1
+                    printf '%s' "$_sum"
+                )
+        )"; then
+        _tmp_add_skipped_bytes "$_bucket" "$_total"
+        return 0
+    fi
+    for _path in "$@"; do
+        _tmp_account_path "$_bucket" "$_path"
+    done
 }
 
 # Headline buckets first (unnamed, no_owner), then the rest. The budget is
@@ -7821,7 +7867,7 @@ _tmp_account_path() {
 # A reclaim scan that stopped early (tmp_scratch_scan_truncated) collected only a prefix of
 # $tmp_root, so its bytes are a lower bound too and the receipt says truncated.
 _tmp_account_skipped() {
-    local _tas_sec="${WORKBAY_REMOTE_AGENT_TMP_ACCOUNTING_SEC:-20}" _tas_path _tas_now _tas_left _tas_window
+    local _tas_sec="${WORKBAY_REMOTE_AGENT_TMP_ACCOUNTING_SEC:-20}" _tas_now _tas_left _tas_window
     # SSH setup runs before this body starts; the receipt transfer runs after it. Neither is in the window.
     local _tas_headroom=10
     case "$_tas_sec" in *[!0-9]*|"") _tas_sec=20 ;; esac
@@ -7841,32 +7887,24 @@ _tmp_account_skipped() {
             [ "$_tas_left" -ge "$_tas_window" ] || _tas_window=$_tas_left
         fi
         if [ "$_tas_window" -gt 0 ]; then
-            _tmp_acct_deadline=$((_tas_now + _tas_window))
+            _tmp_acct_deadline=$((SECONDS + _tas_window))
         else
             echo "remote_agent: tmp_accounting_skipped: caller budget exhausted" >&2
             tmp_skipped_bytes_truncated=1
         fi
     fi
-    for _tas_path in ${_tmp_skip_unnamed[@]+"${_tmp_skip_unnamed[@]}"}; do
-        _tmp_account_path unnamed "$_tas_path"
-    done
-    for _tas_path in ${_tmp_skip_no_owner[@]+"${_tmp_skip_no_owner[@]}"}; do
-        _tmp_account_path no_owner "$_tas_path"
-    done
-    for _tas_path in ${_tmp_skip_fresh[@]+"${_tmp_skip_fresh[@]}"}; do
-        _tmp_account_path fresh "$_tas_path"
-    done
-    for _tas_path in ${_tmp_skip_live[@]+"${_tmp_skip_live[@]}"}; do
-        _tmp_account_path live "$_tas_path"
-    done
-    for _tas_path in ${_tmp_skip_foreign_owner[@]+"${_tmp_skip_foreign_owner[@]}"}; do
-        _tmp_account_path foreign_owner "$_tas_path"
-    done
+    _tmp_account_bucket unnamed ${_tmp_skip_unnamed[@]+"${_tmp_skip_unnamed[@]}"}
+    _tmp_account_bucket no_owner ${_tmp_skip_no_owner[@]+"${_tmp_skip_no_owner[@]}"}
+    _tmp_account_bucket fresh ${_tmp_skip_fresh[@]+"${_tmp_skip_fresh[@]}"}
+    _tmp_account_bucket live ${_tmp_skip_live[@]+"${_tmp_skip_live[@]}"}
+    _tmp_account_bucket foreign_owner ${_tmp_skip_foreign_owner[@]+"${_tmp_skip_foreign_owner[@]}"}
     tmp_unowned_bytes=$((tmp_scratch_skipped_unnamed_bytes + tmp_scratch_skipped_no_owner_bytes))
 }
 
+# Translate the epoch deadline once to avoid forking date for every entry.
+_scratch_scan_deadline=$((SECONDS + reap_deadline - $(date +%s)))
 for _scratch_path in "$tmp_root"/*/; do
-    if [ "$(date +%s)" -ge "$reap_deadline" ]; then
+    if [ "$SECONDS" -ge "$_scratch_scan_deadline" ]; then
         tmp_scratch_scan_truncated=1
         break
     fi
@@ -7874,12 +7912,6 @@ for _scratch_path in "$tmp_root"/*/; do
     _scratch="${_scratch_path%/}"
     [ "$_scratch" = "$uv_tmp_root" ] && continue
     [ ! -L "$_scratch" ] || continue
-    _tmp_scratch_scan_seen=$((_tmp_scratch_scan_seen + 1))
-    if [ "$dry_run" -eq 1 ] && [ "$_tmp_scratch_scan_seen" -gt 50 ]; then
-        tmp_scratch_scan_truncated=1
-        echo 'remote_agent: tmp_scratch_scan_truncated: dry-run candidate scan capped at 50' >&2
-        break
-    fi
     # From here on the entry is a real, non-symlink directory under $tmp_root
     # that is not the uv cache: it has been EXAMINED. Every path out of the
     # loop below must therefore land in exactly one bucket.
@@ -7890,13 +7922,16 @@ for _scratch_path in "$tmp_root"/*/; do
     # name" would hide the one fact an operator can act on. Reclaiming them is
     # an operator decision: there is deliberately no privilege escalation here.
     if [ -n "$_reap_uid" ]; then
-        _scratch_uid="$(_stat_uid "$_scratch" 2>/dev/null || true)"
-        case "$_scratch_uid" in
-            ''|*[!0-9]*)
-                _scratch_skip unmeasurable "$_scratch"
-                continue
-                ;;
-        esac
+        # Dry-run can check effective ownership without launching stat for
+        # every local tree. Apply still reads the numeric UID for each path.
+        if [ "$dry_run" -eq 1 ] && [ "$_reap_uid" = "$EUID" ] && [ -O "$_scratch" ]; then
+            _scratch_uid=$_reap_uid
+        elif _stat_uid "$_scratch"; then
+            _scratch_uid=$_stat_uid_value
+        else
+            _scratch_skip unmeasurable "$_scratch"
+            continue
+        fi
         if [ "$_scratch_uid" != "$_reap_uid" ]; then
             _scratch_skip foreign_owner "$_scratch"
             if [ "$tmp_scratch_skipped_foreign_owner" -le "$_foreign_owner_report_cap" ]; then
@@ -16203,6 +16238,36 @@ if [ -n '${SELFVERIFY_CMD_B64}' ] && command -v base64 >/dev/null 2>&1 && comman
         _sv_budget=\$(( _BOUND_DEADLINE - \$(date +%s) - 15 ))
         if [ "\$_sv_budget" -gt 600 ]; then _sv_budget=600; fi
     fi
+    _sv_sem_python=''
+    _sv_compute_slots='${VM_COMPUTE_SLOTS:-}'
+    if [ -z "\$_sv_compute_slots" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOTS:-}" ]; then
+        _sv_compute_slots="\${WORKBAY_VM_COMPUTE_SLOTS}"
+    fi
+    _sv_compute_slot_dir='${VM_COMPUTE_SLOT_DIR:-}'
+    if [ -z "\$_sv_compute_slot_dir" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOT_DIR:-}" ]; then
+        _sv_compute_slot_dir="\${WORKBAY_VM_COMPUTE_SLOT_DIR}"
+    fi
+    case "\$_sv_compute_slots" in
+        ""|*[!0-9]*) _sv_compute_slots='' ;;
+        *)
+            if [ "\$_sv_compute_slots" -lt 1 ] 2>/dev/null; then
+                _sv_compute_slots=''
+            fi
+            ;;
+    esac
+    if [ -n "\$_sv_compute_slots" ] && [ "\$_sv_budget" -gt 6 ]; then
+        # The two candidate probes each have a two-second limit and one second of kill grace.
+        _sv_probe_started=\$(date +%s)
+        if ! _sv_sem_python=\$(
+            _boundary_runtime_probe_seconds=2
+            _boundary_runtime_probe_grace=1
+            _boundary_runtime_resolve "\$ROOT/.venv/bin/python" "\$SBX" "\$LANE_VENV/bin/python" workbay_orchestrator_mcp.orchestration.vm_compute_semaphore &&
+                printf '%s' "\$_boundary_runtime_python"
+        ); then
+            echo 'remote_agent: vm_compute_semaphore unavailable — falling back to unwrapped self-verify [SECD-05]' >&2
+        fi
+        _sv_budget=\$(( _sv_budget - (\$(date +%s) - _sv_probe_started) ))
+    fi
     if [ "\$_sv_budget" -le 0 ]; then
         echo 'remote_agent: no residual budget for off-box self-verify — skipping capture (patch still emitted)' >&2
         _sv_cmd=''
@@ -16270,38 +16335,14 @@ except OSError:
     sys.exit(125)
 os.execvp("bash", ["bash", "-c", sys.argv[2]])
 '
-        _sv_sem_enabled=0
-        _sv_compute_slots='${VM_COMPUTE_SLOTS:-}'
-        if [ -z "\$_sv_compute_slots" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOTS:-}" ]; then
-            _sv_compute_slots="\${WORKBAY_VM_COMPUTE_SLOTS}"
-        fi
-        _sv_compute_slot_dir='${VM_COMPUTE_SLOT_DIR:-}'
-        if [ -z "\$_sv_compute_slot_dir" ] && [ -n "\${WORKBAY_VM_COMPUTE_SLOT_DIR:-}" ]; then
-            _sv_compute_slot_dir="\${WORKBAY_VM_COMPUTE_SLOT_DIR}"
-        fi
-        case "\$_sv_compute_slots" in
-            ""|*[!0-9]*) _sv_compute_slots='' ;;
-            *)
-                if [ "\$_sv_compute_slots" -lt 1 ] 2>/dev/null; then
-                    _sv_compute_slots=''
-                fi
-                ;;
-        esac
-        if [ -n "\$_sv_compute_slots" ]; then
-            if [ -x "\$SBX/.venv/bin/python" ] && "\$SBX/.venv/bin/python" -c 'import workbay_orchestrator_mcp.orchestration.vm_compute_semaphore' >/dev/null 2>&1; then
-                _sv_sem_enabled=1
-            else
-                echo 'remote_agent: vm_compute_semaphore unavailable in lane venv — falling back to unwrapped self-verify [SECD-05]' >&2
-            fi
-        fi
         _sv_capture_test() {
             _sv_capture_mode="\$1"
             shift
-            if [ "\$_sv_sem_enabled" = 1 ]; then
+            if [ -n "\$_sv_sem_python" ]; then
                 if [ -n "\$_sv_compute_slot_dir" ]; then
-                    set -- "\$SBX/.venv/bin/python" -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" --slot-dir "\$_sv_compute_slot_dir" -- python3 -c "\$_sv_capture_python_code" "\$@"
+                    set -- "\$_sv_sem_python" -I -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" --slot-dir "\$_sv_compute_slot_dir" -- python3 -c "\$_sv_capture_python_code" "\$@"
                 else
-                    set -- "\$SBX/.venv/bin/python" -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" -- python3 -c "\$_sv_capture_python_code" "\$@"
+                    set -- "\$_sv_sem_python" -I -m workbay_orchestrator_mcp.orchestration.vm_compute_semaphore --slots "\$_sv_compute_slots" -- python3 -c "\$_sv_capture_python_code" "\$@"
                 fi
             else
                 set -- python3 -c "\$_sv_capture_python_code" "\$@"
@@ -17185,12 +17226,7 @@ if [ '${AGENT_SPEC_ENABLED}' = 1 ]; then
     _boundary_runtime_python=python3
     if [ '${REVIEW_KIND}' = analysis ] || python3 -I -S -c 'import json, sys; sys.exit(json.load(open(sys.argv[1])).get("backend_id") != "codex-remote")' \
             "\$ROOT/.agent-spec-${LANE_KEY}-${DISPATCH_NONCE}.json" 2>/dev/null; then
-        _boundary_runtime_lane=''
-        if [ "\${_ORIGIN_GUARD_STATUS:-}" = verified_roots ] \
-                && [ -f "\$SBX/packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/__init__.py" ]; then
-            _boundary_runtime_lane="\$LANE_VENV/bin/python"
-        fi
-        if ! _boundary_runtime_resolve \${_boundary_runtime_lane:+"\$_boundary_runtime_lane" "\$SBX/packages/mcp-workbay-orchestrator/pyproject.toml"}; then
+        if ! _boundary_runtime_resolve "\$ROOT/.venv/bin/python" "\$SBX" "\$LANE_VENV/bin/python"; then
             _PHASES_PARTIAL=1
             exit 7
         fi

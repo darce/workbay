@@ -80,6 +80,27 @@ KINDS = frozenset({"implement", "gate", "analysis"})
 LEGACY_PRODUCER = "review_ratchet.verified_legacy_source_history"
 _GIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+_SEMVER_PRERELEASE_ID = rf"(?:{_SEMVER_NUMBER}|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)"
+_SEMVER = re.compile(
+    rf"(?P<core>{_SEMVER_NUMBER}(?:\.{_SEMVER_NUMBER}){{2}})"
+    rf"(?:-(?P<prerelease>{_SEMVER_PRERELEASE_ID}(?:\.{_SEMVER_PRERELEASE_ID})*))?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?"
+)
+
+
+def _semver_precedence(version: object) -> tuple | None:
+    match = _SEMVER.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        return None
+    # Valid numeric identifiers have no leading zeroes, so length then text
+    # gives numeric order. Build metadata is ignored for SemVer precedence.
+    core = tuple((len(part), part) for part in match["core"].split("."))
+    prerelease = match["prerelease"]
+    identifiers = () if prerelease is None else tuple(
+        (0, len(part), part) if part.isdigit() else (1, 0, part) for part in prerelease.split(".")
+    )
+    return core, prerelease is None, identifiers
 
 
 def read_approvals(ledger_dir: Path) -> list[dict]:
@@ -243,6 +264,33 @@ class TrustedPolicy:
         value.pop("routes")
         value.pop("approval_thresholds")
         return value
+
+    def accepts_binding(self, stored: object) -> bool:
+        """Accept the trusted binding or a compatible persisted Canon pin."""
+        current = self.binding()
+        if (
+            not isinstance(stored, dict)
+            or stored.keys() != current.keys()
+            or type(stored["dispatch_stop_at"]) is not int
+            or stored["dispatch_stop_at"] != self.dispatch_stop_at
+        ):
+            return False
+        if stored == current:
+            return True
+
+        digest, rules = stored["manifest_digest"], stored["rule_ids"]
+        if (
+            not isinstance(digest, str)
+            or not _SHA256.fullmatch(digest.lower())
+            or not isinstance(rules, list)
+            or not rules
+            or not all(isinstance(rule, str) and rule in self.rule_ids for rule in rules)
+            or len(set(rules)) != len(rules)
+        ):
+            return False
+        stored_version = _semver_precedence(stored["canon_version"])
+        current_version = _semver_precedence(self.canon_version)
+        return stored_version is not None and current_version is not None and stored_version <= current_version
 
 
 @dataclass(frozen=True)
@@ -636,7 +684,12 @@ class ReviewCycleLedger:
             data = envelope["data"]
             if envelope["sha256"] != _digest(_encoded(data)):
                 raise _Hold("ledger_integrity")
-            if data["version"] != 1 or data["policy"] != self.policy.binding():
+            if (
+                not isinstance(data, dict)
+                or type(data.get("version")) is not int
+                or data["version"] != 1
+                or not self.policy.accepts_binding(data.get("policy"))
+            ):
                 raise _Hold("ledger_policy_or_version_mismatch")
             if not isinstance(data["activated_at"], str) or not data["activated_at"]:
                 raise _Hold("ledger_activation_invalid")
@@ -676,6 +729,7 @@ class ReviewCycleLedger:
             raise _Hold("ledger_unreadable_or_corrupt") from exc
 
     def _write(self, data: dict):
+        data["policy"] = self.policy.binding()
         raw = _encoded({"data": data, "sha256": _digest(_encoded(data))})
         # Same-directory replacement, fsync file and directory: no partial JSON.
         with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix=self.path.name + ".", delete=False) as handle:
@@ -710,7 +764,6 @@ class ReviewCycleLedger:
                         data = {
                             "version": 1,
                             "activated_at": datetime.now(timezone.utc).isoformat(),
-                            "policy": self.policy.binding(),
                             "rows": {},
                             "subjects": {},
                             "sequence": 0,

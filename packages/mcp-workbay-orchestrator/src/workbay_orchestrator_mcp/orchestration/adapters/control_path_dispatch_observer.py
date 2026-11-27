@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Mapping
 
 from ..codex_lane_config import CODEX_SPEED_TO_SERVICE_TIER
+from ..transport_ref import is_transport_ref
 from . import control_path_review_policy as policy
 
 _IDENTITY_KEYS = policy._IDENTITY_KEYS
@@ -195,7 +196,7 @@ def observed_dispatch_identity(spool_dir: str | Path, pass_record_path: str | Pa
     ref, nonce = provenance.get("dispatch_ref"), provenance.get("dispatch_nonce")
     if not _text(ref):
         raise ObserverRefusal("dispatch_ref_missing")
-    if not _text(nonce) or not ref.startswith("refs/heads/") or not ref.endswith("-" + nonce):
+    if not _text(nonce) or not is_transport_ref(ref, nonce):
         raise ObserverRefusal("dispatch_ref_mismatch")
     if provenance.get("schema_version") != 1 or provenance.get("history_stripped") is not True:
         raise ObserverRefusal("provenance_invalid")

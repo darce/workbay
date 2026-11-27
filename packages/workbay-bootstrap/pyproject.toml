@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-bootstrap"
-version = "0.4.46"
+version = "0.4.47"
 description = "Bootstrap CLI that hoists the shared workbay-system surface into consumer repos."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ dependencies = [
 	"tomlkit>=0.13",
 	"pyyaml>=6",
 	"workbay-protocol>=0.3.28,<0.4.0",
-	"workbay-system>=0.4.48,<0.5.0",
+	"workbay-system>=0.4.49,<0.5.0",
 	"packaging>=23",
 ]
 
@@ -49,3 +49,93 @@ tmp_path_retention_policy = "failed"
 testpaths = ["tests"]
 pythonpath = ["src", "../mcp-workbay-handoff/src"]
 addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+warn_return_any = true
+warn_unused_ignores = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
+
+# Current diagnostics in legacy modules. Other diagnostics stay enabled.
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.bootstrap_surfaces"]
+disable_error_code = ["assignment", "return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.worktree_config"]
+disable_error_code = ["assignment", "return-value", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.claude_settings"]
+disable_error_code = ["import-untyped", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.cli"]
+disable_error_code = ["arg-type", "assignment", "attr-defined", "import-untyped", "misc", "no-any-return", "no-redef", "str-bytes-safe"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.coherence"]
+disable_error_code = ["arg-type", "no-redef", "return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.configured_hooks"]
+disable_error_code = ["assignment", "index", "union-attr", "var-annotated"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.dev_temp"]
+disable_error_code = ["call-overload", "import-untyped", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.embedding_backfill_doctor", "workbay_bootstrap.external", "workbay_bootstrap.worktree"]
+disable_error_code = ["return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.embedding_provision", "workbay_bootstrap.mcp_sync"]
+disable_error_code = ["arg-type", "assignment", "return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.git_write"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.gitonly_closure", "workbay_bootstrap.install_plan"]
+disable_error_code = ["arg-type", "assignment"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.harnesses"]
+disable_error_code = ["arg-type", "assignment", "dict-item", "import-untyped", "return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.hook_helpers"]
+disable_error_code = ["operator"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.install"]
+disable_error_code = ["arg-type", "assignment", "attr-defined", "import-not-found", "import-untyped", "no-any-return", "no-redef", "return-value", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.install_receipt"]
+disable_error_code = ["index"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.lifecycle_surfaces", "workbay_bootstrap.native_launcher_surfaces"]
+disable_error_code = ["arg-type", "attr-defined", "index"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.mcp_boot_probe"]
+disable_error_code = ["no-any-return"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.overrides", "workbay_bootstrap.permission_audit"]
+disable_error_code = ["assignment", "import-untyped"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_bootstrap.subcommands"]
+disable_error_code = ["arg-type", "assignment", "attr-defined", "import-untyped", "index", "misc", "no-any-return", "operator", "return-value", "str-bytes-safe"]

@@ -1,6 +1,21 @@
 version: 1
 
 harness_capabilities:
+  mcp_loading:
+    claude:
+      aliases: [claude-code]
+      supports_lazy_loading: true
+    codex:
+      supports_lazy_loading: true
+    vscode:
+      supports_lazy_loading: true
+    cursor:
+      supports_lazy_loading: true
+    grok:
+      supports_lazy_loading: true
+    agy:
+      aliases: [agy-cli, antigravity]
+      supports_lazy_loading: false
   review_parallel:
     rows:
       - harness_key: claude-code
@@ -26,7 +41,7 @@ harness_capabilities:
       - harness_key: agy-cli
         label: Antigravity / agy (coordinator is an in-process agy agent)
         primitive: "in-process `invoke_subagent` tool for reviewer fan-out"
-        notes: "In-process. Use `invoke_subagent` from the active session when available; fallback to `run_structured_turn` on `workbay-orchestrator-mcp` when subagents are unavailable."
+        notes: "In-process. Use `invoke_subagent` from the active session when available. Use the WorkBay CLI for orchestration outside that primitive."
       - harness_key: external
         label: External orchestrator (no interactive harness)
         primitive: "`backend_registry.get_adapter(<kind>)` + `BackendAdapter.execute(...)`"

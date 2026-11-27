@@ -64,6 +64,7 @@ from workbay_orchestrator_mcp.orchestration.openrouter_lane_config import (
     OPENROUTER_ALLOWED_EFFORTS,
     OPENROUTER_TIMEOUT_CAP,
 )
+from workbay_orchestrator_mcp.orchestration.probe_deadline import bounded_probe_many
 
 GROK_OFFLOAD_MODEL = DEFAULT_GROK_MODEL
 CURSOR_OFFLOAD_BACKEND = "cursor-cli"
@@ -515,20 +516,31 @@ def resolve_offload_backend_for_execution_mode(
     ``remote_required_error`` is not None the caller must refuse with outcome
     ``remote_required`` — never substitute a remote backend for an explicit
     local pin ([AGT-10], [RLSE-05]). Under ``remote_only``, an omitted backend
-    is refused; callers must supply an explicit off-box backend.
+    is refused; callers must supply an explicit off-box backend. Under
+    ``local_ok``, omission selects the first supported off-box backend whose
+    availability probe succeeds, in profile order.
     """
     from workbay_protocol.bootstrap import load_execution_mode  # noqa: PLC0415
 
     mode = load_execution_mode(repo_root)
-    explicit = backend is not None and str(backend).strip() != ""
-    if explicit:
-        resolved = str(backend).strip()
-    elif mode == "remote_only":
-        return "", _remote_only_missing_backend_refusal(derive_remote_offload_backends(), repo_root)
-    else:
-        resolved = GROK_OFFLOAD_BACKEND
-
+    resolved = str(backend).strip() if backend is not None else ""
     admitted = derive_remote_offload_backends()
-    if mode == "remote_only" and explicit and resolved not in admitted:
-        return resolved, _remote_only_refusal(resolved, admitted, repo_root)
-    return resolved, None
+    if resolved:
+        if mode == "remote_only" and resolved not in admitted:
+            return resolved, _remote_only_refusal(resolved, admitted, repo_root)
+        return resolved, None
+    if mode == "remote_only":
+        return "", _remote_only_missing_backend_refusal(admitted, repo_root)
+    candidates = (candidate for candidate in OFFLOAD_AGENT_PROFILES if candidate in admitted)
+    probes = bounded_probe_many(
+        candidates,
+        probe=backend_registry.probe_availability,
+        workspace_root=Path(repo_root).expanduser().resolve(),
+    )
+    for candidate, probe in probes.items():
+        if probe.get("is_available") is True:
+            return candidate, None
+    return (
+        "",
+        "remote_required: no available remote offload backend; configure a remote or specify a backend explicitly",
+    )

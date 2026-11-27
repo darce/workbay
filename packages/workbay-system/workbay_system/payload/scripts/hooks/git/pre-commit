@@ -35,4 +35,59 @@ if [ -f "$GUARD_DIR/guard_archived_plan_checklist.py" ]; then
     python3 "$GUARD_DIR/guard_archived_plan_checklist.py" || exit $?
 fi
 
+cd "$REPO_ROOT" || exit 0
+if [ -x .venv/bin/workbay ]; then
+    staged_status=0
+    git diff --cached --quiet --diff-filter=ACMRT -- '*.py' '*.md' || staged_status=$?
+    if [ "$staged_status" -eq 1 ]; then
+        canon_status=0
+        canon_stderr_file=$(mktemp "${TMPDIR:-/tmp}/wb-canon-precommit.XXXXXX")
+        report=$(.venv/bin/workbay canon lint --staged --quiet --json 2>"$canon_stderr_file") || canon_status=$?
+        canon_stderr=$(cat "$canon_stderr_file" 2>/dev/null || true)
+        rm -f "$canon_stderr_file"
+        case "$canon_status" in
+            0|2|4|6) ;;  # Clean, unsupported staged mode, or unavailable.
+            1)  # Block only on verified Tier-B findings; warn on CLI crash.
+                if printf '%s\n' "$report" | .venv/bin/python -c '
+import json
+import sys
+
+report = json.load(sys.stdin)
+findings = report.get("findings")
+sys.exit(0 if isinstance(findings, list) and any(isinstance(f, dict) and f.get("tier") == "B" for f in findings) else 1)
+' 2>/dev/null; then
+                    printf '%s\n' "$report" >&2
+                    exit 1
+                fi
+                printf 'workbay canon lint warning (exit 1: unexpected CLI failure)\n' >&2
+                if [ -n "$canon_stderr" ]; then
+                    printf '%s\n' "$canon_stderr" >&2
+                elif [ -n "$report" ]; then
+                    printf '%s\n' "$report" >&2
+                fi
+                ;;
+            5)  # Tier S is advisory in the hook.
+                printf 'workbay canon lint warning\n%s\n' "$report" >&2
+                ;;
+            *)
+                # Older releases report an unavailable root as a typed error.
+                if printf '%s\n' "$report" | .venv/bin/python -c '
+import json
+import sys
+
+report = json.load(sys.stdin)
+codes = {error["code"] for error in report.get("errors", [])}
+sys.exit(not codes or not codes <= {"canon_root_unavailable", "canon_root_permission_denied", "manifest_missing", "config_missing"})
+' 2>/dev/null; then
+                    exit 0
+                fi
+                printf 'workbay canon lint warning (exit %s)\n' "$canon_status" >&2
+                if [ -n "$report" ]; then
+                    printf '%s\n' "$report" >&2
+                fi
+                ;;
+        esac
+    fi
+fi
+
 exit 0

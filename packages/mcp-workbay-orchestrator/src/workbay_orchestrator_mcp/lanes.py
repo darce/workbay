@@ -6497,6 +6497,130 @@ def manage_worktree_lane(
     )
 
 
+def _lane_prep_as_turn_metric(row: dict[str, object]) -> dict[str, object]:
+    return _decode_turn_metric_row_dict(
+        {
+            **row,
+            "phase": "lane_prep",
+            "model": None,
+            "thread_id": None,
+            "turn_id": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cached_input_tokens": None,
+            "reasoning_output_tokens": None,
+            "total_tokens": None,
+            "usage_source": None,
+            "model_context_window": None,
+            "prompt_tokens": None,
+            "prompt_chars": None,
+            "prompt_token_source": None,
+            "utilization_ratio": None,
+            "domain_signal_ratio": None,
+            "pressure_level": None,
+            "section_sizes_json": "{}",
+            "raw_usage_json": None,
+            "duration_seconds": None,
+        }
+    )
+
+
+def record_lane_prep_metric(
+    session: str,
+    backend: str,
+    *,
+    task_ref: str | None = None,
+    lane_id: str | None = None,
+    cycle: int | None = None,
+    attribution: dict[str, Any] | None = None,
+    replace_prior_same_phase: bool = True,
+    actor: WriteActor | None = None,
+) -> dict:
+    if _normalize_optional_text(session) is None:
+        return _json_response({"ok": False, "error": "session is required."})
+    normalized_backend = _normalize_optional_text(backend)
+    if normalized_backend is None:
+        return _json_response({"ok": False, "error": "backend is required."})
+    attribution_json = json.dumps(attribution or {}, sort_keys=True)
+    with _get_db_connection() as conn:
+        resolved_task_ref = _resolve_task_ref(conn, task_ref)
+        ctx = _resolve_write_actor(conn, actor)
+        resolved_lane_id = _normalize_optional_text(lane_id) or ctx.lane_id
+        # Prune and insert in one transaction so concurrent writers converge
+        # on one row per lane and a failed insert leaves the prior row intact.
+        if replace_prior_same_phase and resolved_lane_id is not None:
+            conn.execute(
+                "DELETE FROM lane_prep_metrics WHERE task_ref = ? AND lane_id = ?",
+                (resolved_task_ref, resolved_lane_id),
+            )
+        cur = conn.execute(
+            """
+            INSERT INTO lane_prep_metrics (
+                task_ref, lane_id, session, cycle, backend, phys_footprint_mb,
+                phys_footprint_source, pid, cost_class, attribution_json
+            )
+            WITH attribution AS (
+                SELECT CASE WHEN json_valid(:attribution_json) THEN :attribution_json END AS valid_json
+            )
+            SELECT :task_ref, :lane_id, :session, :cycle, :backend,
+                   json_extract(valid_json, '$.phys_footprint_mb'),
+                   json_extract(valid_json, '$.phys_footprint_source'),
+                   json_extract(valid_json, '$.pid'),
+                   json_extract(valid_json, '$.cost_class'),
+                   :attribution_json
+            FROM attribution
+            """,
+            {
+                "task_ref": resolved_task_ref,
+                "lane_id": resolved_lane_id,
+                "session": session,
+                "cycle": cycle,
+                "backend": normalized_backend,
+                "attribution_json": attribution_json,
+            },
+        )
+        row = conn.execute("SELECT * FROM lane_prep_metrics WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return _json_response({"ok": True, "task_ref": resolved_task_ref, "lane_prep_metric": _row_to_dict(row) or {}})
+
+
+def list_lane_prep_metrics(
+    task_ref: str | None = None,
+    lane_id: str | None = None,
+    backend: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    limit = _effective_limit(limit, None)
+    offset = max(0, offset)
+    normalized_lane_id = _normalize_optional_text(lane_id)
+    normalized_backend = _normalize_optional_text(backend)
+    with _get_db_connection() as conn:
+        resolved_task_ref = _resolve_task_ref(conn, task_ref)
+        where_sql = "task_ref = ?"
+        params: list[object] = [resolved_task_ref]
+        if normalized_lane_id is not None:
+            where_sql += " AND lane_id = ?"
+            params.append(normalized_lane_id)
+        if normalized_backend is not None:
+            where_sql += " AND backend = ?"
+            params.append(normalized_backend)
+        total, rows = _paginated_query(
+            conn, "lane_prep_metrics", where_sql, tuple(params), limit, offset, "created_at DESC, id DESC"
+        )
+        return _json_response(
+            {
+                "ok": True,
+                "task_ref": resolved_task_ref,
+                "lane_id": normalized_lane_id,
+                "backend": normalized_backend,
+                "total_matching": total,
+                "returned": len(rows),
+                "has_more": offset + len(rows) < total,
+                "lane_prep_metrics": rows,
+            }
+        )
+
+
 def record_turn_metric(
     session: str,
     phase: str,
@@ -6521,6 +6645,20 @@ def record_turn_metric(
     normalized_phase = _normalize_optional_text(phase)
     if normalized_phase is None:
         return _json_response({"ok": False, "error": "phase is required."})
+    if normalized_phase == "lane_prep":
+        result = record_lane_prep_metric(
+            session,
+            backend,
+            task_ref=task_ref,
+            lane_id=lane_id,
+            cycle=cycle,
+            attribution=attribution,
+            replace_prior_same_phase=replace_prior_same_phase,
+            actor=actor,
+        )
+        if result["ok"]:
+            result["turn_metric"] = _lane_prep_as_turn_metric(result["lane_prep_metric"])
+        return _json_response(result)
     normalized_backend = _normalize_optional_text(backend)
     if normalized_backend is None:
         return _json_response({"ok": False, "error": "backend is required."})
@@ -6555,20 +6693,7 @@ def record_turn_metric(
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         ctx = _resolve_write_actor(conn, actor)
         resolved_lane_id = _normalize_optional_text(lane_id) or ctx.lane_id
-        # Latest-wins for lane_prep (and any future same-phase replace). The DELETE and the
-        # INSERT below execute on the same connection inside one `_get_db_connection()` block,
-        # which opens a single implicit transaction committed together on block exit — and
-        # rolled back together on any error, so a failed INSERT never leaves a delete-without-
-        # replacement (the prior row survives; latest-wins degrades to prior-wins, never loss).
-        # That one transaction, plus SQLite WAL single-writer serialization (busy_timeout
-        # bounded), is what makes concurrent prep writers converge on exactly one row — no
-        # duplicate can be left in a window between a *separate* DELETE and INSERT (CON-11).
-        # Contract: replace collapses ALL prior rows for (task_ref, lane_id, phase) regardless
-        # of session/cycle — it means "exactly one durable row per (task_ref, lane_id, phase)",
-        # so do not enable it for a phase whose per-session history must be retained. Scope is
-        # strictly per lane: when no lane_id is resolvable we intentionally skip the prune rather
-        # than issue a lane-less DELETE that would over-broadly clear every lane's same-phase
-        # rows for the task (a documented no-op without a lane).
+        # Replace prior rows for this task, lane and phase in the insert transaction.
         if replace_prior_same_phase and resolved_lane_id is not None:
             conn.execute(
                 "DELETE FROM turn_metrics WHERE task_ref = ? AND lane_id = ? AND phase = ?",
@@ -6639,35 +6764,40 @@ def list_turn_metrics(
 ) -> dict:
     limit = _effective_limit(limit, top_n_turn_metrics)
     offset = max(0, offset)
+    normalized_phase = _normalize_optional_text(phase)
+    normalized_model = _normalize_optional_text(model)
+    lane_prep = normalized_phase == "lane_prep"
     with _get_db_connection() as conn:
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         params: list[object] = [resolved_task_ref]
         where_sql = "task_ref = ?"
-        normalized_phase = _normalize_optional_text(phase)
         for field_name, value in (
             ("lane_id", _normalize_optional_text(lane_id)),
             ("backend", _normalize_optional_text(backend)),
-            ("model", _normalize_optional_text(model)),
-            ("phase", normalized_phase),
+            ("model", None if lane_prep else normalized_model),
+            ("phase", None if lane_prep else normalized_phase),
         ):
             if value is None:
                 continue
             where_sql += f" AND {field_name} = ?"
             params.append(value)
-        # Default list excludes lane_prep footprint telemetry so agent-turn windows
-        # stay readable; pass phase='lane_prep' to opt in (internal).
+        # Legacy handoff imports can still carry prep rows in the turn collection.
         if normalized_phase is None:
             where_sql += " AND COALESCE(phase, '') != 'lane_prep'"
-        total, rows = _paginated_query(
-            conn,
-            "turn_metrics",
-            where_sql,
-            tuple(params),
-            limit,
-            offset,
-            "created_at DESC, id DESC",
-            _decode_turn_metric_row_dict,
-        )
+        if lane_prep and normalized_model is not None:
+            # Prep rows have no model, so a legacy model filter matches zero rows.
+            total, rows = 0, []
+        else:
+            total, rows = _paginated_query(
+                conn,
+                "lane_prep_metrics" if lane_prep else "turn_metrics",
+                where_sql,
+                tuple(params),
+                limit,
+                offset,
+                "created_at DESC, id DESC",
+                _lane_prep_as_turn_metric if lane_prep else _decode_turn_metric_row_dict,
+            )
         return _json_response(
             _shape_list_payload(
                 {
@@ -6675,8 +6805,8 @@ def list_turn_metrics(
                     "task_ref": resolved_task_ref,
                     "lane_id": _normalize_optional_text(lane_id),
                     "backend": _normalize_optional_text(backend),
-                    "model": _normalize_optional_text(model),
-                    "phase": _normalize_optional_text(phase),
+                    "model": normalized_model,
+                    "phase": normalized_phase,
                     "total_matching": total,
                     "returned": len(rows),
                     "has_more": offset + len(rows) < total,
@@ -6700,12 +6830,7 @@ def get_turn_metrics_summary(
         resolved_task_ref = _resolve_task_ref(conn, task_ref)
         normalized_lane_id = _normalize_optional_text(lane_id)
         params: list[object] = [resolved_task_ref]
-        # Exclude per-lane-prep footprint rows (phase='lane_prep', internal-
-        # FOOTPRINT-01 S2): they are token-less observability rows self-written by the
-        # short-lived lane_prompt subprocess, NOT agent execution turns. Counting them
-        # in total_turns / usage coverage would systematically bias every agent-turn
-        # summary and the offload burn-scoring reads (COALESCE keeps any legacy
-        # NULL-phase rows in the agent-turn population).
+        # Keep prep rows from legacy handoff imports out of turn denominators.
         where_sql = "task_ref = ? AND COALESCE(phase, '') != 'lane_prep'"
         if normalized_lane_id is not None:
             where_sql += " AND lane_id = ?"

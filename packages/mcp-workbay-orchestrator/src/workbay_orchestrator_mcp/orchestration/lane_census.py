@@ -418,6 +418,7 @@ def _standalone_reap_custody_script(
     *,
     idle_seconds: int,
     timeout: float,
+    probe_refusals: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> str:
     """Carry the native per-key proof and its unchanged locked checks to the sweep.
 
@@ -466,9 +467,13 @@ def _standalone_reap_custody_script(
                         continue
                     if verdict.kind != native.KIND_SANDBOX_HARVESTED:
                         proofs.pop(item.key, None)
+                        if probe_refusals is not None and verdict.probe_refusal is not None:
+                            probe_refusals[item.key] = verdict.probe_refusal
         except Exception as exc:  # noqa: BLE001 — every key stays held; the sweep still runs
             logger.warning("standalone reap proofs not built: %s", _cap_reap_error(exc))
             proofs.clear()
+            if probe_refusals is not None:
+                probe_refusals.clear()
     cases = []
     release_cases = []
     for key in keys:
@@ -588,6 +593,7 @@ def run_remote_sandbox_reap(
             return evidence_runner(script, timeout=probe_timeout)
         return _default_sandbox_ssh_runner(script, timeout=probe_timeout, workspace_root=root)
 
+    probe_refusals: dict[str, tuple[str, tuple[str, ...]]] = {}
     try:
         # A private, short-lived host script is streamed with the remote body;
         # no VM path or environment sentinel can confer deletion authority.
@@ -597,6 +603,7 @@ def run_remote_sandbox_reap(
                 workspace, rows, eligible_keys, run_proof_ssh,
                 idle_seconds=max(0, int(idle_seconds if idle_seconds is not None else 21_600)),
                 timeout=max(0, deadline - time.monotonic()),
+                probe_refusals=probe_refusals,
             ), encoding="utf-8")
             argv.extend(("--custody-checks-file", str(custody_file)))
             proc = command_runner(
@@ -664,6 +671,12 @@ def run_remote_sandbox_reap(
                     raise ValueError("each hold must include string key and reason fields")
             # Preserve future reason strings and additional hold details exactly;
             # the parser must not turn a newer enum value into receipt failure.
+            for hold in holds:
+                refusal = probe_refusals.get(hold["key"])
+                if hold["reason"] == "missing_source_proof:_proven_tree" and refusal is not None:
+                    hold["reason"], paths = refusal
+                    if paths:
+                        hold["offending_paths"] = list(paths)
             summary["holds"] = holds
         if "holds_truncated" in raw_summary:
             holds_truncated = raw_summary["holds_truncated"]

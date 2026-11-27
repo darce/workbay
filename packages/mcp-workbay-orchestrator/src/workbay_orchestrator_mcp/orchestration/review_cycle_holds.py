@@ -121,6 +121,7 @@ class Holder:
     receipt_head: str | None
     in_flight: bool
     unreadable: bool = False  # a receipt naming this holder could not be decoded
+    receipt_error: str | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -202,6 +203,7 @@ class HolderBlock:
     receipt: str | None
     subject: str | None
     integration_sha: str | None
+    receipt_error: str | None = None
 
     @property
     def holds(self) -> bool:
@@ -209,13 +211,16 @@ class HolderBlock:
         return self.blocks is True or self.blocks == "unknown"
 
     def as_row(self) -> dict:
-        return dict(
+        row = dict(
             receipt=self.receipt, dispatch_id=self.dispatch_id, subject=self.subject or self.holder_branch,
             source_branch=self.holder_branch, source_head=self.holder_tip, holder_tip=self.holder_tip,
             holder_lane=self.holder_lane, holder_task=self.holder_task, overlap_paths=list(self.overlap_paths),
             blocks=self.blocks, reason=self.reason, integration_sha=self.integration_sha,
             predicates_tried=["holder_blocks"],
         )
+        if self.receipt_error is not None:
+            row["receipt_error"] = self.receipt_error
+        return row
 
 
 # ---------------------------------------------------------------- git probes (no lock held)
@@ -255,6 +260,47 @@ def _live_ref(repo: Path, branch: str) -> str | None:
     if symbolic is None or symbolic[0] not in (0, 1):
         return _UNREADABLE
     return _UNREADABLE if symbolic[0] == 0 else None
+
+
+def _batch_live_refs(repo: Path) -> tuple[dict[str, str], Path | None] | None:
+    """Resolve all live refs/heads/* in one git call (CAL-02, ALG-02).
+
+    Preserves fail-closed dangling symbolic ref detection: any branch absent
+    from for-each-ref whose loose ref file exists under ``<git-common-dir>/refs/heads``
+    falls back to :func:`_live_ref`.
+    """
+    answer = _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads")
+    if answer is None or answer[0] != 0:
+        return None
+    live_map: dict[str, str] = {}
+    for line in answer[1].decode(errors="replace").splitlines():
+        sha, _, name = line.partition(" ")
+        if name.startswith("refs/heads/"):
+            live_map[name] = sha if _HEX.fullmatch(sha) else _UNREADABLE
+    common_ans = _git(repo, "rev-parse", "--git-common-dir")
+    common_dir: Path | None = None
+    if common_ans is not None and common_ans[0] == 0:
+        raw_dir = common_ans[1].decode(errors="replace").strip()
+        if raw_dir:
+            cand = Path(raw_dir)
+            common_dir = cand if cand.is_absolute() else (repo / cand).resolve()
+    return live_map, common_dir
+
+
+def _lookup_live_ref(
+    repo: Path, branch: str, batch: tuple[dict[str, str], Path | None] | None
+) -> str | None:
+    if batch is None:
+        return _live_ref(repo, branch)
+    live_map, common_dir = batch
+    ref = "refs/heads/" + branch
+    if ref not in live_map and common_dir is not None and ".." not in branch.split("/"):
+        try:
+            if not os.path.lexists(common_dir / "refs" / "heads" / branch):
+                return None
+        except OSError:
+            pass
+    return _live_ref(repo, branch)
 
 
 _GIT_FALSE = frozenset({b"false", b"no", b"off", b"0"})
@@ -392,23 +438,66 @@ def _changed(repo: Path, integration: str, tip: str) -> tuple[str, ...] | None:
     return tuple(sorted({os.fsdecode(item) for item in diff[1].split(b"\0") if item}))
 
 
+def _batch_integration_ancestors(repo: Path, integration: str, memo: dict) -> frozenset[str] | None:
+    key = ("ancestors", integration)
+    if key in memo:
+        cached = memo[key]
+        return cached if isinstance(cached, frozenset) else None
+    answer = _git(repo, "rev-list", integration)
+    if answer is None or answer[0] != 0:
+        memo[key] = None
+        return None
+    ancestors = frozenset(line for line in answer[1].decode(errors="replace").splitlines() if _HEX.fullmatch(line))
+    memo[key] = ancestors
+    return ancestors
+
+
 def _tip_facts(repo: Path, integration: str, tip: str, memo: dict | None = None) -> TipFacts:
+    cache_key = ("tip_facts", integration, tip)
+    if memo is not None and cache_key in memo:
+        cached = memo[cache_key]
+        if isinstance(cached, TipFacts):
+            return cached
     state = _commit_state(repo, tip, memo)
     if state == _REPLACED:
         # A replace ref resolves an oid that does not exist in raw storage:
         # never report absent; treat as unlanded so missing incoming scope holds unknown.
-        return TipFacts(tip, "ok", landed=False, paths=())
+        fact = TipFacts(tip, "ok", landed=False, paths=())
+        if memo is not None:
+            memo[cache_key] = fact
+        return fact
     if state != "ok":
-        return TipFacts(tip, state)
-    answer = _git(repo, "merge-base", "--is-ancestor", tip, integration)
-    if answer is None or answer[0] not in (0, 1):
-        return TipFacts(tip, _UNREADABLE)
-    if answer[0] == 0:
-        return TipFacts(tip, "ok", landed=True)
+        fact = TipFacts(tip, state)
+        if memo is not None:
+            memo[cache_key] = fact
+        return fact
+    ancestors = memo.get(("ancestors", integration)) if memo is not None else None
+    if isinstance(ancestors, frozenset):
+        if tip in ancestors:
+            fact = TipFacts(tip, "ok", landed=True)
+            if memo is not None:
+                memo[cache_key] = fact
+            return fact
+    else:
+        answer = _git(repo, "merge-base", "--is-ancestor", tip, integration)
+        if answer is None or answer[0] not in (0, 1):
+            fact = TipFacts(tip, _UNREADABLE)
+            if memo is not None:
+                memo[cache_key] = fact
+            return fact
+        if answer[0] == 0:
+            fact = TipFacts(tip, "ok", landed=True)
+            if memo is not None:
+                memo[cache_key] = fact
+            return fact
     paths = _changed(repo, integration, tip)
     if paths is None:
-        return TipFacts(tip, _UNREADABLE)
-    return TipFacts(tip, "ok", landed=False, paths=paths)
+        fact = TipFacts(tip, _UNREADABLE)
+    else:
+        fact = TipFacts(tip, "ok", landed=False, paths=paths)
+    if memo is not None:
+        memo[cache_key] = fact
+    return fact
 
 
 def _on_first_parent(repo: Path, tip: str, integration: str) -> bool:
@@ -548,16 +637,14 @@ def _json_file(path: Path) -> dict | None:
     return _retrying(read)
 
 
-def _receipts(directory: Path) -> tuple[list[tuple[str, dict]], list[str]]:
+def _receipts(directory: Path) -> tuple[list[tuple[str, dict]], list[tuple[str, str]]]:
     receipts, unreadable = [], []
     for path in sorted(directory.glob("*.json")) if directory.is_dir() else ():
         try:
             receipt = _json_file(path)
-        except SnapshotContended:
-            unreadable.append(path.name)
-            continue
-        except OSError:
-            unreadable.append(path.name)
+        except (SnapshotContended, OSError) as exc:
+            cause = exc.__cause__ or exc
+            unreadable.append((path.name, f"{type(cause).__name__}: {cause}"))
             continue
         if receipt is not None:
             receipts.append((path.name, receipt))
@@ -594,7 +681,7 @@ def _receipt_identity(receipt: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _holders(root: Path, lanes: list[dict], receipts: list[tuple[str, dict]], unreadable: list[str],
+def _holders(root: Path, lanes: list[dict], receipts: list[tuple[str, dict]], unreadable: list[tuple[str, str]],
              ledger_rows: dict | None) -> list[Holder]:
     by_branch: dict[str, dict] = {}
 
@@ -611,18 +698,20 @@ def _holders(root: Path, lanes: list[dict], receipts: list[tuple[str, dict]], un
         branch, head = _short(receipt.get("source_branch")), receipt.get("source_head")
         if branch is None or not isinstance(head, str) or identity.get("kind") == "analysis":
             continue
-        entry(branch)["receipts"].append((name, receipt))
+        entry(branch)["receipts"].append((name, receipt, identity))
     holders = []
     for branch, group in sorted(by_branch.items()):
         rows = group["lanes"]
 
         def sequence(item):
-            dispatch_id = (item[1].get("identity") or {}).get("dispatch_id")
+            _, _, identity = item
+            dispatch_id = identity.get("dispatch_id")
             row = (ledger_rows or {}).get(dispatch_id) if isinstance(dispatch_id, str) else None
             issued = row.get("issued_sequence") if isinstance(row, dict) else None
             return (type(issued) is int, issued if type(issued) is int else -1, str(dispatch_id))
 
         latest = max(group["receipts"], key=sequence) if group["receipts"] else None
+        latest_identity = latest[2] if latest else {}
         task_ref = lane_id = None
         if latest is not None:
             task_ref, lane_id = _receipt_identity(latest[1])
@@ -639,8 +728,8 @@ def _holders(root: Path, lanes: list[dict], receipts: list[tuple[str, dict]], un
             roots.update(_manifest_roots(root, row.get("task_ref"), row.get("lane_id")) or _binding_roots(row))
         live_status = lane.get("status") if lane is not None else None
         in_flight = False
-        for name, receipt in group["receipts"]:
-            dispatch_id = (receipt.get("identity") or {}).get("dispatch_id")
+        for _, receipt, identity in group["receipts"]:
+            dispatch_id = identity.get("dispatch_id")
             if receipt.get("state") != "transport_started" or not isinstance(dispatch_id, str):
                 continue
             row = ledger_rows.get(dispatch_id) if isinstance(ledger_rows, dict) else None
@@ -656,17 +745,17 @@ def _holders(root: Path, lanes: list[dict], receipts: list[tuple[str, dict]], un
             lane_identities=tuple(sorted({(row["task_ref"], row["lane_id"]) for row in rows
                                           if isinstance(row.get("task_ref"), str) and isinstance(row.get("lane_id"), str)}
                                          | ({(task_ref, lane_id)} if task_ref and lane_id else set()))),
-            dispatch_id=(latest[1].get("identity") or {}).get("dispatch_id") if latest else None,
+            dispatch_id=latest_identity.get("dispatch_id"),
             receipt=latest[0] if latest else None,
-            subject=(latest[1].get("identity") or {}).get("subject_branch") if latest else None,
+            subject=latest_identity.get("subject_branch"),
             receipt_head=latest[1].get("source_head") if latest else None,
             in_flight=in_flight and live_status in _LIVE_LANE_STATUSES,
         ))
-    for name in unreadable:
+    for name, error in unreadable:
         # A receipt we cannot decode may be the only record of a holder's tip.
         holders.append(Holder(branch="", task_ref=None, lane_id=None, lane_status=None, owned_roots=(),
                               lane_tips=(), lane_identities=(), dispatch_id=None, receipt=name, subject=None,
-                              receipt_head=None, in_flight=False, unreadable=True))
+                              receipt_head=None, in_flight=False, unreadable=True, receipt_error=error))
     return holders
 
 
@@ -719,9 +808,10 @@ def retained_subject_for(repo: Path, incoming: Incoming, incoming_tip: str | Non
     foreign-subject receipt that is settled upstream history: one strictly
     below the base the task was cut from, or one at that base whose stamped
     scope is disjoint from the task's authorized scope and its diff. Without
-    that proof, an unregistered incoming branch (no task binding at all, #56)
-    sheds only foreign-subject receipts already landed on the integration SHA;
-    an unlanded reviewed head keeps its lineage (decision 48657).
+    that proof, a foreign receipt from outside the incoming task is settled
+    history if its head is strictly behind integration. At the integration tip,
+    only an unbound branch can shed a stamped foreign receipt (#56). Unlanded
+    reviewed heads keep their lineage (decision 48657).
 
     The incoming branch's own receipt whose ``source_head`` is not a SHA is
     unreadable lineage, never skipped (CAL-02). Ancestry and distance are
@@ -740,10 +830,8 @@ def retained_subject_for(repo: Path, incoming: Incoming, incoming_tip: str | Non
         return probes[key]
 
     proven = incoming.proof_base is not None and _HEX.fullmatch(incoming.proof_base) is not None
-    # Without any task binding or proof, landed stamped foreign history is settled upstream (#56).
-    shed_landed = (not proven and not tasks and incoming.subject_branch is None and incoming.task_ref is None
-                   and incoming.proof_subject is None
-                   and integration is not None and _HEX.fullmatch(integration) is not None)
+    bound_tasks = {*tasks, incoming.task_ref} - {None}
+    unbound = not bound_tasks and incoming.subject_branch is None and incoming.proof_subject is None
     scope = None
     if proven and incoming.proof_roots is not None and incoming_paths is not None:
         scope = set(incoming.proof_roots) | set(incoming_paths)
@@ -798,6 +886,7 @@ def retained_subject_for(repo: Path, incoming: Incoming, incoming_tip: str | Non
                    source_branch=receipt.get("source_branch"), source_head=head,
                    has_source_task_subject=receipt.get("source_task_subject") is not None,
                    predicates_tried=["retained_subject_for"])
+        receipt_task = _receipt_identity(receipt)[0]
         if proven and subject != expected and not own:
             upstream = head == incoming.proof_base or probe(
                 ("ancestry", head, incoming.proof_base), lambda: _ancestry(repo, head, incoming.proof_base))
@@ -818,17 +907,19 @@ def retained_subject_for(repo: Path, incoming: Incoming, incoming_tip: str | Non
                 if landed:
                     excluded.append(dict(row, excluded="landed_on_integration"))
                     continue
-        if shed_landed and subject != expected and not own and isinstance(receipt.get("source_task_subject"), dict):
+        if (not proven and subject != expected and not own and receipt_task not in bound_tasks
+                and integration is not None and _HEX.fullmatch(integration) is not None
+                and (head != integration or (unbound and isinstance(receipt.get("source_task_subject"), dict)))):
             landed = probe(("ancestry", head, integration), lambda: _ancestry(repo, head, integration))
             if landed is None:
                 return Lineage("unknown", reason="subject_lineage_unreadable", receipts=(row,), incoming_tasks=tasks)
-            if landed:
+            if landed is True:
                 excluded.append(dict(row, excluded="landed_on_integration"))
                 continue
         distance = probe(("distance", head, incoming_tip), lambda: _rev_count(repo, f"{head}...{incoming_tip}"))
         if distance is None:
             return Lineage("unknown", reason="subject_lineage_unreadable", receipts=(row,), incoming_tasks=tasks)
-        nearest.append((distance, name, dict(row, distance=distance), _receipt_identity(receipt)[0]))
+        nearest.append((distance, name, dict(row, distance=distance), receipt_task))
     if not nearest:
         if unreadable_own:
             return Lineage("unknown", reason="subject_lineage_unreadable", incoming_tasks=tasks,
@@ -908,11 +999,12 @@ def take_snapshot(repo: Path, incoming: Incoming, *, orchestrator_root: Path | N
             head = receipt.get("source_head")
             if isinstance(head, str) and _HEX.fullmatch(head):
                 candidate_shas.add(head)
+        live_batch = _batch_live_refs(repo)
         holder_live: dict[tuple[str, str, str], str | None] = {}
         for holder in holders:
             if holder.unreadable or _is_self(incoming, holder):
                 continue
-            live = _live_ref(repo, holder.branch)
+            live = _lookup_live_ref(repo, holder.branch, live_batch)
             holder_live[holder.key] = live
             if live not in (None, _UNREADABLE):
                 candidate_shas.add(live)
@@ -920,6 +1012,7 @@ def take_snapshot(repo: Path, incoming: Incoming, *, orchestrator_root: Path | N
                 if isinstance(tip_sha, str) and _HEX.fullmatch(tip_sha):
                     candidate_shas.add(tip_sha)
         _batch_commit_states(repo, candidate_shas, memo)
+        _batch_integration_ancestors(repo, integration, memo)
         for holder in holders:
             if holder.unreadable or _is_self(incoming, holder):
                 continue
@@ -986,7 +1079,8 @@ def holder_blocks(snapshot: Snapshot, incoming: Incoming, holder: Holder) -> Hol
         return HolderBlock(blocks=blocks, reason=reason, overlap_paths=tuple(sorted(overlap)),
                            holder_tip=tip, holder_lane=holder.lane_id, holder_task=holder.task_ref,
                            holder_branch=holder.branch or None, dispatch_id=holder.dispatch_id,
-                           receipt=holder.receipt, subject=holder.subject, integration_sha=snapshot.integration_sha)
+                           receipt=holder.receipt, subject=holder.subject, integration_sha=snapshot.integration_sha,
+                           receipt_error=holder.receipt_error)
 
     if snapshot.contended:
         return result("retry", SNAPSHOT_CONTENDED)

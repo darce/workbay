@@ -3,6 +3,30 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.55] — 2026-11-27
+
+### Fixed
+- Accept the `refs/workbay/remote-agent/` transport ref namespace in source-provenance validators (internal).
+
+## [0.3.54] — 2026-11-27
+
+### Fixed
+- Preserve the pass ID and underlying error when `review_ratchet` cannot establish nonexecution proof (G18).
+- Drop foreign receipts from retained subject selection when Git proves their heads have landed and the task and branch lineage checks allow it (G18b).
+
+## [0.3.53] - 2026-11-27
+
+### Changed
+- Record lane preparation and observed remote token metrics, including detached turn receipts and Antigravity runs.
+- Accept verified forward canon releases when the review ledger remains compatible, and share the Codex CLI minimum-version probe across preflight and backend registration.
+- Improve remote sandbox reaping, retain cleanup intents for refused and failed terminal outcomes, and accept structured guidance blockers without a prior write attempt.
+- Refresh engine tiers, allow fallback on multiple failure classes, and pass configuration, JSON schema, and timeouts to local OpenAI-compatible models.
+
+## [0.3.52] — 2026-11-26
+
+### Changed
+- Authenticate producer-sealed v2 queue metadata in retained pre-admission refusals so valid claims no longer block subsequent offload admission.
+
 ## [0.3.51] — 2026-11-26
 
 ### Changed

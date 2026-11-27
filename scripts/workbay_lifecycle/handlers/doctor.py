@@ -93,19 +93,15 @@ REMEDIATION_PROBE_DEGRADED = [
 _PROBE_TIMEOUT_ENV = "WORKBAY_DOCTOR_PROBE_TIMEOUT_SECONDS"
 _PROBE_TIMEOUT_DEFAULT_SECONDS = 5.0
 _PROBE_BACKOFF_SLEEPS = (1.0,)
+_WORKTREE_PROBE_TIMEOUT_SECONDS = 1.0
+_TASK_PIN_COMMAND = "WORKBAY_HANDOFF_ACTIVE_TASK='<task_ref>' make doctor"
 
 
 def _probe_timeout_seconds() -> float:
     """Per-attempt probe budget: env override when valid, else the default."""
-    raw = os.environ.get(_PROBE_TIMEOUT_ENV)
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return _PROBE_TIMEOUT_DEFAULT_SECONDS
-        if value > 0:
-            return value
-    return _PROBE_TIMEOUT_DEFAULT_SECONDS
+    return _common._parse_positive_finite_timeout(
+        os.environ.get(_PROBE_TIMEOUT_ENV), _PROBE_TIMEOUT_DEFAULT_SECONDS
+    )
 
 
 _DASHBOARD_FRESH_SECONDS = 24 * 60 * 60
@@ -337,6 +333,14 @@ def _probe_mcp(repo: Path) -> tuple[DoctorMcpProbe, list[ReceiptWarning]]:
         )
     if handoff_warning is not None:
         warnings.append(handoff_warning)
+    if task_resolution is not None:
+        refs = ", ".join(sorted({str(candidate["task_ref"]).strip() for candidate in task_resolution.candidates}))
+        warnings.append(
+            ReceiptWarning(
+                field="mcp.task_resolution",
+                reason=f"Multiple active task mappings: {refs}. {task_resolution.guidance}",
+            )
+        )
 
     orchestrator_status, orchestrator_warning, _ = _probe_with_retry(
         repo,
@@ -878,27 +882,36 @@ def _probe_plan_baseline(
     ), warnings
 
 
-def _integration_target_branches(repo: Path) -> set[str]:
-    primary = resolver.canonical_workspace_root(repo) or repo
+def _integration_target_branches(primary: Path) -> set[str]:
     proc = _common.run_subprocess(
-        ["git", "-C", str(primary), "symbolic-ref", "--short", "-q", "HEAD"]
+        ["git", "-C", str(primary), "symbolic-ref", "--short", "-q", "HEAD"],
+        timeout=_WORKTREE_PROBE_TIMEOUT_SECONDS,
     )
-    integration = (proc.stdout or "").strip()
+    if proc.returncode == 124:
+        raise TimeoutError("integration branch lookup timed out")  # noqa: TRY003
+    integration = proc.stdout.strip() if proc.returncode == 0 else ""
     branches = {"main", "master"}
     if integration:
         branches.update({integration, f"origin/{integration}"})
     return branches
 
 
+def _collision_workspace_root(repo: Path) -> Path:
+    proc = _common.run_subprocess(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        timeout=_WORKTREE_PROBE_TIMEOUT_SECONDS,
+    )
+    if proc.returncode == 124:
+        raise TimeoutError("workspace root lookup timed out")  # noqa: TRY003
+    raw_common_dir = proc.stdout.strip() if proc.returncode == 0 else ""
+    return Path(raw_common_dir).parent if raw_common_dir else repo
+
+
 def _probe_maint_worktree_collision(
     repo: Path,
 ) -> tuple[DoctorMaintWorktreeCollision, list[ReceiptWarning]]:
     """Find MAINT rows that resolve to the same worktree identity."""
-    warnings: list[ReceiptWarning] = []
-    rows, ok = _query_live_handoff_rows(repo)
-    if not ok:
-        note = "handoff-rows query failed"
-        warnings.append(ReceiptWarning(field="maint_worktree_collision", reason=note))
+    def unavailable(note: str) -> tuple[DoctorMaintWorktreeCollision, list[ReceiptWarning]]:
         return (
             DoctorMaintWorktreeCollision(
                 available=False,
@@ -906,11 +919,18 @@ def _probe_maint_worktree_collision(
                 severity="warning",
                 note=note,
             ),
-            warnings,
+            [ReceiptWarning(field="maint_worktree_collision", reason=note)],
         )
 
-    integration_branches = _integration_target_branches(repo)
-    primary_worktree = resolver.canonical_workspace_root(repo) or repo
+    rows, ok = _query_live_handoff_rows(repo)
+    if not ok:
+        return unavailable("handoff-rows query failed")
+    try:
+        primary_worktree = _collision_workspace_root(repo)
+        integration_branches = _integration_target_branches(primary_worktree)
+    except OSError as exc:
+        return unavailable(str(exc) or type(exc).__name__)
+
     candidates_by_worktree: dict[str, set[str]] = {}
     for row in rows:
         task_ref = str(row.get("task_ref") or "").strip()
@@ -919,14 +939,14 @@ def _probe_maint_worktree_collision(
         if str(row.get("target_branch") or "").strip() not in integration_branches:
             continue
         raw_worktree = str(row.get("target_worktree_path") or "").strip()
-        worktree = Path(raw_worktree).expanduser() if raw_worktree else primary_worktree
-        if raw_worktree and not worktree.is_dir():
-            identity = "<unresolvable-worktree>"
-        else:
-            try:
-                identity = os.path.normcase(str(worktree.resolve()))
-            except (OSError, RuntimeError, ValueError):
+        try:
+            worktree = Path(raw_worktree).expanduser() if raw_worktree else primary_worktree
+            if raw_worktree and not worktree.is_dir():
                 identity = "<unresolvable-worktree>"
+            else:
+                identity = os.path.normcase(str(worktree.resolve()))
+        except (OSError, RuntimeError, ValueError):
+            identity = "<unresolvable-worktree>"
         candidates_by_worktree.setdefault(identity, set()).add(task_ref)
 
     candidates = sorted(
@@ -938,13 +958,12 @@ def _probe_maint_worktree_collision(
     if len(candidates) < 2:
         return DoctorMaintWorktreeCollision(
             note="no MAINT worktree collision"
-        ), warnings
+        ), []
 
     note = (
         "multiple live MAINT rows compete for runtime worktree resolution: "
-        f"{', '.join(candidates)}"
+        f"{', '.join(candidates)}. Pin the intended task with WORKBAY_HANDOFF_ACTIVE_TASK."
     )
-    warnings.append(ReceiptWarning(field="maint_worktree_collision", reason=note))
     return (
         DoctorMaintWorktreeCollision(
             status="warning",
@@ -952,18 +971,20 @@ def _probe_maint_worktree_collision(
             colliding_task_refs=candidates,
             note=note,
         ),
-        warnings,
+        [ReceiptWarning(field="maint_worktree_collision", reason=note)],
     )
 
 
-def _suggest_next(branch: DoctorBranch, mcp: DoctorMcp) -> NextCommand:
+def _suggest_next(
+    branch: DoctorBranch, mcp: DoctorMcp, maint_collision: DoctorMaintWorktreeCollision | None = None
+) -> NextCommand:
     """Branch on the tri-state so cold-start (`warming`)
     and outage (`unreachable`) produce distinct operator remediations.
 
     Priority order:
 
     1. Handoff outage — lifecycle gates need it, so this dominates.
-    2. Ambiguous handoff task — select an active task explicitly.
+    2. Ambiguous handoff task or MAINT worktree collision — select a task explicitly.
     3. Handoff cold-start — the probe succeeded on retry, so the right
        advice is "wait a moment, then re-run `make doctor`" rather than
        restarting a healthy server.
@@ -980,9 +1001,11 @@ def _suggest_next(branch: DoctorBranch, mcp: DoctorMcp) -> NextCommand:
         )
     if isinstance(mcp, DoctorMcpProbe) and mcp.task_resolution is not None:
         return NextCommand(
-            command="WORKBAY_HANDOFF_ACTIVE_TASK='<task_ref>' make doctor",
+            command=_TASK_PIN_COMMAND,
             reason="multiple active handoff tasks match this workspace",
         )
+    if maint_collision is not None and maint_collision.colliding_task_refs:
+        return NextCommand(command=_TASK_PIN_COMMAND, reason="multiple live MAINT tasks share a worktree mapping")
     if mcp.mcp_status == "warming":
         return NextCommand(
             command="wait a few seconds and re-run `make doctor`",
@@ -1663,7 +1686,7 @@ def run(argv: list[str]) -> int:
         )
         if interpreter_skew.ci_gate_enabled():
             doctor_ok = False
-    next_command = _suggest_next(branch, mcp)
+    next_command = _suggest_next(branch, mcp, maint_worktree_collision)
 
     receipt_obj = DoctorReceipt(
         ok=doctor_ok,
@@ -1801,6 +1824,9 @@ def run(argv: list[str]) -> int:
             if isinstance(mcp, DoctorMcpProbe) and mcp.task_resolution is not None
             else ""
         )
+        for warning in mcp_warnings:
+            if warning.field == "mcp.task_resolution":
+                sys.stderr.write(f"{warning.reason}\n")
         sys.stderr.write(
             f"doctor: branch={branch.name or '-'} head={(branch.head or '')[:12]} "
             f"dirty={branch.dirty} mcp={mcp.mcp_status} "

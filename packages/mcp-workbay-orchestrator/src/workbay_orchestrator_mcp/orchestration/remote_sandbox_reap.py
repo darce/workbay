@@ -37,6 +37,7 @@ Residual tech-debt:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import json
@@ -201,6 +202,7 @@ class SandboxVerdict:
     kind: str
     tip_sha: str | None
     reason: str
+    probe_refusal: tuple[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1495,7 +1497,7 @@ def _classify(
             detail = error
             if error is None:
                 entries, proof, clean, parse_error = _parse_rowless_probe(raw)
-                detail = parse_error or ("remote product tree changed" if clean else raw.strip())
+                detail = parse_error or ("remote product tree changed" if clean else _probe_detail(raw))
                 if (
                     clean
                     and parse_error is None
@@ -1520,6 +1522,7 @@ def _classify(
                 branch,
                 KIND_SANDBOX_UNHARVESTED,
                 f"terminal alias remote proof failed: {detail or 'missing proof'}",
+                probe_refusal=_parse_dirty_probe(raw),
             )
         statuses = sorted({(row.status or "unknown").strip().lower() for row in mapped.rows})
         return SandboxVerdict(
@@ -1667,7 +1670,8 @@ def _classify(
                 row.branch,
                 KIND_SANDBOX_UNHARVESTED,
                 item.tip_sha,
-                f"lane row status {status}: remote proof failed: {error or parse_error or raw.strip() or 'identity changed'}",
+                f"lane row status {status}: remote proof failed: {error or parse_error or _probe_detail(raw) or 'identity changed'}",
+                probe_refusal=_parse_dirty_probe(raw),
             )
         preserved, detail = _mapped_product_custody(
             repo, _entries or {}, proof, host_tip or "", transition_tip=row.branch_tip_sha
@@ -1723,7 +1727,10 @@ def _classify_rowless_ours(
     if parse_error is not None:
         return _rowless_verdict(item, branch, KIND_PROBE_FAILED, parse_error)
     if not clean:
-        return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, f"rowless ours sandbox is dirty: {raw.strip()}")
+        return _rowless_verdict(
+            item, branch, KIND_SANDBOX_UNHARVESTED, f"rowless ours sandbox is dirty: {_probe_detail(raw)}",
+            probe_refusal=_parse_dirty_probe(raw),
+        )
 
     assert host_entries is not None
     assert remote_entries is not None
@@ -1774,7 +1781,8 @@ def _classify_reclaimed_pin(
             item,
             branch,
             KIND_SANDBOX_UNHARVESTED,
-            f"reclaimed pin sandbox is dirty: {raw.strip() or 'clean proof missing'}",
+            f"reclaimed pin sandbox is dirty: {_probe_detail(raw) or 'clean proof missing'}",
+            probe_refusal=_parse_dirty_probe(raw),
         )
     if proof is None:
         return _rowless_verdict(item, branch, KIND_SANDBOX_UNHARVESTED, "reclaimed pin proof missing")
@@ -1790,7 +1798,10 @@ def _classify_reclaimed_pin(
     )
 
 
-def _rowless_verdict(item: _ListedSandbox, branch: str, kind: str, reason: str) -> SandboxVerdict:
+def _rowless_verdict(
+    item: _ListedSandbox, branch: str, kind: str, reason: str,
+    *, probe_refusal: tuple[str, tuple[str, ...]] | None = None,
+) -> SandboxVerdict:
     return SandboxVerdict(
         sandbox_key=item.key,
         lane_id=None,
@@ -1798,6 +1809,7 @@ def _rowless_verdict(item: _ListedSandbox, branch: str, kind: str, reason: str) 
         kind=kind,
         tip_sha=item.tip_sha,
         reason=reason,
+        probe_refusal=probe_refusal,
     )
 
 
@@ -1813,10 +1825,10 @@ def _host_branch_blobs(repo: Path, branch: str) -> tuple[str | None, TreeEntries
     tip = tip_proc.strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", tip):
         return None, None, f"host tip probe returned malformed sha for {branch}"
-    tree_output, tree_error = _run_local_git(repo, "ls-tree", "-r", "--full-tree", tip)
+    tree_output, tree_error = _run_local_git(repo, "ls-tree", "-rz", "--full-tree", tip)
     if tree_error is not None:
         return None, None, f"host tree probe failed for {branch}: {tree_error}"
-    entries, parse_error = _parse_ls_tree_lines(tree_output.splitlines())
+    entries, parse_error = _parse_ls_tree(tree_output)
     if parse_error is not None:
         return None, None, f"host tree parse failed for {branch}: {parse_error}"
     # Use the dispatch exporter itself: arbitrary missing paths are not proof of
@@ -1848,7 +1860,6 @@ def _run_local_git(repo: Path, *args: str) -> tuple[str, str | None]:
         proc = subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True,
-            text=True,
             check=False,
             timeout=GIT_TIMEOUT_S,
             stdin=subprocess.DEVNULL,
@@ -1856,13 +1867,42 @@ def _run_local_git(repo: Path, *args: str) -> tuple[str, str | None]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return "", str(exc)
     if proc.returncode != 0:
-        return "", (proc.stderr or proc.stdout or f"git exited {proc.returncode}").strip()[:300]
-    return proc.stdout, None
+        detail = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        return "", detail[:300] or f"git exited {proc.returncode}"
+    return proc.stdout.decode("utf-8", "surrogateescape"), None
+
+
+def _decode_git_records(payload: str) -> str:
+    return base64.b64decode(payload, validate=True).decode("utf-8", "surrogateescape")
+
+
+def _parse_dirty_probe(raw: str) -> tuple[str, tuple[str, ...]] | None:
+    reason, _, evidence = raw.removesuffix("\n").partition("\n")
+    if re.fullmatch(r"DIRTY(?: [a-z_]+)?", reason) is None:
+        return None
+    if not evidence:
+        return reason, ()
+    if reason == "DIRTY worktree_inventory" and evidence.startswith("PATHS_Z "):
+        try:
+            paths = _decode_git_records(evidence.removeprefix("PATHS_Z "))
+        except ValueError:
+            return None
+        if paths.endswith("\0") and all(paths[:-1].split("\0")):
+            return reason, tuple(paths[:-1].split("\0"))
+    return None
+
+
+def _probe_detail(raw: str) -> str:
+    refusal = _parse_dirty_probe(raw)
+    if refusal is None:
+        return raw.strip()
+    reason, paths = refusal
+    return f"{reason} paths={json.dumps(paths)}" if paths else reason
 
 
 def _parse_rowless_probe(raw: str) -> tuple[TreeEntries | None, _RowlessProof | None, bool, str | None]:
-    lines = raw.splitlines()
-    if len(lines) == 1 and re.fullmatch(r"DIRTY(?: [a-z_]+)?", lines[0]):
+    lines = raw.removesuffix("\n").split("\n")
+    if _parse_dirty_probe(raw) is not None:
         return {}, None, False, None
     if len(lines) == 1 and re.fullmatch(r"PROBE_FAILED [a-z_]+", lines[0]):
         return None, None, False, lines[0]
@@ -1901,7 +1941,13 @@ def _parse_rowless_probe(raw: str) -> tuple[TreeEntries | None, _RowlessProof | 
             return None, None, False, "delta_malformed"
         proof = replace(proof, delta=delta_text)
         tree_start = delta_end + 1
-    entries, error = _parse_ls_tree_lines(lines[tree_start:])
+    if len(lines) != tree_start + 1 or not lines[tree_start].startswith("TREE_Z:"):
+        return None, None, False, "missing NUL-framed rowless sandbox tree"
+    try:
+        tree = _decode_git_records(lines[tree_start].removeprefix("TREE_Z:"))
+    except ValueError:
+        return None, None, False, "invalid NUL-framed rowless sandbox tree"
+    entries, error = _parse_ls_tree(tree)
     if error is not None:
         return None, None, False, f"unexpected rowless sandbox tree output: {error}"
     return entries, proof, True, None
@@ -1910,7 +1956,7 @@ def _parse_rowless_probe(raw: str) -> tuple[TreeEntries | None, _RowlessProof | 
 def _parse_mapped_delta(raw: str) -> _MappedDelta | None:
     if len(raw.encode()) > _MAPPED_DELTA_BYTE_LIMIT:
         return None
-    lines = raw.splitlines()
+    lines = raw.split("\n")
     if not lines or not re.fullmatch(r"DELTA [0-9a-f]{40}", lines[0]) or lines[-1] != "END_DELTA":
         return None
     worktree: TreeEntries = {}
@@ -1964,10 +2010,10 @@ def _mapped_transition_preserved(
 
     def local(*args: str, data: str | None = None) -> str:
         proc = subprocess.run(
-            ["git", "-C", str(repo), "--no-replace-objects", *args], input=data,
-            capture_output=True, text=True, check=True, timeout=GIT_TIMEOUT_S, env=env,
+            ["git", "-C", str(repo), "--no-replace-objects", *args], input=data.encode() if data is not None else None,
+            capture_output=True, check=True, timeout=GIT_TIMEOUT_S, env=env,
         )
-        return proc.stdout
+        return proc.stdout.decode("utf-8", "surrogateescape")
 
     try:
         # Raw worktree hashes must already be in host custody; never import or
@@ -1996,7 +2042,7 @@ def _mapped_transition_preserved(
                 continue
             carried: set[str] = set()
             for candidate_tree in (tree, parent_tree):
-                candidate, error = _parse_ls_tree_lines(local("ls-tree", "-r", "--full-tree", candidate_tree).splitlines())
+                candidate, error = _parse_ls_tree(local("ls-tree", "-rz", "--full-tree", candidate_tree))
                 if error is not None:
                     return False, "delta_host_tree_unreadable"
                 carried.update(entry[2] for entry in candidate.values())
@@ -2024,15 +2070,15 @@ def _mapped_product_custody(
     return False, "mapped reachable_history or synthetic-base translation is unpreserved"
 
 
-def _parse_ls_tree_lines(lines: Sequence[str]) -> tuple[TreeEntries, str | None]:
+def _parse_ls_tree(tree: str) -> tuple[TreeEntries, str | None]:
+    if tree and not tree.endswith("\0"):
+        return {}, "unterminated git tree record"
     entries: TreeEntries = {}
-    for line in lines:
-        match = re.fullmatch(r"(100644|100755|120000) (blob) ([0-9a-f]{40})\t([^\r\n]+)", line)
+    for record in tree.split("\0")[:-1]:
+        match = re.fullmatch(r"(100644|100755|120000) (blob) ([0-9a-f]{40})\t(.+)", record, re.DOTALL)
         if match is None:
-            return {}, repr(line)
+            return {}, repr(record)
         path = match.group(4)
-        if path.startswith('"'):
-            return {}, f"unsupported quoted path {path!r}"
         if path in entries:
             return {}, f"duplicate path {path!r}"
         entries[path] = (match.group(1), match.group(2), match.group(3))
@@ -3376,10 +3422,6 @@ try:
         remaining()
         meta, path = entry.split(b"\t", 1)
         mode, kind, oid = meta.split()
-        # --stdin-paths is line-delimited and C-unquotes a leading double quote.
-        # Never silently drop or reinterpret an entry that cannot be sent raw.
-        if b"\n" in path or path.startswith(b'"'):
-            refuse("content_unsafe_path")
         if kind != b"blob":
             refuse("raw_content")
         info = os.lstat(os.path.join(os.fsencode(root), path))
@@ -3388,6 +3430,10 @@ try:
                 refuse("raw_content")
             if bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
                 refuse("worktree_inventory")
+            # Git C-unquotes these inputs before opening the path. Encode
+            # literal quotes and line breaks without splitting path records.
+            if b"\n" in path or path.startswith(b'"'):
+                path = b'"' + b''.join(br'\%03o' % byte for byte in path) + b'"'
             paths.append(path)
             expected.append(oid)
         elif mode == b"120000":
@@ -3558,19 +3604,18 @@ def _remote_helpers(root: str, *, operation_timeout: float | None = None, mapped
     artifact_cases = []
     for name in _MAPPED_RUNTIME_ARTIFACTS if mapped_proof else ():
         if name == ".ruff_cache/":
-            artifact_cases.append(f"        {_sh_single_quote('! ' + name)}|'! '*/{name}) ;;\n")
-        elif name.endswith("/"):
+            continue  # Covered by the shared ignored cache inventory.
+        if name.endswith("/"):
             artifact_cases.append(
                 f"        {_sh_single_quote('! ' + name)})\n"
-                f'          [ -d "$1/{name[:-1]}" ] && [ ! -L "$1/{name[:-1]}" ] || return 1 ;;\n'
+                f'          if [ -d "$1/{name[:-1]}" ] && [ ! -L "$1/{name[:-1]}" ]; then continue; fi; _inventory_refused=1 ;;\n'
             )
         else:
             artifact_cases.append(
                 f"        {_sh_single_quote('! ' + name)})\n"
-                f'          [ -f "$1/{name}" ] && [ ! -L "$1/{name}" ] || return 1 ;;\n'
+                f'          if [ -f "$1/{name}" ] && [ ! -L "$1/{name}" ]; then continue; fi; _inventory_refused=1 ;;\n'
             )
     mapped_init = "  _base_tree=\n  _mapped_changed_inventory=0\n" if mapped_proof else ""
-    changed_arm = "        '1 '*|'2 '*|'? '*) _mapped_changed_inventory=1 ;;\n" if mapped_proof else ""
     changed_guard = (
         '    if [ "$_mapped_changed_inventory" = 1 ]; then\n'
         '      [ -n "$_base" ] && [ -n "$_source_commit" ] || return 1\n'
@@ -3781,35 +3826,65 @@ _rowless_inventory_git() {{
   git -c core.ignorecase=false -c core.filemode=true -c core.symlinks=true -c core.fsmonitor=false -c core.untrackedCache=false -c core.trustctime=true -c core.checkStat=default -C "$_inventory_root" --work-tree="$_inventory_root" --git-dir="$_inventory_root/.git" "$@"
 }}
 _rowless_inventory_safe() {{
+  local LC_ALL=C
   _inventory_root="$1"
   _source_commit=
   _translated_source_commit=
 {mapped_init}  _inventory_reason=worktree_inventory
-  # Rowless inventory exempts only the dispatcher-owned marker.
-  _inventory_status=$(_rowless_inventory_git status --porcelain=v2 --ignored=matching --untracked-files=all -- . ':(top,exclude,literal).workbay-lane-sandbox') || return 1
-  if [ "${{3:-rowless}}" = mapped ]; then
-    # remote_agent.sh provisions only this sibling venv symlink. Repository
-    # ignores designate dependency/test caches; arbitrary ignored source is kept.
-    while IFS= read -r _entry; do
+  _inventory_paths=()
+  _inventory_refused=0
+  _inventory_complete=0
+  # The terminator distinguishes a complete empty inventory from a failed Git
+  # invocation. NUL reads preserve filenames and consume both rename paths.
+  while IFS= read -r -d '' _entry; do
+    if [ "$_entry" = END ]; then _inventory_complete=1; break; fi
+    _original=
+    case "$_entry" in
+      '! '*|'? '*) _path=${{_entry:2}} ;;
+      '1 '*|'2 '*|'u '*)
+        case "${{_entry:0:1}}" in 1) _fields=7 ;; 2) _fields=8 ;; u) _fields=9 ;; esac
+        [[ "$_entry" =~ ^.(\\ [^\\ ]+){{$_fields}}\\ (.+)$ ]] || return 1
+        _path="${{BASH_REMATCH[2]}}"
+        if [[ "$_entry" == '2 '* ]]; then
+          IFS= read -r -d '' _original || return 1
+        fi ;;
+      *) return 1 ;;
+    esac
+    # A cache-shaped filename or symlink has no slash after its name. Only
+    # ignored directories and their ignored members are regenerable.
+    if [[ "$_entry" == '! '* && "$_path" =~ (^|/)(\\.pytest_cache|\\.ruff_cache|\\.mypy_cache|[^/]*\\.egg-info|\\.venv|node_modules|\\.task-state)/ ]]; then
+      continue
+    fi
+    if [ "${{3:-rowless}}" = mapped ]; then
+      # Preserve the dispatcher's sibling venv symlink and runtime artifacts.
       case "$_entry" in
-        '') ;;
         '! .venv')
-          [ -L "$1/.venv" ] &&
-            [ "$(readlink -- "$1/.venv")" = "$ROOT/.venv-lane-$_sk" ] || return 1 ;;
-        '! .pytest_cache/'|'! __pycache__/'|'! node_modules/') ;;
-        '! '*/.pytest_cache/|'! '*/__pycache__/|'! '*/node_modules/) ;;
+          if [ -L "$1/.venv" ] && [ "$(readlink -- "$1/.venv")" = "$ROOT/.venv-lane-$_sk" ]; then continue; fi
+          _inventory_refused=1 ;;
+        '! __pycache__/'|'! '*/__pycache__/) continue ;;
 {"".join(artifact_cases)}        '! .workbay-source-provenance')
           [ -f "$1/.workbay-source-provenance" ] && [ ! -L "$1/.workbay-source-provenance" ] || return 1
           _provenance=$(_guard_regular_read "$1/.workbay-source-provenance") || return 1
           _base_tree=$(_rowless_inventory_git rev-parse "$_base^{{tree}}") || return 1
           [[ "$_provenance" =~ ^source_commit=[0-9a-f]{{40}}$'\\n'source_tree=$_base_tree$'\\n'sandbox_base_commit=$_base$'\\n'sandbox_base_tree=$_base_tree$ ]] || return 1
           _source_commit="${{_provenance%%$'\\n'*}}"
-          _source_commit="${{_source_commit#source_commit=}}" ;;
-{changed_arm}        *) return 1 ;;
+          _source_commit="${{_source_commit#source_commit=}}"
+          continue ;;
+        '1 '*|'2 '*|'? '*) _mapped_changed_inventory=1 ;;
+        *) _inventory_refused=1 ;;
       esac
-    done <<< "$_inventory_status"
-{changed_guard}  else
-    [ -z "$_inventory_status" ] || return 1
+    else
+      _inventory_refused=1
+    fi
+    _inventory_paths+=("$_path")
+    [ -z "$_original" ] || _inventory_paths+=("$_original")
+  done < <(
+    _rowless_inventory_git status --porcelain=v2 -z --ignored=matching --untracked-files=all -- . ':(top,exclude,literal).workbay-lane-sandbox' &&
+      printf 'END\\0'
+  )
+  [ "$_inventory_complete" = 1 ] && [ "$_inventory_refused" = 0 ] || return 1
+  if [ "${{3:-rowless}}" = mapped ]; then
+{changed_guard}    :
   fi
   _inventory_reason=extra_refs
   _head_ref=$(_rowless_inventory_git symbolic-ref -q HEAD) || return 1
@@ -4307,7 +4382,15 @@ _content_reason=$(_rowless_content_safe "$_sd" {_sh_single_quote(host_tip)}) || 
   fi
   exit 0
 }}
-_rowless_inventory_safe "$_sd" {_sh_single_quote(host_tip)} {"mapped" if mapped_product else "rowless"} || {{ echo "DIRTY $_inventory_reason"; exit 0; }}
+_rowless_inventory_safe "$_sd" {_sh_single_quote(host_tip)} "$_proof_domain" || {{
+  echo "DIRTY $_inventory_reason"
+  if [ "$_inventory_reason" = worktree_inventory ] && [ "${{#_inventory_paths[@]}}" -gt 0 ]; then
+    printf 'PATHS_Z '
+    printf '%s\\0' "${{_inventory_paths[@]}}" | base64 -w0
+    printf '\\n'
+  fi
+  exit 0
+}}
 _delta=
 if [ "$_proof_domain" = mapped ] && [ -n "$_translated_source_commit" ]; then
   _delta=$(_mapped_delta_safe "$_sd") || {{
@@ -4327,7 +4410,11 @@ esac
 printf 'CLEAN\nTREE %s\nGENERATION %s\nKEY %s\nHEAD %s\nARTIFACTS %s\n' "$_tree" "$_generation" "$_sk" "$_tip" "$_artifacts"
 [ -z "$_translated_source_commit" ] || printf 'SOURCE_COMMIT %s\n' "$_translated_source_commit"
 [ -z "$_delta" ] || printf '%s\n' "$_delta"
-git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" ls-tree -r --full-tree "$_tree"
+# ASCII armor protects Git's NUL records from the SSH runner's text decoding.
+set -o pipefail
+printf 'TREE_Z:'
+git -C "$_sd" --work-tree="$_sd" --git-dir="$_sd/.git" ls-tree -rz --full-tree "$_tree" | base64 -w0
+printf '\\n'
 """
     return _bounded_native_script(payload, "PROBE_FAILED content_deadline")
 

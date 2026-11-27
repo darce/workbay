@@ -74,7 +74,7 @@ def _policy_interpreter_key(candidate: str) -> dict | None:
     try:
         resolved = Path(candidate).resolve(strict=True)
         info = resolved.stat()
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return None
     return {
         "schema_version": _POLICY_VERDICT_SCHEMA_VERSION,
@@ -104,19 +104,32 @@ def _policy_verdict_directory(*, create: bool = False) -> Path:
     return directory
 
 
-def _cached_policy_interpreter(key: dict | None) -> bool:
-    if key is None:
-        return False
+def _read_policy_interpreter_verdict() -> dict | None:
     try:
         path = _policy_verdict_directory() / "policy-interpreter.json"
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, encoding="utf-8") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
-                return False
-            return json.loads(stream.read(8192)) == key
+                return None
+            verdict = json.loads(stream.read(8192))
+            return verdict if isinstance(verdict, dict) else None
     except (OSError, ValueError):
-        return False
+        return None
+
+
+def _cached_policy_interpreter(key: dict | None) -> bool:
+    return key is not None and _read_policy_interpreter_verdict() == key
+
+
+def _cached_policy_python() -> str:
+    verdict = _read_policy_interpreter_verdict()
+    candidate = verdict.get("invocation_path") if verdict else None
+    if not isinstance(candidate, str) or not os.path.isabs(candidate) or "\n" in candidate:
+        return ""
+    if _policy_interpreter_key(candidate) == verdict and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return ""
 
 
 def _cache_policy_interpreter(key: dict | None) -> None:
@@ -240,31 +253,61 @@ def _policy_python_eligible() -> bool:
     return True
 
 
+def _native_policy_pythons():
+    home = Path.home()
+    console_dirs = (os.environ.get("UV_TOOL_BIN_DIR"), os.environ.get("XDG_BIN_HOME"), home / ".local/bin")
+    consoles = [shutil.which("workbay"), *(Path(directory) / "workbay" for directory in console_dirs if directory)]
+    for console in consoles:
+        if console and os.path.isfile(console) and os.access(console, os.X_OK):
+            try:
+                with open(console, "rb") as stream:
+                    first_line = os.fsdecode(stream.readline(4096))
+            except OSError:
+                continue
+            tokens = first_line[2:].split() if first_line.startswith("#!") else []
+            if tokens and os.path.isabs(tokens[0]) and "python" in os.path.basename(tokens[0]):
+                yield tokens[0]
+
+    data_home = os.environ.get("XDG_DATA_HOME")
+    tool_dirs = (
+        os.environ.get("UV_TOOL_DIR"),
+        Path(data_home) / "uv/tools" if data_home else None,
+        home / ".local/share/uv/tools",
+    )
+    for directory in tool_dirs:
+        if directory:
+            tool_dir = Path(directory)
+            paths = [tool_dir / "workbay/bin/python", *sorted(tool_dir.glob("workbay*/bin/python"))]
+            for candidate in paths:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    yield str(candidate)
+
+
+def _repo_policy_python(root: str, deadline: float) -> str:
+    if sys.version_info < _MIN_POLICY_PYTHON:
+        # Unsupported runtimes have one terminal diagnostic, including
+        # when resolver origin checks cannot run from an installed copy.
+        with contextlib.redirect_stderr(io.StringIO()):
+            return _deps_python(repo_root=root, budget_seconds=deadline - time.monotonic())
+    return _deps_python(repo_root=root, budget_seconds=deadline - time.monotonic())
+
+
 def _policy_python_candidates(root: str, deadline: float):
     explicit = os.environ.get("WORKBAY_TOOL_PYTHON")
     if explicit is not None:
         yield explicit, True
+    # Keep an existing project venv ahead of installed tools. With no local
+    # venv, discover native tools before git and origin probes in the resolver.
+    local_venv = any((Path(root) / ".venv" / path).is_file() for path in ("bin/python", "Scripts/python.exe"))
+    if local_venv and time.monotonic() < deadline:
+        yield _repo_policy_python(root, deadline), False
     if time.monotonic() < deadline:
-        if sys.version_info < _MIN_POLICY_PYTHON:
-            # Unsupported runtimes have one terminal diagnostic, including
-            # when resolver origin checks cannot run from an installed copy.
-            with contextlib.redirect_stderr(io.StringIO()):
-                candidate = _deps_python(repo_root=root, budget_seconds=deadline - time.monotonic())
-        else:
-            candidate = _deps_python(repo_root=root, budget_seconds=deadline - time.monotonic())
-        yield candidate, False
-    if time.monotonic() < deadline:
-        workbay_bin = shutil.which("workbay")
-        if workbay_bin:
-            try:
-                with open(workbay_bin, encoding="utf-8") as stream:
-                    first_line = stream.readline()
-            except (OSError, UnicodeDecodeError):
-                first_line = ""
-            if first_line.startswith("#!") and "python" in first_line:
-                tokens = first_line[2:].split()
-                if tokens:
-                    yield tokens[0], False
+        for candidate in _native_policy_pythons():
+            if time.monotonic() >= deadline:
+                return
+            yield candidate, False
+    if not local_venv and time.monotonic() < deadline:
+        yield _repo_policy_python(root, deadline), False
 
 
 def _probe_policy_python(candidate: str, timeout: float) -> str | None:
@@ -564,4 +607,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--cached-policy-python"]:
+        candidate = _cached_policy_python()
+        if candidate:
+            print(candidate)
+        sys.exit(0 if candidate else 1)
     sys.exit(main(sys.argv[1:]))

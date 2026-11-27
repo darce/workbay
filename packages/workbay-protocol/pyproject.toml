@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-protocol"
-version = "0.3.28"
+version = "0.3.29"
 description = "Typed cross-repo contracts for the WorkBay system: handoff state, MCP I/O, hook events, skill manifests, bootstrap install manifest."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,3 +48,25 @@ exclude = ["**/__pycache__", "**/*.pyc"]
 tmp_path_retention_policy = "failed"
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+warn_return_any = true
+warn_unused_ignores = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+# Current diagnostics in legacy modules. Other diagnostics stay enabled.
+
+[[tool.mypy.overrides]]
+module = ["workbay_protocol.bootstrap"]
+disable_error_code = ["arg-type", "return-value"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_protocol.canon_lint", "workbay_protocol.embedding_policy", "workbay_protocol.resource_lifecycle"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_protocol.convergence"]
+disable_error_code = ["misc", "no-any-return", "unused-ignore"]

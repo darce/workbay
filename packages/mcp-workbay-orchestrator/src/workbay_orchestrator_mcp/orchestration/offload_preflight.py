@@ -1688,7 +1688,7 @@ def _materialize_legacy_lane_scope(
         lane_id=lane_id,
         worktree_path=worktree,
         branch=existing_branch,
-        preferred_backend=existing_backend or GROK_OFFLOAD_BACKEND,
+        preferred_backend=existing_backend,
         preferred_model=preferred_model,
         preferred_reasoning_effort=preferred_reasoning_effort,
         preferred_speed=preferred_speed,
@@ -2013,11 +2013,10 @@ def materialize_offload_lane_manifest(
     clear_preferred_speed = preferred_speed == ""
     clear_preferred_tier = preferred_tier == ""
     effective_backend = (
-        str(row_routing.get("backend") or manifest_routing.get("preferred_backend") or GROK_OFFLOAD_BACKEND)
+        str(row_routing.get("backend") or manifest_routing.get("preferred_backend") or "")
         if preferred_backend is None or clear_preferred_backend
         else preferred_backend
     )
-    preferred_backend = effective_backend
     if preferred_model is None:
         preferred_model = row_routing.get("model") or manifest_routing.get("preferred_model")
     if preferred_reasoning_effort is None:
@@ -2036,10 +2035,14 @@ def materialize_offload_lane_manifest(
             f"lane {lane_id!r} branch reference is invalid: {branch!r}",
             outcome=DISPATCH_REFUSED_OUTCOME,
         )
+    if not effective_backend.strip():
+        effective_backend, backend_error = resolve_offload_backend_for_execution_mode(None, repo_root=resolved_worktree)
+        if backend_error is not None:
+            raise OffloadPreflightError(backend_error, outcome="remote_required")
     branch = branch.strip()
     pin: dict[str, str] = {"branch": branch, "worktree_path": resolved_worktree}
     if not clear_preferred_backend:
-        pin["preferred_backend"] = preferred_backend
+        pin["preferred_backend"] = effective_backend
     selected_model = preferred_model
     normalized_tier = str(preferred_tier or "").strip().lower()
     if preferred_tier is not None and preferred_tier != "":
@@ -2052,8 +2055,9 @@ def materialize_offload_lane_manifest(
         tier_rows = [row for row in CODEX_MODEL_TIERS.values() if row.tier == normalized_tier and row.entitled]
         if not tier_rows:
             raise OffloadPreflightError(f"preferred_tier {normalized_tier!r} has no entitled model")
-        selected_model = selected_model or tier_rows[0].slug
-        preferred_reasoning_effort = preferred_reasoning_effort or tier_rows[0].default_effort
+        default_row = next((row for row in tier_rows if row.slug == row.default_model), tier_rows[0])
+        selected_model = selected_model or default_row.slug
+        preferred_reasoning_effort = preferred_reasoning_effort or default_row.default_effort
         preferred_speed = "standard" if preferred_speed is None else preferred_speed
         pin["preferred_tier"] = normalized_tier
     # Pin preferred_model for every offload profile that declares one (implementation note
@@ -2737,8 +2741,6 @@ def _materialize_missing_offload_manifest(
             "error": named,
         }
 
-    # implementation note S2: third defaulting path for dispatch_lane_work auto-materialize
-    # inherits remote_only → grok-remote (and refuses explicit local pins).
     backend, remote_required_error = resolve_offload_backend_for_execution_mode(
         preferred_backend,
         repo_root=wt,

@@ -66,7 +66,10 @@ def _apply_artifact_journal_mode_wal(conn: sqlite3.Connection) -> None:
             delay_ms = _ARTIFACT_JOURNAL_MODE_WAL_RETRY_DELAYS_MS[
                 min(attempt, len(_ARTIFACT_JOURNAL_MODE_WAL_RETRY_DELAYS_MS) - 1)
             ]
-            time.sleep(delay_ms / 1000.0)
+            delay = delay_ms / 1000.0
+            if isinstance(conn, _DeadlineConnection):
+                delay = min(delay, conn.remaining_ms() / 1000)
+            time.sleep(delay)
     assert last_exc is not None
     raise last_exc
 
@@ -195,21 +198,70 @@ def _artifact_schema_bootstrapped(conn: sqlite3.Connection) -> bool:
     return {str(row["name"]) for row in rows} == {"artifact_sources", "artifact_chunks_fts"}
 
 
-def get_artifact_db_connection(artifact_db_path: Path) -> sqlite3.Connection:
+class _DeadlineConnection(sqlite3.Connection):
+    """Give each statement only the remaining lock and query budget."""
+
+    deadline: float
+
+    def remaining_ms(self) -> int:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("artifact database deadline exceeded")  # noqa: TRY003
+        return min(_ARTIFACT_SQLITE_BUSY_TIMEOUT_MS, int(remaining * 1000))
+
+    def _refresh_timeout(self) -> None:
+        super().execute(f"PRAGMA busy_timeout={self.remaining_ms()}")
+
+    def execute(self, sql, parameters=()):
+        self._refresh_timeout()
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        self._refresh_timeout()
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql_script):
+        self._refresh_timeout()
+        return super().executescript(sql_script)
+
+    def commit(self):
+        self._refresh_timeout()
+        return super().commit()
+
+
+def get_artifact_db_connection(
+    artifact_db_path: Path, *, deadline: float | None = None, read_only: bool = False
+) -> sqlite3.Connection:
     """Open (or create) the sidecar artifact database, apply the schema, and return the connection.
 
-    Raises RuntimeError if the local SQLite build does not support FTS5.
+    The default opener checks FTS5 support and bootstraps the schema. With
+    ``read_only``, the sidecar and schema must already exist. A monotonic
+    ``deadline`` limits lock waits and interrupts long-running statements.
     """
-    artifact_db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(artifact_db_path))
+    if read_only:
+        target = artifact_db_path.absolute().as_uri() + "?mode=ro"
+    else:
+        artifact_db_path.parent.mkdir(parents=True, exist_ok=True)
+        target = str(artifact_db_path)
+    if deadline is None:
+        conn = sqlite3.connect(target, uri=read_only)
+    else:
+        bounded = sqlite3.connect(target, uri=read_only, timeout=0, factory=_DeadlineConnection)
+        bounded.deadline = deadline
+        bounded.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+        conn = bounded
     conn.row_factory = sqlite3.Row
     try:
+        if read_only:
+            return conn
         # busy_timeout before journal_mode so patience is set early. Ordering
         # does NOT fix the journal_mode race (exclusive-access bypasses the
         # busy handler); RES-06 retry below is the remedy.
         conn.execute(f"PRAGMA busy_timeout={_ARTIFACT_SQLITE_BUSY_TIMEOUT_MS};")
         _apply_artifact_journal_mode_wal(conn)
-        if not check_fts5_available(conn):
+        # The bounded writer uses the installed schema or lets CREATE
+        # VIRTUAL TABLE test FTS5 in the cold-start transaction.
+        if deadline is None and not check_fts5_available(conn):
             raise RuntimeError(
                 "SQLite FTS5 extension is not available on this system. "
                 "mcp-workbay-handoff artifact indexing requires FTS5. "
@@ -217,7 +269,11 @@ def get_artifact_db_connection(artifact_db_path: Path) -> sqlite3.Connection:
                 "that bundles FTS5 (e.g. system Python on macOS 10.15+ or major Linux distros)."
             )
         if not _artifact_schema_bootstrapped(conn):
-            conn.executescript(ARTIFACT_SCHEMA_SQL)
+            if deadline is None:
+                conn.executescript(ARTIFACT_SCHEMA_SQL)
+            else:
+                conn.executescript("BEGIN IMMEDIATE;\n" + ARTIFACT_SCHEMA_SQL)
+                conn.commit()
     except Exception:
         conn.close()
         raise
@@ -225,13 +281,15 @@ def get_artifact_db_connection(artifact_db_path: Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def _immediate_write(artifact_db_path: Path) -> Iterator[sqlite3.Connection]:
+def _immediate_write(artifact_db_path: Path, *, deadline: float | None = None) -> Iterator[sqlite3.Connection]:
     """Yield a connection holding the artifact write lock until commit or rollback."""
-    conn = get_artifact_db_connection(artifact_db_path)
+    conn = get_artifact_db_connection(artifact_db_path, deadline=deadline)
     try:
         with conn:
             conn.execute("BEGIN IMMEDIATE")
             yield conn
+            if deadline is not None:
+                conn.commit()
     finally:
         conn.close()
 
@@ -961,36 +1019,32 @@ def prune_artifact_sources(
     source_kind: str,
     keep: int,
     artifact_db_path: Path,
+    deadline: float | None = None,
 ) -> int:
     """Keep the newest sources for exactly one task, lane and kind; return deletions."""
     if keep < 0:
         raise ValueError("keep must be non-negative")
-    conn = get_artifact_db_connection(artifact_db_path)
-    try:
-        with conn:
-            conn.execute("BEGIN IMMEDIATE")
-            ids = [
-                int(row["id"])
-                for row in conn.execute(
-                    """
-                    SELECT id FROM artifact_sources
-                    WHERE task_ref = ? AND lane_id IS ? AND source_kind = ?
-                    ORDER BY updated_at DESC, id DESC LIMIT -1 OFFSET ?
-                    """,
-                    [task_ref, lane_id, source_kind, keep],
-                ).fetchall()
-            ]
-            if not ids:
-                return 0
-            placeholders = ",".join("?" * len(ids))
-            conn.execute(
-                f"DELETE FROM artifact_chunks_fts WHERE source_id IN ({placeholders})",
-                [str(source_id) for source_id in ids],
-            )
-            conn.execute(f"DELETE FROM artifact_sources WHERE id IN ({placeholders})", ids)
+    with _immediate_write(artifact_db_path, deadline=deadline) as conn:
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id FROM artifact_sources
+                WHERE task_ref = ? AND lane_id IS ? AND source_kind = ?
+                ORDER BY updated_at DESC, id DESC LIMIT -1 OFFSET ?
+                """,
+                [task_ref, lane_id, source_kind, keep],
+            ).fetchall()
+        ]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"DELETE FROM artifact_chunks_fts WHERE source_id IN ({placeholders})",
+            [str(source_id) for source_id in ids],
+        )
+        conn.execute(f"DELETE FROM artifact_sources WHERE id IN ({placeholders})", ids)
         return len(ids)
-    finally:
-        conn.close()
 
 
 def list_artifact_sources(

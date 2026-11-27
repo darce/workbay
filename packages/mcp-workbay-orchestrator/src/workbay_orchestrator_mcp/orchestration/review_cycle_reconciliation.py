@@ -1190,6 +1190,8 @@ class HolderReleaseWalk:
                     elif data.get("holder_releases"):
                         raise ValueError("unprotected holder release events")
         except (_Hold, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("trusted_canon_"):
+                raise
             raise cycle.HolderLedgerUnavailable("review_cycle_holder_release_ledger_unavailable") from exc
         # holder_releases events stay decodable for audit; holds never read them.
 

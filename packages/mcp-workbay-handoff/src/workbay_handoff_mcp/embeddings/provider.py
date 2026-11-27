@@ -1,9 +1,9 @@
-"""Local, offline gte-base-en-v1.5 embedding provider (implementation note, implementation note).
+"""Pinned ONNX embeddings and an opt-in OpenAI-compatible HTTP provider.
 
 Design constraints (from the plan / scope):
 
-- **Offline & deterministic.** The provider never reaches the network on any code
-  path. The ~147MB int8 ONNX model is *not* bundled; it is resolved from an
+- **Offline & deterministic by default.** The ONNX provider never reaches the
+  network. The ~147MB int8 ONNX model is resolved from an
   explicit, hash-pinned artifact location (e.g. env-configured local path). An
   absent artifact or missing optional libs is a clean degrade, not a fetch.
 - **No prefixes.** gte-base-en-v1.5 requires no query/passage instruction prefix;
@@ -26,19 +26,24 @@ needs only the (optional) numpy dependency.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 import numpy as np
 
-from workbay_handoff_mcp.embeddings.model_pin import EMBEDDING_DIM, MODEL_ID
+from workbay_handoff_mcp.bounded_call import run_with_daemon_timeout, validate_timeout_seconds
+from workbay_handoff_mcp.embeddings.model_pin import EMBEDDING_DIM, MODEL_ID, OpenAIEmbeddingDescriptor
 
 # Bound measured corpus comfortably: concept + compaction texts peak ~1.4k
 # tokens; 2048 is lossless for every observed row with headroom.
@@ -63,6 +68,16 @@ ENV_MODEL_SHA256 = "WORKBAY_HANDOFF_EMBEDDING_MODEL_SHA256"
 ENV_TOKENIZER_SHA256 = "WORKBAY_HANDOFF_EMBEDDING_TOKENIZER_SHA256"
 ENV_EMBEDDINGS_DISABLED = "WORKBAY_HANDOFF_EMBEDDINGS_DISABLED"
 ENV_EMBEDDING_THREADS = "WORKBAY_HANDOFF_EMBEDDING_THREADS"
+ENV_API_URL = "WORKBAY_HANDOFF_EMBEDDING_API_URL"
+ENV_API_MODEL = "WORKBAY_HANDOFF_EMBEDDING_API_MODEL"
+ENV_API_KEY = "WORKBAY_HANDOFF_EMBEDDING_API_KEY"
+ENV_API_DIM = "WORKBAY_HANDOFF_EMBEDDING_API_DIM"
+ENV_API_TIMEOUT = "WORKBAY_HANDOFF_EMBEDDING_TIMEOUT_S"
+DEFAULT_API_TIMEOUT_SECONDS = 5.0
+MAX_API_TIMEOUT_SECONDS = 60.0
+_MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
+_API_REQUIRED_KEYS = (ENV_API_URL, ENV_API_MODEL)
+_ONNX_REQUIRED_KEYS = (ENV_MODEL, ENV_TOKENIZER, ENV_MODEL_SHA256, ENV_TOKENIZER_SHA256)
 
 _TRUE_VALUES = frozenset({"1", "true", "yes"})
 _VERIFY_CACHE_NAME = "verify-cache.json"
@@ -187,6 +202,12 @@ def _embeddings_disabled(env: Mapping[str, str]) -> bool:
     return raw.strip().lower() in _TRUE_VALUES
 
 
+def _missing_provider_keys(env: Mapping[str, str]) -> tuple[str, ...]:
+    if any(env.get(key, "").strip() for key in _API_REQUIRED_KEYS):
+        return tuple(key for key in _API_REQUIRED_KEYS if not env.get(key, "").strip())
+    return tuple(key for key in _ONNX_REQUIRED_KEYS if not env.get(key))
+
+
 class EmbeddingArtifactError(RuntimeError):
     """Raised when an embedding artifact is missing, unreadable, corrupt, hash-mismatched, or its runtime libs are absent."""
 
@@ -200,6 +221,10 @@ class EmbeddingArtifactError(RuntimeError):
         super().__init__(message)
         self.path = path
         self.kind = kind
+
+
+class EmbeddingAPIError(EmbeddingArtifactError):
+    """Endpoint failure reported through the existing embedding degradation path."""
 
 
 def _load_failure(path: Path, exc: Exception) -> EmbeddingArtifactError:
@@ -225,7 +250,7 @@ def embedding_unavailable_reason(
     """Classify *why* embeddings are unavailable.
 
     Env-only (no ``exc``): ``"disabled"`` when embeddings are explicitly turned
-    off, ``"unconfigured"`` when the artifact env vars / SHA pins are missing,
+    off, ``"unconfigured"`` when required provider settings are missing,
     or ``None`` when a provider is constructible. Mirrors ``from_env``'s two
     ``None`` branches so callers can report a typed skip reason instead of the
     generic ``"provider_unavailable"``. Never loads the artifact or imports the
@@ -233,21 +258,19 @@ def embedding_unavailable_reason(
 
     With ``exc``: names a genuine provider fault rather than collapsing it into
     the same absence. ``EmbeddingArtifactError`` / ``ImportError`` are
-    ``"deps_or_model_missing"`` (artifact or optional runtime absent);
-    any other exception is ``"error"`` (inference or unexpected fault).
+    ``"deps_or_model_missing"`` (artifact or optional runtime absent).
+    API deadline failures are ``"timeout"``. Other faults are ``"error"``.
     """
     if exc is not None:
+        if isinstance(exc, EmbeddingAPIError):
+            return "timeout" if exc.kind == "api_timeout" else "error"
         if isinstance(exc, (EmbeddingArtifactError, ImportError)):
             return "deps_or_model_missing"
         return "error"
     source = os.environ if env is None else env
     if _embeddings_disabled(source):
         return "disabled"
-    model = source.get(ENV_MODEL)
-    tokenizer = source.get(ENV_TOKENIZER)
-    model_sha = source.get(ENV_MODEL_SHA256)
-    tokenizer_sha = source.get(ENV_TOKENIZER_SHA256)
-    if not (model and tokenizer and model_sha and tokenizer_sha):
+    if _missing_provider_keys(source):
         return "unconfigured"
     return None
 
@@ -459,7 +482,7 @@ class EmbeddingProvider:
 
     def __init__(
         self,
-        spec: ArtifactSpec,
+        spec: ArtifactSpec | OpenAIEmbeddingDescriptor,
         *,
         max_attention_bytes: int | None = None,
         embedding_threads: int | None = None,
@@ -504,20 +527,21 @@ class EmbeddingProvider:
     def from_env(cls, env: dict[str, str] | None = None) -> EmbeddingProvider | None:
         """Build from the opt-in env configuration, or ``None`` (clean degrade) if unset.
 
-        Returns ``None`` when the artifact is not fully configured so callers fall
-        back to non-semantic reinjection. Never fetches anything.
+        A URL and model select the API provider. Otherwise the offline provider
+        requires both artifacts and their hashes. Provider resolution performs no I/O.
         """
         source = os.environ if env is None else env
-        if _embeddings_disabled(source):
+        if _embeddings_disabled(source) or _missing_provider_keys(source):
             return None
-        model = source.get(ENV_MODEL)
-        tokenizer = source.get(ENV_TOKENIZER)
-        model_sha = source.get(ENV_MODEL_SHA256)
-        tokenizer_sha = source.get(ENV_TOKENIZER_SHA256)
-        if not (model and tokenizer and model_sha and tokenizer_sha):
-            return None
+        if source.get(ENV_API_URL, "").strip():
+            return _api_provider_from_env(source)
         return cls(
-            ArtifactSpec(Path(model), Path(tokenizer), model_sha, tokenizer_sha),
+            ArtifactSpec(
+                Path(source[ENV_MODEL]),
+                Path(source[ENV_TOKENIZER]),
+                source[ENV_MODEL_SHA256],
+                source[ENV_TOKENIZER_SHA256],
+            ),
             max_attention_bytes=resolve_max_attention_bytes(source),
             embedding_threads=resolve_embedding_threads(source),
         )
@@ -530,9 +554,11 @@ class EmbeddingProvider:
         tokenizer cheaply without paying the inference-runtime import cost.
         Raises :class:`EmbeddingArtifactError` on the first failure.
         """
-        verify_artifact(self._spec.model_path, self._spec.model_sha256)
-        verify_artifact(self._spec.tokenizer_path, self._spec.tokenizer_sha256)
-        _warn_if_model_is_on_external_volume(self._spec.model_path)
+        spec = self._spec
+        assert isinstance(spec, ArtifactSpec)
+        verify_artifact(spec.model_path, spec.model_sha256)
+        verify_artifact(spec.tokenizer_path, spec.tokenizer_sha256)
+        _warn_if_model_is_on_external_volume(spec.model_path)
 
     def _ensure_loaded_with_timeout(self, *, timeout_seconds: float, timeout_message: str) -> None:
         """Wait for one shared daemon load attempt, bounding each caller's wait."""
@@ -586,6 +612,8 @@ class EmbeddingProvider:
                 return
             # Fail closed on missing/corrupt artifacts before importing heavy libs.
             self.verify_artifacts()
+            spec = self._spec
+            assert isinstance(spec, ArtifactSpec)
             try:
                 from workbay_handoff_mcp.embeddings.ort_runtime import import_onnxruntime
 
@@ -609,16 +637,16 @@ class EmbeddingProvider:
             try:
                 # onnxruntime's Fail derives from Exception, not OSError.
                 session = ort.InferenceSession(
-                    str(self._spec.model_path),
+                    str(spec.model_path),
                     sess_options=session_options,
                     providers=["CPUExecutionProvider"],
                 )
             except Exception as exc:
-                raise _load_failure(self._spec.model_path, exc) from exc
+                raise _load_failure(spec.model_path, exc) from exc
             try:
-                tokenizer = Tokenizer.from_file(str(self._spec.tokenizer_path))
+                tokenizer = Tokenizer.from_file(str(spec.tokenizer_path))
             except Exception as exc:
-                raise _load_failure(self._spec.tokenizer_path, exc) from exc
+                raise _load_failure(spec.tokenizer_path, exc) from exc
             configure_tokenizer_bounds(tokenizer, max_length=MAX_SEQUENCE_TOKENS)
             # Keep the private aliases in sync for compatibility, then publish
             # the fully initialized pair with one assignment.
@@ -753,9 +781,171 @@ class EmbeddingProvider:
         )
 
 
+def _api_provider_from_env(env: Mapping[str, str]) -> OpenAIEmbeddingProvider:
+    try:
+        url = urlsplit(env[ENV_API_URL].strip())
+        port = url.port
+    except ValueError:
+        raise ValueError(f"{ENV_API_URL} must be a valid HTTP(S) embeddings URL") from None
+    if (
+        url.scheme not in ("http", "https")
+        or not url.hostname
+        or url.username is not None
+        or port == 0
+        or url.query
+        or url.fragment
+    ):
+        raise ValueError(f"{ENV_API_URL} must be a valid HTTP(S) embeddings URL")
+    path = url.path.rstrip("/")
+    if path.endswith("/v1"):
+        path += "/embeddings"
+    elif not path:
+        path = "/v1/embeddings"
+    elif not path.endswith("/v1/embeddings"):
+        raise ValueError(f"{ENV_API_URL} must point to /v1/embeddings or its base URL")
+
+    try:
+        dim = int(env.get(ENV_API_DIM, "").strip() or EMBEDDING_DIM)
+    except ValueError:
+        raise ValueError(f"{ENV_API_DIM} must be a positive integer") from None
+    if dim <= 0:
+        raise ValueError(f"{ENV_API_DIM} must be a positive integer")
+    descriptor = OpenAIEmbeddingDescriptor(url._replace(path=path).geturl(), env[ENV_API_MODEL].strip(), dim)
+    return OpenAIEmbeddingProvider(
+        descriptor,
+        api_key=env.get(ENV_API_KEY, "").strip(),
+        timeout_seconds=env.get(ENV_API_TIMEOUT, "").strip() or DEFAULT_API_TIMEOUT_SECONDS,
+    )
+
+
+class OpenAIEmbeddingProvider(EmbeddingProvider):
+    """POST to an already-running endpoint with one deadline for the full batch.
+
+    Set WORKBAY_HANDOFF_EMBEDDING_API_DIM for models whose native width differs
+    from 768. The width is declared up front for the sidecar and checked on every
+    response. The API key is optional and is sent only as a bearer header. The
+    request deadline defaults to 5 seconds and is capped at 60 seconds.
+    """
+
+    def __init__(
+        self,
+        descriptor: OpenAIEmbeddingDescriptor,
+        *,
+        api_key: str = "",
+        timeout_seconds: float | str = DEFAULT_API_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(descriptor, embedding_threads=1)
+        self._model_id = descriptor.model_id
+        self._model = descriptor.model
+        self._endpoint = urlsplit(descriptor.url)
+        self._api_key = api_key
+        self._timeout_seconds = min(
+            validate_timeout_seconds(timeout_seconds, name=ENV_API_TIMEOUT), MAX_API_TIMEOUT_SECONDS
+        )
+        self._request_lock = threading.Lock()
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def is_loaded(self) -> bool:
+        """The API backend requires no local runtime initialization."""
+        return True
+
+    def verify_artifacts(self) -> None:
+        """Endpoint configuration was validated at construction."""
+
+    def _ensure_loaded(self) -> None:
+        """The endpoint owns model loading."""
+
+    def _request(self, texts: list[str], deadline: float) -> np.ndarray:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        endpoint = self._endpoint
+        connection_type = http.client.HTTPSConnection if endpoint.scheme == "https" else http.client.HTTPConnection
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        body = json.dumps({"model": self._model, "input": texts}).encode("utf-8")
+        try:
+            with closing(connection_type(endpoint.hostname or "", endpoint.port, timeout=remaining)) as connection:
+                connection.request("POST", endpoint.path, body=body, headers=headers)
+                with connection.getresponse() as response:
+                    if response.status != 200:
+                        raise EmbeddingAPIError(f"embedding API returned HTTP {response.status}", kind="api_http_error")
+                    payload = response.read(_MAX_API_RESPONSE_BYTES + 1)
+        except TimeoutError:
+            raise
+        except (OSError, http.client.HTTPException, ValueError):
+            raise EmbeddingAPIError("embedding API request failed", kind="api_transport_error") from None
+        return self._decode_vectors(payload, len(texts))
+
+    def _decode_vectors(self, payload: bytes, batch_size: int) -> np.ndarray:
+        try:
+            if len(payload) > _MAX_API_RESPONSE_BYTES:
+                raise ValueError
+            rows = json.loads(payload)["data"]
+            if not isinstance(rows, list) or len(rows) != batch_size:
+                raise ValueError
+            vectors: dict[int, list[float]] = {}
+            for row in rows:
+                index, vector = row["index"], row["embedding"]
+                if type(index) is not int or not 0 <= index < batch_size or index in vectors:
+                    raise ValueError
+                if not isinstance(vector, list) or len(vector) != self.dim:
+                    raise ValueError
+                if any(type(value) not in (int, float) for value in vector):
+                    raise ValueError
+                vectors[index] = vector
+            matrix = np.asarray([vectors[index] for index in range(batch_size)], dtype=np.float64)
+            if not np.isfinite(matrix).all():
+                raise ValueError
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            raise EmbeddingAPIError(
+                f"embedding API returned invalid vectors (expected {batch_size} x {self.dim})",
+                kind="api_invalid_response",
+            ) from None
+        # Scale before float32 normalization so extreme finite values cannot overflow its norm.
+        scale = np.max(np.abs(matrix), axis=1, keepdims=True)
+        return l2_normalize(matrix / np.where(scale == 0, 1.0, scale))
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dim), dtype=np.float32)
+        deadline = time.monotonic() + self._timeout_seconds
+
+        def request_batch() -> np.ndarray:
+            # Bound the number of workers that can remain in DNS or a socket
+            # operation after their caller's deadline has expired.
+            if not self._request_lock.acquire(blocking=False):
+                raise EmbeddingAPIError("embedding API request already in flight", kind="api_busy")
+            try:
+                return np.vstack(
+                    [
+                        self._request(
+                            [truncate_embed_text(text) for text in texts[start : start + EMBED_SUB_BATCH_SIZE]],
+                            deadline,
+                        )
+                        for start in range(0, len(texts), EMBED_SUB_BATCH_SIZE)
+                    ]
+                )
+            finally:
+                self._request_lock.release()
+
+        try:
+            return run_with_daemon_timeout(request_batch, timeout_seconds=self._timeout_seconds)
+        except TimeoutError:
+            raise EmbeddingAPIError("embedding API request timed out", kind="api_timeout") from None
+
+    def embed_with_budget_isolation(self, texts: list[str]) -> EmbeddingBatchOutcome:
+        return EmbeddingBatchOutcome(self.embed(texts), tuple(range(len(texts))), ())
+
+
 @dataclass(frozen=True)
 class EmbeddingProviderProbe:
-    """Result of ``from_env`` → ``verify_artifacts`` (no ONNX session load)."""
+    """Local artifact verification or API configuration, without loading a model."""
 
     provider: EmbeddingProvider | None
     reason: str | None
@@ -771,7 +961,7 @@ def probe_embedding_provider(
 
     Reasons: ``disabled``, ``unconfigured``, ``artifact_missing``,
     ``artifact_sha_mismatch``, ``artifact_unreadable``. ``reason is None``
-    means a verified provider is ready.
+    means provider configuration passed. API reachability is checked on embed.
     """
     source = os.environ if env is None else env
     env_dict = dict(source)
@@ -779,9 +969,7 @@ def probe_embedding_provider(
     if unavailable == "disabled":
         return EmbeddingProviderProbe(None, "disabled")
     if unavailable == "unconfigured":
-        keys = (ENV_MODEL, ENV_TOKENIZER, ENV_MODEL_SHA256, ENV_TOKENIZER_SHA256)
-        missing = tuple(key for key in keys if not str(env_dict.get(key) or "").strip())
-        return EmbeddingProviderProbe(None, "unconfigured", missing_keys=missing)
+        return EmbeddingProviderProbe(None, "unconfigured", missing_keys=_missing_provider_keys(env_dict))
     provider = EmbeddingProvider.from_env(env_dict)
     if provider is None:
         return EmbeddingProviderProbe(None, "unconfigured")

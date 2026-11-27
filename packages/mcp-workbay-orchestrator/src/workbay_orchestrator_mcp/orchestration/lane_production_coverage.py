@@ -37,6 +37,7 @@ POLICY_VERSION = "native-coverage-v1"
 
 class CoverageReason(str, Enum):
     ROUTE_NOT_N_CAPABLE = "route_not_n_capable"
+    SOURCE_RECORDING_UNAVAILABLE = "source_recording_unavailable"
     CURSOR_GAP = "cursor_gap"
     CURSOR_REPLACED = "cursor_replaced"
     OPEN_OPERATION = "open_operation"
@@ -50,7 +51,7 @@ class CoverageReason(str, Enum):
 
 @dataclass(frozen=True)
 class CoverageResult:
-    status: Literal["covered", "unavailable"]
+    status: Literal["covered", "metadata_only", "unavailable"]
     reason: CoverageReason | None = None
 
 
@@ -64,6 +65,7 @@ class RouteCapability:
         "editable_hooks_path",
         "unmediated",
         "refusal_before_start",
+        "transport_metadata",
     ]
 
 
@@ -71,25 +73,29 @@ class RouteCapability:
 # Unknown backend names fail closed without relying on a name suffix heuristic.
 ROUTE_REGISTRY = MappingProxyType(
     {
-        route: RouteCapability(supported_versions=frozenset({"1"}), recorder="unmediated")
-        for route in (
-            "codex-cli",
-            "codex-subagent",
-            "copilot-host",
-            "claude-code",
-            "grok-cli",
-            "grok-remote",
-            "codex-remote",
-            "openrouter-remote",
-            "cursor-remote",
-            "claude-remote",
-            "claude-api-remote",
-            "muse-remote",
-            "agy-remote",
-            "cursor-cli",
-            "structured-turn",
-            "local-model-openai",
-        )
+        **{
+            route: RouteCapability(supported_versions=frozenset({"1"}), recorder="unmediated")
+            for route in (
+                "codex-cli",
+                "codex-subagent",
+                "copilot-host",
+                "claude-code",
+                "grok-cli",
+                "grok-remote",
+                "codex-remote",
+                "openrouter-remote",
+                "cursor-remote",
+                "claude-remote",
+                "claude-api-remote",
+                "muse-remote",
+                "agy-remote",
+                "cursor-cli",
+                "structured-turn",
+            )
+        },
+        # Local/LAN completions expose transport metadata such as token usage
+        # and model identity. Production proof requires a separate recorder.
+        "local-model-openai": RouteCapability(supported_versions=frozenset({"1"}), recorder="transport_metadata"),
     }
 )
 
@@ -111,6 +117,8 @@ def route_capability(route: str, producer_version: str, registry: Mapping[str, R
         return CoverageResult("unavailable", CoverageReason.ROUTE_NOT_N_CAPABLE)
     if producer_version not in capability.supported_versions:
         return CoverageResult("unavailable", CoverageReason.UNSUPPORTED_VERSION)
+    if capability.recorder == "transport_metadata":
+        return CoverageResult("metadata_only")
     if capability.recorder != "trusted_external":
         return CoverageResult("unavailable", CoverageReason.ROUTE_NOT_N_CAPABLE)
     return CoverageResult("covered")
@@ -152,8 +160,8 @@ def _cursor(value: Mapping[str, Any]) -> dict:
 def _check_capability(route: str, version: str, policy: CoveragePolicy) -> None:
     _require(route in policy.routes, CoverageReason.ROUTE_NOT_N_CAPABLE)
     result = route_capability(route, version, policy.registry)
-    if result.reason:
-        raise _Hold(result.reason)
+    if result.status != "covered":
+        raise _Hold(result.reason or CoverageReason.SOURCE_RECORDING_UNAVAILABLE)
 
 
 def _advance(interval: dict, current: dict, policy: CoveragePolicy) -> dict:

@@ -1249,11 +1249,11 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
     ambiguous = "review_ratchet_superseded_native_history_ambiguous"
     try:
         state = _json(raw)
-        if "superseded_invocations" not in state:
+        prior = state.get("superseded_invocations", [])
+        if prior == []:
             return []
         if not authenticated_current_invocation(repo, state_dir, pass_id, raw):
             raise ValueError("current_invocation_unproven")
-        prior = state["superseded_invocations"]
         if not prior or (state_dir / f"review-receipt-{pass_id}.json").exists():
             raise ValueError("superseded_history_unproven")
         binding = state["lane_cycle_binding"]
@@ -1268,12 +1268,16 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
         for path in sorted(directory.glob("*.json")):
             # Native prepare uses its existing producer-owned custody contract,
             # not the separate owner-only nonexecution receipt namespace.
-            content = regular_file_bytes(path, root=directory)
+            try:
+                content = regular_file_bytes(path, root=directory)
+            except FileNotFoundError:
+                continue  # each sealed predecessor still needs an exact native join below
+            receipt = _json(content)
+            if receipt.get("managed_identity") != managed:
+                continue
             if regular_bytes(path) != content:
                 raise ValueError("native_history_changed")
-            receipt = _json(content)
-            if receipt.get("managed_identity") == managed:
-                candidates.append((path, receipt, content))
+            candidates.append((path, receipt, content))
         used, records, previous_sequence = set(), [], 0
         for invocation in prior:
             request = invocation["completion_config"]
@@ -1349,7 +1353,29 @@ def authenticated_superseded_native_history(repo: Path, state_dir: Path, pass_id
         raise
     except (EvidenceHold, _Hold, OSError, ValueError, KeyError, TypeError, AttributeError,
             subprocess.SubprocessError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("trusted_canon_"):
+            raise _nonexecution_proof_refusal(pass_id, exc) from exc
         raise RatchetRefused(unavailable, str(exc)) from exc
+
+
+def _nonexecution_proof_refusal(pass_id: str, exc: Exception) -> RatchetRefused:
+    detail = f"pass_id={pass_id!r}, {type(exc).__name__}: {exc}"
+    if isinstance(exc, ValueError) and str(exc).startswith("trusted_canon_"):
+        return RatchetRefused(str(exc), detail)
+    return RatchetRefused(f"review_ratchet_nonexecution_proof_unavailable: {detail}", detail)
+
+
+def _pass_nonexecution_proven(repo: Path, state_dir: Path, pass_id: str, raw: bytes) -> bool:
+    from .nonexecution_history import authenticated_nonexecution
+
+    try:
+        if authenticated_superseded_native_history(repo, state_dir, pass_id, raw):
+            return True  # charged native rows remain in their accounting authority
+        return authenticated_nonexecution(repo, state_dir, pass_id, raw)
+    except RatchetRefused:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        raise _nonexecution_proof_refusal(pass_id, exc) from exc
 
 
 def _historical_pass_branch(state: dict) -> str | None:
@@ -1578,14 +1604,10 @@ def verified_legacy_source_history(repo: Path, subject_branch: str) -> list[dict
             record_branch = _historical_pass_branch(state)
             if record_branch is not None and record_branch != subject_branch:
                 continue
-            from .nonexecution_history import authenticated_nonexecution
-
             # Exact-record host recovery authority, never an untrusted label,
             # absent dispatch or inferred outcome. Invalid custody holds.
             recovered_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
-            if authenticated_superseded_native_history(repo, config.state_dir, recovered_pass_id, raw):
-                continue  # charged native rows remain in their accounting authority
-            if authenticated_nonexecution(repo, config.state_dir, recovered_pass_id, raw):
+            if _pass_nonexecution_proven(repo, config.state_dir, recovered_pass_id, raw):
                 continue
             if state.get("branch") != subject_branch:
                 continue
@@ -1774,18 +1796,6 @@ def _load_context(
     retained = []
     from .invocation_disposition import _json, regular_bytes
 
-    def nonexecution_pass(pass_id: str, raw: bytes) -> bool:
-        from .nonexecution_history import authenticated_nonexecution
-
-        try:
-            if authenticated_superseded_native_history(repo, state_dir, pass_id, raw):
-                return True  # charged native rows remain in their accounting authority
-            return authenticated_nonexecution(repo, state_dir, pass_id, raw)
-        except RatchetRefused:
-            raise
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise RatchetRefused("review_ratchet_nonexecution_proof_unavailable") from exc
-
     foreign_passes = []
     for path in state_dir.glob("offload-pass-*.json"):
         try:
@@ -1798,7 +1808,7 @@ def _load_context(
             record_branch = _historical_pass_branch(prior)
             prior_pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
             if record_branch is None or record_branch == branch:
-                if nonexecution_pass(prior_pass_id, raw):
+                if _pass_nonexecution_proven(repo, state_dir, prior_pass_id, raw):
                     continue
             else:
                 # A separate review branch can inherit this subject below.
@@ -1891,7 +1901,7 @@ def _load_context(
     for name, pass_id, raw, prior in foreign_passes:
         if name not in subject_branches:
             continue
-        if nonexecution_pass(pass_id, raw):
+        if _pass_nonexecution_proven(repo, state_dir, pass_id, raw):
             retained = [item for item in retained if item.get("pass_id") != pass_id]
             continue
         prior = review_pass_view(prior)

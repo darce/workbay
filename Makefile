@@ -108,6 +108,7 @@ LIFECYCLE_WORKTREE_BOOTSTRAP :=
 # subject-relative glob would load (or miss) the subject's checkout.
 -include $(JUDGE_ROOT)/packages/workbay-system/workbay_system/payload/Makefile.d/*.mk
 -include $(JUDGE_ROOT)/packages/workbay-system/Makefile.d/evals.mk
+-include $(JUDGE_ROOT)/mk/vm-ci.mk
 
 .DEFAULT_GOAL := help
 
@@ -178,6 +179,7 @@ sync-uv-tool-schema-drift: ## Reinstall uv tools whose vendored HANDOFF_SCHEMA_V
 
 .PHONY: preflight
 preflight: ## Run the pre-release checklist (clean tree, tests, contract, rehearsal)
+	@# release.sh preflight already runs the built-artifact privacy check.
 	$(RELEASE) preflight $(FLAGS)
 
 .PHONY: test
@@ -537,6 +539,10 @@ tla-drift-check: ## Fail (exit 1) when generated TLA+ modules drift from the cha
 tla-check: tla-drift-check ## TLC on every cfg vs expected_verdicts.json with the pinned jar (exit 2 = tlc_unavailable, 3 = refused; never PASS without TLC)
 	.venv/bin/python scripts/check_tla.py --pin $(TLA_PIN) --specs $(TLA_DIR) --expected $(TLA_DIR)/expected_verdicts.json --scratch .task-state/tla/scratch --java $(TLA_JAVA) --report .task-state/tla/tla-check.json
 
+.PHONY: check-boundary-runtime-pin
+check-boundary-runtime-pin: ## Verify the shipped boundary runtime pins match the orchestrator version
+	"$(JUDGE_PYTHON)" scripts/check_boundary_runtime_pin.py
+
 .PHONY: lane-supersede
 lane-supersede: ## Preview a supersede tombstone; pass SUPERSEDE_ARGS="--apply --plan-digest <hex> --branch X --superseded-by SHA --integration-ref REF [--allow-main]" to apply a reviewed plan.
 	.venv/bin/python -m workbay_orchestrator_mcp.orchestration.lane_tombstone $(SUPERSEDE_ARGS)
@@ -631,6 +637,77 @@ brand-check: ## Fail on forbidden prior-brand tokens in tracked source (implemen
 # for this repo's own check-all. Plain := so it wins regardless of include order.
 WORKBAY_CHECKALL_ENGINE := packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py
 
+# Resolve the same published release as `workbay canon`. Skip before calling
+# the cache so a sandbox without the release cannot mint a passing stamp.
+define WORKBAY_CANON_GATE
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tomllib
+from datetime import UTC, datetime
+
+workbay, verb, *cache = sys.argv[1:]
+config_path = Path(".workbay/canon-lint.toml")
+config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+current = Path.home() / "Development/heuristics-canon-current"
+version = config.get("canon_version", "")
+configured = config.get("canon_root", os.environ.get("WORKBAY_HEURISTICS_CANON_ROOT"))
+if configured is None:
+    pinned = current.with_name(f"heuristics-canon-v{version}") if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) else current
+    configured = pinned if os.path.isdir(pinned) else current
+root = Path(configured).expanduser()
+if not configured or not os.access(root, os.R_OK | os.X_OK) or not root.is_dir():
+    print(f"check-canon {verb}: skipping, published canon directory unavailable ({configured or 'empty root setting'})")
+    sys.exit(0)
+
+command = [workbay, "canon", verb, "--json", "--canon-root", str(root)]
+if not os.access(workbay, os.X_OK):
+    sys.exit(f"check-canon {verb}: {workbay} is unavailable")
+if cache:
+    try:
+        release = root.resolve(strict=True)
+        manifest = (release / "meta/release-manifest.json").read_bytes()
+        digest = hashlib.sha256(manifest)
+        if digest.hexdigest() != config.get("manifest_sha256"):
+            raise ValueError("unverified canon manifest")
+        index = json.loads(manifest)
+        for group in ("lexicons", "docs", "reasoning", "sources"):
+            for name in index.get(group, {}):
+                path = (release / name).resolve(strict=True)
+                if not path.is_relative_to(release) or not path.is_file():
+                    raise ValueError("invalid canon release file")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+        paths = [
+            str(config_path), "packages/workbay-canon-lint", "Makefile",
+            "packages/workbay-protocol/src/workbay_protocol/canon_lint.py",
+            "packages/workbay", "pyproject.toml", "uv.lock",
+        ]
+        if verb == "lint":
+            for route in config["routes"]:
+                paths.extend(f":(top,glob){pattern}" for pattern in route["paths"])
+            # A dated exemption can expire with no changes in Git.
+            if config.get("exemptions"):
+                digest.update(datetime.now(UTC).date().isoformat().encode())
+        command = [*cache, "--fingerprint", digest.hexdigest(), "--paths", *paths, "--", *command]
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        # Let the CLI diagnose an invalid release or configuration directly.
+        pass
+sys.exit(subprocess.call(command))
+endef
+
+.PHONY: check-canon-drift check-canon-lint
+check-canon-drift check-canon-lint check-all: export WORKBAY_CANON_GATE_SCRIPT := $(value WORKBAY_CANON_GATE)
+
+check-canon-drift: ## Verify the published canon against the registered rule pins
+	@"$(JUDGE_PYTHON)" -c "$$WORKBAY_CANON_GATE_SCRIPT" .venv/bin/workbay check-drift
+
+check-canon-lint: ## Lint tracked sources against the configured canon rules
+	@"$(JUDGE_PYTHON)" -c "$$WORKBAY_CANON_GATE_SCRIPT" .venv/bin/workbay lint
+
 # RLSE-05 guard: `check-protocol` (below) routes through the
 # $(call workbay_checkall_cache,...) macro from payload/Makefile.d/check.mk,
 # auto-loaded via the `-include ...Makefile.d/*.mk` near the top. GNU make
@@ -656,6 +733,25 @@ check-all: check-disk-space check-review-pipeline ## Format+lint+mypy+tests for 
 	@# Always prove parity, including cache hits; the later hook sub-make marks it already done.
 	$(MAKE) check-hook-twin-parity
 	$(MAKE) statechart-check
+	@"$(JUDGE_PYTHON)" -c "$$WORKBAY_CANON_GATE_SCRIPT" .venv/bin/workbay check-drift \
+		"$(JUDGE_PYTHON)" $(WORKBAY_CHECKALL_ENGINE) run --key check-canon-drift
+	@"$(JUDGE_PYTHON)" -c "$$WORKBAY_CANON_GATE_SCRIPT" .venv/bin/workbay lint \
+		"$(JUDGE_PYTHON)" $(WORKBAY_CHECKALL_ENGINE) run --key check-canon-lint
+	"$(JUDGE_PYTHON)" $(WORKBAY_CHECKALL_ENGINE) run --key tla-drift-check --paths \
+		docs/specs/tla \
+		packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/orchestration/lifecycle_statechart.json \
+		packages/mcp-workbay-orchestrator/src/workbay_orchestrator_mcp/orchestration/statechart_tla.py \
+		Makefile -- $(MAKE) tla-drift-check
+	"$(JUDGE_PYTHON)" $(WORKBAY_CHECKALL_ENGINE) run --key check-boundary-runtime-pin --paths \
+		scripts/check_boundary_runtime_pin.py scripts/remote_agent.sh \
+		packages/workbay-system/workbay_system/payload/scripts/remote_agent.sh \
+		packages/mcp-workbay-orchestrator/pyproject.toml -- $(MAKE) check-boundary-runtime-pin
+	"$(JUDGE_PYTHON)" $(WORKBAY_CHECKALL_ENGINE) run --key evals-fast --paths \
+		packages/workbay-system/config/evals packages/workbay-system/scripts/workbay_evals \
+		packages/workbay-system/Makefile.d/evals.mk \
+		packages/mcp-workbay-handoff/src packages/workbay-protocol/src \
+		packages/workbay-system/workbay_system/payload/scripts/workbay_lifecycle \
+		-- $(MAKE) evals-fast
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-handoff --paths packages/mcp-workbay-handoff packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml packages/mcp-workbay-orchestrator/src packages/mcp-workbay-orchestrator/pyproject.toml packages/workbay-codex-bridge/src packages/workbay-codex-bridge/pyproject.toml packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/mcp-workbay-handoff check-handoff
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-orchestrator --fingerprint "pytest-workers=$(PYTEST_WORKERS)" --paths packages/mcp-workbay-orchestrator packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml packages/mcp-workbay-handoff/src packages/mcp-workbay-handoff/pyproject.toml packages/workbay-codex-bridge/src packages/workbay-codex-bridge/pyproject.toml packages/workbay-system/workbay_system/payload Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/mcp-workbay-orchestrator check-orchestrator
 	$(JUDGE_PYTHON) packages/workbay-system/workbay_system/payload/scripts/workbay/check_all_cache.py run --key check-bridge --paths packages/workbay-codex-bridge packages/workbay-protocol/src packages/workbay-protocol/pyproject.toml Makefile pyproject.toml uv.lock -- $(MAKE) -C packages/workbay-codex-bridge check-bridge
@@ -950,6 +1046,10 @@ check-release-manifest: ## Validate config/release/packages.json package paths a
 .PHONY: export-public-check
 export-public-check: ## Fail if the public export would leak a forbidden token/path (runs the scrub gate in a throwaway tree; ~3s). Wired into check-all + preflight.
 	python scripts/export_public.py --check
+
+.PHONY: check-shipped-privacy
+check-shipped-privacy: ## Scan built wheels and sdists for private content
+	"$(JUDGE_PYTHON)" scripts/check_shipped_privacy.py
 
 .PHONY: check-uvlock-current
 check-uvlock-current: ## Fail if root uv.lock is stale relative to workspace pyprojects (uv lock --check; no write). Wired into check-all + preflight.

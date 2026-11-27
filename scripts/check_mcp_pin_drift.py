@@ -40,7 +40,8 @@ Two entry points:
   version does not already match every pin surface.
 * ``main()`` / ``make check-mcp-pins`` — standalone steady-state check
   (usable in CI / preflight). With no ``--package`` it checks every managed
-  server against its own published (``pyproject.toml``) version.
+  server against its own published (``pyproject.toml``) version. Pass
+  ``--check`` to also verify the built base plugin MCP projection.
 
 A mismatch is **reported, never auto-rewritten**: updating the canonical
 pin is coupled to regenerating the copy (``make mcp-pins-sync``) and
@@ -61,6 +62,7 @@ position and missing a real second pin.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -522,6 +524,29 @@ def check_all(
     return ok, messages
 
 
+def check_mcp_projection(
+    repo_root: Path, plugin_out: Path, *, with_codebase_graph: bool = False
+) -> list[str]:
+    payload = repo_root / "packages/workbay-system/workbay_system/payload"
+    contract = Path("docs/workbay/contracts/harness-protocol.yaml")
+    generator = payload / "scripts/generate_agent_workflows.py"
+    try:
+        if (repo_root / contract).read_bytes() != (payload / contract).read_bytes():
+            return [f"harness protocol drift: {contract} differs from its payload twin"]
+        spec = importlib.util.spec_from_file_location("workbay_mcp_projector", generator)
+        if spec is None or spec.loader is None:
+            return [f"cannot load MCP projector: {generator}"]
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.check_plugin_mcp_projection(
+            payload / "config/agent-workflows/mcp_servers.yaml",
+            plugin_out,
+            with_codebase_graph=with_codebase_graph,
+        )
+    except (OSError, ImportError, SystemExit) as exc:
+        return [f"cannot verify MCP projection: {exc}"]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -539,13 +564,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(REPO_ROOT),
         help="Repository root (defaults to the monorepo containing this script).",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Also verify generated base plugin MCP configs and provenance against the SSOT.",
+    )
+    parser.add_argument(
+        "--plugin-out",
+        type=Path,
+        help="Base plugin tree to verify (defaults to .workbay/generated/plugins/workbay-system/base).",
+    )
+    parser.add_argument(
+        "--with-codebase-graph",
+        action="store_true",
+        help="Check a projection generated with the same opt-in flag.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if (args.plugin_out is not None or args.with_codebase_graph) and not args.check:
+        parser.error("--plugin-out and --with-codebase-graph require --check")
     repo_root = Path(args.repo_root).resolve()
     ok, messages = check_all(repo_root, package_name=args.package)
+    if args.check:
+        plugin_out = args.plugin_out or repo_root / ".workbay/generated/plugins/workbay-system/base"
+        failures = check_mcp_projection(
+            repo_root, plugin_out, with_codebase_graph=args.with_codebase_graph
+        )
+        ok = ok and not failures
+        messages.extend(failures or ["ok: base plugin MCP projection matches the SSOT"])
     stream = sys.stdout if ok else sys.stderr
     for line in messages:
         print(line, file=stream)

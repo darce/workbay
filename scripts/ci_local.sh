@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# ci_local.sh — local/hosted transport of the ONE gate manifest (scripts/gate_manifest.txt).
-# CI_LOCAL_STAGE selects local (default) or hosted rows; no stage list means both.
-# Canon v0.26.2: [REF-45] one authored source for the gate list (this file does
-# NOT author suites; it consumes the manifest like ci_report.sh and test.yml);
-# [TEST-24] commit-stage checks stay local/short — select a fast subset with
+# ci_local.sh — run targets from scripts/gate_manifest.txt.
+# CI_LOCAL_STAGE selects local (default), remote, or vm-ci rows.
+# A target without a stage list runs on every stage. Select a fast subset with
 # CI_LOCAL_SUITES="brand-check format-check". Each transport gates its selected
 # manifest column. Fail-fast by default; CI_LOCAL_KEEP_GOING=1 runs all.
 set -uo pipefail
@@ -13,8 +11,8 @@ MANIFEST="scripts/gate_manifest.txt"
 
 STAGE="${CI_LOCAL_STAGE:-local}"
 case "$STAGE" in
-  local|hosted) ;;
-  *) echo "ci-local: CI_LOCAL_STAGE must be local or hosted (got '$STAGE')" >&2; exit 2 ;;
+  local|remote|vm-ci) ;;
+  *) echo "ci-local: CI_LOCAL_STAGE must be local, remote, or vm-ci (got '$STAGE')" >&2; exit 2 ;;
 esac
 
 PY="${PYTHON:-.venv/bin/python}"

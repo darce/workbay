@@ -151,6 +151,8 @@ _PLUGIN_HARNESSES: tuple[tuple[str, str], ...] = (
 # servers and the plugin tree ships skills only; `plugin` = the plugin
 # tree registers them via plugin.json mcpServers + sibling .mcp.json.
 _MCP_REGISTRATION_OWNERS: frozenset[str] = frozenset({"root", "plugin"})
+_MCP_LOADING_TIERS = ("always", "on_demand")
+_MCP_PROJECTION_FILENAMES = (".mcp.json", "mcp_config.json", ".mcp-ssot.sha256")
 _HARNESS_ROUTING_BEGIN = "<!-- BEGIN GENERATED: harness-routing-table -->"
 _HARNESS_ROUTING_END = "<!-- END GENERATED: harness-routing-table -->"
 _HARNESS_PROTOCOL_REL = HARNESS_CONTRACT_RELPATH  # SSOT (workbay_protocol.paths)
@@ -317,6 +319,11 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="Destination root for emitted plugin trees (required when --mode=plugin). "
         "Trees are written to <plugin-out>/{agy,claude,codex,cursor,grok}/.",
+    )
+    parser.add_argument(
+        "--with-codebase-graph",
+        action="store_true",
+        help="Opt in to codebase-graph-mcp in emitted plugin MCP configs.",
     )
     parser.add_argument(
         "--plugin-overrides",
@@ -2065,41 +2072,63 @@ def _load_mcp_servers_manifest(path: Path) -> dict:
     servers = payload.get("mcp_servers")
     if not isinstance(servers, list) or not servers:
         raise SystemExit(f"{path}: mcp_servers must be a non-empty list")
-    for index, server in enumerate(servers):
+    optional = payload.get("optional_mcp_servers", [])
+    if not isinstance(optional, list):
+        raise SystemExit(f"{path}: optional_mcp_servers must be a list")
+    entries = [(f"mcp_servers[{i}]", server) for i, server in enumerate(servers)]
+    for i, server in enumerate(optional):
+        location = f"optional_mcp_servers[{i}]"
+        flag = server.get("opt_in_flag") if isinstance(server, dict) else None
+        if not isinstance(flag, str) or not flag:
+            raise SystemExit(f"{path}: {location} must declare a non-empty opt_in_flag")
+        entries.append((location, server))
+    names: set[str] = set()
+    for location, server in entries:
         if not isinstance(server, dict):
-            raise SystemExit(f"{path}: mcp_servers[{index}] must be a mapping")
+            raise SystemExit(f"{path}: {location} must be a mapping")
         for field in ("name", "command"):
             value = server.get(field)
             if not isinstance(value, str) or not value.strip():
                 raise SystemExit(
-                    f"{path}: mcp_servers[{index}].{field} must be a non-empty string"
+                    f"{path}: {location}.{field} must be a non-empty string"
                 )
+        if server["name"] in names:
+            raise SystemExit(f"{path}: duplicate MCP server name {server['name']!r}")
+        names.add(server["name"])
         args = server.get("args", [])
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise SystemExit(
-                f"{path}: mcp_servers[{index}].args must be a list of strings"
+                f"{path}: {location}.args must be a list of strings"
             )
         harnesses = server.get("harnesses", [])
         if not isinstance(harnesses, list) or not all(
             isinstance(h, str) for h in harnesses
         ):
             raise SystemExit(
-                f"{path}: mcp_servers[{index}].harnesses must be a list of strings"
+                f"{path}: {location}.harnesses must be a list of strings"
             )
         unregistered = sorted(set(harnesses) - set(registration))
         if unregistered:
             raise SystemExit(
-                f"{path}: mcp_servers[{index}].harnesses {unregistered} missing from "
+                f"{path}: {location}.harnesses {unregistered} missing from "
                 "the `registration` ownership table; every server harness must "
                 "declare root|plugin ownership (implementation note)"
             )
     return payload
 
 
-def _render_mcp_servers_json(mcp_manifest: dict, harness: str) -> str:
+def _select_optional_mcp_servers(mcp_manifest: dict, with_codebase_graph: bool) -> dict:
+    active_flags = {"--with-codebase-graph"} if with_codebase_graph else set()
+    optional = [
+        server for server in mcp_manifest.get("optional_mcp_servers", [])
+        if server["opt_in_flag"] in active_flags
+    ]
+    return {**mcp_manifest, "mcp_servers": [*mcp_manifest["mcp_servers"], *optional]}
+
+
+def _render_mcp_servers_json(servers: list[dict], harness: str) -> str:
     """Render the plugin MCP config JSON blob for the requested harness.
 
-    Servers whose ``harnesses`` list excludes the harness are skipped.
     Output ordering follows the manifest insertion order; each entry
     carries ``"type": "stdio"`` for Claude/Cursor/Grok/Codex to stay
     compatible with the bootstrap install path. ``agy`` uses root
@@ -2108,10 +2137,7 @@ def _render_mcp_servers_json(mcp_manifest: dict, harness: str) -> str:
     entry, so Codex receives the bare server map shape.
     """
     entries: dict[str, dict] = {}
-    for server in mcp_manifest["mcp_servers"]:
-        harnesses = server.get("harnesses") or []
-        if harnesses and harness not in harnesses:
-            continue
+    for server in servers:
         if harness == "agy":
             entry: dict[str, object] = {
                 "command": server["command"],
@@ -2136,6 +2162,89 @@ def _render_mcp_servers_json(mcp_manifest: dict, harness: str) -> str:
             f"unsupported plugin harness for .mcp.json rendering: {harness!r}"
         )
     return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _render_plugin_mcp_outputs(
+    mcp_manifest: dict, harness_protocol: dict, plugin_out: Path
+) -> dict[Path, str]:
+    """Project the selected catalog rows into the harness-owned JSON shapes."""
+    routing_path = _repo_root() / "docs" / "workbay" / "maps" / "mcp-tool-routing.yaml"
+    routing = yaml.safe_load(routing_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(routing, dict)
+        or not isinstance(routing.get("always"), list)
+        or not all(isinstance(name, str) for name in routing["always"])
+        or not isinstance(routing.get("on_demand"), dict)
+    ):
+        raise SystemExit(f"{routing_path}: expected an always list and an on_demand mapping")
+    overlap = set(routing["always"]) & set(routing["on_demand"])
+    if overlap:
+        raise SystemExit(f"{routing_path}: servers in both loading tiers: {sorted(overlap)}")
+    policy_tiers = {server: tier for tier in _MCP_LOADING_TIERS for server in routing[tier]}
+
+    capabilities = harness_protocol.get("harness_capabilities", {}).get("mcp_loading", {})
+    for harness in mcp_manifest["registration"]:
+        if type(capabilities.get(harness, {}).get("supports_lazy_loading")) is not bool:
+            raise SystemExit(f"harness protocol: {harness}.supports_lazy_loading must be a boolean")
+
+    tiers = {}
+    for server in [*mcp_manifest.get("optional_mcp_servers", []), *mcp_manifest["mcp_servers"]]:
+        name = server["name"]
+        policy = policy_tiers.get(name)
+        # Older catalogs and consumer-added servers may lack a tier. An
+        # unclassified server fits the on-demand tier and stays off eager hosts.
+        tier = server.get("loading_tier", policy or "on_demand")
+        if tier not in _MCP_LOADING_TIERS or (policy is not None and tier != policy):
+            raise SystemExit(
+                f"{name}: invalid or conflicting loading_tier {tier!r} "
+                f"(routing policy: {policy!r})"
+            )
+        tiers[name] = tier
+
+    outputs = {}
+    for harness, owner in mcp_manifest["registration"].items():
+        if owner != "plugin":
+            continue
+        supports_lazy_loading = capabilities[harness]["supports_lazy_loading"]
+        servers = [
+            server for server in mcp_manifest["mcp_servers"]
+            if (not server.get("harnesses") or harness in server["harnesses"])
+            and (supports_lazy_loading or tiers[server["name"]] == "always")
+        ]
+        config = "mcp_config.json" if harness == "agy" else ".mcp.json"
+        harness_root = plugin_out / harness
+        outputs[harness_root / config] = _render_mcp_servers_json(servers, harness)
+        provenance = {
+            "catalog": mcp_manifest,
+            "routing": routing,
+            "harness": harness,
+            "supports_lazy_loading": supports_lazy_loading,
+        }
+        digest = _sha256_digest(json.dumps(provenance, sort_keys=True, ensure_ascii=False))
+        outputs[harness_root / ".mcp-ssot.sha256"] = digest.removeprefix("sha256:") + "\n"
+    return outputs
+
+
+def check_plugin_mcp_projection(
+    mcp_servers_path: Path, plugin_out: Path, *, with_codebase_graph: bool = False
+) -> list[str]:
+    """Compare the base tree's MCP configs and provenance with a fresh projection."""
+    manifest = _select_optional_mcp_servers(
+        _load_mcp_servers_manifest(mcp_servers_path), with_codebase_graph
+    )
+    expected = _render_plugin_mcp_outputs(manifest, _load_harness_protocol(), plugin_out)
+    failures = []
+    for harness in manifest["registration"]:
+        for filename in _MCP_PROJECTION_FILENAMES:
+            path = plugin_out / harness / filename
+            if path in expected:
+                if not path.is_file():
+                    failures.append(f"missing MCP projection file: {path}")
+                elif path.read_bytes() != expected[path].encode("utf-8"):
+                    failures.append(f"MCP projection drift: {path}")
+            elif path.exists():
+                failures.append(f"unexpected MCP projection file: {path}")
+    return failures
 
 
 def _render_plugin_manifest_json(
@@ -2965,6 +3074,7 @@ def _expected_plugin_outputs(
     plugin_base_remote_sha: str | None = None,
     plugin_passthrough_lock: bool = False,
     harness_protocol: dict | None = None,
+    with_codebase_graph: bool = False,
 ) -> tuple[dict[Path, str], list[str]]:
     """Map every emitted plugin-tree file to its rendered content.
 
@@ -2985,6 +3095,7 @@ def _expected_plugin_outputs(
     registration = mcp_manifest["registration"]
     if harness_protocol is None:
         harness_protocol = _load_harness_protocol()
+    mcp_manifest = _select_optional_mcp_servers(mcp_manifest, with_codebase_graph)
 
     if plugin_overrides is not None and plugin_passthrough_lock:
         raise SystemExit(
@@ -3098,6 +3209,7 @@ def _expected_plugin_outputs(
     cursor_hooks_body = render_hooks_config_text(
         render_cursor_hooks_config(harness_protocol.get("hooks") or {})
     )
+    outputs.update(_render_plugin_mcp_outputs(mcp_manifest, harness_protocol, plugin_out))
 
     for harness, plugin_dir in _PLUGIN_HARNESSES:
         harness_root = plugin_out / harness
@@ -3114,11 +3226,6 @@ def _expected_plugin_outputs(
             include_mcp_servers=plugin_owns_mcp and harness != "agy",
             include_commands=harness == "claude",
         )
-        if plugin_owns_mcp:
-            mcp_filename = "mcp_config.json" if harness == "agy" else ".mcp.json"
-            outputs[harness_root / mcp_filename] = _render_mcp_servers_json(
-                mcp_manifest, harness
-            )
         if harness == "agy":
             outputs[harness_root / "hooks.json"] = agy_hooks_body
             outputs[harness_root / "hooks" / "run.py"] = agy_adapter_body
@@ -3224,6 +3331,7 @@ def _run_plugin_mode(
         args.plugin_overrides,
         args.plugin_base_remote_sha,
         args.plugin_passthrough_lock,
+        with_codebase_graph=args.with_codebase_graph,
     )
     stale_components: list[dict[str, object]] = []
     conflict_components: list[dict[str, object]] = []
@@ -3301,6 +3409,7 @@ def render_plugin_tree(
     plugin_overrides: Path | None = None,
     plugin_base_remote_sha: str | None = None,
     plugin_passthrough_lock: bool = False,
+    with_codebase_graph: bool = False,
 ) -> dict[Path, str]:
     """Single importable entry point for the plugin-tree payload (path -> content).
 
@@ -3326,6 +3435,7 @@ def render_plugin_tree(
         plugin_overrides,
         plugin_base_remote_sha,
         plugin_passthrough_lock,
+        with_codebase_graph=with_codebase_graph,
     )
     return outputs
 

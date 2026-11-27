@@ -1,0 +1,24 @@
+{
+  "allow": [
+    "scripts/ci_local.sh:SC2164:1:0eaba1f2c35c089104ba8516b5080f12997189e5469742efc434212e1c82917f",
+    "scripts/ci_report.sh:SC2087:36:7b7b9d8e9635ac0a26863d97ae7722d7a0240f5d47e43f9bddca2ec4eaccfb17",
+    "scripts/hooks/_resolve_repo_root.sh:SC2034:3:cf0a95117fa3386c50d830e08aee63c6960a9679afad885823bbaa036bd5ae71",
+    "scripts/install-workbay-studio.sh:SC1087:44:3f83a69b1a8c177758801010af56a6f2b74ec9b9aad4763118d41675cde41a1f",
+    "scripts/offload_flock.sh:SC2154:23:4fb69af7dd0b0f183a6b2723c3fe3c46c5d6d8faaf8af261787f5a1a618e6205",
+    "scripts/offload_flock.sh:SC2154:24:80f32a37350554418d5cceb00f468352d3ea5ed3f3fad7dece1956dd55f562b6",
+    "scripts/offload_flock.sh:SC2154:26:8514557fef98242c8b9c1cf2d2d4f6288e3fb79e8d23f773af636e36cc50e79e",
+    "scripts/offload_flock.sh:SC2154:30:8a132c99109e3e2a4faf0ac1cb03a7c6a85c3bd4764f8487f6eed258346d93ea",
+    "scripts/release.sh:SC2120:1:f1842c0e5b436db751c2afec70bde78ce77239756594eea94bf434faa28829f5",
+    "scripts/release.sh:SC2155:11:6c75a20ae564b910b51623900044feff43c44f01d3970dda56e126a5d71ea783",
+    "scripts/release.sh:SC2294:15:06a9fbfa321134ca10c502ced71b01f1cbe6d3faf7976dbd48dd45c3c5e2a971",
+    "scripts/remote_agent.sh:SC1010:25:9ff4e006ca3f018fc632dce1a48dcd208596ff75667a66e6500a205a1065258a",
+    "scripts/remote_agent.sh:SC1010:30:b4a0625e21bdc07a0f5d732dad6721e00ecfd638abfe30b5a206ce1cd8a36b7c",
+    "scripts/remote_agent.sh:SC1010:37:c275fcd0c6e2e3bd87ec89d68dd59b46ca1b064ab531c26a6cfaeefe0feca69a",
+    "scripts/remote_agent.sh:SC1010:61:c275fcd0c6e2e3bd87ec89d68dd59b46ca1b064ab531c26a6cfaeefe0feca69a",
+    "scripts/remote_agent.sh:SC2034:37:33bda2f1c9e0fdebfdec822674adb7a139c588a65155b768d404f9d69449618f",
+    "scripts/remote_agent.sh:SC2034:72:05d4e3d7553f37242ba5b7f6e80d4629b2b41b79330e7be090ad3cc1bda76f0d",
+    "scripts/remote_agent.sh:SC2155:11:c28ab4d3532c31f91cb079cb6721261143b05c151aa30bc0f7ca818ea06e9f08",
+    "scripts/remote_agent.sh:SC2155:16:d99fd7654f776a1d96053310935cf00a1d0cf8d73549262f4605e21edd4e2f88",
+    "scripts/ui_test_capability.sh:SC2034:53:c2782c2cc205e97ac5c2b694f948842aa24880404791151f9f7bc76aa5994b18"
+  ]
+}

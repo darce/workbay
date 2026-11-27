@@ -30,6 +30,7 @@ from datetime import time as datetime_time
 from pathlib import Path
 
 from .codex_lane_config import EXECUTION_PREFLIGHT_TIMEOUT_S as DEFAULT_TIMEOUT
+from .codex_lane_config import codex_cli_meets_minimum, codex_cli_version_pin, parse_codex_cli_version
 
 SCHEMA = "workbay/execution-preflight@1"
 MIN_FREE_BYTES = 6 * 1024**3
@@ -297,7 +298,7 @@ def _child(argv, *, deadline, env, cwd, evidence=None, evidence_dir=None):
 
 def _runtime_observation(source_root):
     """Observe imports, not just installed distribution metadata."""
-    from .codex_lane_config import CODEX_CLI_VERSION, EXECUTION_PREFLIGHT_IMPORTS
+    from .codex_lane_config import EXECUTION_PREFLIGHT_IMPORTS
     from .preflight_attestation import ATTESTATION_SCHEMA_VERSION
 
     if ATTESTATION_SCHEMA_VERSION != 2:
@@ -335,10 +336,11 @@ def _runtime_observation(source_root):
                 "sha256": hashlib.sha256(origin.read_bytes()).hexdigest(),
             }
         )
+    minimum_version, _, _ = codex_cli_version_pin()
     return {
         "imports": imports,
         "attestation_schema": ATTESTATION_SCHEMA_VERSION,
-        "expected_executable_version": CODEX_CLI_VERSION,
+        "expected_executable_version": minimum_version,
     }
 
 
@@ -827,10 +829,12 @@ def _observe(binary, argv, cwd, output_dir, env, deadline, receipt):
         [observed_binary, "--version"], deadline=deadline, env=env, cwd=cwd, evidence=checks, evidence_dir=output_dir
     )
     receipt["executable_version"] = version.strip()
-    if rc or version.strip() != "codex-cli " + receipt["runtime"]["expected_executable_version"]:
+    minimum_version = receipt["runtime"]["expected_executable_version"]
+    observed_version = parse_codex_cli_version(version)
+    if rc or observed_version is None or not codex_cli_meets_minimum(observed_version, minimum_version):
         raise Refused(
             "executable_version_mismatch",
-            repair="Reprovision the pinned Codex executable and restart the lane runtime; do not refresh metadata alone.",
+            repair=f"Provision a working Codex CLI at version {minimum_version} or newer and restart the lane runtime.",
         )
     receipt["capacity_context"] = {"load_average": list(os.getloadavg()), "cpu_count": os.cpu_count()}
     try:

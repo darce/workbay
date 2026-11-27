@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.29] - 2026-11-27
+
+### Added
+- Define shared canon lint contracts for adapter configuration, provenance, structured findings and errors, CLI exit codes, and decision advisories.
+
 ## [0.3.28] — 2026-11-26
 
 ### Changed

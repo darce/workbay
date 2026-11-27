@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -26,15 +26,14 @@ _PACKAGE_REFERENCE_CONTRACT_RELATIVE_PATH = (
     Path("packages/workbay-system/workbay_system/payload") / HARNESS_CONTRACT_RELPATH
 )
 _OVERLAY_MANIFEST_NAMES = MANIFEST_NAME_PRECEDENCE
-_CANONICAL_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "grok", "vscode", "agy-cli", "manual")
+CompactionContractHarness = Literal["claude-code", "codex", "grok", "vscode", "agy-cli", "manual"]
+_CANONICAL_HARNESSES: tuple[str, ...] = get_args(CompactionContractHarness)
 _HARNESS_ALIASES: dict[str, str] = {
     "cursor": "vscode",
     "agy": "agy-cli",
     "agy-app": "agy-cli",
     "agy-ide": "agy-cli",
 }
-
-CompactionContractHarness = Literal["claude-code", "codex", "grok", "vscode", "agy-cli", "manual"]
 
 
 class TranscriptDiscoveryRule(BaseModel):

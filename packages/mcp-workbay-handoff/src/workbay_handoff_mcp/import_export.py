@@ -545,6 +545,13 @@ def _snapshot_with_test_traces(
         ).fetchall()
     ]
     task_ref = snapshot["task_ref"]
+    payload["lane_prep_metrics"] = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM lane_prep_metrics WHERE task_ref = ? ORDER BY created_at DESC, id DESC",
+            (task_ref,),
+        )
+    ]
     for table, key in _REVIEW_HISTORY_KEYS.items():
         columns = ", ".join(_history_columns(conn, table))
         payload[table] = [
@@ -602,6 +609,7 @@ def export_handoff_state(
                 "lane_messages": len(snapshot_typed["lane_messages"]),
                 "plan_cursors": len(snapshot_typed.get("plan_cursors", [])),
                 "turn_metrics": len(snapshot_typed.get("turn_metrics", [])),
+                "lane_prep_metrics": len(cast(list, snapshot["lane_prep_metrics"])),
                 "repo_instances": len(snapshot_typed.get("repo_instances", [])),
                 "terminal_guard_events": len(snapshot_typed.get("terminal_guard_events", [])),
             },
@@ -703,8 +711,60 @@ def _import_plan_cursors(conn: sqlite3.Connection, task_ref: str, rows: list[dic
         )
 
 
-def _import_turn_metrics(conn: sqlite3.Connection, task_ref: str, rows: list[dict], now: str) -> None:
+def _import_lane_prep_metric(
+    conn: sqlite3.Connection,
+    task_ref: str,
+    row: dict,
+    now: str,
+    *,
+    legacy: bool = False,
+) -> None:
+    attribution_json = row.get("attribution_json")
+    if attribution_json is None:
+        attribution_json = json.dumps(row.get("attribution", {}), sort_keys=True)
+    fields = ("phys_footprint_mb", "phys_footprint_source", "pid", "cost_class")
+    metrics = (
+        conn.execute(
+            """
+            WITH legacy AS (SELECT CASE WHEN json_valid(:raw) THEN :raw END AS attribution)
+            SELECT json_extract(attribution, '$.phys_footprint_mb'),
+                   json_extract(attribution, '$.phys_footprint_source'),
+                   json_extract(attribution, '$.pid'),
+                   json_extract(attribution, '$.cost_class')
+            FROM legacy
+            """,
+            {"raw": attribution_json},
+        ).fetchone()
+        if legacy
+        else tuple(row.get(field) for field in fields)
+    )
+    conn.execute(
+        """
+        INSERT INTO lane_prep_metrics (
+            task_ref, lane_id, session, cycle, backend, phys_footprint_mb,
+            phys_footprint_source, pid, cost_class, attribution_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_ref,
+            row.get("lane_id"),
+            row.get("session", "import"),
+            row.get("cycle"),
+            row.get("backend", "unknown"),
+            *metrics,
+            attribution_json,
+            row.get("created_at") or now,
+        ),
+    )
+
+
+def _import_turn_metrics(conn: sqlite3.Connection, task_ref: str, rows: list[dict], now: str) -> int:
+    legacy_prep_count = 0
     for row in rows:
+        if row.get("phase") == "lane_prep":
+            _import_lane_prep_metric(conn, task_ref, row, now, legacy=True)
+            legacy_prep_count += 1
+            continue
         attribution_json = row.get("attribution_json")
         if attribution_json is None:
             attribution_json = json.dumps(row.get("attribution", {}), sort_keys=True)
@@ -753,6 +813,7 @@ def _import_turn_metrics(conn: sqlite3.Connection, task_ref: str, rows: list[dic
                 row.get("created_at") or now,
             ),
         )
+    return legacy_prep_count
 
 
 def _resolve_import_fallbacks(
@@ -819,6 +880,7 @@ class SnapshotImportData:
     messages: list
     plan_cursors: list
     turn_metrics: list
+    lane_prep_metrics: list
     repo_instances: list
     terminal_guard_events: list
     task_tool_roster: dict | None
@@ -837,6 +899,7 @@ _SNAPSHOT_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("lane_messages", "messages"),
     ("plan_cursors", "plan_cursors"),
     ("turn_metrics", "turn_metrics"),
+    ("lane_prep_metrics", "lane_prep_metrics"),
     ("repo_instances", "repo_instances"),
     ("terminal_guard_events", "terminal_guard_events"),
 )
@@ -869,6 +932,7 @@ def _parse_import_snapshot(snapshot: dict) -> SnapshotImportData:
         messages=extracted["messages"],
         plan_cursors=extracted["plan_cursors"],
         turn_metrics=extracted["turn_metrics"],
+        lane_prep_metrics=extracted["lane_prep_metrics"],
         repo_instances=extracted.get("repo_instances", []),
         terminal_guard_events=extracted.get("terminal_guard_events", []),
         task_tool_roster=roster,
@@ -1432,14 +1496,17 @@ _APPEND_ONLY_SECTIONS = (
     "lane_messages",
     "plan_cursors",
     "turn_metrics",
+    "lane_prep_metrics",
     "active",
 )
 
 
-def _legacy_section_digest(conn, task_ref, section):
+def _legacy_section_digest(conn, task_ref, section, snapshot):
     tables = ("handoff_state",) if section == "active" else (section,)
     if section == "verified_tests":
         tables += ("test_traces",)
+    if section == "turn_metrics" and any(row.get("phase") == "lane_prep" for row in snapshot[section]):
+        tables += ("lane_prep_metrics",)
     digest = hashlib.sha256()
     for table in tables:
         for row in conn.execute(f"SELECT * FROM {table} WHERE task_ref=? ORDER BY rowid", (task_ref,)):
@@ -1504,7 +1571,7 @@ def _restore_review_history(
             continue
         inputs[name] = _import_digest(snapshot[name])
         if reconcile and mode == "merge" and name in previous_digests:
-            if previous_digests[name] == [inputs[name], _legacy_section_digest(conn, task_ref, name)]:
+            if previous_digests[name] == [inputs[name], _legacy_section_digest(conn, task_ref, name, snapshot)]:
                 if name == "active":
                     data.active = None
                 else:
@@ -1512,8 +1579,8 @@ def _restore_review_history(
     return reconcile, state, inputs
 
 
-def _finish_review_history_import(conn, task_ref, state, inputs):
-    digests = {name: [value, _legacy_section_digest(conn, task_ref, name)] for name, value in inputs.items()}
+def _finish_review_history_import(conn, task_ref, state, inputs, snapshot):
+    digests = {name: [value, _legacy_section_digest(conn, task_ref, name, snapshot)] for name, value in inputs.items()}
     conn.execute(
         """INSERT INTO review_snapshot_history(task_ref, state, legacy_sections_json)
            VALUES (?, ?, ?) ON CONFLICT(task_ref) DO UPDATE SET state=excluded.state,
@@ -1590,6 +1657,7 @@ def _import_snapshot(
             "task_tool_roster",
             "plan_cursors",
             "turn_metrics",
+            "lane_prep_metrics",
             "terminal_guard_events",
         ):
             conn.execute(f"DELETE FROM {table} WHERE task_ref = ?", (task_ref,))
@@ -1887,14 +1955,16 @@ def _import_snapshot(
             ),
         )
     _import_plan_cursors(conn, task_ref, plan_cursors, now)
-    _import_turn_metrics(conn, task_ref, turn_metrics, now)
+    legacy_prep_count = _import_turn_metrics(conn, task_ref, turn_metrics, now)
+    for row in data.lane_prep_metrics:
+        _import_lane_prep_metric(conn, task_ref, row, now)
     if set_active and isinstance(data.active, dict):
         if production_imports:
             _set_import_active_state(conn, task_ref, active, git_context=(git_branch, git_commit))
         else:
             _set_import_active_state(conn, task_ref, active)
-    _finish_review_history_import(conn, task_ref, history_state, legacy_inputs)
-    return {
+    _finish_review_history_import(conn, task_ref, history_state, legacy_inputs, snapshot)
+    counts = {
         "blockers": len(blockers),
         "next_actions": len(actions),
         "decisions": len(decisions),
@@ -1905,11 +1975,15 @@ def _import_snapshot(
         "worker_reports": len(reports),
         "lane_messages": len(messages),
         "plan_cursors": len(plan_cursors),
-        "turn_metrics": len(turn_metrics),
+        "turn_metrics": len(turn_metrics) - legacy_prep_count,
         "repo_instances": len(repo_instances),
         "terminal_guard_events": len(terminal_guard_events),
         "task_tool_roster": 1 if task_tool_roster is not None else 0,
     }
+    lane_prep_total = len(data.lane_prep_metrics) + legacy_prep_count
+    if lane_prep_total > 0:
+        counts["lane_prep_metrics"] = lane_prep_total
+    return counts
 
 
 def import_handoff_state(
@@ -1933,7 +2007,8 @@ def import_handoff_state(
     private_tables = {_PRIVATE_CLOSE_EVIDENCE_TABLE, _PRIVATE_CLOSE_OPENINGS_TABLE}
     if private_tables.intersection(payload) or private_tables.intersection(snapshot):
         return _envelope(
-            ok=False, tool="import_handoff_state",
+            ok=False,
+            tool="import_handoff_state",
             data={"error": "Lane close evidence is private to the local handoff database."},
         )
     task_ref = payload.get("task_ref") or snapshot.get("task_ref")
@@ -1952,6 +2027,7 @@ def import_handoff_state(
     optional_sections = (
         "plan_cursors",
         "turn_metrics",
+        "lane_prep_metrics",
         "repo_instances",
         "terminal_guard_events",
         "review_findings_archive",
@@ -2006,11 +2082,17 @@ def import_handoff_state(
     with _get_db_connection() as conn:
         if mode == "replace_task" and not allow_destructive_clear:
             existing_counts = _count_task_rows(conn, task_ref)
+            existing_counts["lane_prep_metrics"] = conn.execute(
+                "SELECT COUNT(*) FROM lane_prep_metrics WHERE task_ref = ?", (task_ref,)
+            ).fetchone()[0]
             if "review_findings_archive" in snapshot:
                 existing_counts["review_findings_archive"] = conn.execute(
                     "SELECT COUNT(*) FROM review_findings_archive WHERE task_ref = ?", (task_ref,)
                 ).fetchone()[0]
             incoming_counts = {key: len(snapshot.get(key, [])) for key in (*required_sections, *optional_sections)}
+            legacy_prep_count = sum(row.get("phase") == "lane_prep" for row in snapshot.get("turn_metrics", []))
+            incoming_counts["turn_metrics"] -= legacy_prep_count
+            incoming_counts["lane_prep_metrics"] += legacy_prep_count
             incoming_tests = snapshot.get("verified_tests") or []
             incoming_counts["test_traces"] = sum(
                 len(row.get("traces") or []) for row in incoming_tests if isinstance(row, Mapping)

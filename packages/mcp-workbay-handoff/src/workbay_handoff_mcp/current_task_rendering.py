@@ -109,6 +109,7 @@ class CurrentTaskRenderState(TypedDict):
     worktree_lanes: list[dict]
     worker_reports_recent: list[dict]
     lane_messages_open: list[dict]
+    turn_metrics: NotRequired[list[dict]]
     dashboard_tasks: NotRequired[list[DashboardTaskRow]]
     review_coverage: NotRequired[ReviewCoverageSummary | None]
     related_findings_open: NotRequired[dict[str, list[dict]]]
@@ -577,6 +578,7 @@ def _build_current_task_state_from_snapshot(snapshot: TaskSnapshot) -> CurrentTa
         "blockers_open": [row for row in snapshot["blockers"] if row.get("status") == BlockerStatus.OPEN],
         "actions_pending": [row for row in snapshot["next_actions"] if row.get("status") == ActionStatus.PENDING],
         "decisions_recent": snapshot["decisions"],
+        "turn_metrics": snapshot.get("turn_metrics", []),
         "tests_recent": snapshot["verified_tests"],
         "findings_open": [row for row in snapshot["review_findings"] if row.get("status") == FindingStatus.OPEN],
         "findings_deferred": [
@@ -886,27 +888,44 @@ def _render_dashboard_section(tasks: list[DashboardTaskRow], active_task_ref: st
     return lines
 
 
-def _render_token_summary_section(decisions: list[dict]) -> list[str]:
+def _render_token_summary_section(decisions: list[dict], turn_metrics: list[dict] | None = None) -> list[str]:
     token_decisions = [d for d in decisions if d.get("total_tokens") is not None]
-    if not token_decisions:
+    observed_turns = [
+        row
+        for row in (turn_metrics or [])
+        if row.get("usage_source") == "observed" and row.get("total_tokens") is not None
+    ]
+    if not observed_turns and not token_decisions:
         return []
-    total_tok = sum(d.get("total_tokens", 0) for d in token_decisions)
-    total_in = sum(d.get("input_tokens", 0) for d in token_decisions if d.get("input_tokens") is not None)
-    total_out = sum(d.get("output_tokens", 0) for d in token_decisions if d.get("output_tokens") is not None)
-    by_agent: dict[str, int] = {}
-    for d in token_decisions:
-        agent_key = d.get("agent") or "unknown"
-        by_agent[agent_key] = by_agent.get(agent_key, 0) + (d.get("total_tokens") or 0)
 
     def _fmt_tok(n: int) -> str:
         return f"{n / 1000:.1f}K" if n >= 1000 else str(n)
 
-    lines: list[str] = ["", "## Token Summary"]
-    lines.append(
-        f"- Decisions with tokens: {len(token_decisions)} ; Total: {_fmt_tok(total_tok)} (in: {_fmt_tok(total_in)}, out: {_fmt_tok(total_out)})"
-    )
-    agent_parts = " ; ".join(f"{a}: {_fmt_tok(t)}" for a, t in sorted(by_agent.items(), key=lambda x: -x[1]))
-    lines.append(f"- By agent: {agent_parts}")
+    lines = ["", "## Token Summary"]
+    decision_label = "Decisions with tokens"
+    if observed_turns:
+        decision_label += " (derived/overlapping)"
+    for rows, label, group_fields in (
+        (observed_turns, "Observed turns", ("backend", "model")),
+        (token_decisions, decision_label, ("agent",)),
+    ):
+        if not rows:
+            continue
+        total = sum(row["total_tokens"] for row in rows)
+        total_in = sum(row.get("input_tokens") or 0 for row in rows)
+        total_out = sum(row.get("output_tokens") or 0 for row in rows)
+        lines.append(
+            f"- {label}: {len(rows)} ; Total: {_fmt_tok(total)} (in: {_fmt_tok(total_in)}, out: {_fmt_tok(total_out)})"
+        )
+        grouped_totals: dict[str, int] = {}
+        for row in rows:
+            group = "/".join(row.get(field) or "unknown" for field in group_fields)
+            grouped_totals[group] = grouped_totals.get(group, 0) + row["total_tokens"]
+        parts = " ; ".join(
+            f"{group}: {_fmt_tok(tokens)}"
+            for group, tokens in sorted(grouped_totals.items(), key=lambda item: -item[1])
+        )
+        lines.append(f"- By {'/'.join(group_fields)}: {parts}")
     return lines
 
 
@@ -914,6 +933,7 @@ def _render_current_task_md(state: CurrentTaskRenderState) -> str:
     active = state.get("active")
     _generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     decisions = state.get("decisions_recent", [])
+    token_summary = _render_token_summary_section(decisions, state.get("turn_metrics", []))
     latest_decision = decisions[0] if decisions else None
 
     def _task_identity_lines(task_ref: str | None) -> list[str]:
@@ -952,7 +972,7 @@ def _render_current_task_md(state: CurrentTaskRenderState) -> str:
     trailing_stamp = f"_Last generated: {_generated_at}_"
 
     if not active:
-        has_data = any(
+        has_data = token_summary or any(
             state.get(key) for key in ("decisions_recent", "findings_open", "blockers_open", "actions_pending")
         )
         if not has_data:
@@ -962,7 +982,7 @@ def _render_current_task_md(state: CurrentTaskRenderState) -> str:
             "## Task Context",
             *_task_identity_lines(task_ref_display),
             "",
-            "> **Note**: No active `handoff_state` row for this task. Context assembled from available decisions, findings, blockers, and actions.",
+            "> **Note**: No active `handoff_state` row for this task. Context assembled from available task records.",
             "",
             "## Latest Decision",
         ]
@@ -1023,7 +1043,7 @@ def _render_current_task_md(state: CurrentTaskRenderState) -> str:
     lines.extend(_render_lanes_section(state))
     lines.extend(_render_coverage_section(state))
     lines.extend(_render_findings_section(state))
-    lines.extend(_render_token_summary_section(decisions))
+    lines.extend(token_summary)
     lines.append("")
     lines.append(trailing_stamp)
     # Trailing empty element => output ends with a single final newline.

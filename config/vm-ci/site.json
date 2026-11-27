@@ -1,0 +1,13 @@
+{
+  "schema": "vm-ci-site/1",
+  "slug": "wb",
+  "display_name": "WorkBay",
+  "image_repository": "workbay",
+  "runner_home": "/home/gate",
+  "remote_app_root": "/opt/workbay",
+  "demo_admin_user": "wb-demo-admin",
+  "public_domain": "workbay.local",
+  "plugin_slug": "workbay",
+  "plugin_source_dir": "packages/workbay-system",
+  "plugin_install_root": "/opt/workbay/plugins"
+}

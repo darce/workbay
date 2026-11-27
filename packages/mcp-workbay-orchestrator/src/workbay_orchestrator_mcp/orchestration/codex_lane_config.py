@@ -22,8 +22,12 @@ Raw evidence lives under ``tests/fixtures/plan0182_s1b/``.
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from workbay_protocol import reasoning_effort as model_routing
@@ -62,6 +66,77 @@ CODEX_PATH_PREPEND = ".local/bin"
 # refused every codex-remote lane (rc 7 executable_version_mismatch) until
 # this pin landed. gpt-6.2-astra requires >= 0.170.0.
 CODEX_CLI_VERSION = "0.170.0"
+
+
+def parse_codex_cli_version(text: str) -> str | None:
+    """Extract a dotted version (e.g. 0.145.0) from ``codex --version`` output."""
+    match = re.search(r"(\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.]+)?)", text or "")
+    return match.group(1) if match else None
+
+
+def codex_cli_version_pin() -> tuple[str, Literal["disk", "import"], str]:
+    """Read the minimum supported Codex CLI version and record its source.
+
+    The MCP server can outlive an edit to ``codex_lane_config.py``. Read the
+    source on every probe so a long-lived process does not misdiagnose a newer
+    on-disk minimum as a remote binary upgrade. ``pin_source=import`` is the
+    fail-closed fallback when the source cannot be read or does not contain a
+    literal ``CODEX_CLI_VERSION`` assignment; that source marker is retained in
+    the probe detail as the durable record of the fallback.
+    """
+    imported_pin = CODEX_CLI_VERSION
+    pin_loaded_at = datetime.now(tz=timezone.utc).isoformat()
+    try:
+        source_path = Path(__file__)
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+                value = node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+                value = node.value
+            else:
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "CODEX_CLI_VERSION" for target in targets):
+                continue
+            parsed_pin = ast.literal_eval(value)
+            if isinstance(parsed_pin, str) and parsed_pin:
+                return parsed_pin, "disk", pin_loaded_at
+            break
+    except (AttributeError, OSError, SyntaxError, TypeError, ValueError, UnicodeError):
+        # ``pin_source=import`` above is the durable fallback record. A probe
+        # must remain available to report its imported pin even when a source
+        # read is interrupted by an edit or filesystem failure.
+        pass
+    return imported_pin, "import", pin_loaded_at
+
+
+def codex_cli_meets_minimum(version: str, minimum_version: str) -> bool:
+    """Return whether ``version`` meets the required minimum."""
+    version_re = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-.]([0-9A-Za-z][0-9A-Za-z.-]*))?(?:\+[0-9A-Za-z.-]+)?$")
+
+    def parts(value: str) -> tuple[tuple[int, int, int], str | None] | None:
+        match = version_re.fullmatch(value.strip())
+        if match is None:
+            return None
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3))), match.group(4)
+
+    remote = parts(version)
+    minimum = parts(minimum_version)
+    if remote is None or minimum is None:
+        return False
+    remote_core, remote_prerelease = remote
+    minimum_core, minimum_prerelease = minimum
+    if remote_core != minimum_core:
+        return remote_core > minimum_core
+    if remote_prerelease is None:
+        return True
+    if minimum_prerelease is None:
+        return False
+    return remote_prerelease >= minimum_prerelease
+
 
 # One-shot S1a observation that `command -v timeout` succeeded. Not durable —
 # S2/S6 must re-probe ([FM-08], [RES-02]).
@@ -142,13 +217,18 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
             default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_senior"],
         ),
         CodexModelTier(
+            slug="gpt-6.2-sol",
+            tier="senior",
+            allowed_efforts=frozenset({"medium", "high"}),
+            default_effort="medium",
+            allowed_service_tiers=frozenset({"default"}),
+            roles=frozenset({"implement", "review", "adjudicate"}),
+            entitled=True,
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_senior"],
+        ),
+        CodexModelTier(
             slug=model_routing.ModelId.CODEX_LEGACY_JUNIOR,
-            # Luna degrades quietly below max: the lane still completes and the
-            # output still reads plausible. The operator directive is that every
-            # Luna lane runs at max, and effort_policy.MAX_EFFORT_MODELS encodes
-            # it for omitted efforts -- this row must agree, or the two dispatch
-            # paths that read default_effort (lane_escalation, offload_preflight
-            # tier resolution) would silently route Luna below max.
+            # Default omitted effort to max for both Luna models.
             tier="junior",
             allowed_efforts=frozenset({"medium", "high", "xhigh", "max"}),
             default_effort="max",
@@ -167,8 +247,7 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
         ),
         CodexModelTier(
             slug=model_routing.ModelId.CODEX_JUNIOR,
-            # Same envelope as gpt-5.6-luna, and the same max-only directive
-            # (effort_policy.MAX_EFFORT_MODELS). The catalogue advertises
+            # Same default as gpt-5.6-luna. The catalogue advertises
             # low..max without ultra; low stays out, as for gpt-5.6-luna.
             # Measured 2026-09-22 on CLI 0.155.1, same ChatGPT account as the
             # gate VM: `codex exec --ignore-user-config -m gpt-6-luna -c
@@ -181,6 +260,16 @@ CODEX_MODEL_TIERS: dict[str, CodexModelTier] = {
             allowed_efforts=frozenset({"medium", "high", "xhigh", "max"}),
             default_effort="max",
             allowed_service_tiers=frozenset({"default", "fast"}),
+            roles=frozenset({"implement"}),
+            entitled=True,
+            default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_junior"],
+        ),
+        CodexModelTier(
+            slug=model_routing.ModelId.CODEX_SUMMARY,
+            tier="junior",
+            allowed_efforts=frozenset({"medium"}),
+            default_effort="medium",
+            allowed_service_tiers=frozenset({"default"}),
             roles=frozenset({"implement"}),
             entitled=True,
             default_model=model_routing.MODEL_ROUTING_DEFAULTS["codex_tier_junior"],

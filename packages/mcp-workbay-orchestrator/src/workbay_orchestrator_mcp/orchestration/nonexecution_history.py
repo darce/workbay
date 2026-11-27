@@ -542,6 +542,19 @@ def _authenticated_constructor(repo, state_dir, pass_id, raw, *, current_invocat
     _require(path.stem == _sha(proof_raw), "nonexecution_constructor_digest_mismatch")
     proof = _json(proof_raw)
     identity = proof["identity"]
+    v2 = proof["schema"] == "workbay/offload-nonexecution@2"
+    allowed_state_keys = {
+        "status",
+        "task_ref",
+        "lane_id",
+        "result",
+        "lane_cycle_binding",
+        "invocation_token",
+        "started_at",
+        "superseded_invocations",
+    }
+    if v2:
+        allowed_state_keys |= {"queue_intent", "queue_intent_committed", "queue_claim"}
     _require(
         proof["schema"] in {"workbay/offload-nonexecution@1", "workbay/offload-nonexecution@2"}
         and proof["producer"] == "engine_before_admission"
@@ -552,9 +565,7 @@ def _authenticated_constructor(repo, state_dir, pass_id, raw, *, current_invocat
         and result.get("model_dispatched") is False
         and result.get("execution_admitted") is False
         and state.get("status") == "done"
-        and not set(state)
-        - {"status", "task_ref", "lane_id", "result", "lane_cycle_binding", "invocation_token", "started_at",
-           "superseded_invocations"},
+        and not set(state) - allowed_state_keys,
         "nonexecution_constructor_identity_mismatch",
     )
     actual = {
@@ -567,7 +578,6 @@ def _authenticated_constructor(repo, state_dir, pass_id, raw, *, current_invocat
     # v2 additionally sealed the retained state and incarnation cursor. v1
     # sealed the token/request/result/source and original lane binding; never
     # manufacture a missing historical cursor from today's registry.
-    v2 = proof["schema"] == "workbay/offload-nonexecution@2"
     superseded = state.get("superseded_invocations", [])
     _require(
         isinstance(superseded, list) and (v2 or "superseded_invocations" not in state),

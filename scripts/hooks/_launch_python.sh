@@ -96,6 +96,8 @@ _signal_list() {
 # TERM then KILL, no deadline grace sleep) and returns nonviable.
 _probe_viable() {
     _interp=$1
+    shift
+    _probe_output=
     _launch_pid=$$
     _old_umask=$(umask)
     umask 077
@@ -117,7 +119,11 @@ _probe_viable() {
         return 1
     }
 
-    "$_interp" -I -c 'raise SystemExit(0)' </dev/null >/dev/null 2>&1 &
+    _probe_stdout=/dev/null
+    if [ "$1" != -c ]; then
+        _probe_stdout=$_work/output
+    fi
+    "$_interp" -I "$@" </dev/null >"$_probe_stdout" 2>/dev/null &
     _pid=$!
     printf '%s\n' "$_pid" > "$_work/pid"
 
@@ -188,7 +194,7 @@ _probe_viable() {
             kill -s KILL "$_pid" 2>/dev/null
             wait "$_pid" 2>/dev/null
         fi
-        command -p rm -f "$_work/live" "$_work/pid" "$_work/ps" "$_work/ready"
+        command -p rm -f "$_work/live" "$_work/pid" "$_work/ps" "$_work/ready" "$_work/output"
         command -p rmdir "$_work" 2>/dev/null
         return 1
     fi
@@ -199,7 +205,10 @@ _probe_viable() {
     command -p rm -f "$_work/live" "$_work/pid" "$_work/ps" "$_work/ready"
     kill "$_wd" 2>/dev/null
     wait "$_wd" 2>/dev/null
-    command -p rm -f "$_work/live" "$_work/pid" "$_work/ps" "$_work/ready"
+    if [ "$_rc" -eq 0 ] && [ "$_probe_stdout" != /dev/null ]; then
+        IFS= read -r _probe_output < "$_work/output" || _probe_output=
+    fi
+    command -p rm -f "$_work/live" "$_work/pid" "$_work/ps" "$_work/ready" "$_work/output"
     command -p rmdir "$_work" 2>/dev/null
 
     [ "$_rc" -eq 0 ]
@@ -217,18 +226,72 @@ _seen=
 _chosen=
 _consider() {
     _c=$1
-    [ -n "$_c" ] || return 0
     [ -z "$_chosen" ] || return 0
+    [ -f "$_c" ] && [ -x "$_c" ] || return 0
     case "$_seen" in
         *"|$_c|"*) return 0 ;;
     esac
     _seen="${_seen}|${_c}|"
-    if _probe_viable "$_c"; then
+    if _probe_viable "$_c" -c 'raise SystemExit(0)'; then
         _chosen=$_c
     fi
 }
 
+_consider_workbay_shebang() {
+    [ -z "$_chosen" ] && [ -f "$1" ] && [ -x "$1" ] || return 0
+    IFS= read -r _shebang < "$1" || return 0
+    case "$_shebang" in
+        '#!'*)
+            _shebang=${_shebang#\#!}
+            read -r _python _options <<EOF
+$_shebang
+EOF
+            case "$_python" in /*) ;; *) return 0 ;; esac
+            case "${_python##*/}" in
+                *python*)
+                    _consider "$_python"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_consider_uv_tools() {
+    [ -z "$_chosen" ] && [ -n "$1" ] || return 0
+    _consider "$1/workbay/bin/python"
+    for _tool_python in "$1"/workbay*/bin/python; do
+        [ -z "$_chosen" ] || break
+        _consider "$_tool_python"
+    done
+}
+
 _consider "${_root}/.venv/bin/python"
+if [ -z "$_chosen" ]; then
+    case "${WORKBAY_TOOL_PYTHON:-}" in
+        */*) _consider "$WORKBAY_TOOL_PYTHON" ;;
+        ?*) _consider "$(command -v "$WORKBAY_TOOL_PYTHON" 2>/dev/null)" ;;
+    esac
+    _consider_workbay_shebang "$(command -v workbay 2>/dev/null)"
+    [ -z "${UV_TOOL_BIN_DIR:-}" ] || _consider_workbay_shebang "$UV_TOOL_BIN_DIR/workbay"
+    [ -z "${XDG_BIN_HOME:-}" ] || _consider_workbay_shebang "$XDG_BIN_HOME/workbay"
+    [ -z "${HOME:-}" ] || _consider_workbay_shebang "$HOME/.local/bin/workbay"
+    _consider_uv_tools "${UV_TOOL_DIR:-}"
+    [ -z "${XDG_DATA_HOME:-}" ] || _consider_uv_tools "$XDG_DATA_HOME/uv/tools"
+    [ -z "${HOME:-}" ] || _consider_uv_tools "$HOME/.local/share/uv/tools"
+fi
+
+# Native installs need no cache reader. For a custom cached runtime, use the
+# bounded bootstrap probe and the guard's existing verdict validation.
+if [ -z "$_chosen" ] && [ -n "${HOME:-}" ] &&
+    [ -f "$HOME/.cache/workbay/run-guard/policy-interpreter.json" ]; then
+    case "${1:-}" in
+        _run_guard.py|*/_run_guard.py)
+            if _probe_viable /usr/bin/python3 -S "$1" --cached-policy-python; then
+                _chosen=$_probe_output
+            fi
+            ;;
+    esac
+fi
 _consider /usr/bin/python3
 _consider /opt/homebrew/bin/python3
 _path_py=$(command -v python3 2>/dev/null) || _path_py=

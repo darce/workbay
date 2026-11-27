@@ -3,6 +3,33 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.4.53] — 2026-11-27
+
+### Fixed
+- Pin the bundled remote agent to orchestrator boundary runtime 0.3.55 for WorkBay v0.1.106.
+
+## [0.4.52] — 2026-11-27
+
+### Fixed
+- Update the bundled remote agent to use orchestrator boundary runtime 0.3.54 for WorkBay v0.1.106.
+
+## [0.4.51] — 2026-11-27
+
+### Fixed
+- Extend VM and host scratch reclamation to cover orphaned virtual environments and stale `wbfix` and `wbscratch` trees (G16).
+- Report ambiguous workspace-to-task mappings in `doctor` and show how to select the intended task explicitly (G17).
+
+## [0.4.50] - 2026-11-27
+
+### Changed
+- Generate Antigravity MCP lazy-loading settings from the shared harness configuration.
+- Run canon lint on staged changes in the shipped pre-commit hook and block only on verified blocking findings.
+
+## [0.4.49] — 2026-11-26
+
+### Changed
+- Update both remote-agent boundary runtime pins to the WorkBay v0.1.106 orchestrator version.
+
 ## [0.4.48] — 2026-11-26
 
 ### Changed

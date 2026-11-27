@@ -300,7 +300,7 @@ class ContentInvalidHandoffError(RuntimeError):
         super().__init__(f"content-invalid lane handoff: {reason}")
 
 
-DegeneracyClassification = Literal["attempted", "degenerate_no_attempt", "turn_cap_exhausted"]
+DegeneracyClassification = Literal["attempted", "blocked", "degenerate_no_attempt", "turn_cap_exhausted"]
 _TURN_CAP_EXHAUSTED = "turn_cap_exhausted"
 _UNKNOWN_MAX_TURNS = 2**31 - 1
 _MAX_TURNS_ENV = "WORKBAY_LANE_MAX_TURNS"
@@ -499,6 +499,22 @@ def _has_attempt_evidence(result: dict[str, Any]) -> bool:
     return _has_nonempty_changed_files(result)
 
 
+def _has_substantive_blocker(result: dict[str, Any]) -> bool:
+    """Recognize a structured blocker without counting receiver diagnostics."""
+    blockers = result.get("blockers")
+    return (
+        isinstance(blockers, list)
+        and not _raw_payload(result).get("handoff_schema_violations")
+        and any(
+            # Remote refusal attribution can append " [backend]" to a note.
+            isinstance(item, str)
+            and item.partition(" [")[0] not in _ADVISORY_BLOCKERS
+            and _meets_substance_floor(item, _SUBSTANCE_20)
+            for item in blockers
+        )
+    )
+
+
 def _cli_max_turns(args: argparse.Namespace) -> int | None:
     """Resolve the handoff CLI cap: ``--max-turns``, else ``WORKBAY_LANE_MAX_TURNS``."""
     explicit = _nonneg_int(getattr(args, "max_turns", None))
@@ -548,13 +564,14 @@ def _is_first_turn(payload: dict[str, Any], *, num_turns: int | None, tool_call_
 
 
 def classify_degeneracy(payload: dict[str, Any], *, max_turns: int) -> DegeneracyClassification:
-    """Classify a received lane result by receiver-visible lifecycle facts.
+    """Classify a received lane result by lifecycle facts and blocker evidence.
 
     ``turn_cap_exhausted`` is a distinct typed outcome: never degenerate, never
     merge_ready. ``degenerate_no_attempt`` is for first-turn documents with no
     adapter-owned lifecycle evidence, including a schema-shaped ``merge_ready``
-    placeholder. Observed token spend and an ``unobservable`` tool-call source
-    are not attempt evidence (F1 / OBS-08).
+    placeholder. A first-turn ``needs_guidance`` with a substantive blocker
+    can instead be ``blocked``. Observed token spend and an ``unobservable``
+    tool-call source are not attempt evidence (F1 / OBS-08).
     """
     payload = _drop_worker_authored_tool_call_count(payload)
     num_turns = _payload_num_turns(payload)
@@ -571,6 +588,8 @@ def classify_degeneracy(payload: dict[str, Any], *, max_turns: int) -> Degenerac
     tool_call_count = _payload_tool_call_count(payload)
     first_turn = _is_first_turn(payload, num_turns=num_turns, tool_call_count=tool_call_count)
     if first_turn and not _has_attempt_evidence(payload):
+        if payload.get("handoff_action") == "needs_guidance" and _has_substantive_blocker(payload):
+            return "blocked"
         return "degenerate_no_attempt"
     return "attempted"
 
@@ -590,9 +609,8 @@ def _degenerate_handoff_reason(
 ) -> DegenerateHandoffReason | None:
     """Return the exact receiving-boundary anti-degeneracy failure, if any.
 
-    ``degenerate_no_attempt`` is vetoed regardless of ``handoff_action`` so a
-    first-turn toolless ``merge_ready`` with no changed files is refused like
-    a first-turn toolless ``needs_guidance`` (F1 / OBS-08).
+    ``degenerate_no_attempt`` is vetoed for either action. Only
+    ``needs_guidance`` can pass on substantive blocker evidence alone.
     """
     if _is_typed_transport_result(result):
         return None
@@ -630,9 +648,16 @@ def _raise_if_envelope_proves_degenerate(
         return
     raise DegenerateHandoffError(
         reason,
-        "needs_guidance requires positive receiver-recorded lifecycle evidence "
-        f"({_attempt_evidence_absence_reason(result)})",
+        _degenerate_handoff_detail(result),
     )
+
+
+def _degenerate_handoff_detail(result: dict[str, Any]) -> str:
+    action = result.get("handoff_action")
+    requirement = "positive receiver-recorded lifecycle evidence"
+    if action == "needs_guidance":
+        requirement = f"a substantive blocker or {requirement}"
+    return f"{action} requires {requirement} ({_attempt_evidence_absence_reason(result)})"
 
 
 def _meets_substance_floor(value: str, pattern: str) -> bool:
@@ -791,16 +816,10 @@ def _schema() -> dict[str, Any]:
                 "enum": ["merge_ready", "needs_guidance"],
                 "description": (
                     "Use merge_ready only when lane-owned code changes were made "
-                    "and are ready for orchestrator review. Do not use "
-                    "needs_guidance as a first-turn or turn-0 exit, as a "
-                    "placeholder, or before attempting the assigned work. "
-                    "needs_guidance also requires at least one concrete, "
-                    "substantive blocker in blockers. "
-                    "needs_guidance is licensed ONLY for external blockers "
-                    "encountered AFTER attempting the work (sandbox failures, "
-                    "verification blockers, already-resolved findings needing "
-                    "orchestrator review). A first-turn needs_guidance document "
-                    "is prohibited."
+                    "and are ready for orchestrator review. Use needs_guidance "
+                    "when the lane needs an orchestrator decision or an external "
+                    "blocker prevents progress. Record concrete blockers in blockers, "
+                    "including any missing prerequisite that prevents work from starting."
                 ),
             },
             "summary": {
@@ -813,9 +832,8 @@ def _schema() -> dict[str, Any]:
                 "minLength": 120,
                 "description": (
                     "Concise explanation of what changed or what was verified, "
-                    "plus why the lane is ready or blocked. When "
-                    "handoff_action is needs_guidance, this must describe what "
-                    "was attempted before requesting guidance."
+                    "plus why the lane is ready or blocked. For needs_guidance, "
+                    "describe work attempted or the prerequisite that prevented it."
                 ),
             },
             "tests_run": {
@@ -885,34 +903,19 @@ def _load_result(path: Path, *, max_turns: int | None = None) -> dict[str, Any]:
         result = _validate_parsed_lane_result(payload)
     except SubstanceValidationError as exc:
         raise RuntimeError(str(exc)) from exc
-    # Constrained decoding cannot reliably enforce an action-dependent schema
-    # branch. At the durable receiving boundary, fail on the fact the policy
-    # actually requires: evidence that work was attempted. Summary, details,
-    # and blockers are worker-authored prose and therefore are not evidence.
-    # Typed adapter failures are transport outcomes, not worker bailouts.
+    # Keep adapter refusal provenance and classify worker results after
+    # substance validation. Advisory blockers cannot satisfy the guard.
     if refusal is not None:
         return {**result, **refusal}
     if _is_typed_transport_result(result):
         return result
-    resolved_max_turns = _resolve_max_turns(result, max_turns)
-    classification = classify_degeneracy(result, max_turns=resolved_max_turns)
+    classification = classify_degeneracy(result, max_turns=_resolve_max_turns(result, max_turns))
     if classification == "turn_cap_exhausted":
         return _apply_turn_cap_exhausted(result)
-    # Veto first-turn toolless placeholders for every action, including
-    # schema-shaped merge_ready (F1). Do not wait for the needs_guidance-only
-    # helper to fire.
     if classification == "degenerate_no_attempt":
         raise DegenerateHandoffError(
             DegenerateHandoffReason.GUIDANCE_WITHOUT_ATTEMPT,
-            "needs_guidance requires positive receiver-recorded lifecycle evidence "
-            f"({_attempt_evidence_absence_reason(result)})",
-        )
-    reason = _degenerate_handoff_reason(result, max_turns=resolved_max_turns)
-    if reason is not None:
-        raise DegenerateHandoffError(
-            reason,
-            "needs_guidance requires positive receiver-recorded lifecycle evidence "
-            f"({_attempt_evidence_absence_reason(result)})",
+            _degenerate_handoff_detail(result),
         )
     return result
 

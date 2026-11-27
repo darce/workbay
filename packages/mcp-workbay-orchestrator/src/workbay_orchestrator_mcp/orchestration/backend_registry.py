@@ -1,4 +1,3 @@
-import ast
 import importlib
 import logging
 import math
@@ -9,7 +8,6 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -34,6 +32,11 @@ from workbay_orchestrator_mcp.orchestration.codex_lane_config import (
     DEFAULT_CODEX_MODEL,
     TRACKED_CODEX_MODEL,
     WORKBAY_CODEX_MODEL_ENV,
+    codex_cli_meets_minimum,
+    parse_codex_cli_version,
+)
+from workbay_orchestrator_mcp.orchestration.codex_lane_config import (
+    codex_cli_version_pin as _codex_cli_version_pin,
 )
 from workbay_orchestrator_mcp.orchestration.cursor_lane_config import (
     CURSOR_LIST_MODELS_ARGV,
@@ -456,10 +459,19 @@ _CLAUDE_REMOTE_ALLOWED_MODELS = frozenset(
         model_routing.ModelId.CLAUDE_OPUS,
         model_routing.ModelId.CLAUDE_SONNET,
         model_routing.ModelId.CLAUDE_FABLE,
+        "claude-fable-5-2",
         model_routing.ModelId.CLAUDE_LEGACY_HAIKU,
         model_routing.ModelId.CLAUDE_HAIKU,
     }
 )
+
+
+def _claude_remote_allowed_models(env_var: str) -> frozenset[str]:
+    """Extend the built-in allowlist from the backend's startup environment."""
+    configured = (value.strip() for value in os.environ.get(env_var, "").split(","))
+    return _CLAUDE_REMOTE_ALLOWED_MODELS.union(
+        slug for slug in configured if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/-]*", slug)
+    )
 
 
 BACKENDS: dict[str, BackendSpec] = {
@@ -816,7 +828,7 @@ BACKENDS: dict[str, BackendSpec] = {
         shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.claude_code.ClaudeCodeAdapter",
         availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_claude_remote",
         allowed_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
-        allowed_models=_CLAUDE_REMOTE_ALLOWED_MODELS,
+        allowed_models=_claude_remote_allowed_models("WORKBAY_CLAUDE_REMOTE_ALLOWED_MODELS"),
         tracked_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         default_effort="xhigh",
         auth=AuthPort(
@@ -866,7 +878,7 @@ BACKENDS: dict[str, BackendSpec] = {
         shaping_adapter_path="workbay_orchestrator_mcp.orchestration.adapters.claude_code.ClaudeCodeAdapter",
         availability_probe_path="workbay_orchestrator_mcp.orchestration.backend_registry._probe_claude_api_remote",
         allowed_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
-        allowed_models=_CLAUDE_REMOTE_ALLOWED_MODELS,
+        allowed_models=_claude_remote_allowed_models("WORKBAY_CLAUDE_API_REMOTE_ALLOWED_MODELS"),
         tracked_model=model_routing.MODEL_ROUTING_DEFAULTS["claude"],
         default_effort="xhigh",
         auth=AuthPort(
@@ -2593,55 +2605,6 @@ def _probe_claude_api_remote(*, workspace_root: Path | str | None = None) -> dic
     )
 
 
-def _parse_codex_cli_version(text: str) -> str | None:
-    """Extract a dotted version (e.g. 0.145.0) from ``codex --version`` output."""
-    import re  # noqa: PLC0415
-
-    match = re.search(r"(\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.]+)?)", text or "")
-    return match.group(1) if match else None
-
-
-def _codex_cli_version_pin() -> tuple[str, Literal["disk", "import"], str]:
-    """Read the minimum supported Codex CLI version and record its source.
-
-    The MCP server can outlive an edit to ``codex_lane_config.py``. Read the
-    source on every probe so a long-lived process does not misdiagnose a newer
-    on-disk minimum as a remote binary upgrade. ``pin_source=import`` is the
-    fail-closed fallback when the source cannot be read or does not contain a
-    literal ``CODEX_CLI_VERSION`` assignment; that source marker is retained in
-    the probe detail as the durable record of the fallback.
-    """
-    from workbay_orchestrator_mcp.orchestration import codex_lane_config  # noqa: PLC0415
-
-    imported_pin = codex_lane_config.CODEX_CLI_VERSION
-    pin_loaded_at = datetime.now(tz=timezone.utc).isoformat()
-    try:
-        source_path = Path(codex_lane_config.__file__)
-        source = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(source_path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-                value = node.value
-            elif isinstance(node, ast.AnnAssign):
-                targets = [node.target]
-                value = node.value
-            else:
-                continue
-            if not any(isinstance(target, ast.Name) and target.id == "CODEX_CLI_VERSION" for target in targets):
-                continue
-            parsed_pin = ast.literal_eval(value)
-            if isinstance(parsed_pin, str) and parsed_pin:
-                return parsed_pin, "disk", pin_loaded_at
-            break
-    except (AttributeError, OSError, SyntaxError, TypeError, ValueError, UnicodeError):
-        # ``pin_source=import`` above is the durable fallback record. A probe
-        # must remain available to report its imported pin even when a source
-        # read is interrupted by an edit or filesystem failure.
-        pass
-    return imported_pin, "import", pin_loaded_at
-
-
 def _codex_pin_detail(
     *,
     pin: str,
@@ -2658,33 +2621,6 @@ def _codex_pin_detail(
     if pin_source == "disk" and pin != imported_pin:
         return f"stale server pin: imported pin is {imported_pin}, disk pin is {pin}; {metadata}"
     return metadata
-
-
-def _codex_version_in_supported_range(remote_version: str, pinned: str) -> bool:
-    """Return whether ``remote_version`` meets the pinned minimum version."""
-    import re  # noqa: PLC0415
-
-    version_re = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-.]([0-9A-Za-z][0-9A-Za-z.-]*))?(?:\+[0-9A-Za-z.-]+)?$")
-
-    def parts(value: str) -> tuple[tuple[int, int, int], str | None] | None:
-        match = version_re.fullmatch(value.strip())
-        if match is None:
-            return None
-        return (int(match.group(1)), int(match.group(2)), int(match.group(3))), match.group(4)
-
-    remote = parts(remote_version)
-    minimum = parts(pinned)
-    if remote is None or minimum is None:
-        return False
-    remote_core, remote_prerelease = remote
-    minimum_core, minimum_prerelease = minimum
-    if remote_core != minimum_core:
-        return remote_core > minimum_core
-    if remote_prerelease is None:
-        return True
-    if minimum_prerelease is None:
-        return False
-    return remote_prerelease >= minimum_prerelease
 
 
 def _codex_remote_required_capabilities() -> frozenset[str]:
@@ -2865,7 +2801,7 @@ def _probe_codex_remote(
         (line.partition(":")[2].strip() for line in combined.splitlines() if line.startswith("CODEX_VERSION:")),
         None,
     )
-    remote_version = _parse_codex_cli_version(version_line or "")
+    remote_version = parse_codex_cli_version(version_line or "")
     if remote_version is None:
         return refuse(
             "codex_probe_output_unparseable",
@@ -2880,7 +2816,7 @@ def _probe_codex_remote(
             f"Remote gate '{host}' returned an incomplete or unparseable codex capability result",
             probed_version=remote_version,
         )
-    if not _codex_version_in_supported_range(remote_version, pin):
+    if not codex_cli_meets_minimum(remote_version, pin):
         return refuse(
             "codex_version_below_minimum",
             f"codex-remote reports version {remote_version}, below minimum {pin}",

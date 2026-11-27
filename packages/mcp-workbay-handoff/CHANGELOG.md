@@ -3,6 +3,26 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.48] — 2026-11-27
+
+### Added
+- Add an OpenAI-compatible local `/v1/embeddings` provider with bounded requests (G15).
+
+### Fixed
+- Bound continuation saves and resume lookups, and report the failure phase when the store cannot complete the operation (G17).
+
+## [0.3.47] - 2026-11-27
+
+### Changed
+- Hydrate decision token counts from observed remote turn metrics, refresh them on duplicate recording, and preserve token evidence through handoff export and import.
+- Add advisory canon checks for recorded decisions and track later reversals.
+- Bound compaction of transcripts over 50 MiB and recognize Antigravity CLI as a harness.
+
+## [0.3.46] — 2026-11-26
+
+### Changed
+- Raise the optional lifecycle dependency floor to the orchestrator release that recovers sealed queued refusals.
+
 ## [0.3.45] — 2026-11-26
 
 ### Changed

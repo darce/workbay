@@ -39,6 +39,11 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 JOB_NAME = re.compile(r"workbay-.+-[0-9]{8}\Z")
+IDLE_SECONDS = 21_600
+IDLE_VM_NAME = re.compile(r"(?:workbay-[A-Za-z0-9._-]+-202[A-Za-z0-9._-]*|acx-train-[A-Za-z0-9._-]+)\Z")
+IDLE_GATE_NAME = re.compile(r"[A-Za-z0-9._-]+-gate-[A-Za-z0-9._-]+\Z")
+VENV_PREFIX = ".venv-lane-"
+IDLE_HOST_CATEGORIES = {"wbfix-": "host_wbfix", "wbscratch-": "host_wbscratch"}
 EXCLUDED = {"workbay-sandbox", "workbay-control-reviews"}
 FILE_CAP = 2 * 1024 * 1024
 # du walks a whole job tree and is slowest exactly when IO is contended.
@@ -1985,7 +1990,7 @@ def excluded_opaque_task(process, census):
         return None
 
 
-def lane_live(paths, census):
+def lane_live(paths, census, ignored_fds=()):
     """Owned reference facets hold unless an opaque task meets contract v1.2."""
     def referenced(value):
         if not value.startswith("/"):
@@ -2009,6 +2014,8 @@ def lane_live(paths, census):
                         # Zombie processes have no cwd/exe; disappearing PIDs are idle.
                         continue
                 for fd in census.children(process / "fd"):
+                    if process.name == str(os.getpid()) and fd.name in ignored_fds:
+                        continue
                     try:
                         if referenced(os.readlink(fd)):
                             return {"reason": "process_reference_inside", "borrower": f"pid:{process.name}"}
@@ -2040,6 +2047,267 @@ def lane_live(paths, census):
     except (OSError, ValueError, RuntimeError, ScanDeadline) as exc:
         return {"reason": "process_census_unknown", "dependency_error": census.diagnostic(exc)}
     return None
+
+
+def idle_locks(directory, lane_key, stack, apply):
+    paths = [directory, directory / "job.lock", directory / ".lock"]
+    if lane_key is not None:
+        paths = [
+            *(directory.parent / name for name in (
+                ".reap.lock", ".reap-sweep.lock", f".lane-lock-{lane_key}", ".queue-publication.lock",
+                f".lane-lease-{lane_key}.lock",
+            )),
+            *paths,
+        ]
+    held = set()
+    for path in paths:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        if apply and path.parent == directory.parent and path != directory:
+            flags |= os.O_CREAT  # Coordinate with the lane producer before rechecking the sibling.
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileNotFoundError:
+            if path == directory:
+                raise
+            continue
+        stack.callback(os.close, fd)
+        info = os.fstat(fd)
+        expected = stat.S_ISDIR if path == directory else stat.S_ISREG
+        if not expected(info.st_mode):
+            raise Refusal("hold", "lock_not_regular")
+        held.add(str(fd))
+        if sys.platform.startswith("linux"):
+            if observed_lock_busy(info):
+                raise Refusal("hold", "lock_busy")
+            if not apply:
+                continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refusal("hold", "lock_busy") from None
+    return held
+
+
+def idle_lane_lease(root, key):
+    try:
+        raw = read_regular(root / f".lane-live-{key}")
+    except FileNotFoundError:
+        return
+    try:
+        fields = dict(line.split("=", 1) for line in raw.decode("utf-8").splitlines())
+        issued, expiry, pid = (int(fields[name]) for name in ("issued", "expiry", "pid"))
+        released = fields.get("released", "0")
+        if not (0 <= issued <= expiry and pid > 0 and released in {"0", "1"}):
+            raise ValueError("invalid lease fields")
+    except (KeyError, ValueError):
+        raise Refusal("hold", "lane_lease_unknown") from None
+    if Path(f"/proc/{pid}").exists() or (released == "0" and time.time() < expiry):
+        raise Refusal("hold", "lane_lease_active")
+
+
+def idle_tree_size(directory, identity, cutoff, host, deadline):
+    """Measure allocated bytes while checking age, ownership and deletion boundaries."""
+    root_stat = directory.lstat()
+    if (root_stat.st_dev, root_stat.st_ino) != identity or not stat.S_ISDIR(root_stat.st_mode):
+        raise Refusal("hold", "directory_changed")
+    if root_stat.st_uid != os.geteuid():
+        raise Refusal("hold", "foreign_owner")
+    if root_stat.st_mtime > cutoff:
+        raise Refusal("hold", "fresh")
+    mounts = set()
+    if sys.platform.startswith("linux"):
+        for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+            value = line.split()[4]
+            mounts.add(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value))
+    allocated, links = root_stat.st_blocks * 512, set()
+    for parent, dirs, files, fd in os.fwalk(directory, follow_symlinks=False, onerror=_rescue_walk_error):
+        if time.monotonic() >= deadline:
+            raise Refusal("hold", "scan_deadline")
+        if parent == str(directory):
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != identity:
+                raise Refusal("hold", "directory_changed")
+        if parent in mounts or os.path.ismount(parent):
+            raise Refusal("hold", "mount_boundary")
+        for name in chain(dirs, files):
+            if time.monotonic() >= deadline:
+                raise Refusal("hold", "scan_deadline")
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if entry.st_dev != root_stat.st_dev or str(Path(parent) / name) in mounts:
+                raise Refusal("hold", "mount_boundary")
+            if entry.st_uid != os.geteuid():
+                raise Refusal("hold", "foreign_owner")
+            relative = (Path(parent) / name).relative_to(directory).as_posix()
+            if name in {"RETENTION.json", "RELEASE.json", ".workbay-lane-sandbox"} or relative in CUSTODY_MARKERS:
+                raise Refusal("hold", "managed_retention_or_custody")
+            if name == ".git" and (not host or not stat.S_ISDIR(entry.st_mode)):
+                raise Refusal("hold", "source_custody_unknown")
+            if Path(parent).name == ".git" and name == "worktrees":
+                raise Refusal("hold", "linked_worktrees")
+            if entry.st_mtime > cutoff:
+                raise Refusal("hold", "fresh")
+            if not stat.S_ISDIR(entry.st_mode) and entry.st_nlink > 1:
+                if entry.st_ino in links:
+                    continue
+                links.add(entry.st_ino)
+            allocated += entry.st_blocks * 512
+    return allocated
+
+
+def idle_live(directory, deadline, ignored_fds, host):
+    if sys.platform.startswith("linux"):
+        # Processes can briefly deny procfs access during exec. Require a
+        # complete observation, with bounded retries for this transient state.
+        for _ in range(3):
+            census = DependencyCensus(deadline)
+            census.start()
+            live = lane_live([directory], census, ignored_fds)
+            if (not live or live.get("dependency_error", {}).get("error_type") != "PermissionError"
+                    or time.monotonic() >= deadline):
+                break
+        return live
+    if host and sys.platform == "darwin":
+        if inside(Path.cwd(), directory):
+            return {"reason": "process_reference_inside"}
+        # Exclude the reaper's own temporary lock descriptors.
+        result = run(["lsof", "-nP", "-a", "-p", f"^{os.getpid()}", "+D", str(directory)],
+                     timeout=max(0, deadline - time.monotonic()))
+        if result.stderr or result.returncode not in (0, 1):
+            return {"reason": "process_census_unknown"}
+        return {"reason": "process_reference_inside"} if result.returncode == 0 else None
+    return {"reason": "process_census_unknown"}
+
+
+def idle_retention(roots, *, apply=False, limit=10, deadline=None, jobs_root=None, sandbox_root=None):
+    """Inventory and reclaim local legacy scratch using the same checks in both modes."""
+    deadline = deadline if deadline is not None else time.monotonic() + CENSUS_TIMEOUT_SECONDS
+    cutoff = time.time() - IDLE_SECONDS
+    result = {"idle_seconds": IDLE_SECONDS, "categories": {}, "entries": [], "errors": []}
+    for root, category_for in roots:
+        try:
+            if root.is_symlink():
+                raise Refusal("hold", "unsafe_scan_root")
+            directories = sorted(root.iterdir())
+        except FileNotFoundError:
+            continue
+        except (OSError, Refusal) as exc:
+            result["errors"].append({"path": str(root), "reason": str(exc)})
+            continue
+        dependency_census = DependencyCensus(deadline, sandbox_root)
+        for directory in directories:
+            category = category_for(directory.name)
+            if not category or directory.name.endswith(".git"):
+                continue
+            host = category in IDLE_HOST_CATEGORIES.values()
+            row = {"path": str(directory), "category": category, "verdict": "held", "bytes": None}
+            result["entries"].append(row)
+            totals = result["categories"].setdefault(category, {
+                "candidate_count": 0, "candidate_bytes": 0, "reclaimed_count": 0, "reclaimed_bytes": 0,
+            })
+            orphan = category == "orphan_venv"
+            lane_key = directory.name.removeprefix(VENV_PREFIX).partition(".tmp.")[0] if orphan else directory.name
+            fenced = orphan or root == sandbox_root
+            unit_job = not host and not orphan
+            sibling = root / lane_key
+            release_record = root / ".workbay-release" / f"{lane_key}.json"
+            try:
+                initial = directory.lstat()
+                if not stat.S_ISDIR(initial.st_mode):
+                    raise Refusal("hold", "not_a_real_directory")
+                if not host and any(os.path.lexists(directory / name) for name in ("RETENTION.json", "RELEASE.json")):
+                    raise Refusal("hold", "managed_retention_or_custody")
+                identity = initial.st_dev, initial.st_ino
+                if initial.st_mtime > cutoff:
+                    raise Refusal("hold", "fresh")
+                if time.monotonic() >= deadline:
+                    raise Refusal("hold", "scan_deadline")
+                if unit_job and terminal_unit_state(directory, deadline) is None:
+                    raise Refusal("hold", "unit_active_or_unknown")
+                if orphan and os.path.lexists(sibling):
+                    raise Refusal("hold", "lane_sibling_exists")
+                if not host and os.path.lexists(release_record):
+                    raise Refusal("hold", "managed_retention_or_custody")
+                row["bytes"] = idle_tree_size(directory, identity, cutoff, host, deadline)
+                with ExitStack() as stack:
+                    delete = apply and limit > 0
+                    held = idle_locks(directory, lane_key if fenced else None, stack, delete)
+                    if fenced:
+                        idle_lane_lease(root, lane_key)
+                    if orphan and os.path.lexists(sibling):
+                        raise Refusal("hold", "lane_sibling_exists")
+                    if not host and os.path.lexists(release_record):
+                        raise Refusal("hold", "managed_retention_or_custody")
+                    if jobs_root is not None and lenders(directory, jobs_root, deadline, dependency_census):
+                        raise Refusal("hold", "native_dependency_borrowed")
+                    live = idle_live(directory, deadline, held, host)
+                    if live:
+                        row.update(live)
+                        continue
+                    if delete:
+                        # Revalidate generation and nested writes after activity/dependency probes.
+                        size = idle_tree_size(directory, identity, cutoff, host, deadline)
+                        if (size != row["bytes"] or (orphan and os.path.lexists(sibling))
+                                or (not host and os.path.lexists(release_record))):
+                            raise Refusal("hold", "directory_changed")
+                        if unit_job and terminal_unit_state(directory, deadline) is None:
+                            raise Refusal("hold", "unit_active_or_unknown")
+                        live = idle_live(directory, deadline, held, host)
+                        if live:
+                            row.update(live)
+                            continue
+                        if not shutil.rmtree.avoids_symlink_attacks:
+                            raise Refusal("hold", "safe_delete_unavailable")
+                        current = directory.lstat()
+                        if (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_ctime_ns) != (
+                            *identity, initial.st_mtime_ns, initial.st_ctime_ns
+                        ):
+                            raise Refusal("hold", "directory_changed")
+                    totals["candidate_count"] += 1
+                    totals["candidate_bytes"] += row["bytes"]
+                    row["verdict"] = "reclaimable"
+                    if delete:
+                        try:
+                            shutil.rmtree(directory)
+                        except OSError as exc:
+                            result["errors"].append({"path": str(directory), "reason": str(exc)})
+                            row.update(verdict="error", reason="delete_failed")
+                            continue
+                        totals["reclaimed_count"] += 1
+                        totals["reclaimed_bytes"] += size
+                        row["verdict"] = "reclaimed"
+                        limit -= 1
+                        dependency_census = DependencyCensus(deadline, sandbox_root)
+            except ScanDeadline:
+                row["reason"] = "scan_deadline"
+            except (OSError, Refusal, ValueError, subprocess.TimeoutExpired) as exc:
+                row.update(verdict="held", reason=str(exc) or type(exc).__name__)
+    return result
+
+
+def idle_vm_retention(root, sandbox_root, **options):
+    def job_category(name):
+        if IDLE_VM_NAME.fullmatch(name):
+            return "vm_acx_train" if name.startswith("acx-train-") else "vm_workbay"
+        if name.startswith(VENV_PREFIX) and len(name) > len(VENV_PREFIX):
+            return "orphan_venv"
+        return None
+
+    def sandbox_category(name):
+        return job_category(name) or ("vm_gate" if IDLE_GATE_NAME.fullmatch(name) else None)
+
+    sandbox = Path(sandbox_root or Path.home() / "workbay-sandbox").expanduser().absolute()
+    roots = [(root, sandbox_category if sandbox == root else job_category)]
+    if sandbox != root:
+        roots.append((sandbox, sandbox_category))
+    return idle_retention(roots, jobs_root=root, sandbox_root=sandbox, **options)
+
+
+def idle_host_retention(root, *, apply=False):
+    def category(name):
+        return next((value for prefix, value in IDLE_HOST_CATEGORIES.items()
+                     if name.startswith(prefix) and len(name) > len(prefix)), None)
+
+    return idle_retention([(Path(root).resolve(), category)], apply=apply)
 
 
 def lane_assess(record, root, jobs_root, deadline=None, assessment=None):
@@ -2521,6 +2789,9 @@ def status(
     lanes = {}
     lane_sandboxes(Path(sandbox_root or Path.home() / "workbay-sandbox").expanduser().absolute(),
                    root, lanes, read_only=True, deadline=deadline)
+    idle = idle_vm_retention(root, sandbox_root, deadline=deadline)
+    if idle["errors"] or any(row.get("reason") == "scan_deadline" for row in idle["entries"]):
+        alarms.append("idle_retention_scan_incomplete")
     if (last_run or {}).get("lane_sandbox_reclaimed"):
         lane_fields(lanes)
         lanes["lane_sandbox_reclaimed"] = last_run["lane_sandbox_reclaimed"]
@@ -2532,6 +2803,7 @@ def status(
         alarms.append("reclaim_starved")
     return {
         **lanes,
+        "idle_retention": idle,
         "schema": 1,
         "root": str(root),
         "df_free_bytes": free,
@@ -2880,7 +3152,7 @@ def write_last_run(state, summary, trigger, started_at, error=None):
             },
             **{key: summary[key] for key in
                ("lane_sandbox_released", "lane_sandbox_reclaimed", "lane_sandbox_holds",
-                "lane_sandbox_assessments") if key in summary},
+                "lane_sandbox_assessments", "idle_retention") if key in summary},
             **{key: summary[key] for key in ("starved", "lease_released") if summary.get(key)},
             "error": error,
             **({"resource_failed": summary["resource_failed"]} if summary.get("resource_failed") else {}),
@@ -3081,6 +3353,12 @@ def apply(
                 pending = pending[:available]
             lane_sandboxes(sandbox_root, root, summary, budget=budget,
                            limit=max(0, max_dirs - summary["reclaimed"] - summary["recovered"]))
+            idle_limit = max(0, max_dirs - summary["reclaimed"] - summary["recovered"]
+                             - summary.get("lane_sandbox_reclaimed", {}).get("count", 0))
+            idle = summary["idle_retention"] = idle_vm_retention(root, sandbox_root, apply=True, limit=idle_limit)
+            for totals in idle["categories"].values():
+                summary["reclaimed"] += totals["reclaimed_count"]
+                summary["bytes_freed"] += totals["reclaimed_bytes"]
             if (summary["reclaimed"] + summary["recovered"] == 0
                     and not summary.get("lane_sandbox_reclaimed", {}).get("count")):
                 starved = starvation(scanned["entries"])
@@ -3108,6 +3386,14 @@ def apply(
                 summary["outcome"] = "error"
                 if error is None:
                     error = {"type": "resource_failed", "message": message}
+                else:
+                    error["message"] += "; " + message
+                summary["error"] = error
+            if idle["errors"]:
+                summary["outcome"] = "error"
+                message = "; ".join(f"{row['path']}: {row['reason']}" for row in idle["errors"])
+                if error is None:
+                    error = {"type": "idle_retention_failed", "message": message}
                 else:
                     error["message"] += "; " + message
                 summary["error"] = error
@@ -3162,6 +3448,10 @@ def main(argv=None):
     scan_parser = commands.add_parser("scan", help="read-only classification")
     scan_parser.add_argument("--root", default=str(Path.home()))
     scan_parser.add_argument("--json", action="store_true")
+    scan_parser.add_argument("--sandbox-root", help="lane sandbox root (default: ~/workbay-sandbox)")
+    host_parser = commands.add_parser("idle-host", help="inventory or reclaim local diagnostic scratch")
+    host_parser.add_argument("--root", default="/tmp")  # noqa: S108 - fixed inventory root, no temp files
+    host_parser.add_argument("--apply", action="store_true")
     status_parser = commands.add_parser("status", help="read-only reclaim health and headroom gauge")
     status_parser.add_argument("--root", default=str(Path.home()))
     status_parser.add_argument("--stale-after-seconds", type=nonnegative, default=5400)
@@ -3229,14 +3519,19 @@ def main(argv=None):
         elif args.command == "release":
             output = release(args.directory, args.owner, args.reason, args.evidence_copied_to)
         elif args.command == "scan":
-            output = scan(args.root)
+            output = scan(args.root, read_only=True, sandbox_root=args.sandbox_root)
+            output["idle_retention"] = idle_vm_retention(Path(output["root"]), args.sandbox_root)
             if not args.json:
                 for row in output["entries"]:
                     print(f"{row['basename']}: {row['verdict']} ({row['reason']})")
+                for row in output["idle_retention"]["entries"]:
+                    print(f"{row['path']}: {row['verdict']} ({row.get('reason', row['category'])})")
                 for blocked in output["recover_blocked_foreign_owner"]:
                     print(f"{blocked['path']}: degraded (recover_blocked_foreign_owner uid={blocked['owner_uid']})")
                 print(json.dumps(output["counts"], sort_keys=True))
                 return 0
+        elif args.command == "idle-host":
+            output = idle_host_retention(args.root, apply=args.apply)
         elif args.command == "status":
             output = status(
                 args.root,

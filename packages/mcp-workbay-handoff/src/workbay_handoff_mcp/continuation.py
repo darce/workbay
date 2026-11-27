@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import time
 import uuid
+from contextlib import closing
 from datetime import UTC, datetime
 from typing import Any
 
 from . import artifact_index
 from .runtime import get_runtime_config
 from .shared_primitives import _envelope, _normalize_optional_text, _resolve_task_ref
-from .shared_schema import _get_db_connection
+from .shared_schema import bounded_handoff_read
 
 SOURCE_KIND = "continuation"
 ARCHIVE_SOURCE_KIND = "continuation_archive"
@@ -40,6 +42,7 @@ SECTION_KEYS: tuple[str, ...] = (
 )
 # Cap across all section text (UTF-8 bytes) so a single packet stays prompt-cheap.
 MAX_SECTIONS_BYTES = 16 * 1024
+_CONTINUATION_BUDGET_SECONDS = 0.75
 
 
 class _PhaseTimer:
@@ -149,71 +152,92 @@ def _packet_from_source(source: dict[str, Any] | None) -> dict[str, Any] | None:
     return None
 
 
-def _load_existing_packet(
-    *,
-    task_ref: str,
-    lane_id: str | None,
-    source_label: str,
-) -> tuple[dict[str, Any] | None, int | None]:
-    config = get_runtime_config()
-    source = artifact_index.get_artifact_source(
-        task_ref=task_ref,
-        source_label=source_label,
-        artifact_db_path=config.artifact_db_path,
+def _packet_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any] | None:
+    # Current packets carry the full body in metadata. Only legacy rows need
+    # to touch the FTS table, where source_id is not indexed.
+    try:
+        metadata = json.loads(row["metadata_json"] or "null")
+    except ValueError:
+        metadata = None
+    if isinstance(metadata, dict) and metadata.get("packet_id"):
+        return _packet_from_source({"metadata": metadata})
+    return _packet_from_source(dict(artifact_index._source_with_chunks(conn, row)))
+
+
+def _head_row(
+    conn: sqlite3.Connection, task_ref: str, lane_id: str | None, source_label: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM artifact_sources
+        WHERE task_ref = ? AND lane_id IS ? AND source_kind = ? AND source_label = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (task_ref, lane_id, SOURCE_KIND, source_label),
+    ).fetchone()
+
+
+def _read_head(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    packet = _packet_from_row(conn, row)
+    if packet is None or (packet.get("task_ref") and packet["task_ref"] != row["task_ref"]):
+        raise ValueError("Stored continuation head is invalid")  # noqa: TRY003
+    return packet
+
+
+def _load_packet_by_id(
+    conn: sqlite3.Connection, packet_id: str, task_ref: str | None
+) -> tuple[dict[str, Any] | None, bool]:
+    archives = conn.execute(
+        """
+        SELECT * FROM artifact_sources WHERE source_kind = ? AND source_label = ?
+        ORDER BY task_ref IS ? DESC, updated_at DESC, id DESC LIMIT 1
+        """,
+        (ARCHIVE_SOURCE_KIND, f"archive:{packet_id}", task_ref),
     )
-    if source is None:
-        return None, None
-    # Prefer the row that matches our source_kind + lane scoping when labels collide.
-    if source.get("source_kind") and source.get("source_kind") != SOURCE_KIND:
-        return None, None
-    packet = _packet_from_source(dict(source))
-    source_id = source.get("id")
-    return packet, int(source_id) if source_id is not None else None
+    for row in archives:
+        packet = _packet_from_row(conn, row)
+        if packet is None or packet.get("packet_id") != packet_id:
+            raise ValueError("Stored continuation archive is invalid")  # noqa: TRY003
+        packet["source_id"] = int(row["id"])
+        return packet, True
 
-
-def _load_packet_by_id(packet_id: str, task_ref: str | None = None) -> tuple[dict[str, Any] | None, bool]:
-    config = get_runtime_config()
-    archive = None
-    if task_ref is not None:
-        archive = artifact_index.get_artifact_source(
-            task_ref=task_ref,
-            source_label=f"archive:{packet_id}",
-            artifact_db_path=config.artifact_db_path,
-        )
-    if archive is None or archive.get("source_kind") != ARCHIVE_SOURCE_KIND:
-        archive = artifact_index.find_artifact_source(
-            source_kind=ARCHIVE_SOURCE_KIND,
-            source_label=f"archive:{packet_id}",
-            artifact_db_path=config.artifact_db_path,
-        )
-    if archive is not None and archive.get("source_kind") == ARCHIVE_SOURCE_KIND:
-        packet = _packet_from_source(dict(archive))
+    # Read modern heads in one query. Only rows without a usable metadata ID
+    # remain candidates for legacy chunk reconstruction.
+    heads = conn.execute(
+        """
+        SELECT * FROM artifact_sources
+        WHERE source_kind = ? AND coalesce(
+            CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.packet_id') END, ''
+        ) IN ('', 0, ?)
+        ORDER BY task_ref IS ? DESC, updated_at DESC, id DESC
+        """,
+        (SOURCE_KIND, packet_id, task_ref),
+    )
+    for row in heads:
+        packet = _packet_from_row(conn, row)
         if packet and packet.get("packet_id") == packet_id:
-            packet["source_id"] = int(archive["id"])
-            return packet, True
-
-    offset = 0
-    while True:
-        sources = artifact_index.list_artifact_sources(
-            task_ref=task_ref,
-            source_kind=SOURCE_KIND,
-            limit=200,
-            offset=offset,
-            artifact_db_path=config.artifact_db_path,
-        )
-        for row in sources:
-            source = artifact_index.get_artifact_source(
-                source_id=int(row["id"]),
-                artifact_db_path=config.artifact_db_path,
-            )
-            packet = _packet_from_source(dict(source) if source else None)
-            if packet and packet.get("packet_id") == packet_id:
-                packet["source_id"] = int(row["id"])
-                return packet, False
-        if len(sources) < 200:
-            break
-        offset += len(sources)
+            packet["source_id"] = int(row["id"])
+            return packet, False
     return None, False
+
+
+def _resolve_continuation_task(task_ref: str | None, deadline: float) -> str:
+    # Explicit refs are authoritative in the shared resolver and need no DB.
+    if task_ref:
+        return task_ref
+    return bounded_handoff_read(
+        get_runtime_config().db_path,
+        lambda conn: _resolve_task_ref(conn, task_ref),
+        deadline=deadline,
+    )
+
+
+def _failure_details(exc: Exception) -> dict[str, str]:
+    details = {"error": str(exc) or type(exc).__name__, "exception_type": type(exc).__name__}
+    sqlite_name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(sqlite_name, str):
+        details["sqlite_error"] = sqlite_name
+    return details
 
 
 def save_continuation(
@@ -226,10 +250,12 @@ def save_continuation(
     gotchas: str | None = None,
 ) -> dict:
     """Upsert the newest continuation packet for ``(task_ref, lane_id)``."""
+    deadline = time.monotonic() + _CONTINUATION_BUDGET_SECONDS
     timer = _PhaseTimer()
 
     def finish(result: dict, phase: str) -> dict:
         timer.mark(phase)
+        result["data"].setdefault("operation", "save")
         result["data"]["phase_timings_ns"] = timer.snapshot()
         return result
 
@@ -247,14 +273,13 @@ def save_continuation(
     timer.mark("validate")
 
     try:
-        with _get_db_connection() as conn:
-            resolved_task_ref = _resolve_task_ref(conn, task_ref)
+        resolved_task_ref = _resolve_continuation_task(task_ref, deadline)
     except Exception as exc:  # noqa: BLE001 — surface as write-contract-shaped error
         return finish(
             _envelope(
                 ok=False,
                 tool="continuation",
-                data={"error": str(exc), "code": "task_ref_unresolved", "outcome": "refused"},
+                data={**_failure_details(exc), "code": "task_ref_unresolved", "outcome": "refused"},
                 task_ref=task_ref,
             ),
             "resolve_task",
@@ -263,23 +288,17 @@ def save_continuation(
 
     normalized_lane = _normalize_optional_text(lane_id)
     source_label = continuation_source_label(normalized_lane)
-    config = get_runtime_config()
     # The prior read, the archive and the head write share one BEGIN IMMEDIATE
     # transaction, so a concurrent saver (thread or process) waits for this commit and
     # then archives this packet rather than the stale prior (CON-05, DATA-18). Failures
     # are caught outside the ``with`` so the archive rolls back with a failed head.
     phase = "open"
     try:
-        with artifact_index._immediate_write(config.artifact_db_path) as conn:
+        config = get_runtime_config()
+        with artifact_index._immediate_write(config.artifact_db_path, deadline=deadline) as conn:
             phase = "read"
-            head = artifact_index._source_by_key_in(
-                conn,
-                task_ref=resolved_task_ref,
-                lane_id=normalized_lane,
-                source_kind=SOURCE_KIND,
-                source_label=source_label,
-            )
-            prior_packet = _packet_from_source(dict(head) if head is not None else None)
+            head = _head_row(conn, resolved_task_ref, normalized_lane, source_label)
+            prior_packet = _read_head(conn, head) if head is not None else None
             prior_source_id = int(head["id"]) if head is not None else None
             prior_packet_id = prior_packet.get("packet_id") if isinstance(prior_packet, dict) else None
             if prior_packet_id is not None and not isinstance(prior_packet_id, str):
@@ -332,7 +351,7 @@ def save_continuation(
             _envelope(
                 ok=False,
                 tool="continuation",
-                data={"error": str(exc) or type(exc).__name__, "code": code, "outcome": "refused"},
+                data={**_failure_details(exc), "code": code, "outcome": "refused", "failure_phase": phase},
                 task_ref=resolved_task_ref,
             ),
             "durable_write",
@@ -346,7 +365,8 @@ def save_continuation(
             lane_id=normalized_lane,
             source_kind=ARCHIVE_SOURCE_KIND,
             keep=ARCHIVE_KEEP,
-            artifact_db_path=get_runtime_config().artifact_db_path,
+            artifact_db_path=config.artifact_db_path,
+            deadline=deadline,
         )
     except Exception:  # noqa: BLE001 — the head is committed; retention is best effort
         retention = "failed"
@@ -397,114 +417,79 @@ def load_continuation(
     Absent packets return ``ok=True`` with ``packet: null`` and a typed
     ``not_found`` outcome. An explicitly supplied id is compared exactly.
     """
+    deadline = time.monotonic() + _CONTINUATION_BUDGET_SECONDS
     timer = _PhaseTimer()
+
+    lookup_path = "packet_id" if packet_id is not None else "head"
 
     def finish(result: dict, phase: str) -> dict:
         timer.mark(phase)
-        result["data"]["phase_timings_ns"] = timer.snapshot()
+        data = result["data"]
+        data["operation"] = "load"
+        data["lookup_path"] = lookup_path
+        data["phase_timings_ns"] = timer.snapshot()
         return result
 
-    resolved_task_ref: str | None = None
-    try:
-        if task_ref is not None or packet_id is None:
-            with _get_db_connection() as conn:
-                resolved_task_ref = _resolve_task_ref(conn, task_ref)
-    except Exception as exc:  # noqa: BLE001
-        # Load by explicit packet_id may still succeed without task resolution.
-        if packet_id is None:
+    resolved_task_ref = task_ref or None
+    if packet_id is None:
+        try:
+            resolved_task_ref = _resolve_continuation_task(task_ref, deadline)
+        except Exception as exc:  # noqa: BLE001 — preserve the task-resolution refusal envelope
             return finish(
                 _envelope(
                     ok=False,
                     tool="continuation",
-                    data={"error": str(exc), "code": "task_ref_unresolved"},
+                    data={**_failure_details(exc), "code": "task_ref_unresolved", "outcome": "refused"},
                     task_ref=task_ref,
                 ),
                 "resolve_task",
             )
     timer.mark("resolve_task")
 
-    if packet_id is not None:
-        try:
-            packet, archived = _load_packet_by_id(packet_id, task_ref=resolved_task_ref)
-            if packet is None and resolved_task_ref is not None:
-                # Preserve the existing global packet-id lookup contract.
-                packet, archived = _load_packet_by_id(packet_id, task_ref=None)
-        except Exception as exc:  # noqa: BLE001 — storage failure is not an absent packet
-            return finish(
-                _envelope(
-                    ok=False,
-                    tool="continuation",
-                    data={"error": str(exc) or type(exc).__name__, "code": "continuation_load_failed"},
-                    task_ref=resolved_task_ref,
-                ),
-                "lookup",
-            )
-        return finish(
-            _envelope(
-                ok=True,
-                tool="continuation",
-                data={
-                    "operation": "load",
-                    "outcome": "found" if packet is not None else "not_found",
-                    "packet": packet,
-                    "archived": archived,
-                },
-                task_ref=(packet or {}).get("task_ref") if packet else resolved_task_ref,
-            ),
-            "lookup",
-        )
-
-    if resolved_task_ref is None:
-        try:
-            with _get_db_connection() as conn:
-                resolved_task_ref = _resolve_task_ref(conn, task_ref)
-        except Exception as exc:  # noqa: BLE001
-            return finish(
-                _envelope(
-                    ok=False,
-                    tool="continuation",
-                    data={"error": str(exc), "code": "task_ref_unresolved"},
-                    task_ref=task_ref,
-                ),
-                "lookup",
-            )
-
-    normalized_lane = _normalize_optional_text(lane_id)
-    source_label = continuation_source_label(normalized_lane)
+    packet = None
+    archived = False
     try:
-        packet, source_id = _load_existing_packet(
-            task_ref=resolved_task_ref,
-            lane_id=normalized_lane,
-            source_label=source_label,
-        )
-    except Exception as exc:  # noqa: BLE001 — storage failure is not an absent packet
+        path = get_runtime_config().artifact_db_path
+        try:
+            path.stat()
+        except FileNotFoundError:
+            # No sidecar has been created yet. A resume read can stay read-only.
+            pass
+        else:
+            with closing(artifact_index.get_artifact_db_connection(path, deadline=deadline, read_only=True)) as conn:
+                # A packet can move from head to archive during a save. Read
+                # both from the same SQLite snapshot.
+                conn.execute("BEGIN")
+                if packet_id is not None:
+                    packet, archived = _load_packet_by_id(conn, packet_id, resolved_task_ref)
+                else:
+                    assert resolved_task_ref is not None
+                    normalized_lane = _normalize_optional_text(lane_id)
+                    row = _head_row(conn, resolved_task_ref, normalized_lane, continuation_source_label(normalized_lane))
+                    if row is not None:
+                        packet = _read_head(conn, row)
+                        packet["source_id"] = int(row["id"])
+    except Exception as exc:  # noqa: BLE001 — storage failure is distinct from an absent packet
         return finish(
             _envelope(
                 ok=False,
                 tool="continuation",
-                data={"error": str(exc) or type(exc).__name__, "code": "continuation_load_failed"},
+                data={**_failure_details(exc), "code": "continuation_load_failed", "outcome": "unavailable"},
                 task_ref=resolved_task_ref,
             ),
             "lookup",
         )
-    if packet is not None:
-        packet = dict(packet)
-        packet["source_id"] = source_id
-        # Guard: wrong kind should never surface.
-        if packet.get("task_ref") and packet["task_ref"] != resolved_task_ref:
-            packet = None
 
     return finish(
         _envelope(
             ok=True,
             tool="continuation",
             data={
-                "operation": "load",
                 "outcome": "found" if packet is not None else "not_found",
                 "packet": packet,
-                "archived": False,
+                "archived": archived,
             },
-            task_ref=resolved_task_ref,
+            task_ref=packet.get("task_ref", resolved_task_ref) if packet else resolved_task_ref,
         ),
         "lookup",
     )
@@ -531,8 +516,10 @@ def build_session_continuation(
         return {"status": "unavailable", "code": data.get("code", "continuation_load_failed")}
     data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
     packet = data.get("packet")
-    if not isinstance(packet, dict) or not packet.get("packet_id"):
+    if packet is None:
         return None
+    if not isinstance(packet, dict) or not packet.get("packet_id"):
+        return {"status": "unavailable", "code": "continuation_load_failed"}
 
     packet_id = str(packet["packet_id"])
     injected = (last_injected_continuation_id or "").strip()

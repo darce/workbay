@@ -155,6 +155,7 @@ from workbay_orchestrator_mcp.orchestration.stop_reasons import (
     STOP_REASONS_CHECKPOINT as _STOP_REASONS_CHECKPOINT,
 )
 from workbay_orchestrator_mcp.orchestration.stop_reasons import admission_defer_summary
+from workbay_orchestrator_mcp.orchestration.transport_ref import is_transport_ref
 
 
 class OffloadOutcome(StrEnum):
@@ -234,7 +235,7 @@ def _build_token_telemetry_payload(
     token_budget: int,
     token_telemetry_supported: bool,
 ) -> dict[str, Any]:
-    """Build pass-end token telemetry using the backend capability contract."""
+    """Build pass-end token telemetry from observations and backend presentation."""
     cumulative = int(getattr(run_ctx, "cumulative_tokens", 0) or 0)
     main_tokens: dict[str, Any] | None = None
     try:
@@ -253,8 +254,11 @@ def _build_token_telemetry_payload(
         else backend_supports_token_telemetry(resolved_backend)
     )
     presentation = None if resolved_telemetry_supported else token_telemetry_presentation_for_backend(resolved_backend)
+    effective_telemetry_supported = resolved_telemetry_supported or (
+        cumulative > 0 and (presentation is None or presentation.usage_source is None)
+    )
     subagents: list[dict[str, Any]] = []
-    if resolved_telemetry_supported:
+    if effective_telemetry_supported:
         if cumulative > 0:
             subagents.append(
                 {
@@ -325,12 +329,12 @@ def _build_token_telemetry_payload(
 
     tokens: dict[str, Any] = {
         "token_budget": token_budget,
-        "token_telemetry": resolved_telemetry_supported,
+        "token_telemetry": effective_telemetry_supported,
         "usage_source": usage_source_label,
         "summary": summary,
         "summary_text": summary.get("text") if isinstance(summary, dict) else str(summary),
     }
-    if resolved_telemetry_supported:
+    if effective_telemetry_supported:
         tokens["cumulative_total"] = cumulative
     else:
         tokens["cumulative_total"] = None
@@ -1421,9 +1425,11 @@ def write_pass_state(
                         runtime_config = get_runtime_config()
                     except RuntimeError:
                         runtime_config = None
-                    if (runtime_config is not None
-                            and (Path(runtime_config.workspace_root) / ".git").exists()
-                            and Path(runtime_config.state_dir).resolve() == Path(state_dir).resolve()):
+                    if (
+                        runtime_config is not None
+                        and (Path(runtime_config.workspace_root) / ".git").exists()
+                        and Path(runtime_config.state_dir).resolve() == Path(state_dir).resolve()
+                    ):
                         try:
                             if authenticated_nonexecution(
                                 Path(runtime_config.workspace_root), Path(state_dir), pass_id, path.read_bytes()
@@ -1560,6 +1566,62 @@ def read_pass_state(state_dir: Path, pass_id: str, *, strict: bool = False) -> d
             raise PassStateUnreadable(pass_id, store, exc) from exc
         return None
     return payload
+
+
+def _backfill_detached_submit_pass_receipts(
+    *,
+    state_dir: Path,
+    job_id: str,
+    current_pass_id: str,
+    tokens_payload: dict[str, Any],
+    dispatch_receipt: dict[str, Any] | None,
+    observed_tokens: int,
+    served_model: str | None,
+) -> int:
+    """Project completed job usage onto earlier submit receipts for that job."""
+    if not job_id or observed_tokens <= 0:
+        return 0
+    if served_model is None and dispatch_receipt is not None:
+        model = dispatch_receipt.get("served_model")
+        served_model = model if isinstance(model, str) else None
+
+    updated = 0
+    try:
+        for path in state_dir.glob("offload-pass-*.json"):
+            pass_id = path.name.removeprefix("offload-pass-").removesuffix(".json")
+            if pass_id == current_pass_id:
+                continue
+            try:
+                record = read_pass_state(state_dir, pass_id, strict=True)
+                if record is None:
+                    continue
+                result = record.get("result")
+                if not isinstance(result, dict) or result.get("outcome") != OffloadOutcome.REMOTE_JOB_PENDING.value:
+                    continue
+                # Older receipts can carry the job identity at either level.
+                job_ids = (record.get("job_id"), result.get("job_id"))
+                if job_id not in job_ids or any(value not in (None, job_id) for value in job_ids):
+                    continue
+                prior_receipt = result.get("dispatch_receipt")
+                receipt = dict(prior_receipt) if isinstance(prior_receipt, dict) else {}
+                receipt["observed_tokens"] = observed_tokens
+                if served_model:
+                    receipt["served_model"] = served_model
+                backfilled = {
+                    **result,
+                    "tokens": tokens_payload,
+                    "dispatch_receipt": receipt,
+                    "token_accounting": "observed",
+                }
+                if backfilled != result and write_pass_state(
+                    state_dir, pass_id, {**record, "result": backfilled}, expected_record=record
+                ):
+                    updated += 1
+            except Exception as exc:  # best-effort enrichment of an independent receipt
+                logger.warning("could not backfill detached submit receipt %s: %s", pass_id, exc)
+    except OSError as exc:
+        logger.warning("could not scan detached submit receipts in %s: %s", state_dir, exc)
+    return updated
 
 
 def _bounded_finding_fragment(finding: Any) -> str:
@@ -2444,11 +2506,7 @@ def _install_detached_result(
             "job_id": job_id,
             "attempt": spec.get("attempt", 0),
             "remote_exec_mode": persisted_mode,
-            **(
-                {"remote_exec_selection": dict(persisted_stamp)}
-                if isinstance(persisted_stamp, dict)
-                else {}
-            ),
+            **({"remote_exec_selection": dict(persisted_stamp)} if isinstance(persisted_stamp, dict) else {}),
         }
     )
     _stamp_detached_off_box_capture(result_payload, raw_payload, paths.get("selfverify"))
@@ -2511,10 +2569,17 @@ def _install_detached_result(
     # Harvesting a transport result is not evidence of paid model entry.
     run_ctx.current_process_ran = (raw_payload.get("source_provenance") or {}).get("model_process_started") is True
     run_ctx.event_turn_usage_seen = False
-    # Usage-free harvest contexts need no config; the promoter short-circuits.
-    _worker_daemon_module()._maybe_record_result_token_telemetry(
-        config=getattr(run_ctx, "config", None), ctx=run_ctx, result=result_payload
-    )
+    config = getattr(run_ctx, "config", None)
+    if config is not None:
+        _worker_daemon_module()._maybe_record_result_token_telemetry(config=config, ctx=run_ctx, result=result_payload)
+    # The result artifact carries observed usage even if metrics recording was skipped.
+    token_usage = result_payload.get("token_usage")
+    if not getattr(run_ctx, "cumulative_tokens", 0) and isinstance(token_usage, dict):
+        for usage in (token_usage.get("total"), token_usage.get("last"), token_usage):
+            total = usage.get("total_tokens") if isinstance(usage, dict) else None
+            if type(total) is int and total > 0:
+                run_ctx.cumulative_tokens = total
+                break
     return True
 
 
@@ -3966,8 +4031,7 @@ def _select_pass_guidance_snapshot(task_ref: str, lane_id: str) -> tuple[list[in
         report_ids = [
             row["id"]
             for row in conn.execute(
-                "SELECT id FROM worker_reports WHERE task_ref = ? AND lane_id = ? "
-                "AND status = 'submitted' ORDER BY id",
+                "SELECT id FROM worker_reports WHERE task_ref = ? AND lane_id = ? AND status = 'submitted' ORDER BY id",
                 (task_ref, lane_id),
             )
         ]
@@ -7088,8 +7152,7 @@ def persist_verified_lane_gate(
             or provenance.get("requested_branch") != branch
             or provenance.get("requested_ref") != f"refs/heads/{branch}"
             or not isinstance(provenance.get("dispatch_ref"), str)
-            or not provenance["dispatch_ref"].startswith("refs/heads/")
-            or not provenance["dispatch_ref"].endswith(f"-{nonce}")
+            or not is_transport_ref(provenance["dispatch_ref"], nonce)
             or not all(
                 isinstance(value, str) and object_id.fullmatch(value)
                 for value in (source_commit, source_tree, source_head, base_tree, base_commit)
@@ -8529,6 +8592,14 @@ def _fold_terminal_receipt_records(
             continue
         excluded = pass_id in excluded_pass_ids
         result = persisted.get("result")
+        if (
+            isinstance(result, dict)
+            and result.get("outcome") == OffloadOutcome.REMOTE_JOB_PENDING.value
+            and result.get("token_accounting") == "observed"
+        ):
+            # Backfilled submit receipts display the completion's usage. The
+            # completion receipt is the accounting entry for the execution.
+            continue
         if not isinstance(result, dict):
             if not excluded:
                 history["history_complete"] = False
@@ -10846,14 +10917,28 @@ def run_offload_pass_engine(
         from .nonexecution_history import preview_pass
 
         return preview_pass(
-            orchestrator_root=orchestrator_root, task_ref=task_ref, lane_id=lane_id,
-            worktree_path=worktree_path, pass_id=pass_id or str(uuid.uuid4()),
+            orchestrator_root=orchestrator_root,
+            task_ref=task_ref,
+            lane_id=lane_id,
+            worktree_path=worktree_path,
+            pass_id=pass_id or str(uuid.uuid4()),
             state_dir=Path(state_dir) if state_dir is not None else Path(orchestrator_root) / ".task-state",
-            request=dict(backend=backend, model=model, reasoning_effort=reasoning_effort, speed=speed, tier=tier,
-                         token_budget=token_budget, timeout_seconds=timeout_seconds, max_review_cycles=max_review_cycles,
-                         turn_timeout_seconds=turn_timeout_seconds, grok_max_turns=grok_max_turns,
-                         session=session, session_mode=session_mode, test_cmd=test_cmd,
-                         canon_proposal_path=canon_proposal_path),
+            request=dict(
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                speed=speed,
+                tier=tier,
+                token_budget=token_budget,
+                timeout_seconds=timeout_seconds,
+                max_review_cycles=max_review_cycles,
+                turn_timeout_seconds=turn_timeout_seconds,
+                grok_max_turns=grok_max_turns,
+                session=session,
+                session_mode=session_mode,
+                test_cmd=test_cmd,
+                canon_proposal_path=canon_proposal_path,
+            ),
         )
 
     started = time.monotonic()
@@ -10954,7 +11039,9 @@ def run_offload_pass_engine(
             "dispatch_id": dispatch_id,
             "start_head_ref": start_head_ref,
             "native_validation_config": (
-                str(native_validation_config) if isinstance(native_validation_config, Path) else native_validation_config
+                str(native_validation_config)
+                if isinstance(native_validation_config, Path)
+                else native_validation_config
             ),
             "native_validation_digest": native_validation_digest,
         },
@@ -10963,10 +11050,14 @@ def run_offload_pass_engine(
     # Durable authority this callback accepted at its first source-bearing
     # publication. Engine rewrites never change these fields.
     try:
-        accepted = read_pass_state(
-            resolved_state_dir, resolved_pass_id,
-            strict=pass_id is not None and detached_completion_job_id is None,
-        ) or {}
+        accepted = (
+            read_pass_state(
+                resolved_state_dir,
+                resolved_pass_id,
+                strict=pass_id is not None and detached_completion_job_id is None,
+            )
+            or {}
+        )
     except PassStateUnreadable as exc:
         return exc.hold()
     if "queue_intent" in accepted and detached_completion_job_id is None:
@@ -11010,15 +11101,33 @@ def run_offload_pass_engine(
     if accepted:
         from .nonexecution_history import authenticated_nonexecution
 
-        if authenticated_nonexecution(Path(worktree_path), resolved_state_dir, resolved_pass_id,
-                                     _pass_state_path(resolved_state_dir, resolved_pass_id).read_bytes()):
-            return {"ok": False, "outcome": "dispatch_refused", "reason": "nonexecution_recovered_identity",
-                    "pass_id": resolved_pass_id, "task_ref": task_ref, "lane_id": lane_id}
+        if authenticated_nonexecution(
+            Path(worktree_path),
+            resolved_state_dir,
+            resolved_pass_id,
+            _pass_state_path(resolved_state_dir, resolved_pass_id).read_bytes(),
+        ):
+            return {
+                "ok": False,
+                "outcome": "dispatch_refused",
+                "reason": "nonexecution_recovered_identity",
+                "pass_id": resolved_pass_id,
+                "task_ref": task_ref,
+                "lane_id": lane_id,
+            }
     # Only this invocation's pre-exposure control flow may produce a constructor
     # receipt. Existing execution/unknown records cannot acquire that authority.
-    constructor_only = not any(accepted.get(key) for key in (
-        "completion_config", "branch", "job_id", "agent_stream_path", "review_cycle_dispatch_id", "progress"
-    ))
+    constructor_only = not any(
+        accepted.get(key)
+        for key in (
+            "completion_config",
+            "branch",
+            "job_id",
+            "agent_stream_path",
+            "review_cycle_dispatch_id",
+            "progress",
+        )
+    )
     if detached_completion_job_id is None and _terminal_review_cycle_publication(accepted):
         # Same-ID retry of a consumed reservation, in EVERY mode (attached or
         # detached begin) and before the WorkerLock or any other mode-specific
@@ -11045,8 +11154,11 @@ def run_offload_pass_engine(
         return refusal
     publication_authority: dict[str, Any] = {
         "invocation_token": accepted.get("invocation_token"),
-        "orchestrator_root": (accepted.get("orchestrator_root") if constructor_only
-                              else accepted.get("orchestrator_root") or str(orchestrator_root)),
+        "orchestrator_root": (
+            accepted.get("orchestrator_root")
+            if constructor_only
+            else accepted.get("orchestrator_root") or str(orchestrator_root)
+        ),
     }
     checkpoints: list[str] = []
     # ``checkpoints`` records implementation checkpoint commits only. Review
@@ -11395,6 +11507,10 @@ def run_offload_pass_engine(
         )
         if dispatch_receipt is not None:
             dispatch_receipt["remote_exec_selection"] = remote_exec_selection
+            if detached_completion_job_id is not None and tokens_payload.get("usage_source") == "observed":
+                dispatch_receipt["observed_tokens"] = cumulative_tokens
+                if observed_model:
+                    dispatch_receipt["served_model"] = str(observed_model)
         if model_call_incomplete_reason is not None:
             tokens_payload["tokens_complete"] = False
             tokens_payload["tokens_incomplete_reason"] = dict(model_call_incomplete_reason)
@@ -11588,8 +11704,12 @@ def run_offload_pass_engine(
 
             try:
                 result = constructor_result(
-                    Path(worktree_path), pass_id=resolved_pass_id, task_ref=task_ref, lane_id=lane_id,
-                    request=rescue_identity["completion_config"], result=result,
+                    Path(worktree_path),
+                    pass_id=resolved_pass_id,
+                    task_ref=task_ref,
+                    lane_id=lane_id,
+                    request=rescue_identity["completion_config"],
+                    result=result,
                     invocation_token=publication_authority["invocation_token"],
                 )
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -11600,9 +11720,12 @@ def run_offload_pass_engine(
             # Compatibility for await: a terminal admission receipt contains no
             # execution constructor/source identity. The immutable mode authority
             # lives above, outside the executable-history namespace.
-            write_pass_state(resolved_state_dir, resolved_pass_id,
+            write_pass_state(
+                resolved_state_dir,
+                resolved_pass_id,
                 {"status": "done", "task_ref": task_ref, "lane_id": lane_id, "result": result},
-                expected_invocation_token=publication_authority["invocation_token"])
+                expected_invocation_token=publication_authority["invocation_token"],
+            )
             return result
         if review_cycle_receipt is not None:
             from .review_cycle_dispatch import (
@@ -11695,13 +11818,21 @@ def run_offload_pass_engine(
                         "ledger_hold", "adapter_refusal_evidence_unavailable", {"producer_reason": str(exc)}
                     )
             from .review_cycle_dispatch import provider_refusal_proof
+
             provider_refusal = None
             candidate = cycle_raw.get("provider_refusal_proof") if isinstance(cycle_raw, dict) else None
-            if (isinstance(candidate, dict) and cycle_raw.get("provider_error_code") == "provider_model_refused"
-                    and cycle_final.get("handoff_action") == "transport_failure"):
-                provider_refusal = provider_refusal_proof(candidate.get("_stream_path"), candidate.get("_spec_path"),
-                    result=candidate.get("_result"), patch=candidate.get("_patch"),
-                    refusal_code="provider_model_refused")
+            if (
+                isinstance(candidate, dict)
+                and cycle_raw.get("provider_error_code") == "provider_model_refused"
+                and cycle_final.get("handoff_action") == "transport_failure"
+            ):
+                provider_refusal = provider_refusal_proof(
+                    candidate.get("_stream_path"),
+                    candidate.get("_spec_path"),
+                    result=candidate.get("_result"),
+                    patch=candidate.get("_patch"),
+                    refusal_code="provider_model_refused",
+                )
                 if provider_refusal != candidate:
                     provider_refusal = None
             settled = evidence_hold or settle_actual(
@@ -11764,6 +11895,21 @@ def run_offload_pass_engine(
             expected_invocation_token=publication_authority["invocation_token"],
         ):
             return result
+        cumulative_tokens = int(getattr(run_ctx, "cumulative_tokens", 0) or 0)
+        if detached_completion_job_id is not None and cumulative_tokens > 0:
+            snapshot = getattr(run_ctx, "final_result_snapshot", None)
+            reported_model = (
+                (snapshot.get("response_model") or snapshot.get("model")) if isinstance(snapshot, dict) else None
+            )
+            _backfill_detached_submit_pass_receipts(
+                state_dir=resolved_state_dir,
+                job_id=detached_completion_job_id,
+                current_pass_id=resolved_pass_id,
+                tokens_payload=result["tokens"],
+                dispatch_receipt=result.get("dispatch_receipt"),
+                observed_tokens=cumulative_tokens,
+                served_model=reported_model if isinstance(reported_model, str) else None,
+            )
         _finish_production_history(
             production_history,
             result,
@@ -12061,10 +12207,14 @@ def run_offload_pass_engine(
                     hold = review_cycle_receipt.get("subject_resolution")
                     review_cycle_receipt = None
                     if hold is not None:
-                        return {**_payload("dispatch_refused", reason="subject_resolution_hold", error=refused["reason"]),
-                                "subject_resolution": hold}
-                    return {**_payload("dispatch_refused", reason=refused["status"], error=refused["reason"]),
-                            "review_cycle_refusal": refused}
+                        return {
+                            **_payload("dispatch_refused", reason="subject_resolution_hold", error=refused["reason"]),
+                            "subject_resolution": hold,
+                        }
+                    return {
+                        **_payload("dispatch_refused", reason=refused["status"], error=refused["reason"]),
+                        "review_cycle_refusal": refused,
+                    }
                 cycle_subject = review_cycle_receipt["identity"]["subject_branch"]
                 review_cycle_context_token = ACTIVE_DISPATCH.set(review_cycle_receipt)
                 rescue_identity.update(
@@ -12073,10 +12223,15 @@ def run_offload_pass_engine(
                     review_cycle=review_cycle_receipt["decision"],
                 )
             except (SubjectResolutionHeld, SubjectScopeUnauthenticated, SubjectAmbiguous) as exc:
-                return {**_payload("dispatch_refused", reason="subject_resolution_hold", error=str(exc)),
-                        "subject_resolution": subject_resolution_details(
-                            Path(worktree_path), exc, kind="gate" if review_lane else "implement",
-                            orchestrator_root=Path(orchestrator_root))}
+                return {
+                    **_payload("dispatch_refused", reason="subject_resolution_hold", error=str(exc)),
+                    "subject_resolution": subject_resolution_details(
+                        Path(worktree_path),
+                        exc,
+                        kind="gate" if review_lane else "implement",
+                        orchestrator_root=Path(orchestrator_root),
+                    ),
+                }
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
                 return _payload("dispatch_refused", reason="ledger_hold", error=str(exc))
         guidance_contract_invalid = False
@@ -13144,8 +13299,12 @@ def run_offload_pass_engine(
             if exec_probe.get("handoff_action") == "transport_failure":
                 if isinstance(raw_payload, dict):
                     transport_payload = dict(raw_payload)
-                outcome = ("transport_failure" if isinstance(raw_payload, dict)
-                           and raw_payload.get("provider_error_code") == "provider_model_refused" else "error")
+                outcome = (
+                    "transport_failure"
+                    if isinstance(raw_payload, dict)
+                    and raw_payload.get("provider_error_code") == "provider_model_refused"
+                    else "error"
+                )
                 failed_stage = "execute"
                 error_reason = _transport_failure_reason(exec_probe, raw_payload)
                 break
@@ -13603,12 +13762,19 @@ def run_offload_pass_engine(
                             else:
                                 verdict = "fail"
                         publication = publish_branch_judgment(
-                            resolved_pass_id, task_ref=task_ref, session=session, subject_path=branch,
+                            resolved_pass_id,
+                            task_ref=task_ref,
+                            session=session,
+                            subject_path=branch,
                             actor={"lane_id": lane_id, "branch": branch, "commit_sha": pre_exec_head},
-                            verdict=verdict, producer="managed", receipt=review_cycle_receipt,
-                            judge_pin={"backend": run_ctx.backend, "model": run_ctx.model,
-                                       "effort": getattr(run_ctx, "cycle_reasoning_effort", None)
-                                       or run_ctx.reasoning_effort},
+                            verdict=verdict,
+                            producer="managed",
+                            receipt=review_cycle_receipt,
+                            judge_pin={
+                                "backend": run_ctx.backend,
+                                "model": run_ctx.model,
+                                "effort": getattr(run_ctx, "cycle_reasoning_effort", None) or run_ctx.reasoning_effort,
+                            },
                         )
                     findings_harvest = _harvest_review_findings(
                         final_result,
@@ -13632,8 +13798,10 @@ def run_offload_pass_engine(
                         and not findings_harvest.get("unrecorded_ids")
                     ):
                         run = project_branch_judgment(
-                            publication, finding_ids=findings_harvest.get("recorded_ids")
-                            or findings_harvest.get("finding_ids") or [],
+                            publication,
+                            finding_ids=findings_harvest.get("recorded_ids")
+                            or findings_harvest.get("finding_ids")
+                            or [],
                             blocking_ids=[row["finding_id"] for row in findings_harvest.get("blocking_findings", [])],
                         )
                         error = run.get("error") or run.get("reason")
@@ -13644,8 +13812,13 @@ def run_offload_pass_engine(
                         if run["status"] == "recorded":
                             findings_harvest["review_run_id"] = run["review_run_id"]
                         else:
-                            logger.warning("review run receipt %s task_ref=%s lane_id=%s: %s",
-                                           run["status"], task_ref, lane_id, error)
+                            logger.warning(
+                                "review run receipt %s task_ref=%s lane_id=%s: %s",
+                                run["status"],
+                                task_ref,
+                                lane_id,
+                                error,
+                            )
                     if _harvest_block_parsed(findings_harvest):
                         durable_output = True
                         if completion["complete"]:
@@ -14418,8 +14591,11 @@ def run_offload_pass_engine(
                 if field_name in transport_payload:
                     payload[field_name] = transport_payload[field_name]
         if transport_payload.get("provider_error_code") == "provider_model_refused":
-            payload.update(reason="provider_model_refused", retryable=True,
-                           retry_after_seconds=transport_payload.get("retry_after_seconds", 120))
+            payload.update(
+                reason="provider_model_refused",
+                retryable=True,
+                retry_after_seconds=transport_payload.get("retry_after_seconds", 120),
+            )
         # E8ROUTE-LOCAL-02: typed channel distinct from free-form error prose.
         if execute_failure_reason:
             payload["failure_reason"] = execute_failure_reason
@@ -15249,10 +15425,7 @@ def _complete_remote_pass_owned(
         }
 
     pass_state = read_pass_state(resolved_state_dir, pass_id, strict=True) or {}
-    is_review_gate = (
-        pass_state.get("kind") == "review_gate"
-        and isinstance(pass_state.get("review_gate_context"), dict)
-    )
+    is_review_gate = pass_state.get("kind") == "review_gate" and isinstance(pass_state.get("review_gate_context"), dict)
     if "plan_review_binding" in spec:
         # A plan review has no lane-pass configuration. Its original
         # coordinator owns collection and the canonical review verdict.
@@ -15456,7 +15629,8 @@ def _complete_remote_pass_owned(
             if observation.get("rescue_artifact") != recorded_result.get("rescue_artifact"):
                 corrected = {**recorded_result, **observation}
                 if not write_pass_state(
-                    resolved_state_dir, pass_id,
+                    resolved_state_dir,
+                    pass_id,
                     {**pass_state, "superseded_rescue_result": recorded_result, "result": corrected},
                     expected_record=pass_state,
                 ):
@@ -15476,12 +15650,17 @@ def _complete_remote_pass_owned(
     recorded_result = pass_state.get("result")
     rescue = job.get("rescue")
     retry_terminal_rescue = (
-        stage in {"done", "completed"} and isinstance(rescue, dict)
-        and pass_state.get("status") == "done" and isinstance(recorded_result, dict)
+        stage in {"done", "completed"}
+        and isinstance(rescue, dict)
+        and pass_state.get("status") == "done"
+        and isinstance(recorded_result, dict)
         and recorded_result.get("terminal") is True
         and (job.get("loss_cause") == remote_job_ledger.UNIT_DEAD_NO_RECEIPT or job.get("supervisor_failure") is True)
         and (
-            (rescue.get("partial") is False and ("capture_scope" not in rescue or job.get("rescue_confirmed") is not True))
+            (
+                rescue.get("partial") is False
+                and ("capture_scope" not in rescue or job.get("rescue_confirmed") is not True)
+            )
             or recorded_result.get("rescue_artifact") != rescue.get("rescue_artifact")
         )
     )
@@ -15500,8 +15679,10 @@ def _complete_remote_pass_owned(
         )
     )
     if (
-        pass_state.get("status") == "done" and isinstance(recorded_result, dict)
-        and not resume_custody and not retry_terminal_rescue
+        pass_state.get("status") == "done"
+        and isinstance(recorded_result, dict)
+        and not resume_custody
+        and not retry_terminal_rescue
     ):
         recorded_outcome = recorded_result.get("outcome")
         if recorded_outcome != OffloadOutcome.REMOTE_JOB_PENDING.value:
@@ -16138,25 +16319,28 @@ def _complete_remote_pass_owned(
                 or collection.get("artifacts") != _detached_collection_manifest(paths)
             ):
                 raise ValueError("detached_preflight_proof_unknown")
-            settled = settle_actual(worktree_path, receipt["identity"], outcome=refusal["outcome"],
-                                    refusal_reason=refusal["reason"])
+            settled = settle_actual(
+                worktree_path, receipt["identity"], outcome=refusal["outcome"], refusal_reason=refusal["reason"]
+            )
             if settled.status != "settled":
                 raise ValueError(f"detached_preflight_settlement_{settled.reason}")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return custody_hold("detached_preflight_evidence_hold", error=str(exc))
-        return persist_terminal({
-            "ok": False,
-            "outcome": refusal["outcome"],
-            "reason": refusal["reason"],
-            "failed_stage": "execute",
-            "summary": "Native provisioning refused before model entry; original reservation settled.",
-            "commit_landed": False,
-            "work_status": "not_landed",
-            "ceremony_status": "not_attempted",
-            "findings": [],
-            "pre_dispatch_refusal": refusal,
-            "review_cycle": {"reservation": receipt["decision"], "settlement": asdict(settled)},
-        })
+        return persist_terminal(
+            {
+                "ok": False,
+                "outcome": refusal["outcome"],
+                "reason": refusal["reason"],
+                "failed_stage": "execute",
+                "summary": "Native provisioning refused before model entry; original reservation settled.",
+                "commit_landed": False,
+                "work_status": "not_landed",
+                "ceremony_status": "not_attempted",
+                "findings": [],
+                "pre_dispatch_refusal": refusal,
+                "review_cycle": {"reservation": receipt["decision"], "settlement": asdict(settled)},
+            }
+        )
     if vm_rc != 0 and not review_gate_success_rc:
         # The exit code alone certifies nothing: keep every AVAILABLE authentic
         # fact of a paid attempt at first publication (same derivation as repair).

@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.22] — 2026-11-27
+
+### Changed
+- Advance the Codex bridge package version for the WorkBay v0.1.106 Git release, which moves release checks and publication to the vm-ci publish adapter, retires GitHub Actions, ships durable token metrics, and updates the canon-lint pin to v0.27.1.
+
 ## [0.3.21] — 2026-11-26
 
 ### Changed

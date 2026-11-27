@@ -28,11 +28,16 @@ from workbay_protocol import reasoning_effort as model_routing
 from .review_cycle_holder_diagnostics import format_holder_diagnostics
 from .review_cycle_ledger import KINDS, LedgerDecision, ReviewCycleLedger, ReviewCycleRoutesError, TrustedPolicy, _Hold
 from .review_ratchet import at_review_source, review_source_ref
+from .transport_ref import is_transport_ref
 
-# Operator-supplied immutable release, overriding the older repository consumer
-# pin for this integration. This is a release digest, never proposal-derived.
-_CANON_DIGEST = "46636aa71f2e2e0c413b6ccff1cae4959543026c6ee7e4abde2bc7f30645a260"
 _PUBLISHED_CANON_LINK = Path("Development/heuristics-canon-current")
+_SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+_SEMVER_PRERELEASE_ID = rf"(?:{_SEMVER_NUMBER}|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)"
+_SEMVER = re.compile(
+    rf"{_SEMVER_NUMBER}(?:\.{_SEMVER_NUMBER}){{2}}"
+    rf"(?:-{_SEMVER_PRERELEASE_ID}(?:\.{_SEMVER_PRERELEASE_ID})*)?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?"
+)
 ACTIVE_DISPATCH: ContextVar[dict | None] = ContextVar("review_cycle_dispatch", default=None)
 # Gate-authored collection artifacts that exist before the model boundary. Any
 # other collected artifact (result, stream, debug, self-verify, remainder) is
@@ -407,32 +412,52 @@ def _trusted_canon_root() -> Path:
     return root
 
 
+def _matches_canon_index(ids: list[str], entry: dict) -> bool:
+    declared_ids = entry.get("rule_ids")
+    count = entry.get("rules")
+    return (isinstance(declared_ids, list) and all(isinstance(item, str) for item in declared_ids)
+            and type(count) is int and len(ids) == count and sorted(ids) == sorted(declared_ids))
+
+
 def trusted_policy() -> TrustedPolicy:
     # Only deployment authority (see _trusted_canon_root). Never read spec.env.
     root = _trusted_canon_root()
     raw = (root / "meta/release-manifest.json").read_bytes()
-    if hashlib.sha256(raw).hexdigest() != _CANON_DIGEST:
+    manifest_digest = hashlib.sha256(raw).hexdigest()
+    expected_digest = os.environ.get("WORKBAY_HEURISTICS_CANON_DIGEST")
+    if expected_digest and manifest_digest != expected_digest:
         raise ValueError("trusted_canon_manifest_mismatch")
-    manifest = json.loads(raw)
-    if manifest["schema"] != "heuristics-canon/release@5" or manifest["version"] != "0.26.2":
+    try:
+        manifest = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("trusted_canon_manifest_invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("trusted_canon_manifest_invalid")
+    version = manifest.get("version")
+    if (manifest.get("schema") != "heuristics-canon/release@5"
+            or not isinstance(version, str) or not _SEMVER.fullmatch(version)):
         raise ValueError("trusted_canon_version_mismatch")
+    lexicons = manifest.get("lexicons")
+    if not isinstance(lexicons, dict):
+        raise ValueError("trusted_canon_manifest_invalid")
     rules = []
-    for relative, entry in manifest["lexicons"].items():
+    for relative, entry in lexicons.items():
+        if not isinstance(entry, dict):
+            raise ValueError("trusted_canon_manifest_invalid")
         path = (root / relative).resolve(strict=True)
         if not path.is_relative_to(root) or not relative.startswith("lexicons/"):
             raise ValueError("trusted_canon_path_invalid")
         content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != entry["sha256"]:
+        if hashlib.sha256(content).hexdigest() != entry.get("sha256"):
             raise ValueError("trusted_canon_lexicon_mismatch")
         actual = re.findall(rb"^\| ([A-Z][A-Z0-9]*-[0-9]+)(?:<|\s)", content, re.M)
         ids = [item.decode() for item in actual]
-        if sorted(ids) != sorted(entry["rule_ids"]) or len(ids) != entry["rules"]:
+        if not _matches_canon_index(ids, entry):
             raise ValueError("trusted_canon_rule_index_mismatch")
         rules.extend(ids)
-    if (len(rules) != manifest["rules"] or len(set(rules)) != len(rules)
-            or sorted(rules) != sorted(manifest["rule_ids"])):
+    if not rules or len(set(rules)) != len(rules) or not _matches_canon_index(rules, manifest):
         raise ValueError("trusted_canon_rule_index_mismatch")
-    return TrustedPolicy(manifest["version"], _CANON_DIGEST, frozenset(rules))
+    return TrustedPolicy(version, manifest_digest, frozenset(rules))
 
 
 def _configured_review_cycle(repo: Path) -> dict:
@@ -2280,7 +2305,7 @@ def shell_entry() -> None:
             # from collected artifacts or the worker's result payload.
             if mode == "pending" and len(sys.argv) == 13:
                 nonce, ref = sys.argv[11:13]
-                if re.fullmatch(r"[0-9]+-[0-9a-f]{16}", nonce) is None or not ref.startswith("refs/heads/"):
+                if re.fullmatch(r"[0-9]+-[0-9a-f]{16}", nonce) is None or not is_transport_ref(ref, nonce):
                     raise ValueError("native_dispatch_identity_invalid")
                 native = dict(dispatch_nonce=nonce, dispatch_ref=ref)
                 if receipt.get("native_dispatch", native) != native:

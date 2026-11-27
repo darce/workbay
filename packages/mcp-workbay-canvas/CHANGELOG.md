@@ -3,6 +3,11 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.1.37] — 2026-11-26
+
+### Changed
+- Set dependency floors to the WorkBay v0.1.106 handoff and orchestrator versions.
+
 ## [0.1.36] — 2026-11-26
 
 ### Changed

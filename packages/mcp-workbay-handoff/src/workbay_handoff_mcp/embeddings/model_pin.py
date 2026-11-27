@@ -4,7 +4,8 @@ Both the embedding provider and the bootstrap provisioner read these constants.
 Digest values were computed offline at pin time from HuggingFace revision
 ``a829fd0e060bb84554da0dfd354d0de0f7712b7f``; no network I/O at import.
 
-This module also owns the only canonical embedding-revision digest (implementation note).
+This module also owns the canonical ONNX embedding-revision digest (implementation note)
+and the model descriptor for endpoint-managed embeddings.
 """
 
 from __future__ import annotations
@@ -53,6 +54,22 @@ MODEL_PIN = ModelPin(
     source_repo=SOURCE_REPO,
     source_revision=SOURCE_REVISION,
 )
+
+
+@dataclass(frozen=True)
+class OpenAIEmbeddingDescriptor:
+    """Identity and vector geometry for an endpoint-managed embedding model."""
+
+    url: str
+    model: str
+    dim: int = EMBEDDING_DIM
+
+    @property
+    def model_id(self) -> str:
+        """Keep persisted vectors scoped to the endpoint, model and width."""
+        endpoint = hashlib.sha256(self.url.encode("utf-8")).hexdigest()
+        return f"openai-compatible:{endpoint}:{self.dim}:{self.model}"
+
 
 REVISION_DOMAIN = "workbay.embedding.revision.v1"
 SUPPORTED_RECIPE_VERSION = "workbay-cls-l2-f32-v1"

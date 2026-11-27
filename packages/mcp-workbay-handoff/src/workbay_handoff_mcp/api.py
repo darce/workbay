@@ -30,6 +30,7 @@ from fastmcp.client import Client, PythonStdioTransport
 from fastmcp.tools import FunctionTool, ToolResult
 from pydantic import BaseModel, Field, TypeAdapter
 from workbay_protocol import BRAND_NAME, StructuredSummary, resolve_env_alias
+from workbay_protocol.reasoning_effort import WORKER_REASONING_EFFORT_CHOICES as WORKER_REASONING_EFFORT_CHOICES
 from workbay_protocol.tool_serving_index import HANDOFF_TOOL_NAMES
 
 from . import compaction as _compaction_module
@@ -456,6 +457,8 @@ class RecordDecisionEvent(BaseModel):
     output_tokens: Annotated[int | None, Field(description="Optional completion token count for this slice.")] = None
     total_tokens: Annotated[int | None, Field(description="Optional total token count for this slice.")] = None
     changed_files: DecisionChangedFilesParam = None
+    supersedes_decision_id: Annotated[int | None, Field(description="ID of the prior decision this reverses.")] = None
+    reversal_cause: Annotated[str | None, Field(description="Cause of the reversal, such as 'canon:DATA-14'.")] = None
     fields: Annotated[
         str | None,
         Field(description="Optional comma-separated write-receipt projection."),
@@ -1402,6 +1405,8 @@ def _record_event_receipt_preview(
             "commit_sha": actor_values.get("commit_sha"),
             "decision_origin": None,
             "created_at": "2000-01-01 00:00:00",
+            "supersedes_decision_id": event_payload.supersedes_decision_id,
+            "reversal_cause": event_payload.reversal_cause,
         }
         return _envelope(
             ok=True,
@@ -1863,6 +1868,8 @@ def record_decision(
         ),
     ] = False,
     deadline: Annotated[float | None, Field(description="Optional absolute monotonic deadline for this write.")] = None,
+    supersedes_decision_id: Annotated[int | None, Field(description="ID of the prior decision this reverses.")] = None,
+    reversal_cause: Annotated[str | None, Field(description="Cause of the reversal, such as 'canon:DATA-14'.")] = None,
 ) -> dict:
     return _core_record_decision(
         session=session,
@@ -1878,6 +1885,8 @@ def record_decision(
         slice_number=slice_number,
         decision_origin=decision_origin,
         refresh_rationale_on_conflict=refresh_rationale_on_conflict,
+        supersedes_decision_id=supersedes_decision_id,
+        reversal_cause=reversal_cause,
         **({"deadline": deadline} if deadline is not None else {}),
     )
 
@@ -1997,6 +2006,8 @@ def record_event(
             output_tokens=event_payload.output_tokens,
             total_tokens=event_payload.total_tokens,
             changed_files=event_payload.changed_files,
+            supersedes_decision_id=event_payload.supersedes_decision_id,
+            reversal_cause=event_payload.reversal_cause,
         )
     elif isinstance(event_payload, RecordTestResultEvent):
         result = _core_record_test_result(
@@ -3216,10 +3227,6 @@ class ArgSpec:
     action: str | None = None  # e.g. "store_true", "append"
     nargs: str | None = None
     dest: str | None = None  # override argparse dest
-
-
-# Choices used by both the tool registry and CLI for worker reasoning effort.
-_WORKER_REASONING_EFFORT_CHOICES = ("inherit", "auto", "low", "medium", "high", "xhigh")
 
 
 @dataclass

@@ -762,6 +762,7 @@ _REGENERABLE_IGNORED_ROOTS: frozenset[str] = frozenset(
     }
 )
 _REGENERABLE_CACHE_DIR_NAMES: frozenset[str] = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
+_REGENERABLE_DEPENDENCY_DIR_NAMES = frozenset({"node_modules", "vendor"})
 #: Roots holding per-worktree runtime state: liveness stamps, locks, breaker
 #: state and daemon logs that a later run re-derives and that nothing outside
 #: this worktree ever reads.  Unlike the content-identity rules, this one makes
@@ -3119,10 +3120,12 @@ def _package_virtualenv_rule(
 ) -> str | None:
     """Authorize ignored files under a structurally verified worktree venv."""
     parts = normalized.split("/")
-    if len(parts) >= 2 and (parts[0] == ".venv" or parts[0].startswith(".venv-")):
+    if len(parts) >= 2 and parts[0].startswith(".venv-"):
         venv_dir = parts[0]
-    elif len(parts) >= 4 and parts[0] == "packages" and (parts[2] == ".venv" or parts[2].startswith(".venv-")):
+    elif len(parts) >= 4 and parts[0] == "packages" and parts[2].startswith(".venv-"):
         venv_dir = "/".join(parts[:3])
+    elif ".venv" in parts[:-1]:
+        venv_dir = "/".join(parts[: parts.index(".venv") + 1])
     else:
         return None
 
@@ -3147,26 +3150,29 @@ def _editable_install_metadata_rule(
 ) -> str | None:
     """Recognize editable-install metadata only beneath a tracked project.
 
-    The package root and metadata directory are intentionally narrow: a name
-    elsewhere, or a project manifest which exists but is not tracked, cannot
-    authorize the deletion. Cache the index proof once per package and per
-    ignored-content probe, never across probes or worktrees.
+    Recognize project roots and their immediate src directories. Cache the
+    tracked manifest proof once per project and per ignored-content probe.
     """
     parts = normalized.split("/")
-    if (
-        worktree_path is None
-        or len(parts) < 5
-        or parts[0] != "packages"
-        or parts[2] != "src"
-        or not any(parts[3].endswith(suffix) and parts[3] != suffix for suffix in (".egg-info", ".dist-info"))
-    ):
+    if worktree_path is None:
         return None
+    for metadata_index, directory_name in enumerate(parts[:-1]):
+        suffixes = (".egg-info",)
+        if metadata_index == 3 and parts[0] == "packages" and parts[2] == "src":
+            suffixes = (".egg-info", ".dist-info")
+        if directory_name.endswith(suffixes) and directory_name not in suffixes:
+            break
+    else:
+        return None
+    project_parts = parts[:metadata_index]
+    if project_parts and project_parts[-1] == "src":
+        project_parts.pop()
 
     # Git enumerates ignored leaves, so do not use a symlinked ancestor or a
     # special leaf as proof of an editable-install metadata directory.
     directory = Path(worktree_path)
     try:
-        for component in parts[:4]:
+        for component in parts[: metadata_index + 1]:
             directory /= component
             if not stat.S_ISDIR(directory.lstat().st_mode):
                 return None
@@ -3176,7 +3182,7 @@ def _editable_install_metadata_rule(
     if candidate is None or _regular_file_size(candidate) is None:
         return None
 
-    manifest = "/".join((parts[0], parts[1], "pyproject.toml"))
+    manifest = "/".join((*project_parts, "pyproject.toml"))
     manifest_path = _contained_worktree_path(worktree_path, manifest)
     if manifest_path is None or _regular_file_size(manifest_path) is None:
         return None
@@ -3209,7 +3215,7 @@ def _editable_install_metadata_rule(
         manifest_cache[manifest] = valid
     if not manifest_cache[manifest]:
         return None
-    return "editable_install_metadata:" + "/".join(parts[:4])
+    return "editable_install_metadata:" + "/".join(parts[: metadata_index + 1])
 
 
 def _ignored_path_regenerable_rule(
@@ -3236,6 +3242,9 @@ def _ignored_path_regenerable_rule(
     # ledger root: that would make ``.venv/x/__pycache__/AUTHORED.md`` safe.
     if cache_matched:
         return cache_rule
+    for directory in parts[:-1]:
+        if directory in _REGENERABLE_DEPENDENCY_DIR_NAMES:
+            return f"dependency_dir:{directory}"
     heartbeat_rule = _heartbeat_rule(parts)
     if heartbeat_rule is not None:
         return heartbeat_rule

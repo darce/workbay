@@ -315,6 +315,10 @@ class CompactionRecordReceipt(BaseModel):
     extract-char clipping so ``tokens_saved_estimate`` stays interpretable when
     ``input_chars`` reflects the slimmed extractor input. Stop-hook/CLI receipt
     lines emit it immediately after ``input_chars``.
+
+    ``transcript_bytes_omitted`` counts bytes skipped at the head of an oversized
+    file when the recorder reads it directly. The Stop hook reads and logs
+    truncation before passing its pre-sliced text to the recorder.
     """
 
     compaction_id: str
@@ -325,6 +329,7 @@ class CompactionRecordReceipt(BaseModel):
     prose_residual_chars: int
     tokens_saved_estimate: int
     db_row_id: int
+    transcript_bytes_omitted: int = Field(default=0, ge=0)
 
 
 class CompactionAdvisoryThresholds(BaseModel):
@@ -398,6 +403,8 @@ def format_compaction_record_receipt_lines(receipt: CompactionRecordReceipt) -> 
     lines = [f"compaction_id={receipt.compaction_id}"]
     for field in COMPACTION_RECORD_RECEIPT_OPERATOR_FIELDS:
         lines.append(f"{field}={getattr(receipt, field)}")
+    if receipt.transcript_bytes_omitted:
+        lines.append(f"transcript_bytes_omitted={receipt.transcript_bytes_omitted}")
     return lines
 
 
@@ -1221,18 +1228,43 @@ def _process_transcript_text(text: str, settings: CompactionSettings) -> str:
     return _cap_extract_chars(processed, settings.max_extract_chars)
 
 
+def _read_transcript_window(
+    transcript_path: Path,
+    max_bytes: int,
+) -> tuple[str, int, int]:
+    """Read a bounded window and return its text, file size, and omitted bytes."""
+    with transcript_path.open("rb") as source:
+        raw_size = os.fstat(source.fileno()).st_size
+        omitted_bytes = max(0, raw_size - max_bytes)
+        starts_mid_line = False
+        if omitted_bytes:
+            source.seek(omitted_bytes - 1)
+            starts_mid_line = source.read(1) != b"\n"
+        raw = source.read(min(raw_size, max_bytes))
+
+    if starts_mid_line:
+        newline = raw.find(b"\n")
+        partial_bytes = len(raw) if newline == -1 else newline + 1
+        omitted_bytes += partial_bytes
+        raw = raw[partial_bytes:]
+    if omitted_bytes:
+        _log.warning(
+            "Compaction transcript truncated: raw_input_bytes=%d max_transcript_bytes=%d transcript_bytes_omitted=%d",
+            raw_size,
+            max_bytes,
+            omitted_bytes,
+        )
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text, raw_size, omitted_bytes
+
+
 def _read_raw_transcript(
     transcript_path: str | Path,
     settings: CompactionSettings | None = None,
 ) -> str:
     resolved_settings = settings or CompactionSettings.from_env()
-    path = Path(transcript_path)
-    raw_size = path.stat().st_size
-    if raw_size > resolved_settings.max_transcript_bytes:
-        raise ValueError(
-            f"Transcript exceeds max_transcript_bytes limit of {resolved_settings.max_transcript_bytes} bytes"
-        )
-    return path.read_text(encoding="utf-8", errors="replace")
+    raw_text, _, _ = _read_transcript_window(Path(transcript_path), resolved_settings.max_transcript_bytes)
+    return raw_text
 
 
 def _read_transcript(
@@ -1444,6 +1476,7 @@ def _build_record_receipt(
     *,
     input_chars: int,
     raw_input_bytes: int,
+    transcript_bytes_omitted: int,
     db_row_id: int,
     tokens_saved_estimate: int,
 ) -> CompactionRecordReceipt:
@@ -1454,6 +1487,7 @@ def _build_record_receipt(
         summary=summary,
         input_chars=input_chars,
         raw_input_bytes=raw_input_bytes,
+        transcript_bytes_omitted=transcript_bytes_omitted,
         summary_chars=summary_chars,
         prose_residual_chars=prose_residual_chars,
         tokens_saved_estimate=tokens_saved_estimate,
@@ -1486,7 +1520,7 @@ def compact_session(
     normalized_harness = _validate_harness(harness)
     resolved_settings = settings or CompactionSettings.from_env()
     transcript_path_obj = Path(transcript_path)
-    raw_input_bytes = transcript_path_obj.stat().st_size
+    transcript_bytes_omitted = 0
     # internal: when the caller supplies turn_range it has already sliced
     # transcript_text to the new turns (the Stop hook does this). Re-slicing here
     # would double-slice — and JSONL re-numbers ordinals from 1, so the second
@@ -1494,16 +1528,15 @@ def compact_session(
     # silently dropped. Track it so the anchor embeds the caller's text as-is.
     caller_supplied_turn_range = turn_range is not None
     if transcript_text is None:
-        raw_text = _read_raw_transcript(transcript_path_obj, settings=resolved_settings)
-        turn_source_text = raw_text
-        transcript = _process_transcript_text(raw_text, resolved_settings)
-        if turn_range is None:
-            turn_range = _derive_turn_range(raw_text)
+        turn_source_text, raw_input_bytes, transcript_bytes_omitted = _read_transcript_window(
+            transcript_path_obj, resolved_settings.max_transcript_bytes
+        )
     else:
+        raw_input_bytes = transcript_path_obj.stat().st_size
         turn_source_text = transcript_text
-        if turn_range is None:
-            turn_range = _derive_turn_range(transcript_text)
-        transcript = _process_transcript_text(transcript_text, resolved_settings)
+    if turn_range is None:
+        turn_range = _derive_turn_range(turn_source_text)
+    transcript = _process_transcript_text(turn_source_text, resolved_settings)
     now = datetime.now(UTC)
 
     with _get_db_connection() as conn:
@@ -1513,7 +1546,12 @@ def compact_session(
         # Bound the new-turn slice for the transcript anchor (internal).
         # Only needed when the caller did NOT pre-slice (turn_range omitted); the
         # Stop hook pre-slices + supplies turn_range, so skip the query there.
-        prior_end_turn = 0 if caller_supplied_turn_range else _prior_compaction_end_turn(conn, resolved_task_ref)
+        # A truncated window starts its JSONL ordinals at 1 again.
+        prior_end_turn = (
+            0
+            if caller_supplied_turn_range or transcript_bytes_omitted
+            else _prior_compaction_end_turn(conn, resolved_task_ref)
+        )
         extracted = _extract_summary_fields(
             conn,
             task_ref=resolved_task_ref,
@@ -1581,6 +1619,7 @@ def compact_session(
         summary,
         input_chars=len(transcript),
         raw_input_bytes=raw_input_bytes,
+        transcript_bytes_omitted=transcript_bytes_omitted,
         db_row_id=db_row_id,
         tokens_saved_estimate=tokens_saved_estimate,
     )

@@ -3,6 +3,33 @@
 Condensed public changelog — internal references removed, one headline
 per change. Auto-generated from the project's release notes.
 
+## [0.3.108] — 2026-11-27
+
+### Fixed
+- Pin orchestrator 0.3.55 and workbay-system 0.4.53 to ship the transport ref fix and matching boundary runtime for WorkBay v0.1.106.
+
+## [0.3.107] — 2026-11-27
+
+### Fixed
+- Pin workbay-system 0.4.52 to ship the corrected boundary runtime pin for WorkBay v0.1.106.
+
+## [0.3.106] — 2026-11-27
+
+### Changed
+- Pin the WorkBay v0.1.106 runtime to Train 4 releases of handoff (0.3.48), orchestrator (0.3.54), and system (0.4.51).
+
+## [0.3.105] - 2026-11-27
+
+### Changed
+- Refresh the v0.1.106 runtime pins and add the `workbay[canon]` extra with canon lint and v0.27.1 pinning support.
+- Move release checks and publication to the vm-ci adapter, retire GitHub Actions, and harden publication hold and SSH handling.
+- Ship token metrics updates and triage Trains 0–2, including canon and ledger compatibility, bounded compaction, lane cleanup, backend routing, and faster native hook startup.
+
+## [0.3.104] — 2026-11-26
+
+### Changed
+- Pin the WorkBay v0.1.106 runtime stack, including the orchestrator fix for sealed queued refusal receipts.
+
 ## [0.3.103] — 2026-11-26
 
 ### Changed

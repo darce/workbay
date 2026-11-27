@@ -64,6 +64,15 @@
       "git_mirror": true
     },
     {
+      "name": "workbay-canon-lint",
+      "path": "packages/workbay-canon-lint",
+      "distribution": "workbay-canon-lint",
+      "artifact_prefix": "workbay_canon_lint",
+      "test_command": "python -m pytest -q",
+      "changelog": "packages/workbay-canon-lint/CHANGELOG.md",
+      "git_mirror": true
+    },
+    {
       "name": "workbay",
       "path": "packages/workbay",
       "distribution": "workbay",

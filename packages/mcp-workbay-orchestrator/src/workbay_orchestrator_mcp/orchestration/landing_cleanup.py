@@ -43,7 +43,16 @@ _MUTABLE_FIELDS = frozenset(
         "next_attempt_at",
     }
 )
-_TERMINAL_CLEANUP_STATES = frozenset({"complete", "skipped", "not_required"})
+_TERMINAL_ERROR_STATES = frozenset({"failed", "refused"})
+_TERMINAL_CLEANUP_STATES = frozenset({"complete", "skipped", "not_required"}) | _TERMINAL_ERROR_STATES
+_REMOTE_REFUSAL_REASONS = frozenset(
+    {"cleanup_lane_owner_identity_mismatch", "cleanup_lane_key_owner_foreign", "remote_lane_key_invalid"}
+)
+_LOCAL_TERMINAL_REASONS = {
+    "captured_branch_unavailable": "failed",
+    "cleanup_intent_identity_invalid": "failed",
+    "tip_moved_after_landing": "refused",
+}
 _INTENT_FILENAME = re.compile(r"^([0-9a-f]{64})\.json$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_INTENT_FILES = 50_000
@@ -122,6 +131,20 @@ def _validated_next_attempt_at(value: object) -> float | None:
     return seconds
 
 
+def _verified_terminal_error(status: str, result: object) -> bool:
+    return (
+        isinstance(result, Mapping)
+        and result.get("ok") is False
+        and result.get("status") == status
+        and isinstance(result.get("reason"), str)
+        and bool(result["reason"].strip())
+    )
+
+
+def _remote_blocked_by_local_error(local_status: str, reason: str) -> dict[str, Any]:
+    return {"ok": False, "status": "refused", "reason": f"local_cleanup_{local_status}:{reason}"}
+
+
 def _validate_listed_intent(payload: Mapping[str, Any], *, filename_id: str) -> dict[str, Any]:
     """Check the complete immutable identity and the durable terminal evidence."""
 
@@ -158,10 +181,7 @@ def _validate_listed_intent(payload: Mapping[str, Any], *, filename_id: str) -> 
         raise CleanupIntentError("cleanup_intent_lane_snapshot_mismatch")
 
     statuses = (payload.get("local_status"), payload.get("remote_status"))
-    if any(
-        not isinstance(status, str) or status not in {"pending", "complete", "skipped", "not_required"}
-        for status in statuses
-    ):
+    if any(not isinstance(status, str) or status not in {"pending", *_TERMINAL_CLEANUP_STATES} for status in statuses):
         raise CleanupIntentError("cleanup_intent_status_invalid")
     if any(status == "skipped" for status in statuses):
         # No status-only or synthetic skip is completion evidence for cleanup.
@@ -173,12 +193,15 @@ def _validate_listed_intent(payload: Mapping[str, Any], *, filename_id: str) -> 
         if status == "pending":
             if result is not None and not isinstance(result, Mapping):
                 raise CleanupIntentError("cleanup_intent_result_invalid")
+        elif status in _TERMINAL_ERROR_STATES:
+            if not _verified_terminal_error(status, result):
+                raise CleanupIntentError("cleanup_intent_terminal_error_unverified")
         elif not isinstance(result, Mapping) or result.get("ok") is not True or result.get("status") != status:
             raise CleanupIntentError("cleanup_intent_completion_unverified")
     if statuses[1] == "not_required":
         _verify_coordination_projection(payload)
     completed_at = payload.get("completed_at")
-    if statuses[0] == "complete" and statuses[1] in {"complete", "not_required"}:
+    if all(status in _TERMINAL_CLEANUP_STATES for status in statuses):
         if type(completed_at) is not int or completed_at <= 0:
             raise CleanupIntentError("cleanup_intent_completion_unverified")
     elif completed_at is not None:
@@ -591,13 +614,19 @@ def update_intent(
             if all(payload.get(key) == value for key, value in updates.items()):
                 return payload
             raise StaleIntentRevision("cleanup_intent_revision_changed")
-        for field in ("local_status", "remote_status"):
-            if (
-                payload.get(field) in {"complete", "not_required"}
-                and field in updates
-                and updates[field] != payload[field]
-            ):
+        for side in ("local", "remote"):
+            field = f"{side}_status"
+            result_field = f"{side}_result"
+            current_status = payload.get(field)
+            status = updates.get(field, current_status)
+            if current_status in {"complete", "not_required", *_TERMINAL_ERROR_STATES} and status != current_status:
                 raise CleanupIntentError("cleanup_intent_terminal_transition_illegal")
+            if status in _TERMINAL_ERROR_STATES:
+                evidence = updates.get(result_field, payload.get(result_field))
+                if current_status == status and evidence != payload.get(result_field):
+                    raise CleanupIntentError("cleanup_intent_terminal_transition_illegal")
+                if not _verified_terminal_error(status, evidence):
+                    raise CleanupIntentError("cleanup_intent_terminal_error_unverified")
         if updates.get("local_status") == "not_required":
             raise CleanupIntentError("cleanup_intent_not_required_illegal")
         if updates.get("remote_status", payload.get("remote_status")) == "not_required":
@@ -765,7 +794,7 @@ def _remote_reap_result(
     identity = intent.get("identity")
     lane_row = intent.get("lane_row")
     if not isinstance(identity, Mapping) or not isinstance(lane_row, Mapping):
-        return {"ok": False, "status": "pending", "reason": "cleanup_intent_snapshot_invalid"}
+        return {"ok": False, "status": "failed", "reason": "cleanup_intent_snapshot_invalid"}
     task_ref = identity.get("task_ref")
     lane_id = identity.get("lane_id")
     expected_tip = identity.get("expected_tip")
@@ -774,7 +803,7 @@ def _remote_reap_result(
     if not all(
         isinstance(value, str) and value.strip() for value in (task_ref, lane_id, expected_tip, landing_commit, branch)
     ):
-        return {"ok": False, "status": "pending", "reason": "cleanup_intent_snapshot_incomplete"}
+        return {"ok": False, "status": "failed", "reason": "cleanup_intent_snapshot_incomplete"}
 
     coordination = coordination_not_required(root, intent, rows)
     if coordination is not None:
@@ -1306,7 +1335,7 @@ def drain_pending_cleanup_intents(
             # Receipt-bound stale local replay belongs to drainreplay-01.
             settle(intent)
             continue
-        if not local_pending and intent.get("local_status") != "complete":
+        if not local_pending and intent.get("local_status") not in {"complete", *_TERMINAL_ERROR_STATES}:
             continue
         next_attempt_at = _validated_next_attempt_at(intent.get("next_attempt_at"))
         if next_attempt_at is not None and next_attempt_at > now_seconds:
@@ -1341,6 +1370,17 @@ def drain_pending_cleanup_intents(
         identity = intent["identity"]
         is_stale = str(intent["intent_id"]) in stale_ids
 
+        if intent.get("local_status") in _TERMINAL_ERROR_STATES:
+            reason = intent["local_result"]["reason"]
+            save(
+                intent,
+                remote_status="refused",
+                remote_result=_remote_blocked_by_local_error(intent["local_status"], reason),
+                last_error=reason,
+                next_attempt_at=None,
+            )
+            continue
+
         if local_pending:
             # Reuse the saved-receipt landing path; skip only its nested global drain.
             from . import lane_land
@@ -1372,8 +1412,11 @@ def drain_pending_cleanup_intents(
                     )
                     if isinstance(replay_result, Mapping):
                         detail = replay_result.get("detail")
-                        if isinstance(detail, str) and detail.startswith("predecessor_retire_preflight_"):
-                            replay_error = " ".join(detail.splitlines())[:500]
+                        if isinstance(detail, str):
+                            if detail in _LOCAL_TERMINAL_REASONS:
+                                replay_error = detail
+                            elif detail.startswith("predecessor_retire_preflight_"):
+                                replay_error = " ".join(detail.splitlines())[:500]
                 except Exception as exc:
                     message = " ".join(str(exc).splitlines())[:400]
                     replay_error = f"local_cleanup_replay_failed:{type(exc).__name__}:{message}"
@@ -1387,16 +1430,35 @@ def drain_pending_cleanup_intents(
             failed_attempts = latest_attempts + 1
             local_status = refreshed.get("local_status")
             remote_status = refreshed.get("remote_status")
-            fully_complete = local_status in {"complete", "skipped"} and remote_status in {
-                "complete",
-                "skipped",
-                "not_required",
-            }
-            if fully_complete:
+            terminal_status = _LOCAL_TERMINAL_REASONS.get(replay_error) if replay_error is not None else None
+            if local_status == "pending" and replay_error is not None and terminal_status is not None:
+                previous_local = refreshed.get("local_result")
+                local_evidence = dict(previous_local) if isinstance(previous_local, Mapping) else {}
+                local_evidence.update(ok=False, status=terminal_status, reason=replay_error)
+                remote_updates = (
+                    {
+                        "remote_status": "refused",
+                        "remote_result": _remote_blocked_by_local_error(terminal_status, replay_error),
+                    }
+                    if remote_status == "pending"
+                    else {}
+                )
+                save(
+                    refreshed,
+                    local_status=terminal_status,
+                    local_result=local_evidence,
+                    attempts=failed_attempts,
+                    last_error=replay_error,
+                    next_attempt_at=None,
+                    **remote_updates,
+                )
+            elif local_status in _TERMINAL_CLEANUP_STATES and remote_status in _TERMINAL_CLEANUP_STATES:
                 save(
                     refreshed,
                     attempts=failed_attempts,
-                    last_error=None,
+                    last_error=refreshed.get("last_error")
+                    if {local_status, remote_status} & _TERMINAL_ERROR_STATES
+                    else None,
                     next_attempt_at=None,
                 )
             else:
@@ -1459,6 +1521,24 @@ def drain_pending_cleanup_intents(
             continue
 
         error = remote_result.get("reason")
+        status = remote_result.get("status")
+        if isinstance(error, str) and error in _REMOTE_REFUSAL_REASONS:
+            status = "refused"
+            remote_result = {**remote_result, "status": status}
+        if (
+            isinstance(status, str)
+            and status in _TERMINAL_ERROR_STATES
+            and _verified_terminal_error(status, remote_result)
+        ):
+            save(
+                intent,
+                remote_status=status,
+                remote_result=remote_result,
+                attempts=attempts + 1,
+                last_error=error,
+                next_attempt_at=None,
+            )
+            continue
         if not isinstance(error, str) or not error.strip():
             error = "remote_cleanup_incomplete"
         error = " ".join(error.splitlines())[:500]
@@ -1479,11 +1559,13 @@ def drain_pending_cleanup_intents(
         if item.get("local_status") == "pending" or item.get("remote_status") == "pending"
     ]
     result["still_pending"] = len(unresolved)
-    result["completed"] = len(pending_records) - len(unresolved)
+    result["completed"] = sum(
+        item.get("local_status") == "complete" and item.get("remote_status") in {"complete", "not_required"}
+        for item in latest.values()
+    )
     result["local_still_pending"] = sum(item.get("local_status") == "pending" for item in unresolved)
     result["local_completed"] = sum(
-        item.get("local_status") == "pending"
-        and latest[str(item["intent_id"])].get("local_status") in _TERMINAL_CLEANUP_STATES
+        item.get("local_status") == "pending" and latest[str(item["intent_id"])].get("local_status") == "complete"
         for item in pending_records
     )
     error_counts: dict[str, int] = {}

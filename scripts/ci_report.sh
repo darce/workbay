@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# CI status reporter — runs the remote gate and publishes one GitHub commit
-# status per gate target, so the gate host serves the role GitHub Actions
-# `test.yml` otherwise plays. No workflow file is touched: `test.yml` stays on
-# disk (packages/workbay-system/tests/make/test_workbay_ci_gate.py pins it), and
-# whether GitHub itself runs it is a repository setting, not this script's job.
+# CI status reporter for on-demand remote gate runs. Publishes one GitHub commit
+# status per gate target. The vm-ci transport replaces the retired GitHub Actions
+# workflow (.github/workflows/test.yml). See config/vm-ci/site.json for site
+# settings, scripts/ci/vm-check-policy.json for check routing, and mk/vm-ci.mk
+# for release publish targets that invoke scripts/ci/vm-ci-workbay-publish.sh.
 #
 # Usage:
 #   scripts/ci_report.sh                       # CI-parity target set against HEAD
@@ -52,7 +52,7 @@ origin_slug() {
 # Gate list comes from the ONE authored manifest (scripts/gate_manifest.txt,
 # canon v0.26.2 [REF-45]) — this script no longer authors its own copy.
 # `check-system` already runs `scripts/tests`; `check-system-integration`
-# (remote stage only, per the manifest) is a deliberate superset of hosted CI.
+# runs in the remote stage only, per the manifest.
 MANIFEST="$(dirname "$0")/gate_manifest.txt"
 [ -f "$MANIFEST" ] || { echo "ci-report: missing $MANIFEST" >&2; exit 2; }
 CI_PARITY_TARGETS=()

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbay-system"
-version = "0.4.48"
+version = "0.4.53"
 description = "Canonical workbay-system overlay payload (skills, hooks, contracts, generator) shipped as package data for workbay-bootstrap."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,7 @@ dev = [
     "pyyaml>=6",
     "hatchling>=1.27",
     "radon>=6.0.0",
-    "workbay-protocol>=0.3.28,<0.4.0",
+    "workbay-protocol>=0.3.29,<0.4.0",
 ]
 
 # uv-only dev provisioning: sibling test deps resolve via path-editable sources.
@@ -47,7 +47,7 @@ dev = [
     "hatchling>=1.27",
     "radon>=6.0.0",
     "mcp-workbay-handoff[test] ; python_version >= '3.12'",
-    "workbay-protocol>=0.3.28,<0.4.0",
+    "workbay-protocol>=0.3.29,<0.4.0",
 ]
 
 
@@ -88,3 +88,35 @@ addopts = "-ra"
 markers = [
     "integration: uv-driven environment provisioning checks (need `uv`; isolated, side-effect-free).",
 ]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["workbay_system"]
+# The overlay contains standalone scripts and consumer tests shipped as data.
+exclude = ["^workbay_system/payload/"]
+warn_return_any = true
+warn_unused_ignores = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
+
+# Current diagnostics in legacy modules. Other diagnostics stay enabled.
+
+[[tool.mypy.overrides]]
+module = ["workbay_system.overlay_tooling.check_harness_sync"]
+disable_error_code = ["assignment", "no-any-return", "union-attr", "unused-ignore", "var-annotated"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_system.overlay_tooling.check_skills"]
+disable_error_code = ["assignment", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_system.overlay_tooling.cli"]
+disable_error_code = ["no-any-return"]
+
+[[tool.mypy.overrides]]
+module = ["workbay_system.overlay_tooling.lint_hoisted_paths"]
+disable_error_code = ["arg-type"]

@@ -38,6 +38,40 @@ def _agy_exec_argv(
     return cmd
 
 
+def _extract_agy_envelope_metadata(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Read provider usage and model identity from the CLI envelope."""
+    metadata: dict[str, Any] = {}
+    for key in ("response_model", "model"):
+        model = parsed.get(key)
+        if isinstance(model, str) and model.strip():
+            metadata["response_model"] = model
+            break
+
+    for key in ("token_usage", "usage"):
+        usage = parsed.get(key)
+        if not isinstance(usage, dict):
+            continue
+        counts = {
+            name: value
+            for name in ("input_tokens", "output_tokens", "total_tokens")
+            if type(value := usage.get(name)) is int and value >= 0
+        }
+        if counts:
+            if "input_tokens" in counts and "output_tokens" in counts:
+                counts.setdefault("total_tokens", counts["input_tokens"] + counts["output_tokens"])
+            metadata["token_usage"] = {
+                "available": True,
+                "basis": "agy_json_usage",
+                "last": dict(counts),
+                "total": counts,
+            }
+            break
+        if key == "token_usage" and any(isinstance(usage.get(name), dict) for name in ("last", "total")):
+            metadata["token_usage"] = usage
+            break
+    return metadata
+
+
 def _parse_agy_output(stdout: str) -> dict[str, Any]:
     """Return the structured JSON payload from `agy -p --output-format json`."""
     stripped = stdout.strip()
@@ -49,19 +83,18 @@ def _parse_agy_output(stdout: str) -> dict[str, Any]:
         raise RuntimeError(f"agy returned non-JSON stdout: {stripped[:200]!r}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError(f"agy returned non-object JSON payload: {type(parsed).__name__}")
-    # Unwrap standard envelope if present (e.g., {"result": {...}} or {"structured_output": {...}})
+    metadata = _extract_agy_envelope_metadata(parsed)
+    # Structured payload fields take precedence over envelope metadata.
     for key in ("structured_output", "result"):
         nested = parsed.get(key)
-        if isinstance(nested, dict):
-            return nested
         if isinstance(nested, str):
             try:
-                decoded = json.loads(nested)
+                nested = json.loads(nested)
             except json.JSONDecodeError:
-                decoded = None
-            if isinstance(decoded, dict):
-                return decoded
-    return parsed
+                continue
+        if isinstance(nested, dict):
+            return {**metadata, **nested}
+    return {**metadata, **parsed}
 
 
 class AgyCliAdapter(BackendAdapter):
